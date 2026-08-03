@@ -1,0 +1,7 @@
+{
+  "exit_code": 0,
+  "terminal": "completed",
+  "require_text_contains": ["不会生成任务清单，也不会改动工作区"],
+  "forbid_text_contains": ["\"tasks\"", "已拆成"],
+  "forbid_event_kinds": ["error"]
+}

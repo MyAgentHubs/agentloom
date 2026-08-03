@@ -1,0 +1,8 @@
+{
+  "driver": "replay",
+  "mode": "run",
+  "run_id": "run_fx02",
+  "user_message": "帮我跑一下验收命令",
+  "events_file": "events.jsonl",
+  "exit_code": 1
+}

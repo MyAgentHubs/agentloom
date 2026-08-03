@@ -1,0 +1,1 @@
+录制自 deepseek（provider=deepseek）· 2026-07-07 · 因 mock provider 在 plan 正常 worklist 路径下永远无法产出可解析的 JSON worklist（mock 无脚本化 worklist 分支，只会回显 `Mock response for: ...` 纯文本，导致 worklist 反复解析失败、最终撞 plan_unreviewable/needs_decision，无法到达 completed），故按 PROGRAM.md 「录制冻结 fallback」用 deepseek 真跑一次并冻结事件流；workspace 绝对路径已替换为 `/tmp/agentloom-eval-ws-04` 占位，不含任何密钥。

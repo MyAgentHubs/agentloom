@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="AgentLoom app icon">
+  <rect width="512" height="512" rx="112" fill="#F5F2EC"/>
+  <rect x="18" y="18" width="476" height="476" rx="96" fill="none" stroke="#E5DDC9" stroke-width="12"/>
+
+  <path
+    d="M128 268C128 188 190 126 270 126C350 126 410 186 410 256C410 326 350 386 270 386C190 386 128 324 128 244C128 178 180 132 246 132"
+    fill="none"
+    stroke="#D97757"
+    stroke-width="44"
+    stroke-linecap="round"
+    stroke-linejoin="round"/>
+
+  <path
+    d="M384 244C384 324 322 386 242 386C162 386 102 326 102 256C102 186 162 126 242 126C322 126 384 188 384 268C384 334 332 380 266 380"
+    fill="none"
+    stroke="#1A1814"
+    stroke-width="44"
+    stroke-linecap="round"
+    stroke-linejoin="round"/>
+
+  <circle cx="256" cy="256" r="46" fill="#FFFEFB" stroke="#D97757" stroke-width="22"/>
+  <circle cx="168" cy="168" r="18" fill="#1A1814"/>
+  <circle cx="344" cy="344" r="18" fill="#D97757"/>
+</svg>

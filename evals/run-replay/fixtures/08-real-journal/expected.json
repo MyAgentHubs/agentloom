@@ -1,0 +1,10 @@
+{
+  "user_message_count": 1,
+  "assistant_message_count": 1,
+  "block_counts_exact": { "run_terminal": 1 },
+  "block_counts_min": { "text": 1, "tool": 1 },
+  "total_blocks_min": 30,
+  "total_blocks_max": 300,
+  "require_text_contains": ["I'll start by reading", "所有验收标准均已通过"],
+  "forbid_text_contains": ["schema_version", "tool_call_id"]
+}

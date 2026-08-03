@@ -1,0 +1,90 @@
+# Public-repo CI. Deliberately minimal: it must run green on a fork with zero
+# secrets configured. Signing, notarization, and store-packaging scripts ship
+# in this repository, but CI does not run them because they require secrets.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend (typecheck / test / format)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run format:check
+
+  engine:
+    name: Engine (myagent)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: harness-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: harness-agent
+      - run: cargo fmt --check
+      # --no-fail-fast: without it cargo stops at the first test binary that
+      # fails, and every later failure stays hidden until that one is fixed.
+      - run: cargo test --locked --no-fail-fast
+
+  app-backend:
+    name: App backend (Rust)
+    # macOS on purpose, not for cost: parts of the backend test suite exercise
+    # macOS-only facilities (`/usr/bin/sandbox-exec` for the verifier sandbox,
+    # `/bin/ps` for descendant-process checks). Roughly 20 tests across
+    # `worktree::`, `checkpoint_hook::` and `proc::` cannot pass on Linux.
+    # Do not "save minutes" by moving this to ubuntu-latest.
+    runs-on: macos-latest
+    env:
+      # bridge_eval spawn scenarios need to launch a real engine process.
+      MYAGENT_BIN: ${{ github.workspace }}/harness-agent/target/release/myagent
+    defaults:
+      run:
+        working-directory: app/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            app/src-tauri
+            harness-agent
+      - run: cargo fmt --check
+      # A fresh checkout has no myagent sidecar; tauri's build script requires it
+      # at binaries/myagent-<host-triple> before anything in src-tauri compiles.
+      - name: Stage myagent sidecar
+        run: |
+          cargo build --release --locked --manifest-path ../../harness-agent/Cargo.toml
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p binaries
+          cp "../../harness-agent/target/release/myagent" "binaries/myagent-${triple}"
+      # --no-run also compiles tests/, which --lib silently skips.
+      - run: cargo test --no-run --locked
+      # --no-fail-fast: without it cargo stops at the first test binary that
+      # fails, and every later failure stays hidden until that one is fixed.
+      - run: cargo test --locked --no-fail-fast

@@ -1,0 +1,6 @@
+{"schema_version":"harness.runtime.v1","event_id":"evt_0001","seq":1,"ts":"2026-07-08T10:00:00Z","run_id":"run_fx10","workspace":"/tmp/ws","type":"orchestration.step.started","payload":{"step":"bootstrap"}}
+{"schema_version":"harness.runtime.v1","event_id":"evt_0002","seq":2,"ts":"2026-07-08T10:00:01Z","run_id":"run_fx10","workspace":"/tmp/ws","type":"capabilities.declared","payload":{"capabilities":["shell_exec","fs_read"]}}
+{"schema_version":"harness.runtime.v1","event_id":"evt_0003","seq":3,"ts":"2026-07-08T10:00:02Z","run_id":"run_fx10","workspace":"/tmp/ws","type":"context.terrain.attached","payload":{"terrain_id":"terr_1"}}
+{"schema_version":"harness.runtime.v1","event_id":"evt_0004","seq":4,"ts":"2026-07-08T10:00:03Z","run_id":"run_fx10","workspace":"/tmp/ws","type":"format.reflex.applied","payload":{"reflex":"markdown"}}
+{"schema_version":"harness.runtime.v1","event_id":"evt_0005","seq":5,"ts":"2026-07-08T10:00:04Z","run_id":"run_fx10","workspace":"/tmp/ws","type":"orchestration.step.started","payload":{"step":"idle"}}
+{"schema_version":"harness.runtime.v1","event_id":"evt_0006","seq":6,"ts":"2026-07-08T10:00:05Z","run_id":"run_fx10","workspace":"/tmp/ws","type":"capabilities.declared","payload":{"capabilities":[]}}

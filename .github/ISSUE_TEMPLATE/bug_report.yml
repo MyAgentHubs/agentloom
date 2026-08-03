@@ -1,0 +1,84 @@
+name: Bug report
+description: Something in AgentLoom doesn't work the way it should
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. A few notes before you start:
+
+        - Please write this in your own words. Generated issue text gets the
+          thread closed — fluent-but-wrong reports cost us a full read before
+          the problem surfaces. Two rough honest sentences are worth more.
+        - Found a security issue? Don't file it here. See
+          [SECURITY.md](https://github.com/MyAgentHubs/agentloom/blob/main/SECURITY.md).
+
+  - type: input
+    id: version
+    attributes:
+      label: AgentLoom version
+      description: Settings → About, or the release you downloaded.
+      placeholder: "0.x.y"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Windows (experimental)
+        - Linux (build from source, unsupported)
+    validations:
+      required: true
+
+  - type: input
+    id: engine
+    attributes:
+      label: Engine and model
+      description: Which agent was running when this happened?
+      placeholder: "built-in myagent + deepseek-v4-pro / Claude Code / Codex"
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What you did, in order, starting from a fresh launch.
+      placeholder: |
+        1. Open project X
+        2. Start a session with ...
+        3. Send ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or error text
+      description: >
+        Paste any error shown in the app. Please redact API keys, tokens, and
+        anything private from your own repositories before posting.
+      render: text
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this isn't a duplicate
+          required: true
+        - label: I can reproduce this on the latest release
+          required: true
+        - label: I wrote this report myself; it is not AI-generated text
+          required: true

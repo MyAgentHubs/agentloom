@@ -1,0 +1,6 @@
+{
+  "driver": "spawn",
+  "mode": "run",
+  "prompt": "写个 hello world 脚本",
+  "criteria": ["cmd: false"]
+}

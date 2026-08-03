@@ -1,0 +1,4 @@
+{"schema_version":"harness.runtime.v1","event_id":"evt_000001","seq":1,"ts":"2026-07-08T10:00:00Z","run_id":"run_fx02","workspace":"/tmp/agentloom-eval-ws","type":"run.started","payload":{"mode":"solo","provider":"mock","model":"mock-1","workspace":"/tmp/agentloom-eval-ws"}}
+{"schema_version":"harness.runtime.v1","event_id":"evt_000002","seq":2,"ts":"2026-07-08T10:00:01Z","run_id":"run_fx02","workspace":"/tmp/agentloom-eval-ws","type":"agent.note.delta","payload":{"text":"开始执行验收命令 cargo test……"}}
+{"schema_version":"harness.runtime.v1","event_id":"evt_000003","seq":3,"ts":"2026-07-08T10:00:02Z","run_id":"run_fx02","workspace":"/tmp/agentloom-eval-ws","type":"agent.note.delta","payload":{"text":"用例跑到一半失败了。"}}
+{"schema_version":"harness.runtime.v1","event_id":"evt_000004","seq":4,"ts":"2026-07-08T10:00:03Z","run_id":"run_fx02","workspace":"/tmp/agentloom-eval-ws","type":"run.failed","payload":{"error":"验收命令 cargo test 退出码 101：2 个用例失败"}}

@@ -1,0 +1,37 @@
+[package]
+name = "myagent"
+version = "0.1.0"
+edition = "2021"
+description = "A standalone runtime CLI for turning OpenAI-compatible LLM APIs into a minimal executable agent."
+authors = ["MyAgentHubs <panda@myagenthubs.com>"]
+license = "AGPL-3.0-only"
+repository = "https://github.com/MyAgentHubs/agentloom"
+
+[[bin]]
+name = "myagent"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rmcp = { version = "2.2.0", default-features = false, features = ["client", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+scraper = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+assert_cmd = "2"
+serial_test = "3"
+tempfile = "3"
+wiremock = "0.6"

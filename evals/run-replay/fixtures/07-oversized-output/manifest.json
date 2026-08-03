@@ -1,0 +1,8 @@
+{
+  "driver": "replay",
+  "mode": "run",
+  "run_id": "run_fx07",
+  "user_message": "帮我跑一下这个会打印很多日志的验收脚本",
+  "events_file": "events.jsonl",
+  "exit_code": 0
+}

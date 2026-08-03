@@ -1,0 +1,7 @@
+{
+  "user_message_count": 1,
+  "assistant_message_count": 1,
+  "block_kind_sequence": ["thinking", "text", "tool", "text", "run_terminal"],
+  "terminal_status": "completed",
+  "require_text_contains": ["正在运行验收命令 cargo test", "验收结果：cargo test 全部通过"]
+}

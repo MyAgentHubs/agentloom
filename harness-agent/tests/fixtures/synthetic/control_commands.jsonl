@@ -1,0 +1,7 @@
+{"type":"stop","run_id":"r"}
+{"type":"approve","run_id":"r","approval_id":"a"}
+{"type":"reject","run_id":"r","approval_id":"a"}
+{"type":"pause","run_id":"r"}
+{"type":"resume","run_id":"r"}
+{"type":"revise","run_id":"r","message":"m"}
+{"type":"inspect_runtime","run_id":"r"}

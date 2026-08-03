@@ -1,0 +1,9 @@
+{
+  "driver": "replay",
+  "mode": "",
+  "run_id": "run_bf49bc2e",
+  "user_message": "把 myagent 的 i18n 缺口补齐（dogfood 会话 568f9326 真实录制·片段版）",
+  "events_file": "events.jsonl",
+  "exit_code": 3,
+  "interrupted": false
+}

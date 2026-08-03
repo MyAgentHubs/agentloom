@@ -1,0 +1,9 @@
+{
+  "driver": "replay",
+  "mode": "run",
+  "run_id": "run_fx03",
+  "user_message": "帮我看看工作区还有什么没提交的改动",
+  "events_file": "events.jsonl",
+  "exit_code": 130,
+  "interrupted": true
+}

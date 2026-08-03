@@ -1,0 +1,3 @@
+{"schema_version":"harness.runtime.v1","event_id":"evt_000001","seq":1,"ts":"2026-07-01T11:30:00Z","run_id":"run_eval_07","workspace":"/tmp/agentloom-eval-ws-07","type":"run.started","payload":{"mode":"solo","provider":"mock","model":"mock-1","workspace":"/tmp/agentloom-eval-ws-07"}}
+{"schema_version":"harness.runtime.v1","event_id":"evt_000002","seq":2,"ts":"2026-07-01T11:30:01Z","run_id":"run_eval_07","workspace":"/tmp/agentloom-eval-ws-07","type":"agent.note.delta","payload":{"text":"正在执行第 3 步……"}}
+{"schema_version":"harness.runtime.v1","event_id":"evt_000003","seq":3,"ts":"2026-07-01T11:30:02Z","run_id":"run_eval_07","workspace":"/tmp/agentloom-eval-ws-07","type":"run.interrupted","payload":{"step_id":"tool.execution","resume_command":"myagent resume run_eval_07"}}

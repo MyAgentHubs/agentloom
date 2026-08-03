@@ -1,0 +1,6 @@
+{
+  "driver": "lead_decision",
+  "user_message": "验收命令连续超时，要不要放宽阈值？",
+  "event_cursor": "evt_cursor_fx06",
+  "decision_block_file": "decision_block.json"
+}

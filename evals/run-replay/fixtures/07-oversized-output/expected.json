@@ -1,0 +1,7 @@
+{
+  "user_message_count": 1,
+  "assistant_message_count": 1,
+  "block_kind_sequence": ["text", "tool", "text", "run_terminal"],
+  "block_counts_exact": {"tool": 1},
+  "terminal_status": "completed"
+}

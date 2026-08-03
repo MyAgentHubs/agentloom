@@ -1,0 +1,9 @@
+{
+  "driver": "replay",
+  "mode": "",
+  "run_id": "run_fx10",
+  "user_message": "随便聊聊",
+  "events_file": "events.jsonl",
+  "exit_code": 0,
+  "interrupted": false
+}

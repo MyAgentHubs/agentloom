@@ -1,0 +1,8 @@
+{
+  "driver": "replay",
+  "mode": "run",
+  "run_id": "run_fx01",
+  "user_message": "帮我确认一下 cargo test 能不能跑绿",
+  "events_file": "events.jsonl",
+  "exit_code": 0
+}

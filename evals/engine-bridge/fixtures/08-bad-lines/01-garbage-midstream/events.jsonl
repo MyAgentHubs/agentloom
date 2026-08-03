@@ -1,0 +1,4 @@
+{"schema_version":"harness.runtime.v1","event_id":"evt_000001","seq":1,"ts":"2026-07-07T09:00:00Z","run_id":"run_eval_08_01","workspace":"/tmp/agentloom-eval-ws-08-01","type":"run.started","payload":{"mode":"solo","provider":"mock","model":"mock-1","workspace":"/tmp/agentloom-eval-ws-08-01"}}
+xx%%not-json%%
+{"schema_version":"harness.runtime.v1","event_id":"evt_000003","seq":3,"ts":"2026-07-07T09:00:02Z","run_id":"run_eval_08_01","workspace":"/tmp/agentloom-eval-ws-08-01","type":"agent.note.delta","payload":{"text":"坏行之后仍继续解析"}}
+{"schema_version":"harness.runtime.v1","event_id":"evt_000004","seq":4,"ts":"2026-07-07T09:00:03Z","run_id":"run_eval_08_01","workspace":"/tmp/agentloom-eval-ws-08-01","type":"run.completed","payload":{}}

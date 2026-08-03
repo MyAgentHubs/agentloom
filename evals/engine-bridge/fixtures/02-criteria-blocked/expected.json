@@ -1,0 +1,5 @@
+{
+  "exit_code": 3,
+  "terminal": "blocked",
+  "message_contains": ["max_eval_attempts exceeded without progress"]
+}

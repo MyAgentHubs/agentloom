@@ -1,0 +1,6 @@
+{
+  "driver": "spawn",
+  "mode": "run",
+  "prompt": "say hello please",
+  "criteria": []
+}

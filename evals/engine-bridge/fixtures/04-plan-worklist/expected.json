@@ -1,0 +1,6 @@
+{
+  "terminal": "completed",
+  "require_text_contains": ["已拆成", "已通过验收"],
+  "forbid_event_kinds": ["error"],
+  "forbid_text_contains": ["\"tasks\"", "depends_on"]
+}

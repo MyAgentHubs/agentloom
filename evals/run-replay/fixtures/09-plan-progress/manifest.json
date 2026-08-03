@@ -1,0 +1,8 @@
+{
+  "driver": "replay",
+  "mode": "plan",
+  "run_id": "run_fx09",
+  "user_message": "帮我用 plan 模式把 hello.txt 建好",
+  "events_file": "events.jsonl",
+  "exit_code": 0
+}

@@ -1,0 +1,8 @@
+{
+  "user_message_count": 1,
+  "assistant_message_count": 1,
+  "require_text_contains": ["已拆成 1 个任务", "已通过验收"],
+  "forbid_text_contains": ["depends_on"],
+  "block_counts_exact": {"run_terminal": 1},
+  "terminal_status": "completed"
+}

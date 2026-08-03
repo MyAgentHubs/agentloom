@@ -1,0 +1,6 @@
+{
+  "driver": "spawn",
+  "mode": "plan",
+  "prompt": "做一个 smoke test：不要改文件，只回复你是否进入了 plan 模式，以及下一步会怎么处理。",
+  "criteria": []
+}

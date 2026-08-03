@@ -1,0 +1,8 @@
+{
+  "driver": "replay_twice",
+  "mode": "run",
+  "run_id": "run_fx05",
+  "user_message": "帮我把这批小文件重命名一下",
+  "events_file": "events.jsonl",
+  "exit_code": 0
+}

@@ -1,0 +1,60 @@
+name: Feature request
+description: Propose a change or a new capability
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        We're issue-first: this is where a change gets agreed before anyone
+        writes code. If we label this `accepted`, a pull request is welcome.
+
+        Please write it in your own words — generated proposals get closed.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you hitting?
+      description: >
+        Describe the situation, not the solution. What were you trying to do,
+        and what got in the way?
+    validations:
+      required: true
+
+  - type: textarea
+    id: current
+    attributes:
+      label: What do you do about it today?
+      description: >
+        Workaround, another tool, or nothing. This tells us how much the
+        problem actually costs you.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like to see?
+      description: Optional. A rough sketch is fine.
+
+  - type: dropdown
+    id: implement
+    attributes:
+      label: Would you want to implement this yourself?
+      description: >
+        Either answer is fine. Please wait for the `accepted` label before
+        starting — we may already have a direction in mind.
+      options:
+        - "Yes, if it's accepted"
+        - "No, just proposing"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and discussions
+          required: true
+        - label: I wrote this myself; it is not AI-generated text
+          required: true

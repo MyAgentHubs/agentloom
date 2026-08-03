@@ -1,0 +1,9 @@
+{
+  "driver": "replay",
+  "mode": "run",
+  "run_id": "run_fx04",
+  "user_message": "帮我把这个 bug 修一下",
+  "events_file": "events.jsonl",
+  "exit_code": 0,
+  "finish_called": false
+}

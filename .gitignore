@@ -1,0 +1,4 @@
+.DS_Store
+node_modules/
+# The repository root is not a Cargo project; ignore stray build output created there.
+/target/

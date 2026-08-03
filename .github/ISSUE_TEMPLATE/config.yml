@@ -1,0 +1,12 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question, idea, or "is this supposed to work like that?"
+    url: https://github.com/MyAgentHubs/agentloom/discussions
+    about: >
+      Discussions are open and low-ceremony. Start here if you're not sure it's
+      a bug.
+  - name: Security vulnerability
+    url: https://github.com/MyAgentHubs/agentloom/security/advisories/new
+    about: >
+      Report privately, never as a public issue. A reproducible proof of
+      concept is required.

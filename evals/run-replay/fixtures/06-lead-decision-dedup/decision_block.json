@@ -1,0 +1,14 @@
+{
+  "type": "decision_card",
+  "decision_id": "dec_fx06_001",
+  "kind": "ask",
+  "question": "验收命令连续两次超时，要不要放宽超时阈值？",
+  "options": ["放宽到 300 秒重试", "保持现状人工介入"],
+  "recommended": "放宽到 300 秒重试",
+  "rationale": "依赖下载耗时波动较大，历史类似情况放宽阈值后基本能过。",
+  "payload": null,
+  "source_run_id": "run_fx06",
+  "status": "pending",
+  "chosen_option": null,
+  "created_at": 1751964000
+}
