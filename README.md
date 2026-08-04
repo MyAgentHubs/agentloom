@@ -117,19 +117,20 @@ and undo. The sidebar holds every project you work on and every session inside i
 - **Bring your own everything** — OpenAI-compatible and Anthropic-compatible endpoints,
   custom base URLs, local models.
 - **i18n** — English and 简体中文 in the UI today, more on the way.
-- **Cross-platform** — macOS (Apple silicon and Intel), signed and notarized. Windows builds
-  and passes an installed smoke test in CI, but is unpublished until we can sign it. Linux is
-  not started.
+- **Cross-platform** — macOS (Apple silicon and Intel), signed and notarized. Windows is
+  available as an unsigned preview until we can sign it. Linux is not started.
 
 ## Install
 
 - **macOS** — grab the `.dmg` for your Mac (Apple silicon or Intel) from the
   [Releases](https://github.com/MyAgentHubs/agentloom/releases/latest) page and drag it to
   Applications. Signed and notarized by Apple; it opens with no warnings.
-- **Windows** — no installer published yet. The build works: CI compiles it, packages an
-  installer and smoke-tests it on a Windows runner. What is missing is a code-signing
-  certificate, and an unsigned installer means a SmartScreen warning for every user, so we
-  would rather hold it. [Build from source](#build-from-source) works in the meantime.
+- **Windows** — an **unsigned preview** is available:
+  [v0.1.0-windows-preview](https://github.com/MyAgentHubs/agentloom/releases/tag/v0.1.0-windows-preview).
+  It is a pre-release on purpose. We have no code-signing certificate, so SmartScreen will
+  warn on it, and nobody has run it on real Windows hardware yet — CI compiles, packages and
+  smoke-tests it, and that is all. Try it if a warning dialog does not put you off, and tell
+  us what breaks.
 
 ## Build from source
 
