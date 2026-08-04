@@ -117,19 +117,19 @@ and undo. The sidebar holds every project you work on and every session inside i
 - **Bring your own everything** — OpenAI-compatible and Anthropic-compatible endpoints,
   custom base URLs, local models.
 - **i18n** — English and 简体中文 in the UI today, more on the way.
-- **macOS today** — Apple silicon and Intel, signed and notarized. Windows is a work in
-  progress: the app backend does not build there yet, and we will not claim a platform we
-  cannot ship. Linux is not started.
+- **Cross-platform** — macOS (Apple silicon and Intel), signed and notarized. Windows builds
+  and passes an installed smoke test in CI, but is unpublished until we can sign it. Linux is
+  not started.
 
 ## Install
 
 - **macOS** — grab the `.dmg` for your Mac (Apple silicon or Intel) from the
   [Releases](https://github.com/MyAgentHubs/agentloom/releases/latest) page and drag it to
   Applications. Signed and notarized by Apple; it opens with no warnings.
-- **Windows** — not available yet, and building from source will not work either: the app
-  backend currently fails to compile for Windows. The `myagent` engine does build and can be
-  used on its own from the command line. Windows support is on the roadmap; if you want it,
-  say so in an issue.
+- **Windows** — no installer published yet. The build works: CI compiles it, packages an
+  installer and smoke-tests it on a Windows runner. What is missing is a code-signing
+  certificate, and an unsigned installer means a SmartScreen warning for every user, so we
+  would rather hold it. [Build from source](#build-from-source) works in the meantime.
 
 ## Build from source
 
@@ -166,7 +166,7 @@ AGENTS.md       Contribution rules for AI agents
 
 ## Roadmap (short version)
 
-- Windows support: make the app backend compile there, then a signed installer
+- A signed Windows installer (the build already works; the certificate does not exist yet)
 - More providers and deeper local-model support
 - Richer agent-team workflows (discussion / round-table modes)
 - GitLab support through the existing adapter seam

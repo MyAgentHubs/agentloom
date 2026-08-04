@@ -107,17 +107,17 @@ AgentLoom 的前提正好相反：很多项目、很多模型、好几个 agent 
   AgentLoom 接了第三方后端(DuckDuckGo 零配置，Brave / Exa 用你自己的 key)，让任何 agent 都能查资料。
 - **什么都能自己接** —— OpenAI 兼容、Anthropic 兼容接口，自定义 base URL，本地模型。
 - **多语言** —— 界面目前支持英文和简体中文，后续会加。
-- **目前只有 macOS** —— Apple 芯片和 Intel，已签名并公证。Windows 还在做：app 后端在
-  Windows 上还编译不过，发不出来的平台我们不会先写上。Linux 尚未开始。
+- **跨平台** —— macOS(Apple 芯片和 Intel)，已签名并公证。Windows 能编译、能打包，
+  CI 里装起来跑通了冒烟测试，但在能签名之前不发布。Linux 尚未开始。
 
 ## 安装
 
 - **macOS** —— 到 [Releases](https://github.com/MyAgentHubs/agentloom/releases/latest) 页
   按你的芯片拿 `.dmg`(Apple 芯片或 Intel)，拖进「应用程序」。已由 Apple 签名并公证，
   打开不会有任何安全警告。
-- **Windows** —— 还没有，而且从源码构建也不行：app 后端目前在 Windows 上编译不过。
-  `myagent` 引擎本身能编，可以单独当命令行工具用。Windows 支持在路线图上，需要的话
-  开个 issue 说一声。
+- **Windows** —— 还没发安装包。构建本身是通的：CI 在 Windows 上编译、打包安装程序、
+  并装起来跑通冒烟测试。缺的是代码签名证书——不签名的话每个用户都会撞
+  SmartScreen 警告，所以先压着不发。这期间可以[从源码构建](#从源码构建)。
 
 ## 从源码构建
 
@@ -154,7 +154,7 @@ AGENTS.md       AI agent 贡献规则
 
 ## 路线图(简版)
 
-- Windows 支持：先让 app 后端在 Windows 上编得过，再出签名安装包
+- 签名的 Windows 安装包(构建已经通了，缺的是证书)
 - 接更多厂商，本地模型支持做深
 - 更丰富的 agent team 协作模式(讨论 / 圆桌)
 - 沿现有 adapter 接口支持 GitLab
