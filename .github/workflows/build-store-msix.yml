@@ -1,0 +1,843 @@
+name: Build Partner Center ingestion-only MSIX
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: store-msix-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '22.23.1'
+  RUST_TOOLCHAIN: '1.97.0'
+  TARGET_TRIPLE: x86_64-pc-windows-msvc
+  PACKAGE_NAME: AgentLoom.AgentLoom
+  PACKAGE_PUBLISHER: CN=0DD4EF95-FAC8-4983-8ECE-11B9906175E7
+  PUBLISHER_DISPLAY_NAME: AgentLoom
+
+jobs:
+  build-and-smoke-test:
+    name: Build and validate Partner Center ingestion-only x64 MSIX
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - name: Check out the dispatched commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Verify checkout provenance and application version
+        shell: pwsh
+        env:
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $head = (git rev-parse HEAD).Trim()
+          if ($head -ne $env:DISPATCH_SHA) {
+            throw "Checkout resolved to $head instead of the dispatched commit."
+          }
+
+          $tauri = Get-Content -LiteralPath 'app/src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json
+          $package = Get-Content -LiteralPath 'app/package.json' -Raw | ConvertFrom-Json
+          $storeIdentity = Get-Content -LiteralPath 'app/src-tauri/store/msix-identity.json' -Raw | ConvertFrom-Json
+          $cargoVersionLine = Select-String -LiteralPath 'app/src-tauri/Cargo.toml' -Pattern '^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$' | Select-Object -First 1
+          if ($null -eq $cargoVersionLine) {
+            throw 'Could not read the application version from Cargo.toml.'
+          }
+          $versions = @([string]$tauri.version, [string]$package.version, [string]$cargoVersionLine.Matches[0].Groups[1].Value)
+          $appVersion = [string]$storeIdentity.appVersion
+          if (@($versions | Select-Object -Unique).Count -ne 1 -or $versions[0] -cne $appVersion -or $appVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Application versions must agree with store identity appVersion and contain exactly three numeric components: $($versions -join ', '), identity=$appVersion."
+          }
+
+          $storeVersionText = [string]$storeIdentity.storeVersion
+          [Version]$storeVersion = $null
+          if (-not [Version]::TryParse($storeVersionText, [ref]$storeVersion)) {
+            throw "Store identity storeVersion is not a valid dotted numeric version: $storeVersionText"
+          }
+          $storeParts = $storeVersionText.Split('.')
+          $invalidStoreParts = @($storeParts | Where-Object { $_ -notmatch '^(0|[1-9][0-9]{0,4})$' -or [int]$_ -gt 65535 })
+          if ($storeParts.Count -ne 4 -or $storeParts[0] -eq '0' -or $invalidStoreParts.Count -ne 0) {
+            throw 'Store identity storeVersion must have four canonical components from 0 through 65535 and a nonzero first component.'
+          }
+
+          $packageFamilyName = [string]$storeIdentity.packageFamilyName
+          $applicationId = [string]$storeIdentity.applicationId
+          if ([string]::IsNullOrWhiteSpace($packageFamilyName) -or [string]::IsNullOrWhiteSpace($applicationId)) {
+            throw 'Store identity must provide packageFamilyName and applicationId for packaged activation.'
+          }
+          $expectedAumid = "$packageFamilyName!$applicationId"
+
+          "APP_VERSION=$appVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "STORE_VERSION=$storeVersionText" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "EXPECTED_PACKAGE_FAMILY_NAME=$packageFamilyName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "EXPECTED_APPLICATION_ID=$applicationId" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "EXPECTED_APP_USER_MODEL_ID=$expectedAumid" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install frontend dependencies
+        shell: pwsh
+        run: npm ci --prefix app
+
+      - name: Install the pinned Rust toolchain and x64 target
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Set-StrictMode -Version Latest
+
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal
+          rustup override set $env:RUST_TOOLCHAIN
+          rustup target add $env:TARGET_TRIPLE --toolchain $env:RUST_TOOLCHAIN
+
+          $rustcVersionLines = @(rustup run $env:RUST_TOOLCHAIN rustc --version)
+          if ($rustcVersionLines.Count -ne 1) {
+            throw "Expected exactly one rustc version line, found $($rustcVersionLines.Count)."
+          }
+          $rustcVersion = [string]$rustcVersionLines[0]
+          $expectedRustcPattern = '^rustc ' + [Regex]::Escape($env:RUST_TOOLCHAIN) + ' \([^)]+\)$'
+          if ($rustcVersion -cnotmatch $expectedRustcPattern) {
+            throw "Pinned rustc version mismatch: expected $env:RUST_TOOLCHAIN, found '$rustcVersion'."
+          }
+
+          "RUSTUP_TOOLCHAIN=$env:RUST_TOOLCHAIN" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build the x64 myagent engine
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --locked --release --manifest-path harness-agent/Cargo.toml --bin myagent --target $env:TARGET_TRIPLE
+
+      - name: Build the x64 AgentLoom application without an installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm run --prefix app tauri -- build --ci --target $env:TARGET_TRIPLE --no-bundle -- --locked
+
+      - name: Build the original unsigned Partner Center ingestion MSIX
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $assetDir = Join-Path $env:RUNNER_TEMP 'partner-center-upload'
+          $assetPath = Join-Path $assetDir "AgentLoom_StoreUpload_$env:STORE_VERSION`_x64_UNSIGNED_PARTNER-CENTER-ONLY.msix"
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE "app/src-tauri/target/$env:TARGET_TRIPLE/release"
+          New-Item -ItemType Directory -Path $assetDir -Force | Out-Null
+
+          node app/scripts/build-store-msix.mjs `
+            --target $env:TARGET_TRIPLE `
+            --release-dir $releaseDir `
+            --output $assetPath
+
+          if (-not (Test-Path -LiteralPath $assetPath -PathType Leaf) -or (Get-Item -LiteralPath $assetPath).Length -eq 0) {
+            throw 'The Store packaging command did not produce a non-empty Partner Center ingestion MSIX.'
+          }
+          "STORE_MSIX=$assetPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify the original unsigned Partner Center ingestion payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          function Find-WindowsSdkTool {
+            param([Parameter(Mandatory = $true)][string]$Name)
+
+            $fromPath = Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -ne $fromPath) {
+              return $fromPath.Source
+            }
+
+            $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
+            $candidates = @(Get-ChildItem -LiteralPath $sdkRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+              $version = $null
+              if ([Version]::TryParse($_.Name, [ref]$version)) {
+                $path = Join-Path $_.FullName "x64/$Name"
+                if (Test-Path -LiteralPath $path -PathType Leaf) {
+                  [PSCustomObject]@{ Version = $version; Path = $path }
+                }
+              }
+            } | Sort-Object Version -Descending)
+            if ($candidates.Count -eq 0) {
+              throw "Could not locate $Name in PATH or an x64 Windows 10 SDK directory."
+            }
+            return $candidates[0].Path
+          }
+
+          function Assert-PeMachineAmd64 {
+            param([Parameter(Mandatory = $true)][string]$Path)
+
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+              throw "Expected PE executable is missing: $Path"
+            }
+            $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            try {
+              $reader = [IO.BinaryReader]::new($stream)
+              try {
+                if ($stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5A4D) {
+                  throw "Executable has no valid DOS header: $Path"
+                }
+                $stream.Position = 0x3C
+                $peOffset = $reader.ReadUInt32()
+                if ([int64]$peOffset + 6 -gt $stream.Length) {
+                  throw "Executable has an invalid PE header offset: $Path"
+                }
+                $stream.Position = $peOffset
+                if ($reader.ReadUInt32() -ne 0x00004550) {
+                  throw "Executable has no valid PE signature: $Path"
+                }
+                $machine = $reader.ReadUInt16()
+                if ($machine -ne 0x8664) {
+                  throw ("Expected PE Machine AMD64 (0x8664), found 0x{0:X4}: {1}" -f $machine, $Path)
+                }
+              } finally {
+                $reader.Dispose()
+              }
+            } finally {
+              $stream.Dispose()
+            }
+          }
+
+          function Assert-StoreMsixCentralDirectory {
+            param(
+              [Parameter(Mandatory = $true)][string]$Path,
+              [Parameter(Mandatory = $true)][string[]]$ExpectedEntries
+            )
+
+            Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+            $archive = [IO.Compression.ZipFile]::OpenRead($Path)
+            try {
+              $entries = @($archive.Entries | ForEach-Object { [string]$_.FullName })
+            } finally {
+              $archive.Dispose()
+            }
+            if ($entries.Count -eq 0) {
+              throw 'The MSIX central directory is empty.'
+            }
+            foreach ($entry in $entries) {
+              if ([string]::IsNullOrWhiteSpace($entry)) {
+                throw 'The MSIX central directory contains an empty entry name.'
+              }
+              if ($entry.Contains('\')) {
+                throw "The MSIX central directory contains a backslash path: $entry"
+              }
+              if ($entry.StartsWith('/') -or $entry -match '^[A-Za-z]:') {
+                throw "The MSIX central directory contains an absolute path: $entry"
+              }
+              if (@($entry.Split('/') | Where-Object { $_ -eq '..' }).Count -ne 0) {
+                throw "The MSIX central directory contains a dot-dot segment: $entry"
+              }
+            }
+
+            $duplicates = @($entries | Group-Object -CaseSensitive | Where-Object { $_.Count -ne 1 })
+            if ($duplicates.Count -ne 0) {
+              throw "The MSIX central directory contains duplicate entries: $($duplicates.Name -join ', ')"
+            }
+            $caseCollisions = @($entries | Group-Object -Property { $_.ToLowerInvariant() } | Where-Object { $_.Count -ne 1 })
+            if ($caseCollisions.Count -ne 0) {
+              throw 'The MSIX central directory contains case-colliding entries.'
+            }
+            if ($entries -contains 'AppxSignature.p7x') {
+              throw 'The Partner Center ingestion package must be explicitly unsigned and contain no AppxSignature.p7x.'
+            }
+
+            $missing = @($ExpectedEntries | Where-Object { $entries -cnotcontains $_ })
+            $unexpected = @($entries | Where-Object { $ExpectedEntries -cnotcontains $_ })
+            if ($missing.Count -ne 0 -or $unexpected.Count -ne 0 -or $entries.Count -ne $ExpectedEntries.Count) {
+              throw "The MSIX central directory does not match the exact ingestion contract. Missing=[$($missing -join ', ')] Unexpected=[$($unexpected -join ', ')]"
+            }
+            return @($ExpectedEntries)
+          }
+
+          function Assert-ExactUnpackedFileSet {
+            param(
+              [Parameter(Mandatory = $true)][string]$Root,
+              [Parameter(Mandatory = $true)][string[]]$ExpectedEntries
+            )
+
+            $directories = @(Get-ChildItem -LiteralPath $Root -Recurse -Force -Directory)
+            $files = @(Get-ChildItem -LiteralPath $Root -Recurse -Force -File)
+            $allUnpackedItems = @($directories) + @($files)
+            $reparsePoints = @($allUnpackedItems | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })
+            if ($reparsePoints.Count -ne 0) {
+              throw 'The unpacked MSIX contains a reparse point.'
+            }
+            $actualEntries = @($files | ForEach-Object { [IO.Path]::GetRelativePath($Root, $_.FullName).Replace('\', '/') })
+            $missing = @($ExpectedEntries | Where-Object { $actualEntries -cnotcontains $_ })
+            $unexpected = @($actualEntries | Where-Object { $ExpectedEntries -cnotcontains $_ })
+            if ($missing.Count -ne 0 -or $unexpected.Count -ne 0 -or $actualEntries.Count -ne $ExpectedEntries.Count) {
+              throw "The unpacked MSIX file set does not match the exact ingestion contract. Missing=[$($missing -join ', ')] Unexpected=[$($unexpected -join ', ')]"
+            }
+          }
+
+          $expectedEntries = @(
+            'agentloom.exe',
+            'myagent.exe',
+            'Assets/StoreLogo.png',
+            'Assets/Square44x44Logo.png',
+            'Assets/Square71x71Logo.png',
+            'Assets/Square150x150Logo.png',
+            'AppxManifest.xml',
+            'AppxBlockMap.xml',
+            '[Content_Types].xml'
+          )
+          $centralDirectoryEntries = @(Assert-StoreMsixCentralDirectory -Path $env:STORE_MSIX -ExpectedEntries $expectedEntries)
+
+          # MakeAppx `unpack` validates the package but does not materialize the OPC
+          # [Content_Types].xml part. The exact central-directory gate above remains
+          # authoritative for that required ninth entry.
+          $makeAppxUnmaterializedEntry = '[Content_Types].xml'
+          $expectedUnpackedEntries = @($centralDirectoryEntries | Where-Object { $_ -cne $makeAppxUnmaterializedEntry })
+          $unmaterializedEntries = @($centralDirectoryEntries | Where-Object { $expectedUnpackedEntries -cnotcontains $_ })
+          if ($expectedUnpackedEntries.Count -ne 8 -or
+              $unmaterializedEntries.Count -ne 1 -or
+              $unmaterializedEntries[0] -cne $makeAppxUnmaterializedEntry) {
+            throw 'The MakeAppx unpack contract must exclude exactly [Content_Types].xml from the nine-entry central directory.'
+          }
+
+          $mutantPath = Join-Path $env:RUNNER_TEMP 'AgentLoom-central-directory-mutant.msix'
+          Copy-Item -LiteralPath $env:STORE_MSIX -Destination $mutantPath -Force
+          $mutantRejected = $false
+          try {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+            $mutantArchive = [IO.Compression.ZipFile]::Open($mutantPath, [IO.Compression.ZipArchiveMode]::Update)
+            try {
+              $mutantEntry = $mutantArchive.CreateEntry('docs/superpowers/unexpected.txt')
+              $mutantStream = $mutantEntry.Open()
+              try {
+                $mutantWriter = [IO.StreamWriter]::new($mutantStream)
+                try {
+                  $mutantWriter.Write('central-directory-whitelist-mutation')
+                } finally {
+                  $mutantWriter.Dispose()
+                }
+              } finally {
+                $mutantStream.Dispose()
+              }
+            } finally {
+              $mutantArchive.Dispose()
+            }
+            try {
+              Assert-StoreMsixCentralDirectory -Path $mutantPath -ExpectedEntries $expectedEntries | Out-Null
+            } catch {
+              if ($_.Exception.Message -notmatch [Regex]::Escape('docs/superpowers/unexpected.txt')) {
+                throw
+              }
+              $mutantRejected = $true
+            }
+          } finally {
+            Remove-Item -LiteralPath $mutantPath -Force -ErrorAction SilentlyContinue
+          }
+          if (-not $mutantRejected) {
+            throw 'The exact MSIX central-directory contract failed to reject the injected unexpected entry mutation.'
+          }
+
+          $unpackDir = Join-Path $env:RUNNER_TEMP 'store-msix-unpacked'
+          Remove-Item -LiteralPath $unpackDir -Recurse -Force -ErrorAction SilentlyContinue
+          & (Find-WindowsSdkTool -Name 'makeappx.exe') unpack /p $env:STORE_MSIX /d $unpackDir /o
+          if ($LASTEXITCODE -ne 0) {
+            throw "MakeAppx failed to unpack the Partner Center ingestion MSIX with exit code $LASTEXITCODE."
+          }
+          Assert-ExactUnpackedFileSet -Root $unpackDir -ExpectedEntries $expectedUnpackedEntries
+
+          $manifestPath = Join-Path $unpackDir 'AppxManifest.xml'
+          if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+            throw 'The Partner Center ingestion MSIX has no root AppxManifest.xml.'
+          }
+          [xml]$manifest = Get-Content -LiteralPath $manifestPath -Raw
+          $identity = $manifest.Package.Identity
+          $displayName = [string]$manifest.Package.Properties.PublisherDisplayName
+          if ([string]$identity.Name -cne $env:PACKAGE_NAME) {
+            throw "Unexpected package identity Name: $($identity.Name)"
+          }
+          if ([string]$identity.Publisher -cne $env:PACKAGE_PUBLISHER) {
+            throw "Unexpected package identity Publisher: $($identity.Publisher)"
+          }
+          if ($displayName -cne $env:PUBLISHER_DISPLAY_NAME) {
+            throw "Unexpected PublisherDisplayName: $displayName"
+          }
+          if ([string]$identity.Version -cne $env:STORE_VERSION) {
+            throw "Unexpected package version $($identity.Version); expected $env:STORE_VERSION."
+          }
+          if ([string]$identity.ProcessorArchitecture -cne 'x64') {
+            throw "Unexpected package processor architecture: $($identity.ProcessorArchitecture)"
+          }
+          if (Test-Path -LiteralPath (Join-Path $unpackDir 'AppxSignature.p7x') -PathType Leaf) {
+            throw 'The Partner Center ingestion MSIX must remain unsigned and contain no AppxSignature.p7x.'
+          }
+
+          Assert-PeMachineAmd64 -Path (Join-Path $unpackDir 'agentloom.exe')
+          Assert-PeMachineAmd64 -Path (Join-Path $unpackDir 'myagent.exe')
+
+          $sourceByEntry = [ordered]@{
+            'agentloom.exe' = (Join-Path $env:GITHUB_WORKSPACE "app/src-tauri/target/$env:TARGET_TRIPLE/release/agentloom.exe")
+            'myagent.exe' = (Join-Path $env:GITHUB_WORKSPACE "app/src-tauri/target/$env:TARGET_TRIPLE/release/myagent.exe")
+            'Assets/StoreLogo.png' = (Join-Path $env:GITHUB_WORKSPACE 'app/src-tauri/icons/StoreLogo.png')
+            'Assets/Square44x44Logo.png' = (Join-Path $env:GITHUB_WORKSPACE 'app/src-tauri/icons/Square44x44Logo.png')
+            'Assets/Square71x71Logo.png' = (Join-Path $env:GITHUB_WORKSPACE 'app/src-tauri/icons/Square71x71Logo.png')
+            'Assets/Square150x150Logo.png' = (Join-Path $env:GITHUB_WORKSPACE 'app/src-tauri/icons/Square150x150Logo.png')
+          }
+          $payloadHashes = [ordered]@{}
+          foreach ($entry in $expectedUnpackedEntries) {
+            $unpackedPath = Join-Path $unpackDir ($entry.Replace('/', [IO.Path]::DirectorySeparatorChar))
+            $payloadHashes[$entry] = (Get-FileHash -LiteralPath $unpackedPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          foreach ($entry in $sourceByEntry.Keys) {
+            $sourceHash = (Get-FileHash -LiteralPath ($sourceByEntry[$entry]) -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($payloadHashes[$entry] -cne $sourceHash) {
+              throw "The unpacked payload does not match its build source: $entry"
+            }
+          }
+
+          $originalHash = (Get-FileHash -LiteralPath $env:STORE_MSIX -Algorithm SHA256).Hash.ToLowerInvariant()
+          $verificationPath = Join-Path $env:RUNNER_TEMP 'store-msix-verification.json'
+          [ordered]@{
+            exactEntries = @($centralDirectoryEntries)
+            payloadHashes = $payloadHashes
+          } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $verificationPath -Encoding utf8
+          "STORE_MSIX_ORIGINAL_SHA256=$originalHash" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "STORE_MSIX_VERIFICATION=$verificationPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install, activate, and remove a temporary self-signed smoke copy
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          function Find-WindowsSdkTool {
+            param([Parameter(Mandatory = $true)][string]$Name)
+
+            $fromPath = Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -ne $fromPath) {
+              return $fromPath.Source
+            }
+            $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
+            $candidates = @(Get-ChildItem -LiteralPath $sdkRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+              $version = $null
+              if ([Version]::TryParse($_.Name, [ref]$version)) {
+                $path = Join-Path $_.FullName "x64/$Name"
+                if (Test-Path -LiteralPath $path -PathType Leaf) {
+                  [PSCustomObject]@{ Version = $version; Path = $path }
+                }
+              }
+            } | Sort-Object Version -Descending)
+            if ($candidates.Count -eq 0) {
+              throw "Could not locate $Name in PATH or an x64 Windows 10 SDK directory."
+            }
+            return $candidates[0].Path
+          }
+
+          function Assert-PeMachineAmd64 {
+            param([Parameter(Mandatory = $true)][string]$Path)
+
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+              throw "Expected installed PE executable is missing: $Path"
+            }
+            $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            try {
+              $reader = [IO.BinaryReader]::new($stream)
+              try {
+                if ($stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5A4D) {
+                  throw "Installed executable has no valid DOS header: $Path"
+                }
+                $stream.Position = 0x3C
+                $peOffset = $reader.ReadUInt32()
+                if ([int64]$peOffset + 6 -gt $stream.Length) {
+                  throw "Installed executable has an invalid PE header offset: $Path"
+                }
+                $stream.Position = $peOffset
+                if ($reader.ReadUInt32() -ne 0x00004550) {
+                  throw "Installed executable has no valid PE signature: $Path"
+                }
+                $machine = $reader.ReadUInt16()
+                if ($machine -ne 0x8664) {
+                  throw ("Expected installed PE Machine AMD64 (0x8664), found 0x{0:X4}: {1}" -f $machine, $Path)
+                }
+              } finally {
+                $reader.Dispose()
+              }
+            } finally {
+              $stream.Dispose()
+            }
+          }
+
+          if ($null -ne (Get-AppxPackage -Name $env:PACKAGE_NAME -ErrorAction SilentlyContinue)) {
+            throw 'The clean hosted runner already has the AgentLoom Store package installed.'
+          }
+
+          $smokePath = Join-Path $env:RUNNER_TEMP 'AgentLoom-smoke-self-signed.msix'
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'AgentLoom-smoke-self-signed.cer'
+          $thumbprintPath = Join-Path $env:RUNNER_TEMP 'AgentLoom-smoke-cert-thumbprint.txt'
+          $pidPath = Join-Path $env:RUNNER_TEMP 'AgentLoom-smoke-process-id.txt'
+          Copy-Item -LiteralPath $env:STORE_MSIX -Destination $smokePath -Force
+
+          $certificate = $null
+          $installedPackage = $null
+          $activatedProcessId = $null
+          $testFailure = $null
+          $cleanupFailures = [Collections.Generic.List[string]]::new()
+          try {
+            $certificate = New-SelfSignedCertificate `
+              -Type Custom `
+              -Subject $env:PACKAGE_PUBLISHER `
+              -KeyAlgorithm RSA `
+              -KeyLength 2048 `
+              -HashAlgorithm SHA256 `
+              -KeyUsage DigitalSignature `
+              -KeyExportPolicy Exportable `
+              -CertStoreLocation 'Cert:\CurrentUser\My' `
+              -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}false') `
+              -NotAfter ([DateTime]::UtcNow.AddDays(1))
+            if ($certificate.Subject -cne $env:PACKAGE_PUBLISHER) {
+              throw "The temporary certificate Subject does not exactly match the package Publisher: $($certificate.Subject)"
+            }
+            $certificate.Thumbprint | Set-Content -LiteralPath $thumbprintPath -Encoding ascii -NoNewline
+            Export-Certificate -Cert $certificate -FilePath $certificatePath -Type CERT | Out-Null
+            $trusted = @(Import-Certificate -FilePath $certificatePath -CertStoreLocation 'Cert:\LocalMachine\TrustedPeople')
+            if ($trusted.Count -ne 1 -or $trusted[0].Thumbprint -ne $certificate.Thumbprint) {
+              throw 'Failed to trust the temporary smoke-test certificate in LocalMachine TrustedPeople.'
+            }
+
+            & (Find-WindowsSdkTool -Name 'signtool.exe') sign /fd SHA256 /sha1 $certificate.Thumbprint /s My $smokePath
+            if ($LASTEXITCODE -ne 0) {
+              throw "SignTool failed to sign the disposable smoke copy with exit code $LASTEXITCODE."
+            }
+
+            # Add-AppxPackage is the disposable copy's signature, Publisher, trust, integrity,
+            # and install gate. The self-signed leaf stays out of Root by design.
+            Add-AppxPackage -Path $smokePath -ForceApplicationShutdown -ErrorAction Stop
+            $packages = @(Get-AppxPackage -Name $env:PACKAGE_NAME -ErrorAction Stop)
+            if ($packages.Count -ne 1) {
+              throw "Expected exactly one installed AgentLoom package, found $($packages.Count)."
+            }
+            $installedPackage = $packages[0]
+            if ([string]$installedPackage.Publisher -cne $env:PACKAGE_PUBLISHER) {
+              throw "The installed package has an unexpected Publisher: $($installedPackage.Publisher)"
+            }
+            if ([string]$installedPackage.Architecture -cne 'X64') {
+              throw "The installed package has an unexpected architecture: $($installedPackage.Architecture)"
+            }
+            $installedMain = Join-Path $installedPackage.InstallLocation 'agentloom.exe'
+            $installedSidecar = Join-Path $installedPackage.InstallLocation 'myagent.exe'
+            Assert-PeMachineAmd64 -Path $installedMain
+            Assert-PeMachineAmd64 -Path $installedSidecar
+
+            if ([string]$installedPackage.PackageFamilyName -cne $env:EXPECTED_PACKAGE_FAMILY_NAME) {
+              throw "The installed package has an unexpected family name: $($installedPackage.PackageFamilyName)"
+            }
+            $installedManifest = $installedPackage | Get-AppxPackageManifest -ErrorAction Stop
+            $manifestApplications = @($installedManifest.Package.Applications.Application)
+            if ($manifestApplications.Count -ne 1) {
+              throw "Expected exactly one installed manifest application, found $($manifestApplications.Count)."
+            }
+            $manifestApplicationId = [string]$manifestApplications[0].Id
+            if ($manifestApplicationId -cne $env:EXPECTED_APPLICATION_ID) {
+              throw "The installed manifest has an unexpected application Id: $manifestApplicationId"
+            }
+            if ([string]$manifestApplications[0].Executable -cne 'agentloom.exe' -or [string]$manifestApplications[0].EntryPoint -cne 'Windows.FullTrustApplication') {
+              throw 'The installed manifest application must launch root agentloom.exe as Windows.FullTrustApplication.'
+            }
+            $manifestAumid = "$($installedPackage.PackageFamilyName)!$manifestApplicationId"
+            if ($manifestAumid -cne $env:EXPECTED_APP_USER_MODEL_ID) {
+              throw "The installed manifest produced an unexpected AUMID: $manifestAumid"
+            }
+
+            $startApps = @(Get-StartApps | Where-Object { [string]$_.AppID -ceq $manifestAumid })
+            if ($startApps.Count -ne 1) {
+              throw "Expected exactly one StartApps registration for $manifestAumid, found $($startApps.Count)."
+            }
+            $actualAumid = [string]$startApps[0].AppID
+            if ($actualAumid -cne $env:EXPECTED_APP_USER_MODEL_ID) {
+              throw "StartApps returned an unexpected AUMID: $actualAumid"
+            }
+
+            $activationEventSource = "AgentLoomSmoke-$([Guid]::NewGuid().ToString('N'))"
+            Register-CimIndicationEvent `
+              -Query "SELECT * FROM Win32_ProcessStartTrace WHERE ProcessName = 'agentloom.exe'" `
+              -SourceIdentifier $activationEventSource | Out-Null
+            try {
+              # Microsoft documents shell:AppsFolder AUMID activation for packaged desktop apps.
+              Start-Process -FilePath (Join-Path $env:SystemRoot 'explorer.exe') -ArgumentList @("shell:AppsFolder\$actualAumid") -ErrorAction Stop
+              $activationEvent = Wait-Event -SourceIdentifier $activationEventSource -Timeout 30
+              if ($null -eq $activationEvent) {
+                throw 'AUMID shell activation did not start agentloom.exe within 30 seconds.'
+              }
+              $activatedProcessId = [uint32]$activationEvent.SourceEventArgs.NewEvent.ProcessID
+              if ($activatedProcessId -eq 0) {
+                throw 'The process start event returned process ID zero.'
+              }
+            } finally {
+              Unregister-Event -SourceIdentifier $activationEventSource -ErrorAction SilentlyContinue
+              Remove-Event -SourceIdentifier $activationEventSource -ErrorAction SilentlyContinue
+            }
+
+            $activatedProcessId | Set-Content -LiteralPath $pidPath -Encoding ascii -NoNewline
+            $appProcess = Get-Process -Id $activatedProcessId -ErrorAction Stop
+            $actualPath = [IO.Path]::GetFullPath($appProcess.Path)
+            $expectedPath = [IO.Path]::GetFullPath($installedMain)
+            if (-not [string]::Equals($actualPath, $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "AUMID activation launched an unexpected executable: $actualPath"
+            }
+            if ($appProcess.WaitForExit(10000)) {
+              throw "The AUMID-activated AgentLoom process exited during the 10-second smoke window with code $($appProcess.ExitCode)."
+            }
+
+            Stop-Process -InputObject $appProcess -Force -ErrorAction Stop
+            Wait-Process -InputObject $appProcess -Timeout 30 -ErrorAction Stop
+            if ($null -ne (Get-Process -Id $activatedProcessId -ErrorAction SilentlyContinue)) {
+              throw 'The AUMID-activated AgentLoom process did not exit before package removal.'
+            }
+            Remove-AppxPackage -Package $installedPackage.PackageFullName -Confirm:$false -ErrorAction Stop
+            $removalDeadline = [DateTime]::UtcNow.AddSeconds(60)
+            do {
+              $packageRemains = $null -ne (Get-AppxPackage -Name $env:PACKAGE_NAME -ErrorAction SilentlyContinue)
+              $processRemains = $null -ne (Get-Process -Id $activatedProcessId -ErrorAction SilentlyContinue)
+              if (-not $packageRemains -and -not $processRemains) {
+                break
+              }
+              Start-Sleep -Seconds 1
+            } while ([DateTime]::UtcNow -lt $removalDeadline)
+            if ($packageRemains -or $processRemains) {
+              throw "Package removal did not clear package=$packageRemains process=$processRemains within 60 seconds."
+            }
+            $installedPackage = $null
+          } catch {
+            $testFailure = $_
+          } finally {
+            if ($null -ne $activatedProcessId) {
+              try { Stop-Process -Id $activatedProcessId -Force -ErrorAction SilentlyContinue } catch { $cleanupFailures.Add($_.Exception.Message) }
+            }
+            if ($null -ne $installedPackage) {
+              try { Remove-AppxPackage -Package $installedPackage.PackageFullName -Confirm:$false -ErrorAction Stop } catch { $cleanupFailures.Add($_.Exception.Message) }
+            } else {
+              foreach ($remainingPackage in @(Get-AppxPackage -Name $env:PACKAGE_NAME -ErrorAction SilentlyContinue)) {
+                try { Remove-AppxPackage -Package $remainingPackage.PackageFullName -Confirm:$false -ErrorAction Stop } catch { $cleanupFailures.Add($_.Exception.Message) }
+              }
+            }
+            if ($null -ne $certificate) {
+              foreach ($storePath in @('Cert:\LocalMachine\TrustedPeople', 'Cert:\CurrentUser\My')) {
+                try { Remove-Item -LiteralPath (Join-Path $storePath $certificate.Thumbprint) -Force -ErrorAction Stop } catch { $cleanupFailures.Add($_.Exception.Message) }
+              }
+            }
+            Remove-Item -LiteralPath $certificatePath -Force -ErrorAction SilentlyContinue
+          }
+
+          if ($null -ne $testFailure) {
+            throw $testFailure
+          }
+          if ($cleanupFailures.Count -ne 0) {
+            throw "Smoke cleanup failed: $($cleanupFailures -join '; ')"
+          }
+          if ($null -ne (Get-AppxPackage -Name $env:PACKAGE_NAME -ErrorAction SilentlyContinue)) {
+            throw 'AgentLoom remained installed after smoke cleanup.'
+          }
+          if ($null -ne $certificate) {
+            foreach ($storePath in @('Cert:\LocalMachine\TrustedPeople', 'Cert:\CurrentUser\My')) {
+              if (Test-Path -LiteralPath (Join-Path $storePath $certificate.Thumbprint)) {
+                throw "The temporary certificate remained in $storePath after smoke cleanup."
+              }
+            }
+          }
+
+          $hashAfterSmoke = (Get-FileHash -LiteralPath $env:STORE_MSIX -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hashAfterSmoke -cne $env:STORE_MSIX_ORIGINAL_SHA256) {
+            throw 'The original unsigned Partner Center ingestion MSIX changed during disposable-copy smoke testing.'
+          }
+
+      - name: Enforce temporary package and certificate cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $cleanupFailures = [Collections.Generic.List[string]]::new()
+          $pidPath = Join-Path $env:RUNNER_TEMP 'AgentLoom-smoke-process-id.txt'
+          $thumbprintPath = Join-Path $env:RUNNER_TEMP 'AgentLoom-smoke-cert-thumbprint.txt'
+          if (Test-Path -LiteralPath $pidPath -PathType Leaf) {
+            $processId = (Get-Content -LiteralPath $pidPath -Raw).Trim()
+            if ($processId -match '^[1-9][0-9]*$') {
+              try { Stop-Process -Id ([int]$processId) -Force -ErrorAction SilentlyContinue } catch { $cleanupFailures.Add($_.Exception.Message) }
+            }
+          }
+          foreach ($remainingPackage in @(Get-AppxPackage -Name $env:PACKAGE_NAME -ErrorAction SilentlyContinue)) {
+            try { Remove-AppxPackage -Package $remainingPackage.PackageFullName -Confirm:$false -ErrorAction Stop } catch { $cleanupFailures.Add($_.Exception.Message) }
+          }
+          if (Test-Path -LiteralPath $thumbprintPath -PathType Leaf) {
+            $thumbprint = (Get-Content -LiteralPath $thumbprintPath -Raw).Trim()
+            if ($thumbprint -match '^[0-9A-Fa-f]{40}$') {
+              foreach ($storePath in @('Cert:\LocalMachine\TrustedPeople', 'Cert:\CurrentUser\My')) {
+                $certificatePath = Join-Path $storePath $thumbprint
+                if (Test-Path -LiteralPath $certificatePath) {
+                  try { Remove-Item -LiteralPath $certificatePath -Force -ErrorAction Stop } catch { $cleanupFailures.Add($_.Exception.Message) }
+                }
+              }
+            } else {
+              $cleanupFailures.Add('The recorded smoke certificate thumbprint is malformed.')
+            }
+          }
+          foreach ($temporaryPath in @(
+            (Join-Path $env:RUNNER_TEMP 'AgentLoom-smoke-self-signed.msix'),
+            (Join-Path $env:RUNNER_TEMP 'AgentLoom-smoke-self-signed.cer'),
+            $pidPath,
+            $thumbprintPath
+          )) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+          }
+
+          if ($null -ne (Get-AppxPackage -Name $env:PACKAGE_NAME -ErrorAction SilentlyContinue)) {
+            $cleanupFailures.Add('AgentLoom remained installed after the final cleanup step.')
+          }
+          if ($cleanupFailures.Count -ne 0) {
+            throw "Final smoke cleanup failed: $($cleanupFailures -join '; ')"
+          }
+
+      - name: Reject generated lockfile drift
+        shell: pwsh
+        run: git diff --exit-code -- app/package-lock.json app/src-tauri/Cargo.lock harness-agent/Cargo.lock
+
+      - name: Prepare the Partner Center ingestion-only artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $artifactDirectory = Split-Path -Parent $env:STORE_MSIX
+          $assetName = Split-Path -Leaf $env:STORE_MSIX
+          $checksumPath = "$env:STORE_MSIX.sha256"
+          $readmePath = Join-Path $artifactDirectory 'README-NOT-FOR-INSTALL.txt'
+          $provenancePath = Join-Path $artifactDirectory 'provenance.json'
+
+          $currentHash = (Get-FileHash -LiteralPath $env:STORE_MSIX -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($currentHash -cne $env:STORE_MSIX_ORIGINAL_SHA256) {
+            throw 'The Partner Center ingestion MSIX changed after its verified smoke copy was made.'
+          }
+          "$env:STORE_MSIX_ORIGINAL_SHA256  $assetName" | Set-Content -LiteralPath $checksumPath -Encoding ascii -NoNewline
+
+          @'
+          NOT FOR LOCAL INSTALLATION
+
+          This unsigned MSIX is an ingestion input for Microsoft Partner Center only.
+          It is intentionally unsigned, installable=false, and will not install by double-clicking.
+          Microsoft Store certification re-signs the accepted package for end users.
+
+          Do not import certificates, bypass Windows security controls, or distribute this artifact to users.
+          '@ | Set-Content -LiteralPath $readmePath -Encoding utf8
+
+          function Assert-ExactPersistedSet {
+            param(
+              [Parameter(Mandatory = $true)][string[]]$Actual,
+              [Parameter(Mandatory = $true)][string[]]$Expected,
+              [Parameter(Mandatory = $true)][string]$Label
+            )
+
+            $duplicates = @($Actual | Group-Object -CaseSensitive | Where-Object { $_.Count -ne 1 })
+            $caseCollisions = @($Actual | Group-Object -Property { $_.ToLowerInvariant() } | Where-Object { $_.Count -ne 1 })
+            $missing = @($Expected | Where-Object { $Actual -cnotcontains $_ })
+            $unexpected = @($Actual | Where-Object { $Expected -cnotcontains $_ })
+            if ($Actual.Count -ne $Expected.Count -or $duplicates.Count -ne 0 -or $caseCollisions.Count -ne 0 -or $missing.Count -ne 0 -or $unexpected.Count -ne 0) {
+              throw "Persisted $Label does not match the trusted exact $($Expected.Count)-entry contract. Missing=[$($missing -join ', ')] Unexpected=[$($unexpected -join ', ')]"
+            }
+          }
+
+          $trustedExpectedEntries = @(
+            'agentloom.exe',
+            'myagent.exe',
+            'Assets/StoreLogo.png',
+            'Assets/Square44x44Logo.png',
+            'Assets/Square71x71Logo.png',
+            'Assets/Square150x150Logo.png',
+            'AppxManifest.xml',
+            'AppxBlockMap.xml',
+            '[Content_Types].xml'
+          )
+          $trustedExpectedPayloadHashEntries = @($trustedExpectedEntries | Where-Object { $_ -cne '[Content_Types].xml' })
+          $trustedExcludedPayloadHashEntries = @($trustedExpectedEntries | Where-Object { $trustedExpectedPayloadHashEntries -cnotcontains $_ })
+          if ($trustedExpectedPayloadHashEntries.Count -ne 8 -or
+              $trustedExcludedPayloadHashEntries.Count -ne 1 -or
+              $trustedExcludedPayloadHashEntries[0] -cne '[Content_Types].xml') {
+            throw 'The persisted payload-hash contract must exclude exactly [Content_Types].xml.'
+          }
+          $verification = Get-Content -LiteralPath $env:STORE_MSIX_VERIFICATION -Raw | ConvertFrom-Json
+          $verifiedEntries = @($verification.exactEntries | ForEach-Object { [string]$_ })
+          $verifiedHashKeys = @($verification.payloadHashes.PSObject.Properties | ForEach-Object { [string]$_.Name })
+          Assert-ExactPersistedSet -Actual $verifiedEntries -Expected $trustedExpectedEntries -Label 'exactEntries set'
+          Assert-ExactPersistedSet -Actual $verifiedHashKeys -Expected $trustedExpectedPayloadHashEntries -Label 'payloadHashes key set'
+          $storeIdentity = Get-Content -LiteralPath 'app/src-tauri/store/msix-identity.json' -Raw | ConvertFrom-Json
+          $provenance = [ordered]@{
+            contract = 'partner-center-ingestion-only'
+            installable = $false
+            signed = $false
+            gitSha = $env:GITHUB_SHA
+            githubRunId = $env:GITHUB_RUN_ID
+            githubRunAttempt = $env:GITHUB_RUN_ATTEMPT
+            appVersion = $env:APP_VERSION
+            storeVersion = $env:STORE_VERSION
+            target = $env:TARGET_TRIPLE
+            identity = [ordered]@{
+              name = [string]$storeIdentity.name
+              publisher = [string]$storeIdentity.publisher
+              publisherDisplayName = [string]$storeIdentity.publisherDisplayName
+              storeId = [string]$storeIdentity.storeId
+              applicationId = [string]$storeIdentity.applicationId
+            }
+            packageFamilyName = $env:EXPECTED_PACKAGE_FAMILY_NAME
+            appUserModelId = $env:EXPECTED_APP_USER_MODEL_ID
+            msix = [ordered]@{
+              fileName = $assetName
+              sha256 = $env:STORE_MSIX_ORIGINAL_SHA256
+              exactEntries = @($verifiedEntries)
+            }
+            payloadHashes = $verification.payloadHashes
+          }
+          $provenance | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $provenancePath -Encoding utf8
+
+          $expectedFileNames = @(
+            $assetName,
+            "$assetName.sha256",
+            'README-NOT-FOR-INSTALL.txt',
+            'provenance.json'
+          )
+          $allItems = @(Get-ChildItem -LiteralPath $artifactDirectory -Force)
+          $directories = @($allItems | Where-Object { $_.PSIsContainer })
+          $files = @($allItems | Where-Object { -not $_.PSIsContainer })
+          $actualFileNames = @($files | ForEach-Object { $_.Name })
+          $missing = @($expectedFileNames | Where-Object { $actualFileNames -cnotcontains $_ })
+          $unexpected = @($actualFileNames | Where-Object { $expectedFileNames -cnotcontains $_ })
+          if ($directories.Count -ne 0 -or $missing.Count -ne 0 -or $unexpected.Count -ne 0 -or $files.Count -ne 4) {
+            throw "Partner Center artifact staging must contain exactly four root files. Missing=[$($missing -join ', ')] Unexpected=[$($unexpected -join ', ')]"
+          }
+          foreach ($file in $files) {
+            if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint -or $file.Length -eq 0) {
+              throw "Partner Center artifact staging contains a link or empty file: $($file.Name)"
+            }
+            if ($file.Name -match '(?i)(self.?signed|smoke|\.pfx$|\.p12$|\.pem$|\.key$|\.cer$)') {
+              throw "Partner Center artifact staging contains forbidden signing or smoke material: $($file.Name)"
+            }
+          }
+
+          $parsedProvenance = Get-Content -LiteralPath $provenancePath -Raw | ConvertFrom-Json
+          if ($parsedProvenance.contract -cne 'partner-center-ingestion-only' -or $parsedProvenance.installable -ne $false -or $parsedProvenance.signed -ne $false) {
+            throw 'Partner Center provenance does not retain the required unsigned, non-installable ingestion contract.'
+          }
+
+      - name: Upload the Partner Center ingestion-only MSIX
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: partner-center-upload-only__unsigned-msix__do-not-install
+          path: ${{ runner.temp }}/partner-center-upload/
+          if-no-files-found: error
+          retention-days: 7
