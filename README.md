@@ -7,7 +7,7 @@
 Run Claude, Codex, DeepSeek, GLM and more — side by side, or as a team.
 The open-source desktop workbench that turns many LLMs into one workforce you control.
 
-[Download](https://github.com/MyAgentHubs/agentloom/releases/latest) · [Report an issue](https://github.com/MyAgentHubs/agentloom/issues)
+[Website](https://www.myagenthubs.com) · [Download](https://www.myagenthubs.com/agentloom#download) · [Report an issue](https://github.com/MyAgentHubs/agentloom/issues)
 
 [![CI](https://github.com/MyAgentHubs/agentloom/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MyAgentHubs/agentloom/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
@@ -122,9 +122,11 @@ and undo. The sidebar holds every project you work on and every session inside i
 
 ## Install
 
-- **macOS** — grab the `.dmg` for your Mac (Apple silicon or Intel) from the
-  [Releases](https://github.com/MyAgentHubs/agentloom/releases/latest) page and drag it to
-  Applications. Signed and notarized by Apple; it opens with no warnings.
+- **macOS** — grab the `.dmg` for your Mac (Apple silicon or Intel) from
+  [myagenthubs.com/agentloom](https://www.myagenthubs.com/agentloom#download) or the
+  [Releases](https://github.com/MyAgentHubs/agentloom/releases/latest) page, and drag it to
+  Applications. Signed and notarized by Apple; it opens with no warnings. The website also
+  serves a mirror, which helps if GitHub is slow where you are.
 - **Windows** — an **unsigned preview** is available:
   [v0.1.0-windows-preview](https://github.com/MyAgentHubs/agentloom/releases/tag/v0.1.0-windows-preview).
   It is a pre-release on purpose. We have no code-signing certificate, so SmartScreen will
@@ -190,5 +192,6 @@ The **AgentLoom** and **MyAgentHubs** names and logos are trademarks of MyAgentH
 ## Contact
 
 - panda@myagenthubs.com
+- https://www.myagenthubs.com
 
 © 2026 MyAgentHubs

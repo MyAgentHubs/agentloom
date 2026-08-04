@@ -7,7 +7,7 @@
 Claude、Codex、DeepSeek、GLM…… 并排跑，也可以组队干活。
 一个开源桌面工作台，把一堆大模型变成一支你说了算的队伍。
 
-[下载](https://github.com/MyAgentHubs/agentloom/releases/latest) · [反馈问题](https://github.com/MyAgentHubs/agentloom/issues)
+[官网](https://www.myagenthubs.com) · [下载](https://www.myagenthubs.com/agentloom#download) · [反馈问题](https://github.com/MyAgentHubs/agentloom/issues)
 
 [![CI](https://github.com/MyAgentHubs/agentloom/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MyAgentHubs/agentloom/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
@@ -112,9 +112,10 @@ AgentLoom 的前提正好相反：很多项目、很多模型、好几个 agent 
 
 ## 安装
 
-- **macOS** —— 到 [Releases](https://github.com/MyAgentHubs/agentloom/releases/latest) 页
-  按你的芯片拿 `.dmg`(Apple 芯片或 Intel)，拖进「应用程序」。已由 Apple 签名并公证，
-  打开不会有任何安全警告。
+- **macOS** —— 到 [myagenthubs.com/agentloom](https://www.myagenthubs.com/agentloom#download)
+  或 [Releases](https://github.com/MyAgentHubs/agentloom/releases/latest) 页按你的芯片拿
+  `.dmg`(Apple 芯片或 Intel)，拖进「应用程序」。已由 Apple 签名并公证，打开不会有任何
+  安全警告。官网还提供一份下载镜像，GitHub 慢的网络可以走那边。
 - **Windows** —— 有一个**未签名的预览版**：
   [v0.1.0-windows-preview](https://github.com/MyAgentHubs/agentloom/releases/tag/v0.1.0-windows-preview)。
   它被有意标成 pre-release：我们没有代码签名证书，所以 SmartScreen 会弹警告；而且
@@ -178,5 +179,6 @@ AGENTS.md       AI agent 贡献规则
 ## 联系
 
 - panda@myagenthubs.com
+- https://www.myagenthubs.com
 
 © 2026 MyAgentHubs

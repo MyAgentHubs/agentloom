@@ -315,7 +315,7 @@ jobs:
             Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
             $mutantArchive = [IO.Compression.ZipFile]::Open($mutantPath, [IO.Compression.ZipArchiveMode]::Update)
             try {
-              $mutantEntry = $mutantArchive.CreateEntry('docs/superpowers/unexpected.txt')
+              $mutantEntry = $mutantArchive.CreateEntry('extra/unexpected.txt')
               $mutantStream = $mutantEntry.Open()
               try {
                 $mutantWriter = [IO.StreamWriter]::new($mutantStream)
@@ -333,7 +333,7 @@ jobs:
             try {
               Assert-StoreMsixCentralDirectory -Path $mutantPath -ExpectedEntries $expectedEntries | Out-Null
             } catch {
-              if ($_.Exception.Message -notmatch [Regex]::Escape('docs/superpowers/unexpected.txt')) {
+              if ($_.Exception.Message -notmatch [Regex]::Escape('extra/unexpected.txt')) {
                 throw
               }
               $mutantRejected = $true
