@@ -1,0 +1,704 @@
+name: Build unsigned Windows x64 test installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-test-exe-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '22.23.1'
+  RUST_TOOLCHAIN: '1.97.0'
+  TARGET_TRIPLE: x86_64-pc-windows-msvc
+
+jobs:
+  build-smoke-and-upload:
+    name: Build and smoke-test unsigned Windows x64 installer
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - name: Check out the dispatched commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Verify checkout provenance and application version
+        shell: pwsh
+        env:
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $head = (git rev-parse HEAD).Trim()
+          if ($head -cne $env:DISPATCH_SHA) {
+            throw "Checkout resolved to $head instead of the dispatched commit."
+          }
+
+          $tauri = Get-Content -LiteralPath 'app/src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json
+          $package = Get-Content -LiteralPath 'app/package.json' -Raw | ConvertFrom-Json
+          $cargoVersionLine = Select-String -LiteralPath 'app/src-tauri/Cargo.toml' -Pattern '^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$' | Select-Object -First 1
+          if ($null -eq $cargoVersionLine) {
+            throw 'Could not read the application version from Cargo.toml.'
+          }
+
+          $versions = @(
+            [string]$tauri.version,
+            [string]$package.version,
+            [string]$cargoVersionLine.Matches[0].Groups[1].Value
+          )
+          $appVersion = $versions[0]
+          if (@($versions | Select-Object -Unique).Count -ne 1) {
+            throw "Application version drift: $($versions -join ', ')."
+          }
+          if ($appVersion -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw "Application version must have three canonical numeric components: $appVersion"
+          }
+          foreach ($component in $appVersion.Split('.')) {
+            if ([uint64]$component -gt 65535) {
+              throw "Application version component exceeds 65535: $appVersion"
+            }
+          }
+
+          "APP_VERSION=$appVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install frontend dependencies
+        shell: pwsh
+        run: npm ci --prefix app
+
+      - name: Install the pinned Rust toolchain and x64 target
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Set-StrictMode -Version Latest
+
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal
+          rustup target add $env:TARGET_TRIPLE --toolchain $env:RUST_TOOLCHAIN
+          rustup override set $env:RUST_TOOLCHAIN
+
+          $rustcVersion = (rustup run $env:RUST_TOOLCHAIN rustc --version).Trim()
+          $expectedRustcPrefix = "rustc $env:RUST_TOOLCHAIN "
+          if (-not $rustcVersion.StartsWith($expectedRustcPrefix, [StringComparison]::Ordinal)) {
+            throw "Pinned Rust verification failed: expected prefix '$expectedRustcPrefix', found '$rustcVersion'."
+          }
+
+          "RUSTUP_TOOLCHAIN=$env:RUST_TOOLCHAIN" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build the x64 myagent engine
+        shell: pwsh
+        run: >-
+          cargo build --locked --release
+          --manifest-path harness-agent/Cargo.toml
+          --bin myagent
+          --target $env:TARGET_TRIPLE
+
+      - name: Build the unsigned x64 NSIS installer
+        shell: pwsh
+        run: >-
+          npm run --prefix app tauri -- build --ci
+          --target $env:TARGET_TRIPLE
+          --bundles nsis
+          -- --locked
+
+      - name: Verify unsigned build inputs and smoke-test the installed app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          function Assert-PeMachineAmd64 {
+            param([Parameter(Mandatory = $true)][string]$Path)
+
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+              throw "Expected AMD64 PE executable is missing: $Path"
+            }
+            $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            try {
+              $reader = [IO.BinaryReader]::new($stream)
+              try {
+                if ($stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5A4D) {
+                  throw "Executable has no valid DOS header: $Path"
+                }
+                $stream.Position = 0x3C
+                $peOffset = $reader.ReadUInt32()
+                if ([int64]$peOffset + 6 -gt $stream.Length) {
+                  throw "Executable has an invalid PE header offset: $Path"
+                }
+                $stream.Position = $peOffset
+                if ($reader.ReadUInt32() -ne 0x00004550) {
+                  throw "Executable has no valid PE signature: $Path"
+                }
+                $machine = $reader.ReadUInt16()
+                if ($machine -ne 0x8664) {
+                  throw ("Expected PE Machine AMD64 (0x8664), found 0x{0:X4}: {1}" -f $machine, $Path)
+                }
+              } finally {
+                $reader.Dispose()
+              }
+            } finally {
+              $stream.Dispose()
+            }
+          }
+
+          function Assert-NotSigned {
+            param([Parameter(Mandatory = $true)][string]$Path)
+
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+              throw "Expected unsigned executable is missing: $Path"
+            }
+            $signature = Get-AuthenticodeSignature -LiteralPath $Path
+            if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::NotSigned) {
+              throw "Expected an unsigned executable, found Authenticode status $($signature.Status): $Path"
+            }
+            if ($null -ne $signature.SignerCertificate -or $null -ne $signature.TimeStamperCertificate) {
+              throw "Unsigned test executable unexpectedly contains signer or timestamp certificate metadata: $Path"
+            }
+          }
+
+          function Get-Sha256 {
+            param([Parameter(Mandatory = $true)][string]$Path)
+
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+              throw "Expected file for SHA256 verification is missing: $Path"
+            }
+            return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+
+          function Get-Sha256ForBytes {
+            param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+
+            $sha256 = [Security.Cryptography.SHA256]::Create()
+            try {
+              return [Convert]::ToHexString($sha256.ComputeHash($Bytes)).ToLowerInvariant()
+            } finally {
+              $sha256.Dispose()
+            }
+          }
+
+          function Find-BytePatternOffsets {
+            param(
+              [Parameter(Mandatory = $true)][byte[]]$Bytes,
+              [Parameter(Mandatory = $true)][byte[]]$Pattern
+            )
+
+            if ($Pattern.Length -eq 0) {
+              throw 'Cannot search for an empty byte pattern.'
+            }
+            $offsets = [Collections.Generic.List[int]]::new()
+            $lastPossibleOffset = $Bytes.Length - $Pattern.Length
+            for ($offset = 0; $offset -le $lastPossibleOffset; $offset++) {
+              $patternMatches = $true
+              for ($patternIndex = 0; $patternIndex -lt $Pattern.Length; $patternIndex++) {
+                if ($Bytes[$offset + $patternIndex] -ne $Pattern[$patternIndex]) {
+                  $patternMatches = $false
+                  break
+                }
+              }
+              if ($patternMatches) {
+                [void]$offsets.Add($offset)
+              }
+            }
+            return $offsets.ToArray()
+          }
+
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE "app\src-tauri\target\$env:TARGET_TRIPLE\release"
+          $bundleDir = Join-Path $releaseDir 'bundle\nsis'
+          $installers = @(Get-ChildItem -LiteralPath $bundleDir -File -Filter '*.exe')
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer, found $($installers.Count)."
+          }
+
+          $mainExecutable = Join-Path $releaseDir 'agentloom.exe'
+          $freshEngine = Join-Path $env:GITHUB_WORKSPACE "harness-agent\target\$env:TARGET_TRIPLE\release\myagent.exe"
+          $sidecarSource = Join-Path $env:GITHUB_WORKSPACE "app\src-tauri\binaries\myagent-$env:TARGET_TRIPLE.exe"
+          $targetSidecarCopy = Join-Path $releaseDir 'myagent.exe'
+          foreach ($executable in @($mainExecutable, $freshEngine, $sidecarSource, $targetSidecarCopy)) {
+            Assert-PeMachineAmd64 -Path $executable
+            Assert-NotSigned -Path $executable
+          }
+          Assert-NotSigned -Path $installers[0].FullName
+
+          $freshEngineHash = Get-Sha256 -Path $freshEngine
+          foreach ($engineCopy in @($sidecarSource, $targetSidecarCopy)) {
+            $engineCopyHash = Get-Sha256 -Path $engineCopy
+            if ($engineCopyHash -cne $freshEngineHash) {
+              throw "Fresh engine SHA256 mismatch: expected $freshEngineHash from $freshEngine, found $engineCopyHash at $engineCopy"
+            }
+          }
+
+          $unknownBundleToken = [Text.Encoding]::ASCII.GetBytes('__TAURI_BUNDLE_TYPE_VAR_UNK')
+          $nsisBundleToken = [Text.Encoding]::ASCII.GetBytes('__TAURI_BUNDLE_TYPE_VAR_NSS')
+          if ($unknownBundleToken.Length -ne $nsisBundleToken.Length) {
+            throw 'The Tauri release and NSIS bundle marker tokens must have equal byte lengths.'
+          }
+          $releaseMainBytes = [IO.File]::ReadAllBytes($mainExecutable)
+          $releaseUnknownOffsets = @(Find-BytePatternOffsets -Bytes $releaseMainBytes -Pattern $unknownBundleToken)
+          $releaseNsisOffsets = @(Find-BytePatternOffsets -Bytes $releaseMainBytes -Pattern $nsisBundleToken)
+          if ($releaseUnknownOffsets.Count -ne 1 -or $releaseNsisOffsets.Count -ne 0) {
+            throw "Release agentloom.exe must contain exactly UNK=1 and NSS=0 Tauri bundle markers; found UNK=$($releaseUnknownOffsets.Count), NSS=$($releaseNsisOffsets.Count)."
+          }
+          [byte[]]$expectedBundledMainBytes = $releaseMainBytes.Clone()
+          [Array]::Copy($nsisBundleToken, 0, $expectedBundledMainBytes, $releaseUnknownOffsets[0], $nsisBundleToken.Length)
+          $expectedBundledMainHash = Get-Sha256ForBytes -Bytes $expectedBundledMainBytes
+          Write-Host "Derived the expected NSIS-patched AgentLoom SHA256 after verifying release markers UNK=1 and NSS=0: $expectedBundledMainHash"
+
+          $installDir = Join-Path $env:RUNNER_TEMP "AgentLoomUnsignedTest-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $pidPath = Join-Path $env:RUNNER_TEMP 'agentloom-unsigned-test-pid.txt'
+          if ($installDir -match '\s') {
+            throw 'The NSIS smoke-test path must not contain whitespace so /D= can remain the final unquoted argument.'
+          }
+          Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+
+          $installProcess = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+          if ($installProcess.ExitCode -ne 0) {
+            throw "The unsigned NSIS installer smoke test failed with exit code $($installProcess.ExitCode)."
+          }
+          if (-not (Test-Path -LiteralPath $installDir -PathType Container)) {
+            throw 'The unsigned NSIS installer did not create the requested install directory.'
+          }
+
+          $installedEntries = @(Get-ChildItem -LiteralPath $installDir -Force -Recurse)
+          $installedDirectories = @($installedEntries | Where-Object { $_.PSIsContainer })
+          if ($installedDirectories.Count -ne 0) {
+            throw "The test install contains unexpected directories: $($installedDirectories.FullName -join ', ')"
+          }
+          $installedFiles = @($installedEntries | Where-Object { -not $_.PSIsContainer })
+          $installedMain = Join-Path $installDir 'agentloom.exe'
+          $installedSidecar = Join-Path $installDir 'myagent.exe'
+          $uninstaller = Join-Path $installDir 'uninstall.exe'
+          $expectedInstalledNames = @('agentloom.exe', 'myagent.exe', 'uninstall.exe') | Sort-Object
+          $actualInstalledNames = @($installedFiles.Name | Sort-Object)
+          if ($installedFiles.Count -ne 3 -or ($actualInstalledNames -join "`n") -cne ($expectedInstalledNames -join "`n")) {
+            throw "Installed payload must contain exactly agentloom.exe, myagent.exe, and uninstall.exe; found: $($actualInstalledNames -join ', ')"
+          }
+          foreach ($installedFile in $installedFiles) {
+            if (($installedFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "Installed payload must not contain reparse points: $($installedFile.FullName)"
+            }
+          }
+          foreach ($executable in @($installedMain, $installedSidecar)) {
+            Assert-PeMachineAmd64 -Path $executable
+            Assert-NotSigned -Path $executable
+          }
+          if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
+            throw "The exact NSIS uninstaller is missing: $uninstaller"
+          }
+          $uninstallerItem = Get-Item -LiteralPath $uninstaller -Force
+          if ($uninstallerItem.PSIsContainer -or ($uninstallerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "The exact NSIS uninstaller must be a regular non-reparse file: $uninstaller"
+          }
+          Assert-NotSigned -Path $uninstaller
+
+          $installedSidecarHash = Get-Sha256 -Path $installedSidecar
+          if ($installedSidecarHash -cne $freshEngineHash) {
+            throw "Installed myagent.exe SHA256 mismatch: expected $freshEngineHash, found $installedSidecarHash"
+          }
+
+          $installedMainBytes = [IO.File]::ReadAllBytes($installedMain)
+          $installedUnknownOffsets = @(Find-BytePatternOffsets -Bytes $installedMainBytes -Pattern $unknownBundleToken)
+          $installedNsisOffsets = @(Find-BytePatternOffsets -Bytes $installedMainBytes -Pattern $nsisBundleToken)
+          if ($installedUnknownOffsets.Count -ne 0 -or $installedNsisOffsets.Count -ne 1) {
+            throw "Installed agentloom.exe must contain exactly UNK=0 and NSS=1 Tauri bundle markers; found UNK=$($installedUnknownOffsets.Count), NSS=$($installedNsisOffsets.Count)."
+          }
+          $installedMainHash = Get-Sha256ForBytes -Bytes $installedMainBytes
+          if ($installedMainHash -cne $expectedBundledMainHash) {
+            throw "Installed agentloom.exe SHA256 mismatch after the single expected Tauri NSIS marker patch: expected $expectedBundledMainHash, found $installedMainHash"
+          }
+          Write-Host "Verified installed AgentLoom markers UNK=0 and NSS=1 and matched the derived NSIS-patched SHA256: $installedMainHash"
+
+          $appProcess = $null
+          $startedProcessId = $null
+          try {
+            $appProcess = Start-Process -FilePath $installedMain -WorkingDirectory $installDir -PassThru
+            $startedProcessId = $appProcess.Id
+            $startedProcessTicks = $appProcess.StartTime.ToUniversalTime().Ticks
+            "$startedProcessId|$startedProcessTicks" | Set-Content -LiteralPath $pidPath -Encoding ascii -NoNewline
+            $appProcess.Refresh()
+            $actualProcessPath = [IO.Path]::GetFullPath($appProcess.Path)
+            $expectedProcessPath = [IO.Path]::GetFullPath($installedMain)
+            if (-not [string]::Equals($actualProcessPath, $expectedProcessPath, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Smoke test launched an unexpected executable: $actualProcessPath"
+            }
+            if ($appProcess.WaitForExit(10000)) {
+              throw "Installed AgentLoom exited during the 10-second smoke window with code $($appProcess.ExitCode)."
+            }
+          } finally {
+            if ($null -ne $appProcess -and -not $appProcess.HasExited) {
+              Stop-Process -InputObject $appProcess -Force -ErrorAction SilentlyContinue
+              [void]$appProcess.WaitForExit(30000)
+            }
+          }
+          if ($null -eq $startedProcessId -or $null -eq $appProcess -or -not $appProcess.HasExited) {
+            throw 'The installed AgentLoom process did not stop before uninstall.'
+          }
+          Remove-Item -LiteralPath $pidPath -Force -ErrorAction Stop
+          if (Test-Path -LiteralPath $pidPath) {
+            throw 'The AgentLoom PID marker remains after the confirmed process stop.'
+          }
+
+          $uninstallProcess = Start-Process -FilePath $uninstaller -ArgumentList @('/S') -Wait -PassThru
+          if ($uninstallProcess.ExitCode -ne 0) {
+            throw "The real NSIS uninstaller failed with exit code $($uninstallProcess.ExitCode)."
+          }
+          $cleanupDeadline = [DateTime]::UtcNow.AddSeconds(60)
+          do {
+            $installDirRemains = Test-Path -LiteralPath $installDir
+            if (-not $installDirRemains) {
+              break
+            }
+            Start-Sleep -Seconds 1
+          } while ([DateTime]::UtcNow -lt $cleanupDeadline)
+          if ($installDirRemains) {
+            try {
+              $diagnosticEntries = @(Get-ChildItem -LiteralPath $installDir -Recurse -Force -ErrorAction Stop)
+              foreach ($entry in $diagnosticEntries) {
+                $lastWriteTimeUtc = $entry.LastWriteTimeUtc.ToString('o')
+                if ($entry.PSIsContainer) {
+                  Write-Host "DIAG: file $($entry.FullName) dir $lastWriteTimeUtc"
+                } else {
+                  Write-Host "DIAG: file $($entry.FullName) $($entry.Length) bytes $lastWriteTimeUtc"
+                }
+              }
+              foreach ($file in @($diagnosticEntries | Where-Object { -not $_.PSIsContainer })) {
+                try {
+                  $probe = [IO.File]::Open($file.FullName, 'Open', 'Read', 'None')
+                  $probe.Close()
+                  Write-Host "DIAG: free $($file.FullName)"
+                } catch {
+                  Write-Host "DIAG: locked $($file.FullName) :: $($_.Exception.Message)"
+                }
+              }
+              Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+                $processPath = ''
+                try {
+                  $processPath = $_.Path
+                } catch {
+                  $processPath = ''
+                }
+                Write-Host "DIAG: proc $($_.Id) $($_.ProcessName) $processPath"
+              }
+              Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+                $null -ne $_.CommandLine -and $_.CommandLine.IndexOf($installDir, [StringComparison]::OrdinalIgnoreCase) -ge 0
+              } | ForEach-Object {
+                Write-Host "DIAG: proc-in-installdir $($_.ProcessId) $($_.CommandLine)"
+              }
+            } catch {
+              Write-Host "DIAG: diagnostics failed :: $($_.Exception.Message)"
+            }
+            throw "Uninstall cleanup incomplete: installDir=$installDirRemains."
+          }
+
+      - name: Reject generated lockfile drift
+        shell: pwsh
+        run: git diff --exit-code -- app/package-lock.json app/src-tauri/Cargo.lock harness-agent/Cargo.lock
+
+      - name: Stage the explicitly unsigned owner test artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE "app\src-tauri\target\$env:TARGET_TRIPLE\release"
+          $bundleDir = Join-Path $releaseDir 'bundle\nsis'
+          $installers = @(Get-ChildItem -LiteralPath $bundleDir -File -Filter '*.exe')
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer before staging, found $($installers.Count)."
+          }
+
+          $stageDir = Join-Path $env:RUNNER_TEMP 'windows-test-exe-upload'
+          Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $stageDir | Out-Null
+          $installerName = "AgentLoom_$env:APP_VERSION`_windows-x64_TEST-UNSIGNED.exe"
+          $stagedInstaller = Join-Path $stageDir $installerName
+          Copy-Item -LiteralPath $installers[0].FullName -Destination $stagedInstaller
+
+          $sourceHash = (Get-FileHash -LiteralPath $installers[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $stagedHash = (Get-FileHash -LiteralPath $stagedInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sourceHash -cne $stagedHash) {
+            throw 'The staged unsigned installer differs from the smoke-tested source installer.'
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $stagedInstaller
+          if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::NotSigned) {
+            throw "The staged test installer must remain unsigned; found $($signature.Status)."
+          }
+
+          "$stagedHash  $installerName" | Set-Content -LiteralPath "$stagedInstaller.sha256" -Encoding ascii -NoNewline
+          @'
+          AGENTLOOM WINDOWS TEST BUILD ONLY - UNSIGNED
+
+          This installer has NO code-signing certificate. It is not a production release.
+          It is NOT for public distribution and must NOT be uploaded to Microsoft Store.
+          Windows SmartScreen may show a warning because this file is unsigned.
+          For owner-only testing, choose "More info" -> "Run anyway" ("更多信息" -> "仍要运行").
+          Use this build only for AgentLoom owner acceptance testing.
+          The final Microsoft Store build is a separate package that Microsoft certifies and signs.
+          '@ | Set-Content -LiteralPath (Join-Path $stageDir 'README-TEST-ONLY.txt') -Encoding utf8
+
+      - name: Enforce the exact upload-stage allowlist
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $stageDir = Join-Path $env:RUNNER_TEMP 'windows-test-exe-upload'
+          if (-not (Test-Path -LiteralPath $stageDir -PathType Container)) {
+            throw 'The isolated upload stage is missing.'
+          }
+          $entries = @(Get-ChildItem -LiteralPath $stageDir -Force -Recurse)
+          $directories = @($entries | Where-Object { $_.PSIsContainer })
+          if ($directories.Count -ne 0) {
+            throw "Upload stage contains unexpected directories: $($directories.FullName -join ', ')"
+          }
+          foreach ($entry in $entries) {
+            if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "Upload stage contains a reparse point: $($entry.FullName)"
+            }
+          }
+
+          $files = @($entries | Where-Object { -not $_.PSIsContainer })
+          $installerName = "AgentLoom_$env:APP_VERSION`_windows-x64_TEST-UNSIGNED.exe"
+          $expectedNames = @($installerName, "$installerName.sha256", 'README-TEST-ONLY.txt') | Sort-Object
+          $actualNames = @($files.Name | Sort-Object)
+          if ($files.Count -ne 3 -or ($actualNames -join "`n") -cne ($expectedNames -join "`n")) {
+            throw "Upload stage must contain exactly installer/checksum/readme; found: $($actualNames -join ', ')"
+          }
+
+          $forbidden = @($files | Where-Object {
+            $_.Extension.ToLowerInvariant() -in @('.pfx', '.cer', '.key') -or
+            [IO.Path]::GetRelativePath($stageDir, $_.FullName) -match '(^|[\\/])(docs|src)([\\/]|$)'
+          })
+          if ($forbidden.Count -ne 0) {
+            throw "Upload stage contains forbidden certificate/key/docs/src content: $($forbidden.FullName -join ', ')"
+          }
+
+          $installerPath = Join-Path $stageDir $installerName
+          $checksumPath = "$installerPath.sha256"
+          $readmePath = Join-Path $stageDir 'README-TEST-ONLY.txt'
+          foreach ($requiredFile in @($installerPath, $checksumPath, $readmePath)) {
+            if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf) -or (Get-Item -LiteralPath $requiredFile).Length -eq 0) {
+              throw "Required upload-stage file is missing or empty: $requiredFile"
+            }
+          }
+          $actualHash = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedChecksum = "$actualHash  $installerName"
+          if ((Get-Content -LiteralPath $checksumPath -Raw) -cne $expectedChecksum) {
+            throw 'The staged SHA256 file does not match the staged installer.'
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installerPath
+          if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::NotSigned) {
+            throw "The upload-stage installer must be NotSigned; found $($signature.Status)."
+          }
+          $readme = Get-Content -LiteralPath $readmePath -Raw
+          foreach ($requiredWarning in @('NO code-signing certificate', 'not a production release', 'NOT for public distribution', 'must NOT be uploaded to Microsoft Store', 'SmartScreen', 'More info', 'Run anyway', 'owner acceptance testing', 'Microsoft certifies and signs')) {
+            if ($readme -cnotmatch [Regex]::Escape($requiredWarning)) {
+              throw "README-TEST-ONLY.txt is missing warning text: $requiredWarning"
+            }
+          }
+
+      - name: Upload the unsigned owner-only test installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-x64-unsigned-test-installer__not-for-public-distribution
+          path: |
+            ${{ runner.temp }}/windows-test-exe-upload/AgentLoom_*_windows-x64_TEST-UNSIGNED.exe
+            ${{ runner.temp }}/windows-test-exe-upload/AgentLoom_*_windows-x64_TEST-UNSIGNED.exe.sha256
+            ${{ runner.temp }}/windows-test-exe-upload/README-TEST-ONLY.txt
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Enforce process, install, and temporary artifact cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Set-StrictMode -Version Latest
+
+          $failures = [Collections.Generic.List[string]]::new()
+          function Add-CleanupFailure {
+            param([Parameter(Mandatory = $true)][string]$Message)
+            [void]$failures.Add($Message)
+          }
+
+          $installDir = Join-Path $env:RUNNER_TEMP "AgentLoomUnsignedTest-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $pidPath = Join-Path $env:RUNNER_TEMP 'agentloom-unsigned-test-pid.txt'
+          $uploadDir = Join-Path $env:RUNNER_TEMP 'windows-test-exe-upload'
+          $installedMain = Join-Path $installDir 'agentloom.exe'
+          $expectedProcessPath = [IO.Path]::GetFullPath($installedMain)
+          $exactUninstaller = Join-Path $installDir 'uninstall.exe'
+
+          if (Test-Path -LiteralPath $pidPath -PathType Leaf) {
+            try {
+              $recordedProcessIdentity = (Get-Content -LiteralPath $pidPath -Raw -ErrorAction Stop).Trim()
+              if ($recordedProcessIdentity -notmatch '^(?<pid>[1-9][0-9]*)\|(?<ticks>[1-9][0-9]*)$' -or
+                  [uint64]$Matches.pid -gt [int]::MaxValue -or
+                  [uint64]$Matches.ticks -gt [int64]::MaxValue) {
+                Add-CleanupFailure -Message 'The recorded AgentLoom process identity is malformed.'
+              } else {
+                $recordedPid = [int]$Matches.pid
+                $recordedStartTicks = [int64]$Matches.ticks
+                $markedProcess = Get-Process -Id $recordedPid -ErrorAction SilentlyContinue
+                if ($null -ne $markedProcess) {
+                  $markedProcessPath = $null
+                  $markedProcessStartTicks = $null
+                  try {
+                    $markedProcessPath = [IO.Path]::GetFullPath($markedProcess.Path)
+                    $markedProcessStartTicks = $markedProcess.StartTime.ToUniversalTime().Ticks
+                  } catch {
+                    Add-CleanupFailure -Message "Could not read the marked process identity for PID $recordedPid; the process was not killed: $($_.Exception.Message)"
+                  }
+                  if ($null -ne $markedProcessPath -and $null -ne $markedProcessStartTicks) {
+                    if (-not [string]::Equals($markedProcessPath, $expectedProcessPath, [StringComparison]::OrdinalIgnoreCase)) {
+                      Add-CleanupFailure -Message "PID marker path mismatch; refusing to kill PID ${recordedPid}: expected $expectedProcessPath, found $markedProcessPath"
+                    } elseif ($markedProcessStartTicks -ne $recordedStartTicks) {
+                      Add-CleanupFailure -Message "PID marker start-time mismatch; refusing to kill reused PID ${recordedPid}."
+                    } else {
+                      try {
+                        Stop-Process -InputObject $markedProcess -Force -ErrorAction Stop
+                        if (-not $markedProcess.WaitForExit(30000)) {
+                          Add-CleanupFailure -Message "The exact marked AgentLoom process did not exit after cleanup: PID $recordedPid"
+                        }
+                      } catch {
+                        Add-CleanupFailure -Message "Could not stop the exact marked AgentLoom process: $($_.Exception.Message)"
+                      }
+                    }
+                  }
+                }
+              }
+            } catch {
+              Add-CleanupFailure -Message "Could not inspect the AgentLoom PID marker: $($_.Exception.Message)"
+            }
+          }
+
+          if (Test-Path -LiteralPath $installDir -PathType Container) {
+            $uninstallerIsSafe = $true
+            if (-not (Test-Path -LiteralPath $exactUninstaller -PathType Leaf)) {
+              Add-CleanupFailure -Message "The exact cleanup uninstaller is missing: $exactUninstaller"
+              $uninstallerIsSafe = $false
+            } else {
+              try {
+                $uninstallerItem = Get-Item -LiteralPath $exactUninstaller -Force -ErrorAction Stop
+                if ($uninstallerItem.PSIsContainer -or ($uninstallerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                  Add-CleanupFailure -Message "The exact cleanup uninstaller is not a regular non-reparse file: $exactUninstaller"
+                  $uninstallerIsSafe = $false
+                }
+                $uninstallerSignature = Get-AuthenticodeSignature -LiteralPath $exactUninstaller -ErrorAction Stop
+                if ($uninstallerSignature.Status -ne [System.Management.Automation.SignatureStatus]::NotSigned -or
+                    $null -ne $uninstallerSignature.SignerCertificate -or
+                    $null -ne $uninstallerSignature.TimeStamperCertificate) {
+                  Add-CleanupFailure -Message "The exact cleanup uninstaller is not strictly NotSigned: $exactUninstaller"
+                  $uninstallerIsSafe = $false
+                }
+              } catch {
+                Add-CleanupFailure -Message "Could not validate the exact cleanup uninstaller: $($_.Exception.Message)"
+                $uninstallerIsSafe = $false
+              }
+            }
+
+            if ($uninstallerIsSafe) {
+              try {
+                $uninstallProcess = Start-Process -FilePath $exactUninstaller -ArgumentList @('/S') -Wait -PassThru -ErrorAction Stop
+                if ($uninstallProcess.ExitCode -ne 0) {
+                  Add-CleanupFailure -Message "Cleanup uninstaller exited with code $($uninstallProcess.ExitCode)."
+                }
+              } catch {
+                Add-CleanupFailure -Message "Cleanup uninstaller failed: $($_.Exception.Message)"
+              }
+            }
+          }
+
+          $cleanupDeadline = [DateTime]::UtcNow.AddSeconds(60)
+          while ((Test-Path -LiteralPath $installDir) -and [DateTime]::UtcNow -lt $cleanupDeadline) {
+            Start-Sleep -Seconds 1
+          }
+          if (Test-Path -LiteralPath $installDir) {
+            Add-CleanupFailure -Message 'Fallback directory removal was required; the real exact NSIS uninstall did not complete cleanly.'
+            try {
+              Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction Stop
+            } catch {
+              Add-CleanupFailure -Message "Could not remove the test install directory: $($_.Exception.Message)"
+            }
+          }
+
+          $targetProcessRemains = $false
+          foreach ($candidateProcess in @(Get-Process -Name 'agentloom' -ErrorAction SilentlyContinue)) {
+            try {
+              $candidatePath = [IO.Path]::GetFullPath($candidateProcess.Path)
+              if ([string]::Equals($candidatePath, $expectedProcessPath, [StringComparison]::OrdinalIgnoreCase)) {
+                $targetProcessRemains = $true
+              }
+            } catch {
+              Add-CleanupFailure -Message "Could not read an agentloom process path during the final cleanup check; no process was killed: PID $($candidateProcess.Id): $($_.Exception.Message)"
+            }
+          }
+
+          Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $uploadDir -Recurse -Force -ErrorAction SilentlyContinue
+
+          if ($targetProcessRemains) {
+            Add-CleanupFailure -Message "The exact target AgentLoom process remains after cleanup: $expectedProcessPath"
+          }
+          if (Test-Path -LiteralPath $installDir) {
+            Add-CleanupFailure -Message 'The test install directory remains after cleanup.'
+          }
+          if (Test-Path -LiteralPath $pidPath) {
+            Add-CleanupFailure -Message 'The AgentLoom PID marker remains after cleanup.'
+          }
+          if (Test-Path -LiteralPath $uploadDir) {
+            Add-CleanupFailure -Message 'The temporary artifact upload directory remains after cleanup.'
+          }
+          if ($failures.Count -ne 0) {
+            try {
+              $diagnosticEntries = @()
+              if (Test-Path -LiteralPath $installDir -PathType Container) {
+                $diagnosticEntries = @(Get-ChildItem -LiteralPath $installDir -Recurse -Force -ErrorAction Stop)
+              }
+              foreach ($entry in $diagnosticEntries) {
+                $lastWriteTimeUtc = $entry.LastWriteTimeUtc.ToString('o')
+                if ($entry.PSIsContainer) {
+                  Write-Host "DIAG: file $($entry.FullName) dir $lastWriteTimeUtc"
+                } else {
+                  Write-Host "DIAG: file $($entry.FullName) $($entry.Length) bytes $lastWriteTimeUtc"
+                }
+              }
+              foreach ($file in @($diagnosticEntries | Where-Object { -not $_.PSIsContainer })) {
+                try {
+                  $probe = [IO.File]::Open($file.FullName, 'Open', 'Read', 'None')
+                  $probe.Close()
+                  Write-Host "DIAG: free $($file.FullName)"
+                } catch {
+                  Write-Host "DIAG: locked $($file.FullName) :: $($_.Exception.Message)"
+                }
+              }
+              Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+                $processPath = ''
+                try {
+                  $processPath = $_.Path
+                } catch {
+                  $processPath = ''
+                }
+                Write-Host "DIAG: proc $($_.Id) $($_.ProcessName) $processPath"
+              }
+              Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+                $null -ne $_.CommandLine -and $_.CommandLine.IndexOf($installDir, [StringComparison]::OrdinalIgnoreCase) -ge 0
+              } | ForEach-Object {
+                Write-Host "DIAG: proc-in-installdir $($_.ProcessId) $($_.CommandLine)"
+              }
+            } catch {
+              Write-Host "DIAG: diagnostics failed :: $($_.Exception.Message)"
+            }
+            throw "Unsigned Windows test cleanup failed: $($failures -join '; ')"
+          }
