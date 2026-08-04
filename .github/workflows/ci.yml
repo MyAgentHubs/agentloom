@@ -88,3 +88,35 @@ jobs:
       # --no-fail-fast: without it cargo stops at the first test binary that
       # fails, and every later failure stays hidden until that one is fixed.
       - run: cargo test --locked --no-fail-fast
+
+  windows-check:
+    name: App backend compiles on Windows
+    # Type-check only, and deliberately not the test suite: a large share of the
+    # backend tests use Unix-only facilities on purpose. What this job protects is
+    # narrower and was worth a whole broken release build to learn — a single
+    # unguarded `use std::os::unix::...` in shipping code silently makes the app
+    # impossible to build on Windows at all, and nothing else in CI notices.
+    # Cross-checking this from a Mac is not an option: the dependency tree pulls
+    # aws-lc-sys, whose build script needs a C toolchain targeting Windows.
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: app/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            app/src-tauri
+            harness-agent
+      # Same reason as the macOS job: tauri's build script resolves the sidecar
+      # before src-tauri compiles. Windows adds the .exe suffix on both ends.
+      - name: Stage myagent sidecar
+        shell: bash
+        run: |
+          cargo build --release --locked --manifest-path ../../harness-agent/Cargo.toml
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p binaries
+          cp "../../harness-agent/target/release/myagent.exe" "binaries/myagent-${triple}.exe"
+      - run: cargo check --locked

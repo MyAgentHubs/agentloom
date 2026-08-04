@@ -870,8 +870,6 @@ pub(crate) fn reject_ignored_exact_paths(
     worktree: &Path,
     exact_paths: &[PathBuf],
 ) -> Result<(), String> {
-    use std::os::unix::ffi::OsStrExt;
-
     // A path missing from disk is exempt from the `.gitignore` wall only if it is a bona fide
     // tracked deletion (present in HEAD). `git check-ignore` has no notion of "already
     // tracked" — a `.gitignore` rule added after a file was committed still flags it — so
@@ -896,10 +894,17 @@ pub(crate) fn reject_ignored_exact_paths(
         .collect::<Vec<_>>();
     let tracked_deletions = head_tracked_subset(worktree, &missing_paths)?;
 
+    // `as_encoded_bytes` rather than the Unix-only `OsStrExt::as_bytes`: on Unix the two are
+    // the same no-op view of the underlying bytes, and this keeps the whole function compiling
+    // on Windows (the Unix-only import silently broke the Windows build once already). On
+    // Windows the encoding is WTF-8, which is exactly UTF-8 for every path git can round-trip;
+    // a path holding an unpaired surrogate would not match a `.gitignore` rule there, which
+    // fails open on this wall rather than crashing — acceptable for a filename Windows itself
+    // cannot represent in UTF-8.
     let paths = exact_paths
         .iter()
         .filter(|path| !tracked_deletions.contains(path.as_path()))
-        .map(|path| path.as_os_str().as_bytes().to_vec())
+        .map(|path| path.as_os_str().as_encoded_bytes().to_vec())
         .collect::<Vec<_>>();
     if paths.is_empty() {
         // Every requested path was either a proven HEAD-tracked deletion (exempt above) or
