@@ -40,9 +40,9 @@ working at once — on your machine, under your control.
   AgentLoom writes the hand-off brief so the next one starts warm.
 
 - **Cheap models that actually finish the job.** AgentLoom ships its own agent engine,
-  `myagent`, written in Rust — no Claude Code, no Codex, no vendor CLI required. It gives any
-  provider the same tool loop, plan mode and checkpoints that the expensive CLIs have, so a
-  pay-as-you-go key gets a real shot at real work.
+  `myagent`, written in Rust — no Claude Code, no Codex, no vendor CLI required. Providers you
+  connect through that engine get the same tool loop, plan mode and checkpoints that the
+  expensive CLIs have, so a pay-as-you-go key gets a real shot at real work.
   <br>*We measured that claim rather than asserting it — see [Benchmarks](#benchmarks--cheap-models-real-work) below.*
 
 - **See every move. Undo any of them.** Every command and every file write lands as a card you
@@ -122,13 +122,12 @@ and undo. The sidebar holds every project you work on and every session inside i
 
 ## Install
 
-Grab the latest installer from the
-[Releases](https://github.com/MyAgentHubs/agentloom/releases/latest) page.
-
-- **macOS** — download the `.dmg` (Apple silicon or Intel), drag to Applications. Notarized;
-  no warnings.
-- **Windows** — download the installer `.exe`. **Experimental**: the Windows build has
-  not yet been verified on real hardware; expect rough edges and please report what you hit.
+- **macOS** — grab the `.dmg` for your Mac (Apple silicon or Intel) from the
+  [Releases](https://github.com/MyAgentHubs/agentloom/releases/latest) page and drag it to
+  Applications. Signed and notarized by Apple; it opens with no warnings.
+- **Windows** — not published yet. The build is not code-signed and has not been verified on
+  real hardware, so we would rather not ship it than ship something your machine flags.
+  [Build from source](#build-from-source) in the meantime.
 
 ## Build from source
 

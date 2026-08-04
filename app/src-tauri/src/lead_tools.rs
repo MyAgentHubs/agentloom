@@ -2447,9 +2447,23 @@ mod tests {
         let team_running_intent = team_running.clone();
         let team_running_inner = team_running.clone();
 
+        // 确定性同步取代 sleep：worker 阻塞在 release_rx 上直到测试放行，"worker 存活"
+        // 窗口因此无上界；settled_rx 等 on_worker_settled 回调，取代"睡 300ms 赌它跑完了"。
+        // 旧版靠 worker sleep(150ms) 撑窗口、主线程超时返回后立刻断言，只有约 130ms 余量
+        // ——CI 上 1700+ 测试并行跑在弱机器上，主线程一旦被调度延迟超过这个余量，worker
+        // 就已经跑完并释放两层 intent，测试假红（产品逻辑无缺陷：intent_guard 移进后台
+        // 线程、run_worker 返回后才 drop，覆盖窗口本身没有空隙）。
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let (settled_tx, settled_rx) = std::sync::mpsc::channel::<()>();
+        let settled_tx = Mutex::new(settled_tx);
+
         let ctx = LeadCtx {
             on_result_delivered: noop_result_delivered(),
-            on_worker_settled: noop_worker_settled(),
+            // 后台线程里 drop(intent_guard) 先于本回调，收到信号即两层 intent 都已释放。
+            on_worker_settled: Arc::new(move || {
+                let _ = settled_tx.lock().unwrap().send(());
+            }),
             is_session_running: Arc::new(move || {
                 team_running_gate
                     .is_session_running(session_id)
@@ -2463,7 +2477,9 @@ mod tests {
                 let _inner_intent = team_running_inner
                     .begin_dispatch_intent(session_id)
                     .unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(150));
+                // 阻塞到测试放行——worker 存活窗口无上界，主线程再怎么被调度延迟也不会
+                // 输掉这场竞速。
+                let _ = release_rx.lock().unwrap().recv();
                 Ok(fake_result())
             }),
             member_pool: vec![pool_member("agent-1")],
@@ -2493,7 +2509,12 @@ mod tests {
             "worker 存活期 is_session_running 应恒为 true（双重登记叠在同一 session 计数上）"
         );
 
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        release_tx
+            .send(())
+            .expect("worker 此刻应仍阻塞在 release_rx 上等待放行");
+        settled_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("worker 放行后应结束并触发 on_worker_settled");
         assert!(
             !team_running.is_session_running(session_id).unwrap(),
             "worker 结束后两层 intent 都应释放，is_session_running 回落 false，计数不残留"

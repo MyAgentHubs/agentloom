@@ -39,8 +39,9 @@ AgentLoom 的前提正好相反：很多项目、很多模型、好几个 agent 
   会话聊长了想开新的，AgentLoom 会替你写好交接说明，新会话直接接上。
 
 - **便宜模型也能真把活干完。** AgentLoom 自带一个用 Rust 写的 agent 引擎 `myagent`，
-  不装 Claude Code、Codex 或别家 CLI 也能跑。它给任何一家厂商配上跟贵价 CLI
-  同样的工具循环、plan 模式和 checkpoint —— 所以一把按量付费的 key，也有机会真干成事。
+  不装 Claude Code、Codex 或别家 CLI 也能跑。凡是通过这个引擎接入的厂商，都能用上
+  跟贵价 CLI 同样的工具循环、plan 模式和 checkpoint —— 所以一把按量付费的 key，
+  也有机会真干成事。
   <br>*这句话我们是测过的，不是自己说的 —— 见下面的[跑分](#跑分--便宜模型也能真干活)。*
 
 - **每一步都看得见，每一步都能撤。** 每一条命令、每一次文件改动都是一张能展开的卡片，
@@ -110,10 +111,11 @@ AgentLoom 的前提正好相反：很多项目、很多模型、好几个 agent 
 
 ## 安装
 
-到 [Releases](https://github.com/MyAgentHubs/agentloom/releases/latest) 页拿最新安装包。
-
-- **macOS** —— 下载 `.dmg`(Apple 芯片或 Intel)，拖进「应用程序」。已公证，不会有安全警告。
-- **Windows** —— 下载 `.exe` 安装包。**实验性**：Windows 构建尚未在真机验证过，可能有毛边，遇到问题请反馈。
+- **macOS** —— 到 [Releases](https://github.com/MyAgentHubs/agentloom/releases/latest) 页
+  按你的芯片拿 `.dmg`(Apple 芯片或 Intel)，拖进「应用程序」。已由 Apple 签名并公证，
+  打开不会有任何安全警告。
+- **Windows** —— 还没发布。这个构建没做代码签名，也没在真机上验证过，与其发一个
+  会被系统拦下来的东西，不如先不发。这期间可以[从源码构建](#从源码构建)。
 
 ## 从源码构建
 
