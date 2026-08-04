@@ -3047,7 +3047,7 @@ describe("App", () => {
     const guide = await screen.findByRole("dialog", {
       name: "还没有可用的 agent",
     });
-    expect(guide).toHaveTextContent("当前两个都没有检测到");
+    expect(guide).toHaveTextContent("内置引擎 myagent");
 
     fireEvent.click(
       within(guide).getByRole("button", { name: "打开 Agent 设置" }),

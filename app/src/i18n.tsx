@@ -118,7 +118,10 @@ const messages = {
     "settings.agents.deleteAria": "删除 {name}",
     "onboarding.installGuide.title": "还没有可用的 agent",
     "onboarding.installGuide.reason":
-      "AgentLoom 通过本机的 Claude Code 或 Codex CLI 驱动 agent，当前两个都没有检测到。",
+      "AgentLoom 可以用内置引擎 myagent 跑 agent —— 只需要你自己的 API key，不用装任何厂商 CLI；也可以驱动本机的 Claude Code 或 Codex CLI。当前三种都还没配置好。",
+    "onboarding.installGuide.harnessDescription":
+      "用你自己的 API key 直接跑，不需要安装任何厂商 CLI。",
+    "onboarding.installGuide.configureHarness": "去配置",
     "onboarding.installGuide.claudeDescription":
       "使用 Anthropic 账号运行 Claude agent。",
     "onboarding.installGuide.codexDescription":
@@ -1542,7 +1545,10 @@ const messages = {
     "settings.agents.deleteAria": "Delete {name}",
     "onboarding.installGuide.title": "No agents are available yet",
     "onboarding.installGuide.reason":
-      "AgentLoom runs agents through Claude Code or the Codex CLI on this computer, and neither was detected.",
+      "AgentLoom can run agents with its built-in engine, myagent — all it needs is your own API key — or drive Claude Code or the Codex CLI on this computer. None of these is set up yet.",
+    "onboarding.installGuide.harnessDescription":
+      "Run agents with your own API key. No vendor CLI to install.",
+    "onboarding.installGuide.configureHarness": "Set up",
     "onboarding.installGuide.claudeDescription":
       "Run Claude agents with your Anthropic account.",
     "onboarding.installGuide.codexDescription":

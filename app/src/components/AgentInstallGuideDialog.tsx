@@ -49,6 +49,21 @@ export function AgentInstallGuideDialog({ onClose, onOpenSettings }: Props) {
         <div className="agent-install-guide__options">
           <div className="agent-install-guide__option">
             <div>
+              <h3 className="agent-install-guide__name">myagent</h3>
+              <p className="agent-install-guide__description">
+                {t("onboarding.installGuide.harnessDescription")}
+              </p>
+            </div>
+            <button
+              type="button"
+              className="dialog__btn"
+              onClick={handleOpenSettings}
+            >
+              {t("onboarding.installGuide.configureHarness")}
+            </button>
+          </div>
+          <div className="agent-install-guide__option">
+            <div>
               <h3 className="agent-install-guide__name">Claude Code</h3>
               <p className="agent-install-guide__description">
                 {t("onboarding.installGuide.claudeDescription")}

@@ -1,6 +1,6 @@
 [package]
 name = "agentloom"
-version = "0.1.0"
+version = "0.1.1"
 description = "AgentLoom is an open-source desktop workbench that turns many LLMs into one workforce you control."
 authors = ["MyAgentHubs <panda@myagenthubs.com>"]
 license = "AGPL-3.0-only"
