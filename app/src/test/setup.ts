@@ -44,3 +44,7 @@ if (!hasLocalStorage) {
     configurable: true,
   });
 }
+
+// Keep existing component tests deterministic: an explicit user locale takes
+// priority over jsdom's default navigator.language (en-US), just as in production.
+globalThis.localStorage.setItem("agentloom.locale.v2", "zh");

@@ -328,7 +328,9 @@ describe("RightPanel v3", () => {
     );
     expect(screen.getByText("无法生成改动对比")).toBeInTheDocument();
     expect(
-      screen.getByText("这个项目不是带 HEAD 的 Git 工作树"),
+      screen.getByText(
+        "这个项目还不是带 HEAD 的 Git 工作树。先做一次提交（commit），这里就能看到改动对比了。",
+      ),
     ).toBeInTheDocument();
   });
 });

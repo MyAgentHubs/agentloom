@@ -383,7 +383,8 @@ const messages = {
     "reviewPanel.statusCommittedOnly": "已提交 {committed} 个文件",
     "reviewPanel.statusUncommittedOnly": "未提交 {uncommitted} 个文件",
     "reviewPanel.unavailableTitle": "无法生成改动对比",
-    "reviewPanel.unavailableDescription": "这个项目不是带 HEAD 的 Git 工作树",
+    "reviewPanel.unavailableDescription":
+      "这个项目还不是带 HEAD 的 Git 工作树。先做一次提交（commit），这里就能看到改动对比了。",
     "reviewPanel.otherDirty": "工作目录另有 {count} 个未纳入本次 Review 的变更",
     "undoPanel.checklist.aria": "这一轮的撤销清单",
     "undoPanel.checklist.title": "这一轮的改动 · {count} 个文件",
@@ -1836,7 +1837,7 @@ const messages = {
     "reviewPanel.statusUncommittedOnly": "{uncommitted} file(s) uncommitted",
     "reviewPanel.unavailableTitle": "Unable to generate a diff",
     "reviewPanel.unavailableDescription":
-      "This project is not a Git working tree with a HEAD commit",
+      "This project is not a Git working tree with a HEAD commit yet. Make one commit and changes will show up here.",
     "reviewPanel.otherDirty":
       "{count} other change(s) in the working directory are not part of this review",
     "undoPanel.checklist.aria": "Undo checklist for this turn",
@@ -3035,8 +3036,19 @@ function detectLocale(): Locale {
   } catch {
     // localStorage can be unavailable in tests or hardened webviews.
   }
-  // 中文优先：用户显式切语言写 localStorage 才覆盖，不依赖 navigator.language
-  return "zh";
+
+  try {
+    const systemLanguage =
+      typeof navigator === "undefined"
+        ? undefined
+        : navigator.language || navigator.languages?.[0];
+    if (normalizeLocale(systemLanguage) === "zh") return "zh";
+  } catch {
+    // Navigator language APIs can be unavailable in hardened webviews.
+  }
+
+  // First launch follows the system language, with English as the safe fallback.
+  return "en";
 }
 
 function translate(

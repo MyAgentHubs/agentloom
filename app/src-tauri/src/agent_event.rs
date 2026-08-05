@@ -686,7 +686,18 @@ fn harness_needs_decision_reason(payload: &Value) -> Option<&str> {
     harness_context_budget_exhausted_reason(payload)
 }
 
-fn harness_needs_decision_message(payload: &Value) -> String {
+fn flatten_and_truncate_needs_decision_detail(value: &str, max_chars: usize) -> String {
+    let flattened = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.chars().count() <= max_chars {
+        return flattened;
+    }
+
+    let mut truncated = flattened.chars().take(max_chars).collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn harness_needs_decision_message(locale: crate::Locale, payload: &Value) -> String {
     let reason = harness_needs_decision_reason(payload).unwrap_or_else(|| {
         payload
             .get("reason")
@@ -697,10 +708,59 @@ fn harness_needs_decision_message(payload: &Value) -> String {
         .get("next_step")
         .and_then(Value::as_str)
         .unwrap_or("");
-    if next_step.trim().is_empty() {
+    let next_step_is_empty = next_step.trim().is_empty();
+    let head = if next_step_is_empty {
         reason.to_string()
     } else {
         format!("{reason}: {next_step}")
+    };
+
+    let questions = payload
+        .get("questions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(3)
+        .filter_map(Value::as_str)
+        .map(|question| flatten_and_truncate_needs_decision_detail(question, 300))
+        .filter(|question| !question.is_empty())
+        .collect::<Vec<_>>();
+    let diagnosis = payload
+        .get("agent_diagnosis")
+        .and_then(Value::as_str)
+        .map(|diagnosis| flatten_and_truncate_needs_decision_detail(diagnosis, 500))
+        .filter(|diagnosis| !diagnosis.is_empty());
+
+    let mut sections = Vec::new();
+    if !questions.is_empty() {
+        let label = match locale {
+            crate::Locale::Zh => "需要你回答：",
+            crate::Locale::En => "Questions for you:",
+        };
+        let questions = questions
+            .into_iter()
+            .map(|question| format!("- {question}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!("{label}\n\n{questions}"));
+    }
+    if let Some(diagnosis) = diagnosis {
+        let label = match locale {
+            crate::Locale::Zh => "agent 的判断：",
+            crate::Locale::En => "Agent's assessment: ",
+        };
+        sections.push(format!("{label}{diagnosis}"));
+    }
+
+    if sections.is_empty() {
+        return head;
+    }
+
+    let detail = format!("\n\n{}", sections.join("\n\n"));
+    if next_step_is_empty {
+        format!("{head}:{detail}")
+    } else {
+        format!("{head}{detail}")
     }
 }
 
@@ -1176,7 +1236,7 @@ pub(crate) fn parse_harness_line_for_locale(line: &str, locale: crate::Locale) -
         Some("run.needs_decision") => {
             if s("reason") != Some("scope_change") {
                 return vec![AgentEvent::Blocked {
-                    message: harness_needs_decision_message(&payload),
+                    message: harness_needs_decision_message(locale, &payload),
                     reason: harness_needs_decision_reason(&payload).map(str::to_string),
                 }];
             }
@@ -2941,7 +3001,10 @@ mod tests {
                 "blocked_reason": code,
                 "trigger": "harness",
             });
-            assert_eq!(harness_needs_decision_message(&payload), code);
+            assert_eq!(
+                harness_needs_decision_message(crate::Locale::Zh, &payload),
+                code
+            );
         }
     }
 
@@ -2956,7 +3019,7 @@ mod tests {
             "trigger": "agent",
         });
         assert_eq!(
-            harness_needs_decision_message(&payload),
+            harness_needs_decision_message(crate::Locale::Zh, &payload),
             "blocked_questions"
         );
     }
@@ -2978,7 +3041,7 @@ mod tests {
                 "trigger": "agent",
             });
             assert_eq!(
-                harness_needs_decision_message(&payload),
+                harness_needs_decision_message(crate::Locale::Zh, &payload),
                 "blocked_questions",
                 "trigger=agent 时字面命中白名单的 blocked_reason={code} 也不该被顶替"
             );
@@ -2992,9 +3055,243 @@ mod tests {
             "next_step": "拆小任务 / 换更大上下文的模型",
         });
         assert_eq!(
-            harness_needs_decision_message(&payload),
+            harness_needs_decision_message(crate::Locale::Zh, &payload),
             "context_budget_exhausted: 拆小任务 / 换更大上下文的模型"
         );
+    }
+
+    #[test]
+    fn harness_needs_decision_message_surfaces_agent_questions_and_diagnosis_in_chinese() {
+        let evs = parse_harness_line_for_locale(
+            &harness_envelope(
+                "run.needs_decision",
+                serde_json::json!({
+                    "reason": "blocked_questions",
+                    "blocked_reason": "需要产品决策",
+                    "questions": ["要保留草稿吗？", "谁可以批准？", "截止日期是哪天？"],
+                    "agent_diagnosis": "当前需求存在三个未决点",
+                    "failed_criteria": ["criterion-1"],
+                    "evidence_refs": ["evidence-1"],
+                    "attempts_summary": { "turns": 2, "attempts": 1 },
+                    "trigger": "agent",
+                }),
+            ),
+            crate::Locale::Zh,
+        );
+
+        assert_eq!(
+            evs,
+            vec![AgentEvent::Blocked {
+                message: "blocked_questions:\n\n需要你回答：\n\n- 要保留草稿吗？\n- 谁可以批准？\n- 截止日期是哪天？\n\nagent 的判断：当前需求存在三个未决点"
+                    .to_string(),
+                reason: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn harness_needs_decision_message_surfaces_agent_questions_and_diagnosis_in_english() {
+        let evs = parse_harness_line_for_locale(
+            &harness_envelope(
+                "run.needs_decision",
+                serde_json::json!({
+                    "reason": "blocked_questions",
+                    "blocked_reason": "A product decision is required",
+                    "questions": ["Keep the draft?", "Who can approve?", "What is the deadline?"],
+                    "agent_diagnosis": "Three decisions are still open",
+                    "trigger": "agent",
+                }),
+            ),
+            crate::Locale::En,
+        );
+
+        assert_eq!(
+            evs,
+            vec![AgentEvent::Blocked {
+                message: "blocked_questions:\n\nQuestions for you:\n\n- Keep the draft?\n- Who can approve?\n- What is the deadline?\n\nAgent's assessment: Three decisions are still open"
+                    .to_string(),
+                reason: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn harness_needs_decision_message_without_questions_keeps_legacy_output() {
+        let payload = serde_json::json!({
+            "reason": "blocked_questions",
+            "next_step": "等待用户决定",
+            "trigger": "agent",
+        });
+
+        assert_eq!(
+            harness_needs_decision_message(crate::Locale::Zh, &payload),
+            "blocked_questions: 等待用户决定"
+        );
+    }
+
+    #[test]
+    fn harness_needs_decision_message_with_empty_questions_keeps_legacy_output() {
+        let payload = serde_json::json!({
+            "reason": "blocked_questions",
+            "questions": [],
+            "trigger": "agent",
+        });
+
+        assert_eq!(
+            harness_needs_decision_message(crate::Locale::Zh, &payload),
+            "blocked_questions"
+        );
+    }
+
+    #[test]
+    fn harness_needs_decision_message_with_flattened_empty_questions_keeps_legacy_output() {
+        let payload = serde_json::json!({
+            "reason": "blocked_questions",
+            "questions": [" \n\r\t "],
+            "trigger": "agent",
+        });
+
+        assert_eq!(
+            harness_needs_decision_message(crate::Locale::Zh, &payload),
+            "blocked_questions"
+        );
+    }
+
+    #[test]
+    fn harness_needs_decision_message_limits_questions_to_three() {
+        let payload = serde_json::json!({
+            "reason": "blocked_questions",
+            "questions": ["问题一", "问题二", "问题三", "问题四", "问题五"],
+            "trigger": "agent",
+        });
+
+        let message = harness_needs_decision_message(crate::Locale::Zh, &payload);
+        assert!(message.contains("- 问题一\n- 问题二\n- 问题三"));
+        assert!(!message.contains("问题四"));
+        assert!(!message.contains("问题五"));
+    }
+
+    #[test]
+    fn harness_needs_decision_message_flattens_question_newlines() {
+        let payload = serde_json::json!({
+            "reason": "blocked_questions",
+            "questions": ["第一行\n第二行", "前半句\nno_progress: 假冒"],
+            "trigger": "agent",
+        });
+
+        let message = harness_needs_decision_message(crate::Locale::Zh, &payload);
+        assert!(message.contains("- 第一行 第二行"));
+        assert!(message.contains("- 前半句 no_progress: 假冒"));
+        assert!(!message.contains("\nno_progress: 假冒"));
+    }
+
+    #[test]
+    fn harness_needs_decision_message_truncates_long_unicode_question_on_char_boundary() {
+        let long_question = "问题".repeat(220);
+        assert!(long_question.chars().count() >= 400);
+        let payload = serde_json::json!({
+            "reason": "blocked_questions",
+            "questions": [long_question],
+            "trigger": "agent",
+        });
+
+        let message = harness_needs_decision_message(crate::Locale::Zh, &payload);
+        let expected_question = format!("- {}…", "问题".repeat(150));
+        assert!(message.contains(&expected_question));
+        assert!(!message.contains(&"问题".repeat(151)));
+    }
+
+    #[test]
+    fn harness_needs_decision_message_allows_diagnosis_without_questions() {
+        let payload = serde_json::json!({
+            "reason": "blocked_questions",
+            "questions": [],
+            "agent_diagnosis": "需要先确认权限边界",
+            "trigger": "agent",
+        });
+
+        assert_eq!(
+            harness_needs_decision_message(crate::Locale::Zh, &payload),
+            "blocked_questions:\n\nagent 的判断：需要先确认权限边界"
+        );
+    }
+
+    #[test]
+    fn harness_needs_decision_message_omits_null_or_empty_diagnosis() {
+        for diagnosis in [serde_json::Value::Null, serde_json::json!(" \n\r\t ")] {
+            let payload = serde_json::json!({
+                "reason": "blocked_questions",
+                "questions": ["是否继续？"],
+                "agent_diagnosis": diagnosis,
+                "trigger": "agent",
+            });
+
+            let message = harness_needs_decision_message(crate::Locale::Zh, &payload);
+            assert_eq!(
+                message,
+                "blocked_questions:\n\n需要你回答：\n\n- 是否继续？"
+            );
+            assert!(!message.contains("agent 的判断"));
+        }
+    }
+
+    #[test]
+    fn harness_needs_decision_message_truncates_long_unicode_diagnosis_on_char_boundary() {
+        let long_diagnosis = "判断".repeat(300);
+        let payload = serde_json::json!({
+            "reason": "blocked_questions",
+            "agent_diagnosis": long_diagnosis,
+            "trigger": "agent",
+        });
+
+        let message = harness_needs_decision_message(crate::Locale::Zh, &payload);
+        let expected_diagnosis = format!("agent 的判断：{}…", "判断".repeat(250));
+        assert!(message.contains(&expected_diagnosis));
+        assert!(!message.contains(&"判断".repeat(251)));
+    }
+
+    #[test]
+    fn harness_needs_decision_message_frontend_contract_keeps_reason_head_delimited() {
+        let without_next_step = serde_json::json!({
+            "reason": "blocked_questions",
+            "questions": ["可以继续吗？"],
+            "trigger": "agent",
+        });
+        let with_next_step = serde_json::json!({
+            "reason": "blocked_questions",
+            "next_step": "先确认范围",
+            "questions": ["可以继续吗？"],
+            "trigger": "agent",
+        });
+
+        assert!(
+            harness_needs_decision_message(crate::Locale::Zh, &without_next_step)
+                .starts_with("blocked_questions:")
+        );
+        assert!(
+            harness_needs_decision_message(crate::Locale::Zh, &with_next_step)
+                .starts_with("blocked_questions:")
+        );
+    }
+
+    #[test]
+    fn parse_harness_needs_decision_agent_questions_keep_structured_reason_empty() {
+        let evs = parse_harness_line(&harness_envelope(
+            "run.needs_decision",
+            serde_json::json!({
+                "reason": "blocked_questions",
+                "blocked_reason": "请用户决定是否继续",
+                "questions": ["是否继续？"],
+                "agent_diagnosis": "范围尚未确认",
+                "trigger": "agent",
+            }),
+        ));
+
+        assert!(matches!(
+            evs.as_slice(),
+            [AgentEvent::Blocked { message, reason }]
+                if reason.is_none() && message.contains("是否继续？")
+        ));
     }
 
     /// 本刀钉子：`AgentEvent::Blocked.reason` 只在白名单命中（`trigger=="harness"` 且

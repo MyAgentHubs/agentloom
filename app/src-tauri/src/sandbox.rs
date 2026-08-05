@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -343,23 +344,27 @@ pub(crate) fn git_write_seatbelt_profile_for_bin(
 
 /// 解析 claude 绝对路径：GUI(launchd 最小 PATH)下 bare claude 找不到(常在 ~/.local/bin)。
 pub fn resolve_claude_bin() -> String {
-    let mut cmd = crate::proc::command("which");
-    cmd.arg("claude");
-    if let Some(path) = crate::agent::augmented_path_for_spawn() {
-        cmd.env("PATH", path);
-    }
-    let which_path = if let Ok(out) = cmd.output() {
-        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if out.status.success() && !p.is_empty() && Path::new(&p).exists() {
-            Some(p)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let home = std::env::var("HOME").unwrap_or_default();
-    resolve_claude_bin_from(which_path, &home, Path::exists)
+    let detected = crate::detect::which_or_fallback("claude", &[]);
+    let home = std::env::var_os("HOME");
+    let user_profile = std::env::var_os("USERPROFILE");
+    let windows = cfg!(target_os = "windows");
+    resolve_claude_bin_with_env(detected, home.as_deref(), user_profile.as_deref(), |path| {
+        crate::detect::executable_candidate_allowed(path, windows) && path.exists()
+    })
+}
+
+fn resolve_claude_bin_with_env(
+    detected: Option<String>,
+    home: Option<&OsStr>,
+    user_profile: Option<&OsStr>,
+    path_exists: impl Fn(&Path) -> bool,
+) -> String {
+    let home = home
+        .filter(|value| !value.is_empty())
+        .or_else(|| user_profile.filter(|value| !value.is_empty()))
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    resolve_claude_bin_from(detected, &home, path_exists)
 }
 
 fn resolve_claude_bin_from(
@@ -370,12 +375,16 @@ fn resolve_claude_bin_from(
     if let Some(path) = which_path {
         return path;
     }
-    for c in [
-        format!("{home}/.local/bin/claude"),
-        "/opt/homebrew/bin/claude".into(),
-        "/usr/local/bin/claude".into(),
-        "/usr/bin/claude".into(),
-    ] {
+    let mut candidates = Vec::new();
+    if !home.is_empty() {
+        candidates.push(format!("{home}/.local/bin/claude"));
+    }
+    candidates.extend([
+        "/opt/homebrew/bin/claude".to_string(),
+        "/usr/local/bin/claude".to_string(),
+        "/usr/bin/claude".to_string(),
+    ]);
+    for c in candidates {
         if path_exists(Path::new(&c)) {
             return c;
         }
@@ -623,6 +632,27 @@ mod tests {
         assert_eq!(resolved, "/usr/bin/claude");
 
         assert_eq!(resolve_claude_bin_from(None, home, |_| false), "claude");
+    }
+
+    #[test]
+    fn resolve_claude_bin_from_skips_home_candidate_when_home_is_missing() {
+        assert_eq!(
+            resolve_claude_bin_from(None, "", |path| { path == Path::new("/.local/bin/claude") }),
+            "claude"
+        );
+    }
+
+    #[test]
+    fn resolve_claude_bin_with_env_uses_user_profile_when_home_is_missing() {
+        assert_eq!(
+            resolve_claude_bin_with_env(
+                None,
+                None,
+                Some(OsStr::new("/Users/windows")),
+                |path| path == Path::new("/Users/windows/.local/bin/claude"),
+            ),
+            "/Users/windows/.local/bin/claude"
+        );
     }
 
     // ── resolve_git_bin：Xcode 转发壳检测 + 穿透（2026-07-25 dogfood 定罪修复） ──

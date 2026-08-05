@@ -1,7 +1,7 @@
 // @ts-expect-error - Vitest runs in Node, but this frontend tsconfig has no Node type declarations.
 import { readFileSync } from "fs";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
@@ -15,11 +15,85 @@ function Probe() {
   return <span>{t("overview.title")}</span>;
 }
 
+function LocaleProbe() {
+  const { locale } = useI18n();
+  return <span data-testid="locale">{locale}</span>;
+}
+
+function mockSystemLanguages(language: string, languages = [language]) {
+  vi.spyOn(window.navigator, "language", "get").mockReturnValue(language);
+  vi.spyOn(window.navigator, "languages", "get").mockReturnValue(languages);
+}
+
+function renderDetectedLocale() {
+  render(
+    <I18nProvider>
+      <LocaleProbe />
+    </I18nProvider>,
+  );
+  return screen.getByTestId("locale");
+}
+
 describe("i18n", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     invokeMock.mockResolvedValue(undefined);
     window.localStorage.clear();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("prefers a stored locale over the system language", () => {
+    window.localStorage.setItem("agentloom.locale.v2", "zh");
+    mockSystemLanguages("en-US");
+
+    expect(renderDetectedLocale()).toHaveTextContent("zh");
+  });
+
+  it("detects zh-CN as Chinese", () => {
+    mockSystemLanguages("zh-CN");
+
+    expect(renderDetectedLocale()).toHaveTextContent("zh");
+  });
+
+  it("detects zh-TW as Chinese", () => {
+    mockSystemLanguages("zh-TW");
+
+    expect(renderDetectedLocale()).toHaveTextContent("zh");
+  });
+
+  it("detects en-US as English", () => {
+    mockSystemLanguages("en-US");
+
+    expect(renderDetectedLocale()).toHaveTextContent("en");
+  });
+
+  it("defaults other system languages to English", () => {
+    mockSystemLanguages("ja-JP");
+
+    expect(renderDetectedLocale()).toHaveTextContent("en");
+  });
+
+  it("uses navigator.languages when navigator.language is empty", () => {
+    mockSystemLanguages("", ["zh-Hans"]);
+
+    expect(renderDetectedLocale()).toHaveTextContent("zh");
+  });
+
+  it("defaults to English when system language information is unavailable", () => {
+    mockSystemLanguages("", []);
+
+    expect(renderDetectedLocale()).toHaveTextContent("en");
+  });
+
+  it("defaults to English when the navigator language API throws", () => {
+    vi.spyOn(window.navigator, "language", "get").mockImplementation(() => {
+      throw new Error("navigator language unavailable");
+    });
+
+    expect(renderDetectedLocale()).toHaveTextContent("en");
   });
 
   it("defaults to zh outside provider", () => {
