@@ -977,6 +977,7 @@ function MessageContentImpl({
             <LeadSummaryBlock
               key={`b-${i}`}
               block={block}
+              sessionId={sessionId}
               onViewRun={onViewRun}
               onTakeOver={readonly ? undefined : onTakeOver}
               onCleanRedispatch={

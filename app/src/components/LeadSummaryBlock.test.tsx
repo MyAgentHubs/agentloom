@@ -1,7 +1,17 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it, test } from "vitest";
+import { render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, test, vi } from "vitest";
 import { LeadSummaryBlock } from "./LeadSummaryBlock";
 import type { LeadSummaryBlock as LSB } from "../types/agent";
+
+const invokeMock = vi.fn();
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (...args: unknown[]) => invokeMock(...args),
+}));
+
+beforeEach(() => {
+  invokeMock.mockReset();
+});
 
 const lsb = (o: Partial<LSB> = {}): LSB => ({
   type: "lead_summary",
@@ -636,5 +646,60 @@ describe("LeadSummaryBlock", () => {
     expect(
       screen.getByText("API 鉴权失败已拼在旧正文里。"),
     ).toBeInTheDocument();
+  });
+
+  test("renders a relative image through the local attachment path", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "cmVsYXRpdmU=",
+      mediaType: "image/png",
+    });
+    const { container } = render(
+      <LeadSummaryBlock
+        block={lsb({
+          sections: [
+            {
+              heading: "",
+              body_richtext: "![chart](assets/x.png)",
+              findings: [],
+              attribution: ["a1"],
+              trace_ref: { run_id: "r1", assignment_ids: ["a1"] },
+            },
+          ],
+        })}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+        path: "assets/x.png",
+        sessionId: null,
+      }),
+    );
+    expect(container.querySelector('img[src="assets/x.png"]')).toBeNull();
+  });
+
+  test("still renders absolute and remote images inline", async () => {
+    render(
+      <LeadSummaryBlock
+        block={lsb({
+          sections: [
+            {
+              heading: "",
+              body_richtext: "![a](https://example.com/x.png)",
+              findings: [],
+              attribution: ["a1"],
+              trace_ref: { run_id: "r1", assignment_ids: ["a1"] },
+            },
+          ],
+        })}
+      />,
+    );
+
+    expect(await screen.findByRole("img", { name: "a" })).toHaveAttribute(
+      "src",
+      "https://example.com/x.png",
+    );
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 });

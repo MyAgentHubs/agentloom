@@ -1874,6 +1874,52 @@ describe("MessageContent read 类与 verifier 工具输出不误渲图片卡", (
   });
 });
 
+describe("MessageContent lead_summary", () => {
+  it("passes the session id into lead summary rendering", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "cmVsYXRpdmU=",
+      mediaType: "image/png",
+    });
+
+    render(
+      <MessageContent
+        blocks={[
+          {
+            type: "lead_summary",
+            run_id: "r1",
+            summary_source: "lead_synthesis",
+            status: {
+              kind: "all_succeeded",
+              succeeded_count: 1,
+              total: 1,
+            },
+            sections: [
+              {
+                heading: "",
+                body_richtext: "![chart](assets/x.png)",
+                findings: [],
+                attribution: ["a1"],
+                trace_ref: { run_id: "r1", assignment_ids: ["a1"] },
+              },
+            ],
+            findings: [],
+            artifact_refs: [],
+          },
+        ]}
+        sessionId="s-1"
+      />,
+    );
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("read_attachment", {
+        path: "assets/x.png",
+        sessionId: "s-1",
+      }),
+    );
+  });
+});
+
 describe("MessageContent dispatch_card", () => {
   it("dispatch_card 块 → 渲 DispatchCard（.workerrow 存在·未落 markdown 默认分支）", () => {
     const m = member({

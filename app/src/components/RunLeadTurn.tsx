@@ -9,6 +9,7 @@ import { LeadSummaryBlock } from "./LeadSummaryBlock";
 
 type Props = {
   turn: LeadTurnView;
+  sessionId?: string | null;
   onViewProcess?: (runId: string) => void;
   onOpenMember?: (runId: string, assignmentId: string) => void;
   onUndoRun?: (runId: string) => void;
@@ -20,6 +21,7 @@ type Props = {
 
 export function RunLeadTurn({
   turn,
+  sessionId,
   onViewProcess,
   onOpenMember,
   onUndoRun,
@@ -74,6 +76,7 @@ export function RunLeadTurn({
         <>
           <LeadSummaryBlock
             block={turn.verdict}
+            sessionId={sessionId}
             stopNotice={showStoppedNotice}
           />
           {turn.showProcessFold && (

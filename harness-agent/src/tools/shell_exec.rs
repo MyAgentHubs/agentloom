@@ -25,6 +25,14 @@ pub const ShellExecTool: ShellExecToolImpl = ShellExecToolImpl {
     fs_write_fence: crate::exec::sandbox::FsWriteFence::Off,
 };
 
+/// 单流输出的 canonical/model 结果上限。捕获上限（output_cap_bytes = 64KB）不受影响：
+/// tool.stdout.delta / tool.stderr.delta 事件、run journal、UI 终端显示仍拿全量；返回给模型
+/// 的工具结果以及 canonical messages / conversation.json 拿剪过版本，resume 后仍是剪过版本且无回灌。
+/// 这是为减轻 canonical 与 resume 负担的刻意取舍，代价是 canonical 历史不再全量；若将来增加
+/// 读取 messages 做审计的路径，须知那里只有 16KB 视图。
+/// 参照同仓 search 工具的 MAX_OUTPUT_BYTES（8KB），shell 放宽到 16KB。
+const WIRE_OUTPUT_CAP_BYTES: usize = 16 * 1024;
+
 impl ShellExecToolImpl {
     pub const fn with_write_fence(
         self,
@@ -53,6 +61,51 @@ fn shell_unavailable_message(error: &HarnessError) -> Option<&str> {
         HarnessError::ShellUnavailable(message) => Some(message),
         _ => None,
     }
+}
+
+/// 中段被省略时插的标记。
+fn wire_elided_marker(bytes: usize) -> String {
+    format!("\n[… {bytes} bytes elided from the middle to keep this result inside the model's context window; re-run the command with a narrower filter (for example, grep/head/tail) to retrieve the needed section …]\n")
+}
+
+/// 把超长输出剪成「头 + 省略标记 + 尾」。UTF-8 边界安全·确定性。
+/// 保证：返回串字节数 <= max_bytes。返回 (剪后串, 是否真的剪了)。
+fn cap_for_wire(s: &str, max_bytes: usize) -> (String, bool) {
+    if s.len() <= max_bytes {
+        return (s.to_string(), false);
+    }
+
+    let marker_len = wire_elided_marker(s.len()).len();
+    let body_budget = max_bytes.saturating_sub(marker_len);
+    if body_budget == 0 {
+        let marker = wire_elided_marker(s.len());
+        let mut marker_end = max_bytes.min(marker.len());
+        while !marker.is_char_boundary(marker_end) {
+            marker_end -= 1;
+        }
+        return (marker[..marker_end].to_string(), true);
+    }
+
+    let head_bytes = body_budget * 3 / 5;
+    let tail_bytes = body_budget - head_bytes;
+    let mut head_end = head_bytes;
+    while !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = s.len() - tail_bytes;
+    while !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    if head_end >= tail_start {
+        return (s.to_string(), false);
+    }
+
+    let elided = tail_start - head_end;
+    let marker = wire_elided_marker(elided);
+    (
+        format!("{}{}{}", &s[..head_end], marker, &s[tail_start..]),
+        true,
+    )
 }
 
 fn recover_shell_unavailable(
@@ -256,14 +309,17 @@ impl Tool for ShellExecToolImpl {
                 "truncated": truncated,
             }),
         )?;
+        let (wire_stdout, stdout_elided) = cap_for_wire(&stdout, WIRE_OUTPUT_CAP_BYTES);
+        let (wire_stderr, stderr_elided) = cap_for_wire(&stderr, WIRE_OUTPUT_CAP_BYTES);
         let exit_note = exit_code
             .and_then(|code| crate::safety::exit_semantics::exit_note(&request.command, code));
         Ok(ToolOutcome::success(serde_json::to_string(&json!({
-            "stdout": stdout,
-            "stderr": stderr,
+            "stdout": wire_stdout,
+            "stderr": wire_stderr,
             "exit_code": exit_code,
             "duration_ms": duration_ms,
             "truncated": truncated,
+            "wire_truncated": stdout_elided || stderr_elided,
             "exit_note": exit_note,
         }))?))
     }
@@ -302,6 +358,138 @@ mod tests {
                 arguments: args.to_string(),
             },
         }
+    }
+
+    #[test]
+    fn cap_for_wire_leaves_small_output_untouched() {
+        let input = "short output\n";
+        let (out, truncated) = cap_for_wire(input, WIRE_OUTPUT_CAP_BYTES);
+
+        assert_eq!(out.as_bytes(), input.as_bytes());
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn cap_for_wire_keeps_head_and_tail_and_marks_middle() {
+        let input = "A".repeat(8_000) + &"B".repeat(8_000) + &"C".repeat(8_000);
+        let (out, truncated) = cap_for_wire(&input, WIRE_OUTPUT_CAP_BYTES);
+
+        assert!(out.len() <= WIRE_OUTPUT_CAP_BYTES);
+        assert!(truncated);
+        assert!(out.starts_with('A'));
+        assert!(out.ends_with('C'));
+        assert!(out.contains("bytes elided from the middle"));
+    }
+
+    #[test]
+    fn cap_for_wire_is_utf8_safe() {
+        let input = "中文测试abc".repeat(3_000);
+
+        for max_bytes in [WIRE_OUTPUT_CAP_BYTES, 512] {
+            let (out, truncated) = cap_for_wire(&input, max_bytes);
+            assert!(truncated);
+            assert!(out.len() <= max_bytes);
+            assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn cap_for_wire_is_deterministic() {
+        let input = "deterministic-output-中文".repeat(2_000);
+
+        assert_eq!(
+            cap_for_wire(&input, WIRE_OUTPUT_CAP_BYTES),
+            cap_for_wire(&input, WIRE_OUTPUT_CAP_BYTES)
+        );
+    }
+
+    #[test]
+    fn cap_for_wire_边界() {
+        let input = "中文测试abc".repeat(100);
+        let (out, truncated) = cap_for_wire(&input, 32);
+
+        assert!(truncated);
+        assert!(out.len() <= 32);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn shell_exec_emits_full_stdout_but_caps_wire_output() {
+        let workspace = tempfile::tempdir().unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
+        let journal = journal_dir.path().join("events.jsonl");
+        let mut recorder =
+            EventRecorder::new("r", None, None, &journal, crate::events::OutputMode::Silent)
+                .unwrap();
+        let mut ledger = crate::file_ledger::FileLedger::new();
+        let mut ctx = context(workspace.path(), &mut recorder, &mut ledger);
+
+        let out = ShellExecTool
+            .execute(
+                &mut ctx,
+                &call(json!({
+                    "command": "awk 'BEGIN { for (i = 0; i < 20000; i++) printf \"A\" }'"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, crate::tools::ToolStatus::Success);
+        let wire: Value = serde_json::from_str(&out.content).unwrap();
+        assert!(wire["stdout"].as_str().unwrap().len() <= WIRE_OUTPUT_CAP_BYTES);
+        assert_eq!(wire["wire_truncated"], true);
+
+        let events: Vec<Value> = std::fs::read_to_string(&journal)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let stdout_event = events
+            .iter()
+            .find(|event| event["type"] == "tool.stdout.delta")
+            .expect("tool.stdout.delta event");
+        assert!(stdout_event["payload"]["text"].as_str().unwrap().len() > WIRE_OUTPUT_CAP_BYTES);
+    }
+
+    #[tokio::test]
+    async fn shell_exec_caps_stderr_into_the_wire_too() {
+        let workspace = tempfile::tempdir().unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
+        let journal = journal_dir.path().join("events.jsonl");
+        let mut recorder =
+            EventRecorder::new("r", None, None, &journal, crate::events::OutputMode::Silent)
+                .unwrap();
+        let mut ledger = crate::file_ledger::FileLedger::new();
+        let mut ctx = context(workspace.path(), &mut recorder, &mut ledger);
+
+        let out = ShellExecTool
+            .execute(
+                &mut ctx,
+                &call(json!({
+                    "command": "awk 'BEGIN { for (i = 0; i < 20000; i++) printf \"E\" }' >&2"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, crate::tools::ToolStatus::Success);
+        let wire: Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(wire["stdout"], "");
+        let wire_stderr = wire["stderr"].as_str().unwrap();
+        assert!(wire_stderr.len() <= WIRE_OUTPUT_CAP_BYTES);
+        assert!(wire_stderr.contains("bytes elided from the middle"));
+        assert_eq!(wire["wire_truncated"], true);
+
+        let events: Vec<Value> = std::fs::read_to_string(&journal)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let stderr_event = events
+            .iter()
+            .find(|event| event["type"] == "tool.stderr.delta")
+            .expect("tool.stderr.delta event");
+        assert!(stderr_event["payload"]["text"].as_str().unwrap().len() > WIRE_OUTPUT_CAP_BYTES);
     }
 
     #[test]

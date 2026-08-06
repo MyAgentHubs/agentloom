@@ -1,7 +1,9 @@
+import { useMemo } from "react";
 import type { Components } from "react-markdown";
 import type { LeadSummaryBlock as LSB, Finding } from "../types/agent";
 import { useI18n } from "../i18n";
 import { useMarkdownLib } from "../lib/useMarkdown";
+import { localImageMarkdownComponent } from "./localMarkdownImage";
 import type * as MarkdownLib from "../lib/markdownLib";
 import type {
   KeyedFinding,
@@ -20,6 +22,7 @@ type Props = {
   onViewRun?: () => void;
   onTakeOver?: () => void;
   onCleanRedispatch?: () => void;
+  sessionId?: string | null;
 };
 
 const leadMarkdownComponents: Components = {
@@ -49,9 +52,11 @@ const leadMarkdownComponents: Components = {
 function LeadMarkdown({
   children,
   markdownLib,
+  components,
 }: {
   children: string;
   markdownLib: typeof MarkdownLib | null;
+  components: Components;
 }) {
   if (!markdownLib) {
     return <div style={{ whiteSpace: "pre-wrap" }}>{children}</div>;
@@ -60,7 +65,7 @@ function LeadMarkdown({
     <markdownLib.Markdown
       remarkPlugins={[markdownLib.remarkGfm]}
       skipHtml={true}
-      components={leadMarkdownComponents}
+      components={components}
     >
       {children}
     </markdownLib.Markdown>
@@ -231,9 +236,17 @@ export function LeadSummaryBlock({
   block,
   stopNotice = false,
   onViewRun,
+  sessionId,
 }: Props) {
   const { t } = useI18n();
   const markdownLib = useMarkdownLib();
+  const components = useMemo(
+    () => ({
+      ...leadMarkdownComponents,
+      img: localImageMarkdownComponent({ sessionId }),
+    }),
+    [sessionId],
+  );
 
   if (block.summary_source === "pending") {
     return (
@@ -288,7 +301,9 @@ export function LeadSummaryBlock({
         return heading === "" ? (
           <div className="lead-summary__say" key={i}>
             {body !== "" && (
-              <LeadMarkdown markdownLib={markdownLib}>{body}</LeadMarkdown>
+              <LeadMarkdown markdownLib={markdownLib} components={components}>
+                {body}
+              </LeadMarkdown>
             )}
           </div>
         ) : (
@@ -296,7 +311,9 @@ export function LeadSummaryBlock({
             <h4 className="lead-summary__h">{heading}</h4>
             {body !== "" && (
               <div className="lead-summary__body">
-                <LeadMarkdown markdownLib={markdownLib}>{body}</LeadMarkdown>
+                <LeadMarkdown markdownLib={markdownLib} components={components}>
+                  {body}
+                </LeadMarkdown>
               </div>
             )}
           </section>

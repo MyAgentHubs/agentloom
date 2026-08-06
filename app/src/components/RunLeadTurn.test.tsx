@@ -1,5 +1,5 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { RunLeadTurn } from "./RunLeadTurn";
 import type { LeadTurnView } from "../lib/leadTurns";
 import type {
@@ -7,6 +7,16 @@ import type {
   LeadSummaryBlock,
   MemberUnit,
 } from "../types/agent";
+
+const invokeMock = vi.fn();
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (...args: unknown[]) => invokeMock(...args),
+}));
+
+beforeEach(() => {
+  invokeMock.mockReset();
+});
 
 const member = (overrides: Partial<MemberUnit> = {}): MemberUnit => ({
   participant_id: "p1",
@@ -187,6 +197,42 @@ describe("RunLeadTurn", () => {
     ).not.toBeNull();
     expect(screen.getByText("DeepSeekFlash")).toBeInTheDocument();
     expect(screen.getByText("Kimi")).toBeInTheDocument();
+  });
+
+  it("forwards the session id to the lead summary", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "cmVsYXRpdmU=",
+      mediaType: "image/png",
+    });
+
+    render(
+      <RunLeadTurn
+        sessionId="s-2"
+        turn={turn({
+          verdict: verdict({
+            sections: [
+              {
+                heading: "",
+                body_richtext: "![chart](assets/x.png)",
+                findings: [],
+                attribution: ["a1"],
+                trace_ref: { run_id: "r1", assignment_ids: ["a1"] },
+              },
+            ],
+          }),
+          phase: "terminal",
+          outcome: "succeeded",
+        })}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+        path: "assets/x.png",
+        sessionId: "s-2",
+      }),
+    );
   });
 
   it("查看过程把当前 run id 上抛给右侧过程面板", () => {

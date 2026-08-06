@@ -2492,7 +2492,10 @@ fn resolve_session_attachment_base_in(
     local_base: &std::path::Path,
 ) -> Result<std::path::PathBuf, String> {
     match resolve_session_workspace(conn, session_id)? {
-        SessionWorkspace::Local => Ok(local_base.to_path_buf()),
+        SessionWorkspace::Local => match inplace_project_path(conn, session_id)? {
+            Some(project) => Ok(project),
+            None => Ok(local_base.to_path_buf()),
+        },
         SessionWorkspace::Repo(path) => Ok(path),
     }
 }
@@ -23928,6 +23931,51 @@ mod tests {
 
         assert_eq!(base, workspace);
         assert_eq!(attachment.content, "local result");
+    }
+
+    #[test]
+    fn local_project_session_relative_attachment_uses_bound_project() {
+        let conn = crate::test_support::mem_db();
+        let (_guard, root) = crate::test_support::tmp_root();
+        let project = root.join("bound-project");
+        let asset = project.join("assets/x.png");
+        std::fs::create_dir_all(asset.parent().unwrap()).unwrap();
+        std::fs::write(&asset, "image bytes").unwrap();
+        repos_repo::add_repo(
+            &conn,
+            "repo-local-attachment",
+            "local",
+            "local",
+            None,
+            "bound-project",
+            project.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        db::create_session(
+            &conn,
+            "s-local-project-attachment",
+            "Local project",
+            "repo-local-attachment",
+            "local",
+        )
+        .unwrap();
+
+        let unrelated_local_base = root.join("unrelated-local-base");
+        std::fs::create_dir_all(&unrelated_local_base).unwrap();
+
+        let base = resolve_session_attachment_base_in(
+            &conn,
+            "s-local-project-attachment",
+            &unrelated_local_base,
+        )
+        .unwrap();
+
+        assert_eq!(base, project);
+        assert_eq!(
+            resolve_attachment_path("assets/x.png", Some(&base)).unwrap(),
+            asset.canonicalize().unwrap()
+        );
     }
 
     #[test]

@@ -602,6 +602,7 @@ export const MessageStream = React.memo(function MessageStream({
     <RunLeadTurn
       key={`run:${turn.runId}`}
       turn={turn}
+      sessionId={sessionId}
       onViewProcess={(runId) => onViewRun?.(runId)}
       onOpenMember={onOpenMember}
       onUndoRun={onUndoRun}

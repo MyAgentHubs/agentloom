@@ -8,9 +8,10 @@ import { CodeBlock } from "./CodeBlock";
 import { MermaidBlock } from "./MermaidBlock";
 import { useI18n } from "../i18n";
 import {
-  getAttachmentDataUri,
-  setAttachmentDataUri,
-} from "../lib/attachmentCache";
+  isLocalImagePath,
+  localImageMarkdownComponent,
+  PreviewablePath,
+} from "./localMarkdownImage";
 import { renderBackendError } from "../lib/backendMsg";
 
 // 内联代码若形如「带已知可预览后缀的文件路径」→ 可点开预览。
@@ -37,135 +38,6 @@ function decodeFilePath(path: string): string {
   } catch {
     return path;
   }
-}
-
-function isLocalImagePath(src: string): boolean {
-  if (
-    !src ||
-    src.startsWith("//") ||
-    src.startsWith("#") ||
-    src.startsWith("?")
-  ) {
-    return false;
-  }
-  return /^[a-z]:[\\/]/i.test(src) || !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(src);
-}
-
-function decodeLocalImagePath(path: string): string {
-  try {
-    return decodeURI(path);
-  } catch {
-    return path;
-  }
-}
-
-type AttachmentContent = {
-  kind: "text" | "image" | "binary";
-  imageBase64?: string;
-  mediaType?: string;
-};
-
-function PreviewablePath({
-  path,
-  onOpenPreview,
-}: {
-  path: string;
-  onOpenPreview?: (path: string) => void;
-}) {
-  if (!onOpenPreview) return <code className="inline">{path}</code>;
-
-  return (
-    <code
-      className="inline inline-path"
-      role="button"
-      tabIndex={0}
-      title={path}
-      onClick={() => onOpenPreview(path)}
-      onKeyDown={(event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          onOpenPreview(path);
-        }
-      }}
-    >
-      {path}
-    </code>
-  );
-}
-
-function LocalMarkdownImage({
-  path,
-  alt,
-  sessionId,
-  onOpenPreview,
-  onOpenLightbox,
-}: {
-  path: string;
-  alt?: string;
-  sessionId?: string | null;
-  onOpenPreview?: (path: string) => void;
-  onOpenLightbox?: (path: string) => void;
-}) {
-  const decodedPath = decodeLocalImagePath(path);
-  const [dataUri, setDataUri] = useState<string | null>(() =>
-    getAttachmentDataUri(decodedPath, sessionId),
-  );
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    const cached = getAttachmentDataUri(decodedPath, sessionId);
-    if (cached) {
-      setDataUri(cached);
-      setFailed(false);
-      return;
-    }
-    setFailed(false);
-
-    void invoke<AttachmentContent>("read_attachment", {
-      path: decodedPath,
-      sessionId: sessionId ?? null,
-    })
-      .then((attachment) => {
-        if (cancelled) return;
-        if (attachment.imageBase64 && attachment.mediaType) {
-          const nextDataUri = `data:${attachment.mediaType};base64,${attachment.imageBase64}`;
-          setAttachmentDataUri(decodedPath, sessionId, nextDataUri);
-          setDataUri(nextDataUri);
-        } else {
-          setFailed(true);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setFailed(true);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [decodedPath, sessionId]);
-
-  if (dataUri) {
-    return (
-      <img
-        src={dataUri}
-        alt={alt ?? ""}
-        onClick={onOpenLightbox ? () => onOpenLightbox(decodedPath) : undefined}
-        style={{
-          maxWidth: "100%",
-          cursor: onOpenLightbox ? "zoom-in" : undefined,
-        }}
-      />
-    );
-  }
-  if (failed) {
-    return <PreviewablePath path={decodedPath} onOpenPreview={onOpenPreview} />;
-  }
-  return (
-    <span role="status" aria-label={alt || decodedPath}>
-      {decodedPath}
-    </span>
-  );
 }
 
 type Props = {
@@ -243,34 +115,11 @@ export const MarkdownBody = React.memo(function MarkdownBody({
           </code>
         );
       },
-      img({
-        src,
-        alt,
-        style,
-        node: _node,
-        ...props
-      }: React.ComponentProps<"img"> & { node?: unknown }) {
-        if (src && isLocalImagePath(src)) {
-          return (
-            <LocalMarkdownImage
-              key={src}
-              path={src}
-              alt={alt}
-              sessionId={sessionId}
-              onOpenPreview={onOpenPreview}
-              onOpenLightbox={onOpenLightbox}
-            />
-          );
-        }
-        return (
-          <img
-            {...props}
-            src={src || undefined}
-            alt={alt ?? ""}
-            style={{ ...style, maxWidth: "100%" }}
-          />
-        );
-      },
+      img: localImageMarkdownComponent({
+        sessionId,
+        onOpenPreview,
+        onOpenLightbox,
+      }),
       table({ children }: React.ComponentProps<"table">) {
         return (
           <div className="mm-table-wrap">
