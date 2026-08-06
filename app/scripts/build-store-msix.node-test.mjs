@@ -26,19 +26,19 @@ async function writeFixtureFile(filePath, contents = "non-empty") {
 async function createFixture() {
   const repoRoot = await mkdtemp(path.join(os.tmpdir(), "agentloom-msix-test-"));
   const releaseDir = path.join(repoRoot, "release");
-  const output = path.join(repoRoot, "out", "AgentLoom_0.1.3_windows-x64.msix");
+  const output = path.join(repoRoot, "out", "AgentLoom_0.1.4_windows-x64.msix");
 
   await writeFixtureFile(
     path.join(repoRoot, "app", "package.json"),
-    JSON.stringify({ name: "agentloom", version: "0.1.3" }),
+    JSON.stringify({ name: "agentloom", version: "0.1.4" }),
   );
   await writeFixtureFile(
     path.join(repoRoot, "app", "src-tauri", "tauri.conf.json"),
-    JSON.stringify({ productName: "AgentLoom", version: "0.1.3" }),
+    JSON.stringify({ productName: "AgentLoom", version: "0.1.4" }),
   );
   await writeFixtureFile(
     path.join(repoRoot, "app", "src-tauri", "Cargo.toml"),
-    '[package]\nname = "agentloom"\nversion = "0.1.3"\n\n[dependencies]\n',
+    '[package]\nname = "agentloom"\nversion = "0.1.4"\n\n[dependencies]\n',
   );
   await mkdir(path.join(repoRoot, "app", "src-tauri", "store"), { recursive: true });
   await cp(
@@ -95,13 +95,13 @@ test("three synchronized app versions match appVersion while Store version stays
   const fixture = await createFixture();
   t.after(fixture.cleanup);
   assert.deepEqual(await resolveStoreVersions(fixture.repoRoot), {
-    appVersion: "0.1.3",
-    storeVersion: "1.0.3.0",
+    appVersion: "0.1.4",
+    storeVersion: "1.0.4.0",
   });
 
   await writeFixtureFile(
     path.join(fixture.repoRoot, "app", "package.json"),
-    JSON.stringify({ version: "0.1.4" }),
+    JSON.stringify({ version: "0.1.5" }),
   );
   await assert.rejects(resolveStoreVersions(fixture.repoRoot), /version drift/i);
 });
@@ -144,7 +144,7 @@ test("rendered manifest is well-formed and declares the x64 full-trust desktop p
   assert.equal(validateXmlWellFormed(manifest), true);
   assert.match(manifest, /Name="AgentLoom\.AgentLoom"/);
   assert.match(manifest, /Publisher="CN=0DD4EF95-FAC8-4983-8ECE-11B9906175E7"/);
-  assert.match(manifest, /Version="1\.0\.3\.0"/);
+  assert.match(manifest, /Version="1\.0\.4\.0"/);
   assert.match(manifest, /ProcessorArchitecture="x64"/);
   assert.match(manifest, /Id="AgentLoom"/);
   assert.match(manifest, /Executable="agentloom\.exe"/);
@@ -214,8 +214,8 @@ test("dry-run works off Windows and validates all inputs without writing output"
   });
 
   assert.equal(result.dryRun, true);
-  assert.equal(result.appVersion, "0.1.3");
-  assert.equal(result.storeVersion, "1.0.3.0");
+  assert.equal(result.appVersion, "0.1.4");
+  assert.equal(result.storeVersion, "1.0.4.0");
   assert.equal(result.identity.packageFamilyName, "AgentLoom.AgentLoom_msmzkd80wev1c");
   await assert.rejects(access(fixture.output));
 });
@@ -302,7 +302,7 @@ test("real packaging stages exact payload, publishes atomically, and cleans stag
   assert.deepEqual(stagedFiles.main, "main-binary");
   assert.deepEqual(stagedFiles.sidecar, "sidecar-binary");
   assert.equal(stagedFiles.storeLogo, "StoreLogo.png");
-  assert.match(stagedFiles.manifest, /Version="1\.0\.3\.0"/);
+  assert.match(stagedFiles.manifest, /Version="1\.0\.4\.0"/);
   assert.equal(await readFile(fixture.output, "utf8"), "unsigned-msix");
   const siblings = await import("node:fs/promises").then(({ readdir }) => readdir(path.dirname(fixture.output)));
   assert.deepEqual(siblings, [path.basename(fixture.output)]);

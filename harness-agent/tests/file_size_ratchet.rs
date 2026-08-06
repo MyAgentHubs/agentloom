@@ -25,7 +25,9 @@ const WHITELIST: &[(&str, usize)] = &[
     ("plan/write_audit.rs", 1031),
     ("provider/openai_compatible.rs", 1068),
     // 棘轮重基线：跨平台 shell、专属进程组收割和 checkpoint 竞态修复；后续按职责拆分。
-    ("exec/controlled.rs", 1715),
+    ("exec/controlled/mod.rs", 960),
+    // 棘轮重基线：从 controlled.rs 原样搬出的回归测试；后续按行为域拆测试模块。
+    ("exec/controlled/tests.rs", 934),
     ("tools/fs_edit.rs", 915),
     ("tools/fs_write.rs", 916),
     ("tools/mod.rs", 845),
