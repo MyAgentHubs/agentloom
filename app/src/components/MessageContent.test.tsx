@@ -1918,6 +1918,50 @@ describe("MessageContent lead_summary", () => {
       }),
     );
   });
+
+  it("forwards fallback preview clicks from a reloaded raw lead summary", async () => {
+    vi.mocked(invoke).mockRejectedValueOnce(new Error("missing attachment"));
+    const onOpenPreview = vi.fn();
+
+    render(
+      <MessageContent
+        blocks={[
+          {
+            type: "lead_summary",
+            run_id: "reload-preview",
+            summary_source: "lead_synthesis",
+            status: {
+              kind: "all_succeeded",
+              succeeded_count: 1,
+              total: 1,
+            },
+            sections: [
+              {
+                heading: "",
+                body_richtext: "![reload](assets/reload-preview.png)",
+                findings: [],
+                attribution: ["a1"],
+                trace_ref: {
+                  run_id: "reload-preview",
+                  assignment_ids: ["a1"],
+                },
+              },
+            ],
+            findings: [],
+            artifact_refs: [],
+          },
+        ]}
+        onOpenPreview={onOpenPreview}
+      />,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "assets/reload-preview.png",
+      }),
+    );
+    expect(onOpenPreview).toHaveBeenCalledWith("assets/reload-preview.png");
+  });
 });
 
 describe("MessageContent dispatch_card", () => {

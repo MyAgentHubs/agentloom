@@ -190,6 +190,9 @@ type RunInfo = {
   agent_id: string;
   agent_name_snapshot: string | null;
 };
+type RuntimeCredentialHints = Partial<
+  Record<"claude" | "codex", boolean | null>
+>;
 type UsageDeltaEnvelope = {
   session_id: string;
   dispatch?: AgentEventEnvelope["dispatch"];
@@ -666,6 +669,7 @@ function AppContent() {
     new Map(),
   );
   const runningSessionsRef = useRef<Map<string, RunInfo>>(new Map());
+  const sessionEventEpochRef = useRef<Map<string, number>>(new Map());
   const stopIssuedAtRef = useRef<Map<string, number>>(new Map());
   // 左栏行状态点三态：running 由 runningSessions 派生即可（此 map 记 running + 终态 attention/done，
   // 用 ref 镜像给 deps=[] 的 agent-event 监听器读最新值，避免 stale 闭包）。
@@ -684,6 +688,9 @@ function AppContent() {
   const [runtimeDetect, setRuntimeDetect] = useState<RuntimeDetect | undefined>(
     undefined,
   );
+  const [runtimeCredentialHints, setRuntimeCredentialHints] = useState<
+    RuntimeCredentialHints | undefined
+  >(undefined);
   const [done, setDone] = useState<{
     cost_usd: number | null;
     output_tokens: number | null;
@@ -2753,16 +2760,24 @@ function AppContent() {
 
   const refreshRuntimeDetect = useCallback(() => {
     invoke<{
-      claude?: { available?: boolean };
-      codex?: { available?: boolean };
+      claude?: { available?: boolean; creds_hint?: boolean | null };
+      codex?: { available?: boolean; creds_hint?: boolean | null };
     }>("detect_runtime")
-      .then((r) =>
+      .then((r) => {
         setRuntimeDetect({
           claude: Boolean(r?.claude?.available),
           codex: Boolean(r?.codex?.available),
-        }),
-      )
-      .catch(() => setRuntimeDetect(undefined)); // 失败保持 undefined = 乐观（不误隐原生）
+        });
+        setRuntimeCredentialHints({
+          claude: r?.claude?.creds_hint,
+          codex: r?.codex?.creds_hint,
+        });
+      })
+      .catch(() => {
+        // 检测失败保持 undefined = 乐观（不误隐原生、不误报未登录）。
+        setRuntimeDetect(undefined);
+        setRuntimeCredentialHints(undefined);
+      });
   }, []);
 
   const refetchAgents = useCallback(async () => {
@@ -3127,6 +3142,10 @@ function AppContent() {
     ) => {
       const sid = ev.session_id;
       if (!sid) return;
+      sessionEventEpochRef.current.set(
+        sid,
+        (sessionEventEpochRef.current.get(sid) ?? 0) + 1,
+      );
 
       if (ev.kind === "session_started") {
         return;
@@ -4823,6 +4842,19 @@ function AppContent() {
     if (!sendGate.effectiveAgentId) return;
     const selectedAgentId = sendGate.effectiveAgentId;
     const agentNameSnapshot = agentNameSnapshotFor(selectedAgentId);
+    const selectedAgent = agents.find((agent) => agent.id === selectedAgentId);
+    const missingNativeCredentials =
+      selectedAgent?.access === "native" &&
+      (selectedAgent.provider === "claude" ||
+        selectedAgent.provider === "codex") &&
+      runtimeCredentialHints?.[selectedAgent.provider] === false
+        ? selectedAgent.provider
+        : null;
+    const sessionDotStatusBeforeSend =
+      sessionStatusRef.current.get(sid) ?? null;
+    const sessionEventEpochBeforeSend =
+      sessionEventEpochRef.current.get(sid) ?? 0;
+    const optimisticAssistantId = crypto.randomUUID();
     setSessionMessages(sid, [
       ...arr,
       {
@@ -4830,8 +4862,29 @@ function AppContent() {
         role: "user",
         content: [{ type: "text", text }],
       },
+      ...(missingNativeCredentials
+        ? [
+            {
+              id: crypto.randomUUID(),
+              role: "assistant" as const,
+              content: [
+                {
+                  type: "text" as const,
+                  text: t(
+                    missingNativeCredentials === "codex"
+                      ? "app.run.nativeCredentialsMissing.codex"
+                      : "app.run.nativeCredentialsMissing.claude",
+                  ),
+                },
+              ],
+              engine: selectedAgentId,
+              agent_id: selectedAgentId,
+              agent_name_snapshot: agentNameSnapshot,
+            },
+          ]
+        : []),
       {
-        id: crypto.randomUUID(),
+        id: optimisticAssistantId,
         role: "assistant",
         content: [],
         engine: selectedAgentId,
@@ -4839,19 +4892,86 @@ function AppContent() {
         agent_name_snapshot: agentNameSnapshot,
       },
     ]);
-    setRun(sid, {
+    const optimisticRun: RunInfo = {
       startedAt: Date.now(),
       workingTokens: null,
       engine: selectedAgentId,
       agent_id: selectedAgentId,
       agent_name_snapshot: agentNameSnapshot,
-    });
+    };
+    setRun(sid, optimisticRun);
     // user 由后端 send_message 落库；assistant 由前端 completed 落库
     invoke(
       "send_message",
       sendMessagePayload(sid, selectedAgentId, text, config),
     ).catch((err) => {
-      if (String(err).startsWith("SESSION_ALREADY_RUNNING:")) return;
+      if (String(err).startsWith("SESSION_ALREADY_RUNNING:")) {
+        console.error("[send_message] backend session already running", err);
+        const sessionReceivedEvent =
+          (sessionEventEpochRef.current.get(sid) ?? 0) !==
+          sessionEventEpochBeforeSend;
+        if (!sessionReceivedEvent) {
+          setRun(sid, null);
+          setSessionDotStatus(sid, sessionDotStatusBeforeSend);
+        }
+        const currentMessages = messagesRef.current.get(sid) ?? [];
+        const withoutEmptyOptimisticAssistant = currentMessages.filter(
+          (message) =>
+            (message as ChatMessage & { id?: string }).id !==
+              optimisticAssistantId || message.content.length > 0,
+        );
+        const alreadyRunningMessage: ChatMessage & { id: string } = {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: [
+            {
+              type: "text",
+              text: t("app.run.alreadyRunning"),
+            },
+          ],
+          engine: selectedAgentId,
+          agent_id: selectedAgentId,
+          agent_name_snapshot: agentNameSnapshot,
+        };
+        if (!sessionReceivedEvent) {
+          setSessionMessages(sid, [
+            ...withoutEmptyOptimisticAssistant,
+            alreadyRunningMessage,
+          ]);
+          return;
+        }
+
+        let lastAssistantIndex = -1;
+        for (
+          let index = withoutEmptyOptimisticAssistant.length - 1;
+          index >= 0;
+          index -= 1
+        ) {
+          if (withoutEmptyOptimisticAssistant[index].role === "assistant") {
+            lastAssistantIndex = index;
+            break;
+          }
+        }
+        if (lastAssistantIndex < 0) {
+          const optimisticAssistantIndex = currentMessages.findIndex(
+            (message) =>
+              (message as ChatMessage & { id?: string }).id ===
+              optimisticAssistantId,
+          );
+          setSessionMessages(sid, [
+            ...currentMessages.slice(0, optimisticAssistantIndex),
+            alreadyRunningMessage,
+            ...currentMessages.slice(optimisticAssistantIndex),
+          ]);
+          return;
+        }
+        setSessionMessages(sid, [
+          ...withoutEmptyOptimisticAssistant.slice(0, lastAssistantIndex),
+          alreadyRunningMessage,
+          ...withoutEmptyOptimisticAssistant.slice(lastAssistantIndex),
+        ]);
+        return;
+      }
       setRun(sid, null);
       // PROJECT_INVALID / PROJECT_ARCHIVED / ALREADY_ADDED 弹 dialog / 切 repo · 不污染消息流
       if (handleProjectError(err)) {

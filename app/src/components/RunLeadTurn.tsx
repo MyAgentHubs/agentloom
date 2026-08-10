@@ -17,6 +17,8 @@ type Props = {
   onShelve?: (runId: string) => void;
   onRetryVerify?: (runId: string) => void;
   onDecisionChoose?: (decisionId: string, option: string) => void;
+  onOpenPreview?: (path: string) => void;
+  onOpenLightbox?: (path: string) => void;
 };
 
 export function RunLeadTurn({
@@ -29,6 +31,8 @@ export function RunLeadTurn({
   onShelve,
   onRetryVerify,
   onDecisionChoose,
+  onOpenPreview,
+  onOpenLightbox,
 }: Props) {
   const { t } = useI18n();
   const [processOpen, setProcessOpen] = useState(false);
@@ -78,6 +82,8 @@ export function RunLeadTurn({
             block={turn.verdict}
             sessionId={sessionId}
             stopNotice={showStoppedNotice}
+            onOpenPreview={onOpenPreview}
+            onOpenLightbox={onOpenLightbox}
           />
           {turn.showProcessFold && (
             <div className={`proc-fold${processOpen ? " open" : ""}`}>

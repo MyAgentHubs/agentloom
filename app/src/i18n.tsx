@@ -1315,6 +1315,12 @@ const messages = {
     "app.repo.alreadyAdded": "已在列表 · 已切到该项目",
     "app.session.moveRepoMismatch": "该会话不属于此 repo，无法移入",
     "app.run.startFailed": "[启动失败] {error}",
+    "app.run.alreadyRunning":
+      "后端显示上一次运行仍未结束（可能已卡住）。请稍候或点停止后重试。",
+    "app.run.nativeCredentialsMissing.codex":
+      "Codex 似乎尚未登录（未找到凭据文件）。若长时间无响应，请在终端运行 `codex login` 后重试。",
+    "app.run.nativeCredentialsMissing.claude":
+      "Claude Code 似乎尚未登录（未找到凭据文件）。若长时间无响应，请在终端运行 `claude` 完成登录后重试。",
     "app.session.deleteBody": "会话将从列表移除，保留 30 天后永久清除。",
     "app.session.deleteBodyWithContinuations":
       "此会话还有 {count} 个活跃的接续会话。删除只会删除当前会话，接续会话会保留为独立会话。当前会话将从列表移除，保留 30 天后永久清除。",
@@ -2879,6 +2885,12 @@ const messages = {
     "app.session.moveRepoMismatch":
       "This session does not belong to this repository and cannot be moved here",
     "app.run.startFailed": "[Failed to start] {error}",
+    "app.run.alreadyRunning":
+      "The backend reports that the previous run has not ended and may be stuck. Please wait, or stop it and try again.",
+    "app.run.nativeCredentialsMissing.codex":
+      "Codex does not appear to be signed in (no credentials file was found). If it remains unresponsive, run `codex login` in a terminal and try again.",
+    "app.run.nativeCredentialsMissing.claude":
+      "Claude Code does not appear to be signed in (no credentials file was found). If it remains unresponsive, run `claude` in a terminal, sign in, and try again.",
     "app.session.deleteBody":
       "The session will be removed from the list and permanently deleted after 30 days.",
     "app.session.deleteBodyWithContinuations":

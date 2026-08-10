@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, test, vi } from "vitest";
 import { LeadSummaryBlock } from "./LeadSummaryBlock";
 import type { LeadSummaryBlock as LSB } from "../types/agent";
@@ -677,6 +677,107 @@ describe("LeadSummaryBlock", () => {
       }),
     );
     expect(container.querySelector('img[src="assets/x.png"]')).toBeNull();
+  });
+
+  test("loads a Windows absolute image path through read_attachment", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "d2luZG93cw==",
+      mediaType: "image/png",
+    });
+    render(
+      <LeadSummaryBlock
+        block={lsb({
+          sections: [
+            {
+              heading: "",
+              body_richtext: "![c](C:\\\\tmp\\\\x.png)",
+              findings: [],
+              attribution: ["a1"],
+              trace_ref: { run_id: "r1", assignment_ids: ["a1"] },
+            },
+          ],
+        })}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+        path: "C:\\tmp\\x.png",
+        sessionId: null,
+      }),
+    );
+  });
+
+  test("sanitizes links independently while preserving local image src exceptions", async () => {
+    render(
+      <LeadSummaryBlock
+        block={lsb({
+          sections: [
+            {
+              heading: "",
+              body_richtext: String.raw`[rel](docs/a%20b.md)
+
+[win](C:\\tmp\\note.md)
+
+[custom](j:%5Cfoo)
+
+[remote link](https://example.com/docs)
+
+![remote image](https://example.com/x.png)`,
+              findings: [],
+              attribution: ["a1"],
+              trace_ref: { run_id: "r1", assignment_ids: ["a1"] },
+            },
+          ],
+        })}
+      />,
+    );
+
+    expect(await screen.findByRole("link", { name: "rel" })).toHaveAttribute(
+      "href",
+      "docs/a%20b.md",
+    );
+    expect(screen.getByText("win").closest("a")).toHaveAttribute("href", "");
+    expect(screen.getByText("custom").closest("a")).toHaveAttribute("href", "");
+    expect(screen.getByRole("link", { name: "remote link" })).toHaveAttribute(
+      "href",
+      "https://example.com/docs",
+    );
+    expect(screen.getByRole("img", { name: "remote image" })).toHaveAttribute(
+      "src",
+      "https://example.com/x.png",
+    );
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  test("opens the preview from the fallback path when image loading fails", async () => {
+    invokeMock.mockRejectedValueOnce(new Error("boom"));
+    const onOpenPreview = vi.fn();
+    render(
+      <LeadSummaryBlock
+        block={lsb({
+          sections: [
+            {
+              heading: "",
+              body_richtext: "![fallback](assets/lead-fallback.png)",
+              findings: [],
+              attribution: ["a1"],
+              trace_ref: { run_id: "r1", assignment_ids: ["a1"] },
+            },
+          ],
+        })}
+        onOpenPreview={onOpenPreview}
+      />,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "assets/lead-fallback.png",
+      }),
+    );
+
+    expect(onOpenPreview).toHaveBeenCalledWith("assets/lead-fallback.png");
   });
 
   test("still renders absolute and remote images inline", async () => {

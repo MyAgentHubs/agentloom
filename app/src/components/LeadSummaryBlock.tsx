@@ -1,9 +1,16 @@
 import { useMemo } from "react";
-import type { Components } from "react-markdown";
+import {
+  defaultUrlTransform,
+  type Components,
+  type UrlTransform,
+} from "react-markdown";
 import type { LeadSummaryBlock as LSB, Finding } from "../types/agent";
 import { useI18n } from "../i18n";
 import { useMarkdownLib } from "../lib/useMarkdown";
-import { localImageMarkdownComponent } from "./localMarkdownImage";
+import {
+  isLocalImagePath,
+  localImageMarkdownComponent,
+} from "./localMarkdownImage";
 import type * as MarkdownLib from "../lib/markdownLib";
 import type {
   KeyedFinding,
@@ -23,6 +30,8 @@ type Props = {
   onTakeOver?: () => void;
   onCleanRedispatch?: () => void;
   sessionId?: string | null;
+  onOpenPreview?: (path: string) => void;
+  onOpenLightbox?: (path: string) => void;
 };
 
 const leadMarkdownComponents: Components = {
@@ -49,6 +58,20 @@ const leadMarkdownComponents: Components = {
   },
 };
 
+const leadUrlTransform: UrlTransform = (url, key, node) => {
+  if (key !== "src" || node?.tagName !== "img") {
+    return defaultUrlTransform(url);
+  }
+
+  let candidate = url;
+  try {
+    candidate = decodeURI(url);
+  } catch {
+    // Let react-markdown sanitize malformed URLs through its default transform.
+  }
+  return isLocalImagePath(candidate) ? candidate : defaultUrlTransform(url);
+};
+
 function LeadMarkdown({
   children,
   markdownLib,
@@ -65,6 +88,7 @@ function LeadMarkdown({
     <markdownLib.Markdown
       remarkPlugins={[markdownLib.remarkGfm]}
       skipHtml={true}
+      urlTransform={leadUrlTransform}
       components={components}
     >
       {children}
@@ -237,15 +261,21 @@ export function LeadSummaryBlock({
   stopNotice = false,
   onViewRun,
   sessionId,
+  onOpenPreview,
+  onOpenLightbox,
 }: Props) {
   const { t } = useI18n();
   const markdownLib = useMarkdownLib();
   const components = useMemo(
     () => ({
       ...leadMarkdownComponents,
-      img: localImageMarkdownComponent({ sessionId }),
+      img: localImageMarkdownComponent({
+        sessionId,
+        onOpenPreview,
+        onOpenLightbox,
+      }),
     }),
-    [sessionId],
+    [onOpenLightbox, onOpenPreview, sessionId],
   );
 
   if (block.summary_source === "pending") {

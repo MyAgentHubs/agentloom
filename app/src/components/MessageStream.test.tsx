@@ -1,10 +1,15 @@
 import { render, screen, fireEvent } from "@testing-library/react";
 import { act, useState } from "react";
-import { afterEach, describe, it, expect, vi, test } from "vitest";
+import { afterEach, beforeEach, describe, it, expect, vi, test } from "vitest";
 import { MessageStream } from "./MessageStream";
 import type { ChatMessage, LeadSummaryBlock, MemberUnit } from "../types/agent";
 
 const messageContentMountProbe = vi.hoisted(() => vi.fn());
+const invokeMock = vi.hoisted(() => vi.fn());
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (...args: unknown[]) => invokeMock(...args),
+}));
 
 vi.mock("./MessageContent", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./MessageContent")>();
@@ -21,6 +26,10 @@ vi.mock("./MessageContent", async (importOriginal) => {
       return React.createElement(actual.MessageContent, props);
     },
   };
+});
+
+beforeEach(() => {
+  invokeMock.mockReset();
 });
 
 const messages: ChatMessage[] = [
@@ -1107,6 +1116,59 @@ describe("MessageStream team_run plumbing", () => {
     expect(container.querySelector(".taskstack")).not.toBeNull();
     // 状态由 bar 颜色 class（st-run）声明·不再用状态徽标文字
     expect(container.querySelector(".task-row.st-run")).not.toBeNull();
+  });
+
+  test("实时 team turn 的总结回退 chip 点击透传到顶层预览回调", async () => {
+    invokeMock.mockRejectedValueOnce(new Error("missing attachment"));
+    const onOpenPreview = vi.fn();
+    const runId = "stream-preview";
+    const verdict: LeadSummaryBlock = {
+      ...leadSummary(runId),
+      sections: [
+        {
+          heading: "",
+          body_richtext: "![stream](assets/stream-preview.png)",
+          attribution: ["a1"],
+          trace_ref: { run_id: runId, assignment_ids: ["a1"] },
+        },
+      ],
+    };
+    const message: ChatMessage = {
+      role: "assistant",
+      engine: "agent-team",
+      content: [
+        {
+          type: "team_run",
+          run_id: runId,
+          goal: null,
+          lead: "Claude",
+          members: [
+            member({
+              assignment_id: "a1",
+              status: "done",
+              steps_done: 1,
+              steps_total: 1,
+            }),
+          ],
+        },
+        verdict,
+      ],
+    };
+
+    render(
+      <MessageStream
+        messages={[message]}
+        busy={false}
+        onOpenPreview={onOpenPreview}
+      />,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "assets/stream-preview.png",
+      }),
+    );
+    expect(onOpenPreview).toHaveBeenCalledWith("assets/stream-preview.png");
   });
 });
 

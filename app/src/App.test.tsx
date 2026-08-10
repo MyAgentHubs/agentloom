@@ -326,9 +326,10 @@ describe("App", () => {
     options: {
       messages?: ChatMessage[];
       session?: Partial<Session>;
+      sessions?: Session[];
       runtimeDetect?: {
-        claude: { available: boolean };
-        codex: { available: boolean };
+        claude: { available: boolean; creds_hint?: boolean | null };
+        codex: { available: boolean; creds_hint?: boolean | null };
       };
     } = {},
   ) {
@@ -341,15 +342,17 @@ describe("App", () => {
     invokeMock.mockImplementation((cmd: string, args?: any) => {
       if (cmd === "list_agents") return Promise.resolve(agentList);
       if (cmd === "list_sessions")
-        return Promise.resolve([
-          makeSession({
-            id: "s1",
-            title: "会话一",
-            repo_id: "local-default",
-            namespace_id: "local",
-            ...options.session,
-          }),
-        ]);
+        return Promise.resolve(
+          options.sessions ?? [
+            makeSession({
+              id: "s1",
+              title: "会话一",
+              repo_id: "local-default",
+              namespace_id: "local",
+              ...options.session,
+            }),
+          ],
+        );
       if (cmd === "get_messages") return Promise.resolve(messages);
       if (cmd === "list_run_commits") return Promise.resolve([]);
       if (cmd === "session_review") return Promise.resolve(emptyReview);
@@ -522,6 +525,24 @@ describe("App", () => {
     )?.[1];
     if (!handler) throw new Error("agent-event-batch listener 未注册");
     return handler as (e: { payload: unknown }) => void;
+  }
+
+  function emitAgentEventBatch(
+    events: Array<{ kind: string; [key: string]: unknown }>,
+  ) {
+    agentEventBatchCb()({
+      payload: {
+        batches: [
+          {
+            session_id: "s1",
+            events: events.map((event, index) => ({
+              seq: index + 1,
+              ...event,
+            })),
+          },
+        ],
+      },
+    });
   }
 
   function sessionReviewCallCount() {
@@ -4947,6 +4968,404 @@ describe("App", () => {
         screen.getByText("[启动失败] 未设置 DEEPSEEK_API_KEY 环境变量"),
       ).toBeInTheDocument();
     });
+  });
+
+  it("SESSION_ALREADY_RUNNING：零事件延迟拒绝时完整回滚并恢复发送前 attention 状态点", async () => {
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    const sendDeferred = deferred<void>();
+    mockBasicApp(agentProfiles, {
+      sessions: [
+        makeSession({
+          id: "s1",
+          title: "会话一",
+          repo_id: "local-default",
+          namespace_id: "local",
+        }),
+        makeSession({
+          id: "s2",
+          title: "会话二",
+          repo_id: "local-default",
+          namespace_id: "local",
+        }),
+      ],
+    });
+    const fallback = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd === "send_message") return sendDeferred.promise;
+      return fallback?.(cmd, args);
+    });
+
+    const { container } = render(<App />);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("get_messages", {
+        sessionId: "s1",
+      }),
+    );
+    act(() => {
+      emitAgentEventBatch([{ kind: "blocked", message: "no_progress" }]);
+    });
+
+    const input = screen.getByPlaceholderText(/输入消息/);
+    fireEvent.change(input, { target: { value: "test" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() =>
+      expect(container.querySelector(".turn__working")).not.toBeNull(),
+    );
+
+    await act(async () => {
+      sendDeferred.reject("SESSION_ALREADY_RUNNING:s1");
+      await sendDeferred.promise.catch(() => {});
+    });
+
+    const hint = await screen.findByText(
+      "后端显示上一次运行仍未结束（可能已卡住）。请稍候或点停止后重试。",
+    );
+    expect(container.querySelectorAll(".turn--assistant")).toHaveLength(1);
+    expect(container.querySelectorAll(".turn--user")).toHaveLength(1);
+    const turns = container.querySelectorAll(".turn");
+    expect(turns[turns.length - 1]).toBe(hint.closest(".turn--assistant"));
+    expect(container.querySelector(".turn__working")).toBeNull();
+    expect(screen.queryByRole("button", { name: "停止" })).toBeNull();
+    fireEvent.click(screen.getByText("会话二"));
+    await waitFor(() =>
+      expect(
+        container.querySelector('[data-session-id="s1"] .sess__dot'),
+      ).toHaveClass("attention"),
+    );
+    expect(consoleError).toHaveBeenCalledWith(
+      "[send_message] backend session already running",
+      "SESSION_ALREADY_RUNNING:s1",
+    );
+  });
+
+  it("SESSION_ALREADY_RUNNING：拒绝前 text_delta 保留活跃 run，提示不截胡后续正文", async () => {
+    const sendDeferred = deferred<void>();
+    mockBasicApp(agentProfiles, {
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "旧流起点" }],
+          engine: "claude",
+          agent_id: "claude",
+        },
+      ],
+    });
+    const fallback = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd === "send_message") return sendDeferred.promise;
+      return fallback?.(cmd, args);
+    });
+
+    const { container } = render(<App />);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("get_messages", {
+        sessionId: "s1",
+      }),
+    );
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), {
+      target: { value: "test" },
+    });
+    fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), {
+      key: "Enter",
+    });
+
+    act(() => {
+      emitAgentEventBatch([{ kind: "text_delta", text: "拒绝前正文" }]);
+    });
+    await screen.findByText("拒绝前正文");
+    await act(async () => {
+      sendDeferred.reject("SESSION_ALREADY_RUNNING:s1");
+      await sendDeferred.promise.catch(() => {});
+    });
+
+    const hint = await screen.findByText(
+      "后端显示上一次运行仍未结束（可能已卡住）。请稍候或点停止后重试。",
+    );
+    const hintTurn = hint.closest(".turn--assistant");
+    const hintText = hintTurn?.textContent;
+    const assistantTurns = container.querySelectorAll(".turn--assistant");
+    expect(assistantTurns[assistantTurns.length - 2]).toBe(hintTurn);
+    expect(assistantTurns[assistantTurns.length - 1]).toHaveTextContent(
+      "拒绝前正文",
+    );
+    expect(container.querySelector(".turn__working")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument();
+
+    act(() => {
+      emitAgentEventBatch([{ kind: "text_delta", text: "拒绝后正文" }]);
+    });
+    await waitFor(() =>
+      expect(
+        container.querySelectorAll(".turn--assistant")[
+          container.querySelectorAll(".turn--assistant").length - 1
+        ],
+      ).toHaveTextContent("拒绝前正文拒绝后正文"),
+    );
+    expect(hintTurn?.textContent).toBe(hintText);
+  });
+
+  it("SESSION_ALREADY_RUNNING：拒绝前 usage_delta 保留活跃 run，提示不截胡后续正文", async () => {
+    const sendDeferred = deferred<void>();
+    mockBasicApp(agentProfiles, {
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "旧流起点" }],
+          engine: "claude",
+          agent_id: "claude",
+        },
+      ],
+    });
+    const fallback = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd === "send_message") return sendDeferred.promise;
+      return fallback?.(cmd, args);
+    });
+
+    const { container } = render(<App />);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("get_messages", {
+        sessionId: "s1",
+      }),
+    );
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), {
+      target: { value: "test" },
+    });
+    fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), {
+      key: "Enter",
+    });
+
+    act(() => {
+      emitAgentEventBatch([
+        {
+          kind: "usage_delta",
+          input_tokens: 2,
+          output_tokens: 3,
+        },
+      ]);
+    });
+    await act(async () => {
+      sendDeferred.reject("SESSION_ALREADY_RUNNING:s1");
+      await sendDeferred.promise.catch(() => {});
+    });
+
+    const hint = await screen.findByText(
+      "后端显示上一次运行仍未结束（可能已卡住）。请稍候或点停止后重试。",
+    );
+    const hintTurn = hint.closest(".turn--assistant");
+    const hintText = hintTurn?.textContent;
+    const assistantTurns = container.querySelectorAll(".turn--assistant");
+    expect(assistantTurns[assistantTurns.length - 2]).toBe(hintTurn);
+    expect(assistantTurns[assistantTurns.length - 1]).toHaveTextContent(
+      "旧流起点",
+    );
+    expect(container.querySelector(".turn__working")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument();
+
+    act(() => {
+      emitAgentEventBatch([{ kind: "text_delta", text: "拒绝后正文" }]);
+    });
+    await waitFor(() =>
+      expect(
+        container.querySelectorAll(".turn--assistant")[
+          container.querySelectorAll(".turn--assistant").length - 1
+        ],
+      ).toHaveTextContent("旧流起点拒绝后正文"),
+    );
+    expect(hintTurn?.textContent).toBe(hintText);
+  });
+
+  it("SESSION_ALREADY_RUNNING：空会话拒绝前仅 usage_delta 时保留乐观气泡承接后续正文", async () => {
+    const sendDeferred = deferred<void>();
+    mockBasicApp(agentProfiles);
+    const fallback = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd === "send_message") return sendDeferred.promise;
+      return fallback?.(cmd, args);
+    });
+
+    const { container } = render(<App />);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("get_messages", {
+        sessionId: "s1",
+      }),
+    );
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), {
+      target: { value: "test" },
+    });
+    fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), {
+      key: "Enter",
+    });
+
+    act(() => {
+      emitAgentEventBatch([
+        {
+          kind: "usage_delta",
+          input_tokens: 2,
+          output_tokens: 3,
+        },
+      ]);
+    });
+    await act(async () => {
+      sendDeferred.reject("SESSION_ALREADY_RUNNING:s1");
+      await sendDeferred.promise.catch(() => {});
+    });
+
+    const hint = await screen.findByText(
+      "后端显示上一次运行仍未结束（可能已卡住）。请稍候或点停止后重试。",
+    );
+    const hintTurn = hint.closest(".turn--assistant");
+    const hintText = hintTurn?.textContent;
+    const assistantTurns = container.querySelectorAll(".turn--assistant");
+    expect(assistantTurns).toHaveLength(2);
+    expect(assistantTurns[0]).toBe(hintTurn);
+    expect(assistantTurns[1]).toContainElement(
+      container.querySelector(".turn__working"),
+    );
+
+    act(() => {
+      emitAgentEventBatch([{ kind: "text_delta", text: "拒绝后正文" }]);
+    });
+    await waitFor(() =>
+      expect(container.querySelectorAll(".turn--assistant")[1]).toHaveTextContent(
+        "拒绝后正文",
+      ),
+    );
+    expect(hintTurn?.textContent).toBe(hintText);
+  });
+
+  it("native Codex creds_hint=false 时显示未登录软提示且仍照常发送", async () => {
+    const codexAgent = agentProfile({
+      id: "codex",
+      name: "Codex",
+      access: "native",
+      provider: "codex",
+    });
+    const { sendCalls } = mockBasicApp([codexAgent], {
+      runtimeDetect: {
+        claude: { available: true, creds_hint: true },
+        codex: { available: true, creds_hint: false },
+      },
+    });
+
+    const { container } = render(<App />);
+    await screen.findByRole("button", { name: "选择 agent：Codex" });
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("detect_runtime"),
+    );
+
+    const input = screen.getByPlaceholderText(/输入消息/);
+    fireEvent.change(input, { target: { value: "test" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(container.querySelector(".turn--assistant")).toHaveTextContent(
+        "Codex 似乎尚未登录（未找到凭据文件）。若长时间无响应，请在终端运行 codex login 后重试。",
+      ),
+    );
+    await waitFor(() => expect(sendCalls).toHaveLength(1));
+    expect(sendCalls[0]).toMatchObject({
+      sessionId: "s1",
+      agentId: "codex",
+      message: "test",
+    });
+  });
+
+  it("borrow access 且 provider=codex 时即使 creds_hint=false 也不显示未登录提示", async () => {
+    const borrowedCodexAgent = agentProfile({
+      id: "borrowed-codex",
+      name: "Borrowed Codex",
+      access: "borrow",
+      provider: "codex",
+    });
+    const { sendCalls } = mockBasicApp([borrowedCodexAgent], {
+      runtimeDetect: {
+        claude: { available: true, creds_hint: true },
+        codex: { available: true, creds_hint: false },
+      },
+    });
+
+    render(<App />);
+    await screen.findByRole("button", { name: "选择 agent：Borrowed Codex" });
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("detect_runtime"),
+    );
+
+    const input = screen.getByPlaceholderText(/输入消息/);
+    fireEvent.change(input, { target: { value: "test" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(sendCalls).toHaveLength(1));
+    expect(
+      screen.queryByText(/Codex 似乎尚未登录（未找到凭据文件）/),
+    ).toBeNull();
+  });
+
+  it("native Claude creds_hint=false 时显示 Claude 版未登录软提示", async () => {
+    const claudeAgent = agentProfile({
+      id: "claude",
+      name: "Claude Code",
+      access: "native",
+      provider: "claude",
+    });
+    const { sendCalls } = mockBasicApp([claudeAgent], {
+      runtimeDetect: {
+        claude: { available: true, creds_hint: false },
+        codex: { available: true, creds_hint: true },
+      },
+    });
+
+    const { container } = render(<App />);
+    await screen.findByRole("button", { name: "选择 agent：Claude Code" });
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("detect_runtime"),
+    );
+
+    const input = screen.getByPlaceholderText(/输入消息/);
+    fireEvent.change(input, { target: { value: "test" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(container.querySelector(".turn--assistant")).toHaveTextContent(
+        "Claude Code 似乎尚未登录（未找到凭据文件）。若长时间无响应，请在终端运行 claude 完成登录后重试。",
+      ),
+    );
+    await waitFor(() => expect(sendCalls).toHaveLength(1));
+  });
+
+  it.each([
+    ["creds_hint=true", true],
+    ["creds_hint 缺数据", null],
+  ])("native Codex %s 时不显示未登录提示", async (_label, credsHint) => {
+    const codexAgent = agentProfile({
+      id: "codex",
+      name: "Codex",
+      access: "native",
+      provider: "codex",
+    });
+    const { sendCalls } = mockBasicApp([codexAgent], {
+      runtimeDetect: {
+        claude: { available: true, creds_hint: true },
+        codex: { available: true, creds_hint: credsHint },
+      },
+    });
+
+    render(<App />);
+    await screen.findByRole("button", { name: "选择 agent：Codex" });
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("detect_runtime"),
+    );
+
+    const input = screen.getByPlaceholderText(/输入消息/);
+    fireEvent.change(input, { target: { value: "test" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(sendCalls).toHaveLength(1));
+    expect(
+      screen.queryByText(/Codex 似乎尚未登录（未找到凭据文件）/),
+    ).toBeNull();
   });
 
   it("session 并发 Task 3 · 流式进行中时左栏新建按钮仍可用", async () => {

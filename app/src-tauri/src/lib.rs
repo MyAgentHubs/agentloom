@@ -239,6 +239,7 @@ fn build_synthesis_prompt(goal: &str, workers: &[(String, String)]) -> String {
          - When workers' conclusions, facts, or recommendations disagree, explicitly list the conflicts and explain which points still require verification.\n\
          - Content unsupported by any worker, lacking sufficient evidence, or inferred by the lead must be labeled “Unverified” (for a Chinese target language, label it “未验证”).\n\
          - Preserve the original text of code, file names, commands, APIs, and proper nouns.\n\
+         - Preserve Markdown image references exactly as written, including `![alt](path)` syntax and bare image paths; never rewrite or omit them.\n\
          - Follow the natural language of the “Goal” below: use Chinese for a Chinese goal and English for an English goal; when workers' output languages differ, normalize them to the goal's language; do not force English output merely because this prompt is in English. Use an overall bilingual format only when the “Goal” explicitly requests Chinese-English side-by-side or bilingual output; otherwise, only parenthetically annotate a term in the other language when it first appears in the body (for an English target language, for example, “capital markets（资本市场）”; for a Chinese target language, for example, “资本市场（capital markets）”), and do not make headings or table headers bilingual.\n\
          \n\
          Table usage rules:\n\
@@ -18643,6 +18644,9 @@ mod tests {
         assert!(p.contains("Table"));
         assert!(p.contains("deliverable"));
         assert!(p.contains("neutral"));
+        assert!(p.contains(
+            "Preserve Markdown image references exactly as written, including `![alt](path)` syntax and bare image paths; never rewrite or omit them."
+        ));
     }
 
     #[test]

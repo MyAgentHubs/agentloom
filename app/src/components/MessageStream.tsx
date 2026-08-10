@@ -610,6 +610,8 @@ export const MessageStream = React.memo(function MessageStream({
       onShelve={readonlyReason ? undefined : onShelve}
       onRetryVerify={readonlyReason ? undefined : onRetryVerify}
       onDecisionChoose={readonlyReason ? undefined : onDecisionChoose}
+      onOpenPreview={onOpenPreview}
+      onOpenLightbox={onOpenLightbox}
     />
   );
 

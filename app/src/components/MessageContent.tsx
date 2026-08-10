@@ -979,6 +979,8 @@ function MessageContentImpl({
               block={block}
               sessionId={sessionId}
               onViewRun={onViewRun}
+              onOpenPreview={onOpenPreview}
+              onOpenLightbox={onOpenLightbox}
               onTakeOver={readonly ? undefined : onTakeOver}
               onCleanRedispatch={
                 readonly ? undefined : () => onCleanRedispatch?.(block.run_id)
