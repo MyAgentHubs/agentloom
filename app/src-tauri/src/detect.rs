@@ -558,6 +558,11 @@ fn candidate_exists(path: &Path, windows: bool) -> bool {
             }))
 }
 
+#[doc(hidden)]
+pub fn candidate_exists_for_test(path: &Path) -> bool {
+    candidate_exists(path, cfg!(windows))
+}
+
 fn candidate_exists_from(
     path: &Path,
     windows: bool,

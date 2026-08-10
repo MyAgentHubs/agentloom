@@ -74,11 +74,6 @@ jobs:
           cargo test --locked --lib windows_ -- --nocapture
           cargo test --locked --lib fallback -- --nocapture
 
-      - name: Prove the candidate probe against real Windows app execution aliases
-        shell: pwsh
-        working-directory: app/src-tauri
-        run: cargo test --locked --test windows_cli_detection -- --ignored --nocapture real_windows_app_execution_aliases_satisfy_candidate_probe
-
       - name: Install Claude Code and Codex
         shell: pwsh
         run: |
@@ -393,6 +388,11 @@ jobs:
           Write-Host 'Verified no remaining PATH entry contains claude or codex.'
 
           cargo test --locked --test windows_cli_detection -- --ignored --nocapture
+
+      - name: Prove the candidate probe against real Windows app execution aliases
+        shell: pwsh
+        working-directory: app/src-tauri
+        run: cargo test --locked --test windows_cli_detection -- --ignored --nocapture real_windows_app_execution_aliases_satisfy_candidate_probe
 
       - name: Print final CLI lookup and detection diagnostics
         if: always()

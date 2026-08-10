@@ -1,5 +1,6 @@
 #![cfg(windows)]
 
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use app_lib::detect::{self, DetectResult};
@@ -79,46 +80,59 @@ fn real_windows_app_execution_aliases_satisfy_candidate_probe() {
     paths.sort();
     println!("Enumerated {} WindowsApps entries", paths.len());
 
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
     let mut aliases = Vec::new();
+    let mut diagnostics = Vec::new();
     for path in paths {
         let metadata = std::fs::metadata(&path);
         let symlink_metadata = std::fs::symlink_metadata(&path);
-        let metadata_ok_nondir = metadata.as_ref().is_ok_and(|value| !value.is_dir());
-        let symlink_metadata_ok_nondir_nonsymlink = symlink_metadata.as_ref().is_ok_and(|value| {
+        let file_attributes = symlink_metadata
+            .as_ref()
+            .ok()
+            .map(|metadata| metadata.file_attributes());
+        let is_app_execution_alias = symlink_metadata.as_ref().is_ok_and(|value| {
             let file_type = value.file_type();
-            !file_type.is_dir() && !file_type.is_symlink()
+            !file_type.is_dir()
+                && !file_type.is_symlink()
+                && value.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
         });
 
-        if metadata.is_err() && symlink_metadata_ok_nondir_nonsymlink {
-            let path_exists = path.exists();
-            println!(
-                "Real app execution alias: path={path:?}; metadata={metadata:?}; metadata_ok_nondir={metadata_ok_nondir}; symlink_metadata={symlink_metadata:?}; symlink_metadata_ok_nondir_nonsymlink={symlink_metadata_ok_nondir_nonsymlink}; Path::exists()={path_exists}"
-            );
-            aliases.push((
-                path,
-                metadata_ok_nondir,
-                symlink_metadata_ok_nondir_nonsymlink,
-                path_exists,
-            ));
+        if is_app_execution_alias {
+            aliases.push(path.clone());
         }
+        diagnostics.push((path, metadata, symlink_metadata, file_attributes));
     }
 
     if aliases.is_empty() {
+        for (path, metadata, symlink_metadata, file_attributes) in diagnostics {
+            let file_attributes = file_attributes
+                .map(|attributes| format!("{attributes:#010x}"))
+                .unwrap_or_else(|| "unavailable".to_string());
+            println!(
+                "WindowsApps entry: name={:?}; metadata={metadata:?}; symlink_metadata={symlink_metadata:?}; file_attributes={file_attributes}",
+                path.file_name()
+            );
+        }
         panic!(
             "this runner image has no app execution alias usable for validation; coverage is missing (scanned {windows_apps:?})"
         );
     }
 
-    for (path, metadata_ok, symlink_metadata_ok_nondir_nonsymlink, path_exists) in aliases {
-        let accepted_by_candidate_probe =
-            metadata_ok || (cfg!(windows) && symlink_metadata_ok_nondir_nonsymlink);
-        assert!(
-            accepted_by_candidate_probe,
-            "candidate probe rejected real app execution alias {path:?}: metadata_ok={metadata_ok}, symlink_metadata_ok_nondir_nonsymlink={symlink_metadata_ok_nondir_nonsymlink}"
+    assert!(
+        !aliases.is_empty(),
+        "expected at least one real Windows app execution alias"
+    );
+
+    for path in aliases {
+        let metadata = std::fs::metadata(&path);
+        let path_exists = path.exists();
+        println!(
+            "Real app execution alias: path={path:?}; fs::metadata_is_ok={}; Path::exists()={path_exists}",
+            metadata.is_ok()
         );
         assert!(
-            !path_exists,
-            "Path::exists() unexpectedly returned true for real app execution alias {path:?}; the test no longer proves why the relaxed probe is required"
+            detect::candidate_exists_for_test(&path),
+            "candidate probe rejected real app execution alias {path:?}; metadata={metadata:?}; Path::exists()={path_exists}"
         );
     }
 }
