@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        install-method: [native, npm]
+        install-method: [native, npm, winget]
     steps:
       - name: Check out the dispatched commit
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -74,6 +74,11 @@ jobs:
           cargo test --locked --lib windows_ -- --nocapture
           cargo test --locked --lib fallback -- --nocapture
 
+      - name: Prove the candidate probe against real Windows app execution aliases
+        shell: pwsh
+        working-directory: app/src-tauri
+        run: cargo test --locked --test windows_cli_detection -- --ignored --nocapture real_windows_app_execution_aliases_satisfy_candidate_probe
+
       - name: Install Claude Code and Codex
         shell: pwsh
         run: |
@@ -105,6 +110,115 @@ jobs:
               Write-Host '(directory does not exist)'
             }
             throw "Installed CLI '$CliName' is missing from $Directory (tried .exe, .cmd, and .bat)."
+          }
+
+          function Write-WinGetDiagnostics {
+            Write-Host 'WinGet diagnostics:'
+            try {
+              $wingetCommand = Get-Command winget.exe -ErrorAction Stop
+              Write-Host "winget.exe command: $($wingetCommand.Source)"
+            } catch {
+              Write-Host "winget.exe command lookup failed: $($_.Exception.Message)"
+            }
+
+            try {
+              winget --version 2>&1 | ForEach-Object { Write-Host $_ }
+              Write-Host "winget --version exit code: $LASTEXITCODE"
+            } catch {
+              Write-Host "winget --version failed: $($_.Exception.Message)"
+            }
+
+            try {
+              $appInstaller = @(Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction Stop)
+              if ($appInstaller.Count -eq 0) {
+                Write-Host 'Get-AppxPackage found no Microsoft.DesktopAppInstaller package.'
+              } else {
+                $appInstaller |
+                  Format-List -Property Name, PackageFullName, Version, InstallLocation, Status |
+                  Out-String |
+                  Write-Host
+              }
+            } catch {
+              Write-Host "Get-AppxPackage Microsoft.DesktopAppInstaller failed: $($_.Exception.Message)"
+            }
+          }
+
+          function Find-WinGetInstalledCli {
+            param([Parameter(Mandatory = $true)][string]$CliName)
+
+            $whereOutput = @()
+            $whereExitCode = -1
+            $savedNativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+            try {
+              $PSNativeCommandUseErrorActionPreference = $false
+              $whereOutput = @(where.exe $CliName 2>&1)
+              $whereExitCode = $LASTEXITCODE
+            } finally {
+              $PSNativeCommandUseErrorActionPreference = $savedNativeErrorPreference
+            }
+            Write-Host "where.exe $CliName output after WinGet installation:"
+            if ($whereOutput.Count -eq 0) {
+              Write-Host '(no output)'
+            } else {
+              $whereOutput | ForEach-Object { Write-Host $_ }
+            }
+            Write-Host "where.exe $CliName exit code: $whereExitCode"
+
+            $linksDir = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links'
+            $packagesDir = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+            $windowsAppsDir = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
+            $candidateDirectories = [Collections.Generic.List[string]]::new()
+            $candidateDirectories.Add($linksDir)
+            $candidateDirectories.Add($windowsAppsDir)
+            if (Test-Path -LiteralPath $packagesDir -PathType Container) {
+              @(Get-ChildItem -LiteralPath $packagesDir -Force -Directory | Sort-Object -Property FullName) |
+                ForEach-Object { $candidateDirectories.Add($_.FullName) }
+            }
+
+            $candidateNames = @("$CliName.exe", "$CliName.cmd", "$CliName.bat")
+            $discovered = [Collections.Generic.List[string]]::new()
+            foreach ($directory in $candidateDirectories) {
+              Write-Host "Inspecting WinGet candidate directory: $directory"
+              if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+                Write-Host '(directory does not exist)'
+                continue
+              }
+
+              $entries = @(Get-ChildItem -LiteralPath $directory -Force)
+              $entries |
+                Format-Table -AutoSize -Property Mode, Length, LastWriteTime, Name |
+                Out-String |
+                Write-Host
+              foreach ($entry in $entries) {
+                if ($candidateNames -contains $entry.Name) {
+                  Write-Host "Discovered $CliName from WinGet candidate directory: $($entry.FullName)"
+                  if (-not $discovered.Contains($entry.FullName)) {
+                    $discovered.Add($entry.FullName)
+                  }
+                }
+              }
+            }
+
+            foreach ($line in $whereOutput) {
+              $wherePath = "$line".Trim()
+              if ([string]::IsNullOrWhiteSpace($wherePath)) {
+                continue
+              }
+              if ($candidateNames -notcontains (Split-Path -Path $wherePath -Leaf)) {
+                Write-Host "Ignoring non-candidate where.exe output: $wherePath"
+                continue
+              }
+              Write-Host "Discovered $CliName from where.exe: $wherePath"
+              if (-not $discovered.Contains($wherePath)) {
+                $discovered.Add($wherePath)
+              }
+            }
+
+            if ($discovered.Count -eq 0) {
+              throw "WinGet installation produced no discoverable $CliName executable (.exe, .cmd, or .bat); see where.exe output and candidate directory listings above."
+            }
+            Write-Host "Selected installed CLI: $($discovered[0])"
+            return $discovered[0]
           }
 
           $claudeNativeDir = Join-Path $env:USERPROFILE '.local\bin'
@@ -148,6 +262,15 @@ jobs:
               throw "Claude Code installer returned unsupported content type '$contentType' from $installerUrl"
             }
             Invoke-Expression $installerScript
+          } elseif ('${{ matrix.install-method }}' -eq 'winget') {
+            Write-WinGetDiagnostics
+            try {
+              winget install --id Anthropic.ClaudeCode --exact --silent --accept-package-agreements --accept-source-agreements
+            } catch {
+              Write-Host "WinGet installation failed: $($_.Exception.Message)"
+              Write-WinGetDiagnostics
+              throw
+            }
           } else {
             npm install -g @anthropic-ai/claude-code
           }
@@ -160,18 +283,22 @@ jobs:
           }
           Write-Host "npm global install directory after CLI installation: $npmInstallDir"
 
-          $claudeInstallDir = if ('${{ matrix.install-method }}' -eq 'native') {
-            $claudeNativeDir
+          $expectedClaude = if ('${{ matrix.install-method }}' -eq 'winget') {
+            Find-WinGetInstalledCli -CliName 'claude'
           } else {
-            $npmInstallDir
+            $claudeInstallDir = if ('${{ matrix.install-method }}' -eq 'native') {
+              $claudeNativeDir
+            } else {
+              $npmInstallDir
+            }
+            Find-InstalledCli -Directory $claudeInstallDir -CliName 'claude'
           }
-          $expectedClaude = Find-InstalledCli -Directory $claudeInstallDir -CliName 'claude'
           $expectedCodex = Find-InstalledCli -Directory $npmInstallDir -CliName 'codex'
 
           "AGENTLOOM_EXPECTED_CLAUDE_PATH=$expectedClaude" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "AGENTLOOM_EXPECTED_CODEX_PATH=$expectedCodex" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          $claudeNativeDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Split-Path -Path $expectedClaude -Parent | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           $npmInstallDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Prove detection with the normal PATH

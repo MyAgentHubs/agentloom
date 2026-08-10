@@ -55,6 +55,75 @@ fn assert_detected(name: &str, expected_path: &Path, result: &DetectResult) {
 }
 
 #[test]
+#[ignore = "requires real app execution aliases from a Windows runner image"]
+fn real_windows_app_execution_aliases_satisfy_candidate_probe() {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .unwrap_or_else(|| panic!("LOCALAPPDATA is missing; cannot inspect Windows app aliases"));
+    let windows_apps = PathBuf::from(local_app_data)
+        .join("Microsoft")
+        .join("WindowsApps");
+    println!("Scanning Windows app execution aliases in {windows_apps:?}");
+
+    let mut paths = std::fs::read_dir(&windows_apps)
+        .unwrap_or_else(|error| {
+            panic!("failed to enumerate Windows app alias directory {windows_apps:?}: {error}")
+        })
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|error| {
+                    panic!("failed to read an entry from {windows_apps:?}: {error}")
+                })
+                .path()
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    println!("Enumerated {} WindowsApps entries", paths.len());
+
+    let mut aliases = Vec::new();
+    for path in paths {
+        let metadata = std::fs::metadata(&path);
+        let symlink_metadata = std::fs::symlink_metadata(&path);
+        let metadata_ok_nondir = metadata.as_ref().is_ok_and(|value| !value.is_dir());
+        let symlink_metadata_ok_nondir_nonsymlink = symlink_metadata.as_ref().is_ok_and(|value| {
+            let file_type = value.file_type();
+            !file_type.is_dir() && !file_type.is_symlink()
+        });
+
+        if metadata.is_err() && symlink_metadata_ok_nondir_nonsymlink {
+            let path_exists = path.exists();
+            println!(
+                "Real app execution alias: path={path:?}; metadata={metadata:?}; metadata_ok_nondir={metadata_ok_nondir}; symlink_metadata={symlink_metadata:?}; symlink_metadata_ok_nondir_nonsymlink={symlink_metadata_ok_nondir_nonsymlink}; Path::exists()={path_exists}"
+            );
+            aliases.push((
+                path,
+                metadata_ok_nondir,
+                symlink_metadata_ok_nondir_nonsymlink,
+                path_exists,
+            ));
+        }
+    }
+
+    if aliases.is_empty() {
+        panic!(
+            "this runner image has no app execution alias usable for validation; coverage is missing (scanned {windows_apps:?})"
+        );
+    }
+
+    for (path, metadata_ok, symlink_metadata_ok_nondir_nonsymlink, path_exists) in aliases {
+        let accepted_by_candidate_probe =
+            metadata_ok || (cfg!(windows) && symlink_metadata_ok_nondir_nonsymlink);
+        assert!(
+            accepted_by_candidate_probe,
+            "candidate probe rejected real app execution alias {path:?}: metadata_ok={metadata_ok}, symlink_metadata_ok_nondir_nonsymlink={symlink_metadata_ok_nondir_nonsymlink}"
+        );
+        assert!(
+            !path_exists,
+            "Path::exists() unexpectedly returned true for real app execution alias {path:?}; the test no longer proves why the relaxed probe is required"
+        );
+    }
+}
+
+#[test]
 #[ignore = "requires a real Windows machine with installed CLIs; driven by windows-cli-detection-check"]
 fn detects_the_installed_claude_and_codex_clis() {
     let expected_claude = required_expected_path("AGENTLOOM_EXPECTED_CLAUDE_PATH");
