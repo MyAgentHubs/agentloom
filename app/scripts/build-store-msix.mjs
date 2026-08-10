@@ -33,8 +33,8 @@ export const EXPECTED_STORE_IDENTITY = Object.freeze({
   packageFamilyName: "AgentLoom.AgentLoom_msmzkd80wev1c",
   storeId: "9N5XQM276FCJ",
   applicationId: "AgentLoom",
-  appVersion: "0.1.4",
-  storeVersion: "1.0.4.0",
+  appVersion: "0.1.5",
+  storeVersion: "1.0.5.0",
 });
 
 function describePath(filePath) {
