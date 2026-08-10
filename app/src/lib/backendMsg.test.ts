@@ -218,7 +218,9 @@ describe("backend error translation coverage", () => {
       scanBackendErrorCodes();
 
     if (literalCodes.size === 0) {
-      throw new Error("No literal al_err codes were found; the scanner must fail closed.");
+      throw new Error(
+        "No literal al_err codes were found; the scanner must fail closed.",
+      );
     }
     assertNoUnknownDynamicAlErrCalls(unknownDynamicLocations);
 
@@ -240,7 +242,7 @@ describe("backend error translation coverage", () => {
 
   it("fails when a non-literal al_err call is not allowlisted", () => {
     const { unknownDynamicLocations } = auditBackendErrorSources({
-      "new_runtime.rs": 'fn report(code: &str) {\n    al_err(code, &[]);\n}',
+      "new_runtime.rs": "fn report(code: &str) {\n    al_err(code, &[]);\n}",
     });
 
     expect(() =>

@@ -5229,9 +5229,9 @@ describe("App", () => {
       emitAgentEventBatch([{ kind: "text_delta", text: "拒绝后正文" }]);
     });
     await waitFor(() =>
-      expect(container.querySelectorAll(".turn--assistant")[1]).toHaveTextContent(
-        "拒绝后正文",
-      ),
+      expect(
+        container.querySelectorAll(".turn--assistant")[1],
+      ).toHaveTextContent("拒绝后正文"),
     );
     expect(hintTurn?.textContent).toBe(hintText);
   });

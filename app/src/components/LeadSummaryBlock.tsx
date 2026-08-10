@@ -1,11 +1,11 @@
 import { useMemo } from "react";
-import type { Components, UrlTransform } from "react-markdown";
+import type { Components } from "react-markdown";
 import type { LeadSummaryBlock as LSB, Finding } from "../types/agent";
 import { useI18n } from "../i18n";
 import { useMarkdownLib } from "../lib/useMarkdown";
 import {
-  isLocalImagePath,
   localImageMarkdownComponent,
+  makeImgOnlyUrlTransform,
 } from "./localMarkdownImage";
 import type * as MarkdownLib from "../lib/markdownLib";
 import type {
@@ -54,24 +54,6 @@ const leadMarkdownComponents: Components = {
   },
 };
 
-function makeLeadUrlTransform(
-  defaultUrlTransform: typeof MarkdownLib.defaultUrlTransform,
-): UrlTransform {
-  return (url, key, node) => {
-    if (key !== "src" || node?.tagName !== "img") {
-      return defaultUrlTransform(url);
-    }
-
-    let candidate = url;
-    try {
-      candidate = decodeURI(url);
-    } catch {
-      // Let react-markdown sanitize malformed URLs through its default transform.
-    }
-    return isLocalImagePath(candidate) ? candidate : defaultUrlTransform(url);
-  };
-}
-
 function LeadMarkdown({
   children,
   markdownLib,
@@ -84,7 +66,7 @@ function LeadMarkdown({
   if (!markdownLib) {
     return <div style={{ whiteSpace: "pre-wrap" }}>{children}</div>;
   }
-  const leadUrlTransform = makeLeadUrlTransform(
+  const leadUrlTransform = makeImgOnlyUrlTransform(
     markdownLib.defaultUrlTransform,
   );
   return (

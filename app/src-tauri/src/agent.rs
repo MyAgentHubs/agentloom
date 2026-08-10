@@ -233,9 +233,16 @@ pub(crate) fn claude_effort_for_reasoning_tier(tier: &str) -> Option<&'static st
     }
 }
 
+/// solo/Normal 会话产图引导：产出图片时用 Markdown 内联图语法引用，裸路径不会内联显示。
+/// 语义与 `member_runner.rs` 任务包工程纪律段的英文版一致（同一条产品行为、两处措辞同源）。
+pub(crate) const SOLO_IMAGE_OUTPUT_GUIDANCE: &str = "\
+If you produce or generate an image file (such as a screenshot or chart) that you want the user \
+to see directly in chat, reference it in your reply with the Markdown inline image syntax \
+`![](absolute image path)`; a bare path will not display inline.";
+
 fn system_prompt_for_mode(mode: BuildMode) -> Option<&'static str> {
     match mode {
-        BuildMode::Normal => None,
+        BuildMode::Normal => Some(SOLO_IMAGE_OUTPUT_GUIDANCE),
         BuildMode::Summarize => None,
         BuildMode::Worker => Some(crate::WORKER_ONESHOT_PROMPT),
         BuildMode::LeadDraft => Some(crate::lead_draft::LEAD_DRAFT_SYS_PROMPT),
@@ -243,7 +250,7 @@ fn system_prompt_for_mode(mode: BuildMode) -> Option<&'static str> {
     }
 }
 
-const CODEX_IMAGE_OUTPUT_INSTRUCTION: &str = "If you generate any image files, save or copy them into the current workspace and state each image's absolute path in your final reply. Do not leave generated images only under $CODEX_HOME/generated_images.";
+const CODEX_IMAGE_OUTPUT_INSTRUCTION: &str = "If you generate any image files, save or copy them into the current workspace and state each image's absolute path in your final reply. Do not leave generated images only under $CODEX_HOME/generated_images. Also reference each image in your final reply with Markdown inline image syntax `![](absolute path)`; a bare path will not display inline.";
 
 fn prompt_for_mode(mode: BuildMode, prompt: &str) -> String {
     let prompt = match system_prompt_for_mode(mode) {
@@ -1961,6 +1968,45 @@ mod tests {
     }
 
     #[test]
+    fn borrow_normal_also_appends_solo_image_output_guidance() {
+        // 实勘：BorrowClaudeBackend（deepseek 等借壳会话）同样经 system_prompt_for_mode
+        // 消费 Normal 的产图引导——这是预期的可接受行为，不为它加特判。
+        let test = setup_context();
+        let backend = BorrowClaudeBackend {
+            profile: borrow_profile(),
+            api_key: "test-key".to_string(),
+        };
+        let ctx = BuildContext {
+            prompt: "hi",
+            session_id: &test.session_id,
+            run_id: "test-run",
+            wt: &test.home,
+            conn: &test.conn,
+            mode: BuildMode::Normal,
+            locale: crate::Locale::Zh,
+            reasoning_tier: None,
+            criteria: &[],
+        };
+
+        let cmd = backend.build_command(&ctx).unwrap();
+        let args = command_args(&cmd);
+        let system_prompt = args
+            .windows(2)
+            .find(|window| window[0] == "--append-system-prompt")
+            .map(|window| window[1].as_str())
+            .expect("expected --append-system-prompt value");
+
+        assert!(
+            system_prompt.contains(SOLO_IMAGE_OUTPUT_GUIDANCE),
+            "expected solo image output guidance appended after the borrow identity prompt: {args:?}"
+        );
+        assert!(
+            system_prompt.contains("绝不能自称 Claude"),
+            "identity prompt must still precede the image guidance: {args:?}"
+        );
+    }
+
+    #[test]
     fn borrow_worker_does_not_append_language_directive() {
         let test = setup_context();
         let backend = BorrowClaudeBackend {
@@ -2138,6 +2184,64 @@ mod tests {
     }
 
     #[test]
+    fn native_claude_normal_appends_solo_image_output_guidance() {
+        let test = setup_context();
+        let backend = NativeBackend {
+            provider: "claude".to_string(),
+            primary_model: None,
+        };
+        let ctx = build_context(&test, "hi");
+
+        let cmd = backend.build_command(&ctx).unwrap();
+        let args = command_args(&cmd);
+
+        assert!(
+            contains_adjacent_pair(
+                &args,
+                "--append-system-prompt",
+                SOLO_IMAGE_OUTPUT_GUIDANCE
+            ),
+            "expected solo image output guidance via --append-system-prompt for Normal claude: {args:?}"
+        );
+        assert!(
+            SOLO_IMAGE_OUTPUT_GUIDANCE.contains("![]("),
+            "solo image output guidance should teach the Markdown inline image syntax: {SOLO_IMAGE_OUTPUT_GUIDANCE}"
+        );
+    }
+
+    #[test]
+    fn native_claude_lead_action_system_prompt_stays_pure() {
+        let test = setup_context();
+        let backend = NativeBackend {
+            provider: "claude".to_string(),
+            primary_model: None,
+        };
+        let ctx = BuildContext {
+            prompt: "decide next",
+            session_id: &test.session_id,
+            run_id: "test-run",
+            wt: &test.home,
+            conn: &test.conn,
+            mode: BuildMode::LeadAction,
+            locale: crate::Locale::Zh,
+            reasoning_tier: None,
+            criteria: &[],
+        };
+
+        let cmd = backend.build_command(&ctx).unwrap();
+        let args = command_args(&cmd);
+
+        assert!(
+            contains_adjacent_pair(
+                &args,
+                "--append-system-prompt",
+                crate::lead_step::LEAD_DECISION_SYS_PROMPT
+            ),
+            "LeadAction's Claude system prompt must remain exactly LEAD_DECISION_SYS_PROMPT, unpolluted by the solo image guidance: {args:?}"
+        );
+    }
+
+    #[test]
     fn claude_effort_clamps_reasoning_tiers_to_supported_values() {
         assert_eq!(claude_effort_for_reasoning_tier("auto"), Some("medium"));
         assert_eq!(claude_effort_for_reasoning_tier("none"), Some("low"));
@@ -2291,6 +2395,27 @@ mod tests {
             assert!(
                 !prompt_arg.contains(IMAGE_OUTPUT_INSTRUCTION),
                 "did not expect image persistence instruction for {mode:?}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_codex_write_modes_teach_markdown_inline_image_syntax() {
+        let test = setup_context();
+        let backend = NativeBackend {
+            provider: "codex".to_string(),
+            primary_model: None,
+        };
+
+        for mode in [BuildMode::Normal, BuildMode::Worker] {
+            let ctx = build_context_for_mode(&test, "create an image", mode);
+            let cmd = backend.build_command(&ctx).unwrap();
+            let args = command_args(&cmd);
+            let prompt_arg = args.last().expect("codex prompt arg should exist");
+
+            assert!(
+                prompt_arg.contains("![]("),
+                "expected Markdown inline image syntax guidance for {mode:?}: {args:?}"
             );
         }
     }

@@ -5064,6 +5064,196 @@ fn windows_kill_command_args(pid: u32) -> Vec<String> {
     ]
 }
 
+#[cfg_attr(unix, allow(dead_code))]
+fn unix_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 单条 taskkill **spawn** 结果日志行的格式——抽成纯函数以便单测，不含 cfg 依赖。这条只说明
+/// taskkill 命令本身起没起来；它真正杀没杀掉目标树，看 `windows_taskkill_exit_log_line`。
+#[cfg_attr(unix, allow(dead_code))]
+fn windows_taskkill_log_line(pid: u32, unix_secs: u64, error: Option<&str>) -> String {
+    match error {
+        Some(err) => format!("[{unix_secs}] taskkill pid={pid} spawn=failed error={err}\n"),
+        // 仅测试构造·生产不可达：`log_windows_taskkill_outcome` 生产上唯一调用点
+        // （`windows_taskkill_tree` 的 spawn `Err` 分支）总传 `Some(..)`——spawn 成功走的是
+        // `Ok(child)` 分支起 watcher 线程，从不落这条「spawn=ok」行。留着这条分支是因为删掉
+        // 会牵连别的断言：`log_windows_taskkill_outcome_appends_ok_line_under_logs_dir` /
+        // `_appends_multiple_calls_instead_of_overwriting` 两条测试专门传 `None` 来跟
+        // `Some` 的失败行做区分断言，删掉这条分支得连带改写它们。
+        None => format!("[{unix_secs}] taskkill pid={pid} spawn=ok\n"),
+    }
+}
+
+/// 单条 taskkill **真实退出结局**日志行的格式——纯函数以便单测。`exit` 取值：十进制退出码 /
+/// "unknown"（拿不到退出码）/ "wait-error:<err>"（轮询本身出错）/ "timeout"（有界轮询超时、
+/// 兜底 kill 掉 taskkill 命令本身）。
+#[cfg_attr(unix, allow(dead_code))]
+fn windows_taskkill_exit_log_line(
+    pid: u32,
+    unix_secs: u64,
+    exit: &str,
+    stderr_head: &str,
+) -> String {
+    if stderr_head.is_empty() {
+        format!("[{unix_secs}] taskkill pid={pid} exit={exit}\n")
+    } else {
+        format!("[{unix_secs}] taskkill pid={pid} exit={exit} stderr={stderr_head}\n")
+    }
+}
+
+/// windows-taskkill.log 防膨胀阈值：数值同 `BOOT_TRACE_LOG_MAX_BYTES`——这条诊断日志同样不是
+/// 审计日志，简单粗暴即可。
+#[cfg_attr(unix, allow(dead_code))]
+const WINDOWS_TASKKILL_LOG_MAX_BYTES: u64 = BOOT_TRACE_LOG_MAX_BYTES;
+/// taskkill 子进程 stderr 首行的截断长度：诊断日志够用即可，别把整段错误堆栈灌进文件。
+#[cfg_attr(unix, allow(dead_code))]
+const WINDOWS_TASKKILL_STDERR_HEAD_BYTES: usize = 200;
+/// `windows_taskkill_tree` 起的 detached 线程有界轮询 taskkill 子进程本身退出的节奏/上限——
+/// 这是「taskkill 命令本身跑没跑完」的等待，跟 `kill_handoff_child_with` 里「root 有没有被
+/// 杀死」的等待（`WINDOWS_TASKKILL_REAP_*`）是两条独立的有界等待，互不阻塞。
+#[cfg_attr(unix, allow(dead_code))]
+const WINDOWS_TASKKILL_WATCH_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(10);
+#[cfg_attr(unix, allow(dead_code))]
+const WINDOWS_TASKKILL_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 追加写一行到 `~/.agentloom/logs/windows-taskkill.log`（惯例同 `log_file_for`/
+/// `write_boot_trace_line`：目录建不出、文件打不开一律静默吞掉——诊断设施绝不能反过来搞崩杀
+/// 进程主流程）。防膨胀写法也照抄 `write_boot_trace_line`：写入前若文件已超阈值，先截断重写。
+#[cfg_attr(unix, allow(dead_code))]
+fn append_windows_taskkill_log_line(line: &str) {
+    let dir = worktree::logs_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("windows-taskkill.log");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > WINDOWS_TASKKILL_LOG_MAX_BYTES {
+            let _ = std::fs::write(&path, "");
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Windows release 是 GUI subsystem，stderr 100% 不可见——这条记 taskkill **命令本身**能不能
+/// spawn 起来，是「Stop 没反应」类报障能查的第一条线索。
+#[cfg_attr(unix, allow(dead_code))]
+fn log_windows_taskkill_outcome(pid: u32, error: Option<String>) {
+    let line = windows_taskkill_log_line(pid, unix_secs_now(), error.as_deref());
+    append_windows_taskkill_log_line(&line);
+}
+
+/// taskkill 子进程本身跑完后的真实结局——跟 spawn 是否成功是两回事：spawn 成功只说明命令起来
+/// 了，不代表它真把目标树杀掉了。
+#[cfg_attr(unix, allow(dead_code))]
+fn log_windows_taskkill_exit(pid: u32, exit: &str, stderr_head: &str) {
+    let line = windows_taskkill_exit_log_line(pid, unix_secs_now(), exit, stderr_head);
+    append_windows_taskkill_log_line(&line);
+}
+
+/// 单条「`kill_handoff_child_with` 有界等 root 退出超时、抢刀兜底 `child.kill()`」日志行的
+/// 格式——纯函数以便单测。这条日志行专门给「孙进程又活下来」现场留痕：跟 watcher 回填的
+/// taskkill 真实退出结局（`windows_taskkill_exit_log_line`）对照时间戳，能交叉定罪是不是这条
+/// 1s 超时兜底路径抢跑在 taskkill 真正收掉目标树之前。
+#[cfg_attr(unix, allow(dead_code))]
+fn windows_taskkill_reap_timeout_log_line(pid: u32, unix_secs: u64) -> String {
+    format!("[{unix_secs}] taskkill pid={pid} reap=timeout-fallback-kill\n")
+}
+
+/// `windows_taskkill_reap_timeout_log_line` 落盘。
+#[cfg_attr(unix, allow(dead_code))]
+fn log_windows_taskkill_reap_timeout(pid: u32) {
+    let line = windows_taskkill_reap_timeout_log_line(pid, unix_secs_now());
+    append_windows_taskkill_log_line(&line);
+}
+
+/// 读 taskkill 子进程 stderr 的开头一段（截断 `WINDOWS_TASKKILL_STDERR_HEAD_BYTES` 字节、只取
+/// 第一行）。只在子进程已退出（写端已关闭）之后调用——此时管道里剩余的字节数有限，读不会阻塞。
+#[cfg_attr(unix, allow(dead_code))]
+fn windows_taskkill_stderr_head(taskkill_child: &mut Child) -> String {
+    let Some(mut stderr) = taskkill_child.stderr.take() else {
+        return String::new();
+    };
+    let mut buf = [0_u8; WINDOWS_TASKKILL_STDERR_HEAD_BYTES];
+    let read = stderr.read(&mut buf).unwrap_or(0);
+    String::from_utf8_lossy(&buf[..read])
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// `windows_taskkill_tree` 起的 detached 线程体：有界轮询 taskkill 子进程本身退出，退出后落
+/// `exit=<code>` + stderr 首行；超过 `WINDOWS_TASKKILL_WATCH_TIMEOUT` 仍没退出则兜底 kill 掉
+/// taskkill、落 `exit=timeout`。全程不影响调用方——调用方等的是目标 root 子进程死没死（见
+/// `kill_handoff_child_with`），不是这条 taskkill 命令本身跑完没跑完。
+#[cfg_attr(unix, allow(dead_code))]
+fn watch_windows_taskkill_exit(pid: u32, mut taskkill_child: Child) {
+    let deadline = Instant::now() + WINDOWS_TASKKILL_WATCH_TIMEOUT;
+    loop {
+        match taskkill_child.try_wait() {
+            Ok(Some(status)) => {
+                let exit = status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let stderr_head = windows_taskkill_stderr_head(&mut taskkill_child);
+                log_windows_taskkill_exit(pid, &exit, &stderr_head);
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                log_windows_taskkill_exit(pid, &format!("wait-error:{error}"), "");
+                return;
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = taskkill_child.kill();
+            log_windows_taskkill_exit(pid, "timeout", "");
+            return;
+        }
+        std::thread::sleep(WINDOWS_TASKKILL_WATCH_POLL_INTERVAL);
+    }
+}
+
+/// Windows 树杀共用点：`kill_process_group` / `kill_handoff_child_with` 共用。调用前提 = pid
+/// 被调用方持有的 Child 句柄钉住、尚未被收割复用（Windows 语义下句柄存活期间 pid 不会被系统
+/// 复用），这条前提由各自调用方保证，本函数不重复校验。Fire-and-forget、零阻塞：taskkill 命令
+/// 本身跑没跑完、真实退出码是什么，交给上面的 detached 线程有界轮询回填日志，本函数立刻返回。
+#[cfg_attr(unix, allow(dead_code))]
+fn windows_taskkill_tree(pid: u32) {
+    let system_root = std::env::var("SystemRoot").ok();
+    let program = windows_taskkill_program(system_root.as_deref());
+    let args = windows_kill_command_args(pid);
+    match crate::proc::command(program)
+        .args(args)
+        // stdout 没人读——taskkill 正常输出走 stdout，我们只关心失败诊断（stderr）与真实退出
+        // 结局（watcher 的 try_wait），piped 而不读只会占着管道缓冲区，硬化成 null。
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => {
+            std::thread::spawn(move || watch_windows_taskkill_exit(pid, child));
+        }
+        Err(error) => {
+            eprintln!("taskkill failed for pid {pid}: {error}");
+            log_windows_taskkill_outcome(pid, Some(error.to_string()));
+        }
+    }
+}
+
 pub(crate) fn kill_process_group(pid: u32) {
     // 负 pid 语义 = 进程组：killpg 干掉 agent 及其 spawn 的 bash/git/... 整棵。
     #[cfg(unix)]
@@ -5073,20 +5263,7 @@ pub(crate) fn kill_process_group(pid: u32) {
     #[cfg(not(unix))]
     {
         // Windows 用 taskkill /T /F 强制终止整棵进程树；Job Object 留待 v2。
-        let system_root = std::env::var("SystemRoot").ok();
-        let program = windows_taskkill_program(system_root.as_deref());
-        let args = windows_kill_command_args(pid);
-        match crate::proc::command(program).args(args).spawn() {
-            Ok(child) => {
-                // Fire-and-forget matches Unix killpg: signal delivery is asynchronous, while
-                // callers synchronize through their existing child.wait()/stdout EOF paths.
-                // Windows has no zombie-process state, and dropping Child immediately only closes
-                // our handles. The taskkill result is deliberately unobserved, following the same
-                // discipline as the Unix branch's ignored killpg return value.
-                drop(child);
-            }
-            Err(error) => eprintln!("taskkill failed for pid {pid}: {error}"),
-        }
+        windows_taskkill_tree(pid);
     }
 }
 
@@ -7047,34 +7224,84 @@ fn unregister_handoff_process(
     }
 }
 
-fn kill_handoff_child(child: &mut Child) -> std::io::Result<()> {
-    #[cfg(unix)]
-    let group_result = unsafe {
-        if libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) == 0 {
-            Ok(())
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                Ok(())
-            } else {
-                Err(error)
-            }
+/// 非 unix 分支有界等 root 退出的节奏/上限。事实：taskkill 是异步子进程，spawn 返回时它还
+/// 没跑到枚举进程表那一步——若这里抢跑 `child.kill()` 先杀掉 root，taskkill 到场时 pid 已经
+/// 从进程表消失，报 "no running instance" 退出，孙进程一个都杀不掉（GitLab runner issue
+/// #3747 同形态）。所以 `kill_handoff_child_with` 改成有界轮询等 root 被 taskkill 自己收掉，
+/// 不抢先补刀；只有超时 root 仍活着，才用 `child.kill()` 兜底。
+#[cfg_attr(unix, allow(dead_code))]
+const WINDOWS_TASKKILL_REAP_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(10);
+#[cfg_attr(unix, allow(dead_code))]
+const WINDOWS_TASKKILL_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 树杀 + 有界等 root 退出的通用逻辑，从 `kill_handoff_child` 的非 unix 分支抽出来单独测试：
+/// `tree_kill` 是注入点（仿同文件 `run_oneshot_llm_with_timeout_and_kill` 的 `kill_child`
+/// 注入先例），生产传 `windows_taskkill_tree`，测试传探针闭包钉住调用时机/pid。这段逻辑本身
+/// 只用跨平台 std API（`Child::try_wait`/`kill`、`Instant`、`thread::sleep`），不含任何
+/// Windows-only 调用，因此不加 cfg 限制——真正分平台的是下面 `kill_handoff_child` 这层薄封装：
+/// unix 走原生 killpg（不变），非 unix 走这里。
+///
+/// pid 的安全前提 = 调用方手上一直攥着这个 Child 句柄（Windows 语义下句柄存活期间 pid 不会被
+/// 系统复用）——不靠某把特定的锁或某个特定调用方：`kill_handoff_child` 目前两条生产路径
+/// （`run_oneshot_llm_with_timeout_and_kill` 内联持有 child 锁 / `cancel_handoff_generation_
+/// inner` 克隆同一把 `Arc<Mutex<Child>>` 后单独持有）都各自满足这条前提，本函数不重复校验。
+#[cfg_attr(unix, allow(dead_code))]
+fn kill_handoff_child_with(child: &mut Child, tree_kill: impl FnOnce(u32)) -> std::io::Result<()> {
+    let pid = child.id();
+    tree_kill(pid);
+    // 代码顺序 ≠ 时间顺序：树杀命令是异步发起的（见上面大注释），这里有界轮询 root 自己退出，
+    // 不抢先补刀。
+    let deadline = Instant::now() + WINDOWS_TASKKILL_REAP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(error) => return Err(error),
         }
-    };
-    let child_result = match child.kill() {
+        if Instant::now() >= deadline {
+            // 1s 兜底触发留痕：这是「孙进程又活下来」的现场——taskkill 到场前 root 就被
+            // child.kill() 抢刀收走，孙进程失怙。unix 分支本来没有这条轮询，日志只在非
+            // unix 落。
+            #[cfg(not(unix))]
+            log_windows_taskkill_reap_timeout(pid);
+            break;
+        }
+        std::thread::sleep(WINDOWS_TASKKILL_REAP_POLL_INTERVAL);
+    }
+    // 轮询超时、root 仍活着：兜底补刀（同 unix 分支收尾 root 句柄的既有约定）。
+    match child.kill() {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
         Err(error) => Err(error),
-    };
+    }
+}
+
+fn kill_handoff_child(child: &mut Child) -> std::io::Result<()> {
     #[cfg(unix)]
     {
+        let group_result = unsafe {
+            if libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) == 0 {
+                Ok(())
+            } else {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+        };
+        let child_result = match child.kill() {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+            Err(error) => Err(error),
+        };
         group_result.and(child_result)
     }
     #[cfg(not(unix))]
     {
-        // Windows does not yet use a Job Object, so descendants may survive. Output
-        // draining below is bounded to guarantee the request guard still releases.
-        child_result
+        kill_handoff_child_with(child, windows_taskkill_tree)
     }
 }
 
@@ -7341,25 +7568,31 @@ fn cancel_handoff_generation_inner(
     session_id: &str,
     request_id: &str,
 ) -> Result<bool, String> {
-    let processes = registry
-        .0
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(request) = processes.requests.get(session_id) else {
-        return Ok(false);
+    // 只在这个块内持有全局 registry 锁，拿到目标 child 的 Arc 克隆后立刻 drop——`kill_handoff_
+    // child` 的非 unix 分支现在要有界等最长 1s，绝不能攥着全局锁陪等，否则同一时刻别的
+    // session 的 register/cancel 全被卡住。pid 的安全前提不靠这把全局锁，靠紧接着单独 lock 住
+    // 的 `Arc<Mutex<Child>>` 本身（Windows 语义下 Child 句柄存活期间 pid 不会被系统复用）。
+    let child_handle = {
+        let processes = registry
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(request) = processes.requests.get(session_id) else {
+            return Ok(false);
+        };
+        if request.request_id != request_id {
+            return Ok(false);
+        }
+        request.cancel_requested.store(true, Ordering::Release);
+        let Some(registered) = processes.children.get(session_id) else {
+            return Ok(true);
+        };
+        if registered.request_id != request_id {
+            return Ok(false);
+        }
+        registered.child.clone()
     };
-    if request.request_id != request_id {
-        return Ok(false);
-    }
-    request.cancel_requested.store(true, Ordering::Release);
-    let Some(registered) = processes.children.get(session_id) else {
-        return Ok(true);
-    };
-    if registered.request_id != request_id {
-        return Ok(false);
-    }
-    let mut child = registered
-        .child
+    let mut child = child_handle
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if child.try_wait().map_err(|e| e.to_string())?.is_some() {
@@ -7369,7 +7602,11 @@ fn cancel_handoff_generation_inner(
     Ok(true)
 }
 
-#[tauri::command]
+// async：非 unix 分支 `kill_handoff_child_with` 里有界等 root 退出最长 1s（见该函数注释），
+// 同步 command 在 tauri v2 跑在主线程上，Windows 上点 Stop 最坏会卡 UI 1s；改 async 让 tauri
+// 把它派到线程池跑，不阻塞主线程。对前端 `invoke("cancel_handoff_generation", ...)` 调用方
+// 透明——两种形式 JS 侧都拿到一个 Promise，无需改动。
+#[tauri::command(async)]
 fn cancel_handoff_generation(
     processes: State<'_, HandoffProcesses>,
     session_id: String,
@@ -14047,6 +14284,115 @@ mod tests {
         assert_eq!(windows_taskkill_program(None), "taskkill");
     }
 
+    #[test]
+    fn windows_taskkill_log_line_records_success() {
+        assert_eq!(
+            windows_taskkill_log_line(4242, 1_700_000_000, None),
+            "[1700000000] taskkill pid=4242 spawn=ok\n"
+        );
+    }
+
+    #[test]
+    fn windows_taskkill_log_line_records_failure_with_error_text() {
+        assert_eq!(
+            windows_taskkill_log_line(4242, 1_700_000_000, Some("program not found")),
+            "[1700000000] taskkill pid=4242 spawn=failed error=program not found\n"
+        );
+    }
+
+    #[test]
+    fn windows_taskkill_exit_log_line_records_exit_code_without_stderr() {
+        assert_eq!(
+            windows_taskkill_exit_log_line(4242, 1_700_000_000, "0", ""),
+            "[1700000000] taskkill pid=4242 exit=0\n"
+        );
+    }
+
+    #[test]
+    fn windows_taskkill_exit_log_line_appends_stderr_head_when_present() {
+        assert_eq!(
+            windows_taskkill_exit_log_line(4242, 1_700_000_000, "1", "ERROR: not found"),
+            "[1700000000] taskkill pid=4242 exit=1 stderr=ERROR: not found\n"
+        );
+    }
+
+    #[test]
+    fn windows_taskkill_exit_log_line_records_timeout() {
+        assert_eq!(
+            windows_taskkill_exit_log_line(4242, 1_700_000_000, "timeout", ""),
+            "[1700000000] taskkill pid=4242 exit=timeout\n"
+        );
+    }
+
+    // 下面这批用 TestHome（硬编码 /private/tmp 造临时 HOME）在 Windows 上必 panic，且最后一条
+    // 依赖「Mac 上没有 taskkill 可执行文件」这个前提在真 Windows 上语义相反——四条都只在 unix
+    // 跑（这台 CI 用 `cargo test --lib windows_` 按子串选测试，会选中它们）。
+    #[cfg(unix)]
+    #[test]
+    fn log_windows_taskkill_outcome_appends_ok_line_under_logs_dir() {
+        let home = TestHome::new();
+
+        log_windows_taskkill_outcome(4242, None);
+
+        let logged =
+            std::fs::read_to_string(home.path.join(".agentloom/logs/windows-taskkill.log"))
+                .unwrap();
+        assert!(logged.contains("pid=4242 spawn=ok"), "{logged}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_windows_taskkill_outcome_appends_failure_line_with_error_text() {
+        let home = TestHome::new();
+
+        log_windows_taskkill_outcome(4242, Some("access denied".to_string()));
+
+        let logged =
+            std::fs::read_to_string(home.path.join(".agentloom/logs/windows-taskkill.log"))
+                .unwrap();
+        assert!(
+            logged.contains("pid=4242 spawn=failed error=access denied"),
+            "{logged}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_windows_taskkill_outcome_appends_multiple_calls_instead_of_overwriting() {
+        let home = TestHome::new();
+
+        log_windows_taskkill_outcome(1, None);
+        log_windows_taskkill_outcome(2, Some("boom".to_string()));
+
+        let logged =
+            std::fs::read_to_string(home.path.join(".agentloom/logs/windows-taskkill.log"))
+                .unwrap();
+        let lines: Vec<&str> = logged.lines().collect();
+        assert_eq!(lines.len(), 2, "{logged}");
+        assert!(lines[0].contains("pid=1 spawn=ok"), "{logged}");
+        assert!(
+            lines[1].contains("pid=2 spawn=failed error=boom"),
+            "{logged}"
+        );
+    }
+
+    /// Mac 测试机上没有 `taskkill` 这个可执行文件，spawn 必然走 Err 分支——这正好让我们不靠
+    /// 真 Windows 就能演练 `windows_taskkill_tree` 的失败路径（spawn 失败 + 落日志 + 不 panic）。
+    /// 成功路径（真 taskkill 树杀整棵进程 + detached 线程回填 exit 日志）测不到，留给 Windows
+    /// CI 编译门禁 + 真机验收。
+    #[cfg(unix)]
+    #[test]
+    fn windows_taskkill_tree_logs_failure_when_program_missing() {
+        let home = TestHome::new();
+
+        windows_taskkill_tree(999_999);
+
+        let logged =
+            std::fs::read_to_string(home.path.join(".agentloom/logs/windows-taskkill.log"))
+                .unwrap();
+        assert!(logged.contains("pid=999999 spawn=failed"), "{logged}");
+    }
+
     fn running_dispatch_card_for_reconcile(assignment_id: &str) -> db::Block {
         db::Block::DispatchCard {
             run_id: format!("worker-run-{assignment_id}"),
@@ -18867,6 +19213,100 @@ mod tests {
         assert!(!cancelled);
         assert!(child_was_left_running);
         assert!(request.cancel_requested.load(Ordering::Acquire));
+    }
+
+    /// F1/F5（opus 修复轮）：钉住 `kill_handoff_child_with` 的两条不变量——① 探针收到的 pid
+    /// 就是 root child 的 pid；② 探针被调用时 root 还活着（顺序不变量：先树杀、后有界等/兜底
+    /// kill，绝不能反过来）。探针不经 `child`（那会跟外层的 `&mut child` 借用冲突），改用
+    /// `ps -o stat= -p <pid>` 侧面探活——**不能**用 `libc::kill(pid, 0)`：signal 0 对「已被
+    /// SIGKILL 但还没被 wait() 收割」的僵尸进程一样返回成功（pid 槽位在被收割前一直有效），
+    /// 测不出「已经被杀过一次」这件事；`ps` 的 stat 字段能看见 `Z`（zombie/`<defunct>`），
+    /// 才是这条顺序不变量真正需要的信号。探针探活后自己用 SIGKILL 收掉 root（模拟 taskkill
+    /// 树杀生效），让外层的有界等待在下一次 `try_wait()` 就能探测到退出，不用真等满 1s 超时
+    /// 兜底。
+    ///
+    /// 变异自证（人工验证，未入库；已用 `ps` 版本重新验证过，不是被 signal-0 的僵尸进程漏洞
+    /// 误判为绿）：把 `kill_handoff_child_with` 里"先 tree_kill 后有界等"的顺序改成"先有界
+    /// 等/兜底 kill 后 tree_kill"，这条测试必须变红（探针探活时 root 已经被提前杀掉、`ps`
+    /// 看到 `Z`）；验完已还原顺序，回归绿。
+    #[cfg(unix)]
+    #[test]
+    fn kill_handoff_child_with_tree_kill_runs_before_root_is_reaped() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 5")
+            .spawn()
+            .expect("spawn probe child");
+        let expected_pid = child.id();
+        let observed_pid = Arc::new(Mutex::new(None));
+        let observed_pid_for_probe = observed_pid.clone();
+        let root_alive_when_probed = Arc::new(AtomicBool::new(false));
+        let root_alive_when_probed_for_probe = root_alive_when_probed.clone();
+
+        let result = kill_handoff_child_with(&mut child, move |pid| {
+            *observed_pid_for_probe.lock().unwrap() = Some(pid);
+            let alive = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p"])
+                .arg(pid.to_string())
+                .output()
+                .map(|out| {
+                    let stat = String::from_utf8_lossy(&out.stdout);
+                    let stat = stat.trim();
+                    out.status.success() && !stat.is_empty() && !stat.contains('Z')
+                })
+                .unwrap_or(false);
+            root_alive_when_probed_for_probe.store(alive, Ordering::SeqCst);
+            // 探针本身承担「模拟 taskkill 生效」的角色——kill_handoff_child_with 的有界等待
+            // 循环在下一次 try_wait() 就会看到 root 已退出，不需要真等满超时兜底。
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        });
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(observed_pid.lock().unwrap().unwrap(), expected_pid);
+        assert!(
+            root_alive_when_probed.load(Ordering::SeqCst),
+            "tree_kill 探针被调用时 root 必须还活着——它必须先于 root 被收割运行"
+        );
+        let _ = child.wait();
+    }
+
+    /// opus delta 复核指出：上面那条接缝测试只钉住「先树杀、后有界等，不抢跑」的调用顺序，
+    /// 没钉住「真的有界轮询等待、而不是照抢不误」这件事本身——探针里用 SIGKILL 收掉 root，
+    /// 这一步在「正确的有界轮询实现」和「tree_kill 后立刻 child.kill() 抢跑」两种实现下看到
+    /// 的现象是一样的（root 都被杀死），测不出区别。这条反过来补：tree_kill 探针什么都不杀
+    /// （模拟 taskkill 树杀命令本身还没来得及生效），root 用一个远小于 1s 有界等待上限的短命
+    /// 自退进程（`sh -c 'sleep 0.2'`）。正确实现下有界轮询会在超时前的某次 `try_wait()` 看到
+    /// root 已经自然退出（`ExitStatus::code() == Some(0)`）；若改回抢跑，root 会被
+    /// `child.kill()` 用 SIGKILL 杀死而不是自然退出——Unix 下被信号杀死的进程 `code()` 是
+    /// `None`（退出码槽位没有意义），测试变红。
+    ///
+    /// 变异自证（人工验证，未入库）：把本函数体临时改成「tree_kill(pid); 直接返回
+    /// `child.kill()` 的结果」这种抢跑写法（不再有有界轮询），这条测试如期变红——
+    /// `status.code()` 变成 `None`（被 SIGKILL 杀死）而非 `Some(0)`；验完已还原成有界轮询
+    /// 实现，回归绿。
+    #[cfg(unix)]
+    #[test]
+    fn kill_handoff_child_with_does_not_preempt_a_naturally_exiting_root() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 0.2")
+            .spawn()
+            .expect("spawn short-lived probe child");
+
+        let result = kill_handoff_child_with(&mut child, |_pid| {
+            // tree_kill 探针什么都不杀：模拟 taskkill 树杀命令还没生效，root 只能靠自己的
+            // 自然退出被有界轮询捕获——不能抢跑补刀。
+        });
+
+        assert!(result.is_ok(), "{result:?}");
+        let status = child.wait().expect("root should already have exited");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "root 必须是自然退出（有界等而非被抢跑 kill 掉）：{status:?}"
+        );
     }
 
     #[test]

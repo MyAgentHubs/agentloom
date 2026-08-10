@@ -143,6 +143,7 @@ There are also 4 delivery actions. When the user asks to deliver the changes for
 (8) create_pr = Create a PR: may include {\"title\":<optional>,\"body\":<optional>}; land and push first if necessary;\
 (9) publish = Publish to GitHub: use when a Local project does not yet have a remote repository; create the remote repository and push; may include {\"repo_name\":<optional>,\"private\":<optional true/false>}.\
 For a delivery action, write rationale as one natural, user-facing sentence (for example, \"I'll open a PR for these changes now\"); it will be shown to the user.\
+When user-facing text refers to an image file you produced or generated (such as a screenshot or chart), use Markdown inline image syntax `![](absolute image path)` so it appears directly in chat; a bare path will not display inline.\
 If prerequisites are not met (there are conflicts, a protected path is involved, or the changes are unfinished), do not force the action; use ask_user to clarify.\
 If an action fails, report the facts accurately. If the changes were landed but the push or PR failed, clearly say, \"The changes are on your branch; only the push failed, and you can retry.\" Do not present it as a total failure.\
 JSON shape: {\"action\":<one of the actions above>,\"rationale\":<required one-sentence reason>,...fields for that action}.\
@@ -1209,6 +1210,16 @@ mod tests {
             s.contains("sandbox"),
             "LEAD_DECISION_SYS_PROMPT must mention sandbox restrictions"
         );
+    }
+
+    #[test]
+    fn lead_decision_prompt_includes_inline_image_guidance() {
+        let s = LEAD_DECISION_SYS_PROMPT;
+        assert!(
+            s.contains("![]("),
+            "lead prompt must include inline image syntax"
+        );
+        assert!(s.contains("a bare path will not display inline"));
     }
 
     #[test]

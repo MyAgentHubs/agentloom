@@ -346,3 +346,52 @@ describe("MarkdownBody images", () => {
     expect(invokeMock).not.toHaveBeenCalled();
   });
 });
+
+describe("MarkdownBody urlTransform scope (img src only)", () => {
+  it("sanitizes non-image URLs while preserving local image src exemptions", async () => {
+    invokeMock.mockResolvedValue({
+      kind: "image",
+      imageBase64: "d2luZG93cw==",
+      mediaType: "image/png",
+    });
+
+    render(
+      <MarkdownBody streaming={false}>
+        {String.raw`[win](C:\\tmp\\note.md)
+
+[custom](j:%5Cfoo)
+
+[remote link](https://example.com/docs)
+
+![chart](C:\\tmp\\x.png)
+
+![encoded](C:%5Ctmp%5Cy.png)`}
+      </MarkdownBody>,
+    );
+
+    // 盘符形态的链接 href 回归 defaultUrlTransform 默认消毒：清空。
+    expect(screen.getByText("win").closest("a")).toHaveAttribute("href", "");
+    // `j:%5C` 这类伪装盘符（percent-encoded 反斜杠）同样不放行。
+    expect(screen.getByText("custom").closest("a")).toHaveAttribute("href", "");
+    // 正常 http/https 链接不受影响。
+    expect(screen.getByRole("link", { name: "remote link" })).toHaveAttribute(
+      "href",
+      "https://example.com/docs",
+    );
+
+    // 未编码的盘符路径 img src 照常豁免、渲出图。
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+        path: "C:\\tmp\\x.png",
+        sessionId: null,
+      }),
+    );
+    // 含 %5C 编码反斜杠的盘符路径 img src 解码后同样豁免。
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+        path: "C:\\tmp\\y.png",
+        sessionId: null,
+      }),
+    );
+  });
+});

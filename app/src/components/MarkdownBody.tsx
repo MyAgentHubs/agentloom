@@ -8,8 +8,8 @@ import { CodeBlock } from "./CodeBlock";
 import { MermaidBlock } from "./MermaidBlock";
 import { useI18n } from "../i18n";
 import {
-  isLocalImagePath,
   localImageMarkdownComponent,
+  makeImgOnlyUrlTransform,
   PreviewablePath,
 } from "./localMarkdownImage";
 import { renderBackendError } from "../lib/backendMsg";
@@ -150,9 +150,7 @@ export const MarkdownBody = React.memo(function MarkdownBody({
       <Markdown
         remarkPlugins={[remarkGfm]}
         skipHtml={true}
-        urlTransform={(url) =>
-          isLocalImagePath(url) ? url : defaultUrlTransform(url)
-        }
+        urlTransform={makeImgOnlyUrlTransform(defaultUrlTransform)}
         components={components}
       >
         {children}

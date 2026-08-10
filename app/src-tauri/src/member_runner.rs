@@ -594,8 +594,8 @@ fn build_task_pack(
         }
     }
     pack.push_str(match locale {
-        crate::Locale::Zh => "\n\n## 工程纪律\n- 只修改任务点名的文件；别顺手重构或改动任务范围外的代码。\n- 严禁全局格式化（如 `cargo fmt` 不带参数、`prettier --write .`）——只格式化你亲手改的文件。\n- 严禁用 `git stash` / `git restore` / `git checkout --` 回滚不是你本次创建的改动——工作区里可能有前序 worker 的成果。\n- 本会话可能跑在 AgentLoom 外层 macOS 沙箱内（系统禁止嵌套沙箱）：如需派 codex 子进程，勿用 `--sandbox workspace-write`（会以 sandbox_apply: Operation not permitted / exit 71 失败），改用 `--dangerously-bypass-approvals-and-sandbox`——该子进程与你安全地位相同，须遵守与你相同的工作区纪律；外层沙箱仍会阻止写入 AgentLoom 自身状态目录。",
-        crate::Locale::En => "\n\n## Engineering Discipline\n- Only touch the files this task names; don't drive-by refactor or edit code outside its scope.\n- No global formatting (e.g. bare `cargo fmt`, `prettier --write .`) — only format the files you personally changed.\n- Never use `git stash` / `git restore` / `git checkout --` to roll back changes you didn't create this run — the workspace may hold prior workers' work.\n- This session may be running inside AgentLoom's outer macOS sandbox (nested sandboxes are disallowed): if you spawn a codex subprocess, don't use `--sandbox workspace-write` (fails with sandbox_apply: Operation not permitted / exit 71) — use `--dangerously-bypass-approvals-and-sandbox` instead. That child has the same security standing as you and must follow the same workspace discipline; the outer sandbox still blocks writes to AgentLoom's own state directories.",
+        crate::Locale::Zh => "\n\n## 工程纪律\n- 只修改任务点名的文件；别顺手重构或改动任务范围外的代码。\n- 严禁全局格式化（如 `cargo fmt` 不带参数、`prettier --write .`）——只格式化你亲手改的文件。\n- 严禁用 `git stash` / `git restore` / `git checkout --` 回滚不是你本次创建的改动——工作区里可能有前序 worker 的成果。\n- 如果你产出/生成了希望用户在聊天里直接看到的图片文件（截图、图表等），汇报时用 Markdown 内联图片语法 `![](图片绝对路径)` 引用；只写裸路径不会内联显示。\n- 本会话可能跑在 AgentLoom 外层 macOS 沙箱内（系统禁止嵌套沙箱）：如需派 codex 子进程，勿用 `--sandbox workspace-write`（会以 sandbox_apply: Operation not permitted / exit 71 失败），改用 `--dangerously-bypass-approvals-and-sandbox`——该子进程与你安全地位相同，须遵守与你相同的工作区纪律；外层沙箱仍会阻止写入 AgentLoom 自身状态目录。",
+        crate::Locale::En => "\n\n## Engineering Discipline\n- Only touch the files this task names; don't drive-by refactor or edit code outside its scope.\n- No global formatting (e.g. bare `cargo fmt`, `prettier --write .`) — only format the files you personally changed.\n- Never use `git stash` / `git restore` / `git checkout --` to roll back changes you didn't create this run — the workspace may hold prior workers' work.\n- If you produce or generate an image file (such as a screenshot or chart) that you want the user to see directly in chat, reference it in your report with the Markdown inline image syntax `![](absolute image path)`; a bare path will not display inline.\n- This session may be running inside AgentLoom's outer macOS sandbox (nested sandboxes are disallowed): if you spawn a codex subprocess, don't use `--sandbox workspace-write` (fails with sandbox_apply: Operation not permitted / exit 71) — use `--dangerously-bypass-approvals-and-sandbox` instead. That child has the same security standing as you and must follow the same workspace discipline; the outer sandbox still blocks writes to AgentLoom's own state directories.",
     });
     pack.push_str(if goal.is_empty() {
         match locale {
@@ -4330,6 +4330,20 @@ fi"#,
     }
 
     #[test]
+    fn build_task_pack_includes_inline_image_guidance_zh_and_en() {
+        let zh = build_task_pack("g", "s", &[], &[], crate::Locale::Zh);
+        assert!(zh.contains("![]("), "中文任务包须包含内联图片语法");
+        assert!(zh.contains("只写裸路径不会内联显示"));
+
+        let en = build_task_pack("g", "s", &[], &[], crate::Locale::En);
+        assert!(
+            en.contains("![]("),
+            "English task pack must include inline image syntax"
+        );
+        assert!(en.contains("a bare path will not display inline"));
+    }
+
+    #[test]
     fn build_task_pack_includes_nested_sandbox_guidance_zh() {
         let pack = build_task_pack("g", "s", &[], &[], crate::Locale::Zh);
         assert!(pack.contains("嵌套沙箱"));
@@ -4374,14 +4388,14 @@ fi"#,
     #[test]
     fn task_pack_non_empty_goal_is_byte_identical_zh() {
         let pack = build_task_pack("总目标", "子任务", &[], &[], crate::Locale::Zh);
-        let expected = "## 总目标\n总目标\n\n## 你的子任务\n子任务\n\n## 文件范围（≤3 文件为默认非硬规则）\n- （未指定·按子任务自行判断）\n\n## 验收\n- （本子任务无显式验收条目）\n\n\n## 工程纪律\n- 只修改任务点名的文件；别顺手重构或改动任务范围外的代码。\n- 严禁全局格式化（如 `cargo fmt` 不带参数、`prettier --write .`）——只格式化你亲手改的文件。\n- 严禁用 `git stash` / `git restore` / `git checkout --` 回滚不是你本次创建的改动——工作区里可能有前序 worker 的成果。\n- 本会话可能跑在 AgentLoom 外层 macOS 沙箱内（系统禁止嵌套沙箱）：如需派 codex 子进程，勿用 `--sandbox workspace-write`（会以 sandbox_apply: Operation not permitted / exit 71 失败），改用 `--dangerously-bypass-approvals-and-sandbox`——该子进程与你安全地位相同，须遵守与你相同的工作区纪律；外层沙箱仍会阻止写入 AgentLoom 自身状态目录。\n\n产出与汇报的语言跟随上面「总目标」的自然语言：总目标中文则中文、英文则英文；代码、命令、文件名、路径保持原样。";
+        let expected = "## 总目标\n总目标\n\n## 你的子任务\n子任务\n\n## 文件范围（≤3 文件为默认非硬规则）\n- （未指定·按子任务自行判断）\n\n## 验收\n- （本子任务无显式验收条目）\n\n\n## 工程纪律\n- 只修改任务点名的文件；别顺手重构或改动任务范围外的代码。\n- 严禁全局格式化（如 `cargo fmt` 不带参数、`prettier --write .`）——只格式化你亲手改的文件。\n- 严禁用 `git stash` / `git restore` / `git checkout --` 回滚不是你本次创建的改动——工作区里可能有前序 worker 的成果。\n- 如果你产出/生成了希望用户在聊天里直接看到的图片文件（截图、图表等），汇报时用 Markdown 内联图片语法 `![](图片绝对路径)` 引用；只写裸路径不会内联显示。\n- 本会话可能跑在 AgentLoom 外层 macOS 沙箱内（系统禁止嵌套沙箱）：如需派 codex 子进程，勿用 `--sandbox workspace-write`（会以 sandbox_apply: Operation not permitted / exit 71 失败），改用 `--dangerously-bypass-approvals-and-sandbox`——该子进程与你安全地位相同，须遵守与你相同的工作区纪律；外层沙箱仍会阻止写入 AgentLoom 自身状态目录。\n\n产出与汇报的语言跟随上面「总目标」的自然语言：总目标中文则中文、英文则英文；代码、命令、文件名、路径保持原样。";
         assert_eq!(pack, expected);
     }
 
     #[test]
     fn task_pack_non_empty_goal_is_byte_identical_en() {
         let pack = build_task_pack("goal", "subtask", &[], &[], crate::Locale::En);
-        let expected = "## Goal\ngoal\n\n## Your Subtask\nsubtask\n\n## File Scope (≤3 files, a default not a hard rule)\n- (Not specified; determine based on the subtask)\n\n## Acceptance\n- (No explicit acceptance criteria for this subtask)\n\n\n## Engineering Discipline\n- Only touch the files this task names; don't drive-by refactor or edit code outside its scope.\n- No global formatting (e.g. bare `cargo fmt`, `prettier --write .`) — only format the files you personally changed.\n- Never use `git stash` / `git restore` / `git checkout --` to roll back changes you didn't create this run — the workspace may hold prior workers' work.\n- This session may be running inside AgentLoom's outer macOS sandbox (nested sandboxes are disallowed): if you spawn a codex subprocess, don't use `--sandbox workspace-write` (fails with sandbox_apply: Operation not permitted / exit 71) — use `--dangerously-bypass-approvals-and-sandbox` instead. That child has the same security standing as you and must follow the same workspace discipline; the outer sandbox still blocks writes to AgentLoom's own state directories.\n\nWrite your output and report in the language of the goal above: a Chinese goal gets Chinese, an English goal gets English; keep code, commands, file names, and paths as-is.";
+        let expected = "## Goal\ngoal\n\n## Your Subtask\nsubtask\n\n## File Scope (≤3 files, a default not a hard rule)\n- (Not specified; determine based on the subtask)\n\n## Acceptance\n- (No explicit acceptance criteria for this subtask)\n\n\n## Engineering Discipline\n- Only touch the files this task names; don't drive-by refactor or edit code outside its scope.\n- No global formatting (e.g. bare `cargo fmt`, `prettier --write .`) — only format the files you personally changed.\n- Never use `git stash` / `git restore` / `git checkout --` to roll back changes you didn't create this run — the workspace may hold prior workers' work.\n- If you produce or generate an image file (such as a screenshot or chart) that you want the user to see directly in chat, reference it in your report with the Markdown inline image syntax `![](absolute image path)`; a bare path will not display inline.\n- This session may be running inside AgentLoom's outer macOS sandbox (nested sandboxes are disallowed): if you spawn a codex subprocess, don't use `--sandbox workspace-write` (fails with sandbox_apply: Operation not permitted / exit 71) — use `--dangerously-bypass-approvals-and-sandbox` instead. That child has the same security standing as you and must follow the same workspace discipline; the outer sandbox still blocks writes to AgentLoom's own state directories.\n\nWrite your output and report in the language of the goal above: a Chinese goal gets Chinese, an English goal gets English; keep code, commands, file names, and paths as-is.";
         assert_eq!(pack, expected);
     }
 

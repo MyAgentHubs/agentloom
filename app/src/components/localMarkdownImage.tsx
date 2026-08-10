@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import React, { useEffect, useState } from "react";
+import type { UrlTransform } from "react-markdown";
 import {
   getAttachmentDataUri,
   setAttachmentDataUri,
@@ -15,6 +16,28 @@ export function isLocalImagePath(src: string): boolean {
     return false;
   }
   return /^[a-z]:[\\/]/i.test(src) || !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(src);
+}
+
+/// react-markdown 的 urlTransform 工厂：本地路径豁免只作用于 <img src>（配合
+/// localImageMarkdownComponent 使用），其余一切 URL（含 <a href>）一律交给调用方
+/// 传入的 react-markdown 默认消毒器处理。用于避免「图片本地路径豁免」被误套用到
+/// 链接 href 上、放行盘符形态（`C:\...`）或伪装盘符（`j:%5C...`）的路径。
+export function makeImgOnlyUrlTransform(
+  defaultUrlTransform: (url: string) => string,
+): UrlTransform {
+  return (url, key, node) => {
+    if (key !== "src" || node?.tagName !== "img") {
+      return defaultUrlTransform(url);
+    }
+
+    let candidate = url;
+    try {
+      candidate = decodeURI(url);
+    } catch {
+      // Let react-markdown sanitize malformed URLs through its default transform.
+    }
+    return isLocalImagePath(candidate) ? candidate : defaultUrlTransform(url);
+  };
 }
 
 function decodeLocalImagePath(path: string): string {
