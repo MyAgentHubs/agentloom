@@ -1158,7 +1158,7 @@ where
         }
         Err(error) => {
             // 槽锁 poisoned 时仍 best-effort 终止已 spawn 的 child，但后续清理有界：超时即返回，
-            // 允许 child 未被收割（Unix 可能留下僵尸；非 Unix 上 kill_process_group 是空操作，
+            // 允许 child 未被收割（Unix 可能留下僵尸；非 Unix 上 taskkill 也可能失败，
             // 进程甚至可能继续运行）。这里运行在同步 Tauri command 的调用线程上，无界等待会
             // 冻住整个 send_message 和 UI；接受泄漏一个句柄也好过冻住 UI。此时无法证明槽归属，
             // 所以不做无锁清理，把错误交给调用方报告。
@@ -5043,6 +5043,27 @@ pub(crate) fn apply_session_workdir(
     Ok(wt)
 }
 
+#[cfg_attr(unix, allow(dead_code))]
+fn windows_taskkill_program(system_root: Option<&str>) -> String {
+    match system_root {
+        Some(system_root) => format!(
+            r"{}\System32\taskkill.exe",
+            system_root.trim_end_matches(['\\', '/'])
+        ),
+        None => "taskkill".to_string(),
+    }
+}
+
+#[cfg_attr(unix, allow(dead_code))]
+fn windows_kill_command_args(pid: u32) -> Vec<String> {
+    vec![
+        "/PID".to_string(),
+        pid.to_string(),
+        "/T".to_string(),
+        "/F".to_string(),
+    ]
+}
+
 pub(crate) fn kill_process_group(pid: u32) {
     // 负 pid 语义 = 进程组：killpg 干掉 agent 及其 spawn 的 bash/git/... 整棵。
     #[cfg(unix)]
@@ -5051,7 +5072,21 @@ pub(crate) fn kill_process_group(pid: u32) {
     }
     #[cfg(not(unix))]
     {
-        let _ = pid; // 非 unix：停止随 Windows 沙箱一起 B 之后
+        // Windows 用 taskkill /T /F 强制终止整棵进程树；Job Object 留待 v2。
+        let system_root = std::env::var("SystemRoot").ok();
+        let program = windows_taskkill_program(system_root.as_deref());
+        let args = windows_kill_command_args(pid);
+        match crate::proc::command(program).args(args).spawn() {
+            Ok(child) => {
+                // Fire-and-forget matches Unix killpg: signal delivery is asynchronous, while
+                // callers synchronize through their existing child.wait()/stdout EOF paths.
+                // Windows has no zombie-process state, and dropping Child immediately only closes
+                // our handles. The taskkill result is deliberately unobserved, following the same
+                // discipline as the Unix branch's ignored killpg return value.
+                drop(child);
+            }
+            Err(error) => eprintln!("taskkill failed for pid {pid}: {error}"),
+        }
     }
 }
 
@@ -5915,8 +5950,8 @@ fn spawn_and_stream(
                 |child| Child::try_wait(child).map(|status| status.is_some()),
                 Child::wait,
                 || {
-                    // On non-Unix this is currently a no-op. Reaping a Windows process tree
-                    // requires a Job Object and is intentionally a separate change.
+                    // On Windows, taskkill /T /F best-effort terminates the process tree;
+                    // Job Object ownership remains an intentionally separate v2 change.
                     kill_process_group(current_pid)
                 },
                 Instant::now,
@@ -5945,8 +5980,8 @@ fn spawn_and_stream(
                         |handle| Ok::<_, std::convert::Infallible>(handle.is_finished()),
                         |handle| handle.join().map_err(|_| ()),
                         || {
-                            // On non-Unix this is currently a no-op. Reaping a Windows process
-                            // tree requires a Job Object and is intentionally a separate change.
+                            // On Windows, taskkill /T /F best-effort terminates the process tree;
+                            // Job Object ownership remains an intentionally separate v2 change.
                             kill_process_group(current_pid)
                         },
                         Instant::now,
@@ -13985,6 +14020,32 @@ mod tests {
     use super::*;
     use crate::agent::{AgentBackend, BorrowClaudeBackend, BuildContext, NativeBackend, ParseFn};
     use crate::keychain::FakeKeyStore;
+
+    #[test]
+    fn windows_kill_command_targets_process_tree_forcefully() {
+        assert_eq!(
+            windows_kill_command_args(1234),
+            vec![
+                "/PID".to_string(),
+                "1234".to_string(),
+                "/T".to_string(),
+                "/F".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_taskkill_program_uses_system_root_when_available() {
+        assert_eq!(
+            windows_taskkill_program(Some(r"C:\Windows")),
+            r"C:\Windows\System32\taskkill.exe"
+        );
+    }
+
+    #[test]
+    fn windows_taskkill_program_falls_back_when_system_root_is_missing() {
+        assert_eq!(windows_taskkill_program(None), "taskkill");
+    }
 
     fn running_dispatch_card_for_reconcile(assignment_id: &str) -> db::Block {
         db::Block::DispatchCard {

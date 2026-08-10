@@ -1,9 +1,5 @@
 import { useMemo } from "react";
-import {
-  defaultUrlTransform,
-  type Components,
-  type UrlTransform,
-} from "react-markdown";
+import type { Components, UrlTransform } from "react-markdown";
 import type { LeadSummaryBlock as LSB, Finding } from "../types/agent";
 import { useI18n } from "../i18n";
 import { useMarkdownLib } from "../lib/useMarkdown";
@@ -58,19 +54,23 @@ const leadMarkdownComponents: Components = {
   },
 };
 
-const leadUrlTransform: UrlTransform = (url, key, node) => {
-  if (key !== "src" || node?.tagName !== "img") {
-    return defaultUrlTransform(url);
-  }
+function makeLeadUrlTransform(
+  defaultUrlTransform: typeof MarkdownLib.defaultUrlTransform,
+): UrlTransform {
+  return (url, key, node) => {
+    if (key !== "src" || node?.tagName !== "img") {
+      return defaultUrlTransform(url);
+    }
 
-  let candidate = url;
-  try {
-    candidate = decodeURI(url);
-  } catch {
-    // Let react-markdown sanitize malformed URLs through its default transform.
-  }
-  return isLocalImagePath(candidate) ? candidate : defaultUrlTransform(url);
-};
+    let candidate = url;
+    try {
+      candidate = decodeURI(url);
+    } catch {
+      // Let react-markdown sanitize malformed URLs through its default transform.
+    }
+    return isLocalImagePath(candidate) ? candidate : defaultUrlTransform(url);
+  };
+}
 
 function LeadMarkdown({
   children,
@@ -84,6 +84,9 @@ function LeadMarkdown({
   if (!markdownLib) {
     return <div style={{ whiteSpace: "pre-wrap" }}>{children}</div>;
   }
+  const leadUrlTransform = makeLeadUrlTransform(
+    markdownLib.defaultUrlTransform,
+  );
   return (
     <markdownLib.Markdown
       remarkPlugins={[markdownLib.remarkGfm]}
