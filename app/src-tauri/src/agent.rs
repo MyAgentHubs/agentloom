@@ -83,6 +83,42 @@ pub struct NativeBackend {
     pub primary_model: Option<String>,
 }
 
+/// Windows 上 npm 装的 codex 只落 `codex.cmd`（没有 `codex.exe`），而 `Command::new("codex")`
+/// 只会补 `.exe`、不查 PATHEXT —— 裸名永远找不到它。这里改走 detect 那套 PATHEXT 感知的解析
+/// 拿绝对路径（再由 proc::command 把外壳换成真实解释器）。
+/// 非 Windows 保持裸名 "codex"（走 PATH + augmented PATH），行为逐字节不变。
+pub(crate) fn resolve_codex_bin() -> Result<OsString, String> {
+    let windows = cfg!(target_os = "windows");
+    let override_path = crate::cli_path_override_for_spawn("codex");
+    crate::detect::resolve_cli_path_with_override(override_path.as_deref(), windows, || {
+        windows
+            .then(|| crate::detect::which_or_fallback("codex", &[]))
+            .flatten()
+    })
+    .map(|path| {
+        path.map(OsString::from)
+            .unwrap_or_else(|| OsString::from("codex"))
+    })
+}
+
+fn resolve_codex_bin_from(
+    override_path: Option<&str>,
+    windows: bool,
+    path_is_file: impl FnMut(&Path) -> bool,
+    automatic_path: impl FnMut() -> Option<String>,
+) -> Result<OsString, String> {
+    crate::detect::resolve_cli_path_with_override_from(
+        override_path,
+        windows,
+        path_is_file,
+        automatic_path,
+    )
+    .map(|path| {
+        path.map(OsString::from)
+            .unwrap_or_else(|| OsString::from("codex"))
+    })
+}
+
 pub(crate) fn supports_solo_commit_mcp(profile: &AgentProfile) -> bool {
     matches!(profile.provider.as_str(), "claude" | "codex") && profile.access == "native"
 }
@@ -372,7 +408,7 @@ impl AgentBackend for NativeBackend {
                 Ok(cmd)
             }
             "codex" => {
-                let mut cmd = crate::proc::command("codex");
+                let mut cmd = crate::proc::command(resolve_codex_bin()?);
                 if let Some(path) = augmented_path_for_spawn() {
                     cmd.env("PATH", path);
                 }
@@ -1278,6 +1314,137 @@ mod tests {
     fn contains_adjacent_pair(args: &[String], left: &str, right: &str) -> bool {
         args.windows(2)
             .any(|window| window[0] == left && window[1] == right)
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_codex_bin_keeps_non_windows_bare_name() {
+        assert_eq!(resolve_codex_bin().unwrap(), OsString::from("codex"));
+    }
+
+    #[test]
+    fn resolve_codex_bin_reads_the_spawn_override_cache() {
+        let _guard = crate::detect::CliPathOverrideTestGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("codex");
+        std::fs::write(&cli, "test cli").unwrap();
+        crate::detect::set_cached_cli_path("codex", cli.to_str()).unwrap();
+
+        let resolved = resolve_codex_bin().unwrap();
+        crate::detect::set_cached_cli_path("codex", None).unwrap();
+
+        assert_eq!(resolved, cli.into_os_string());
+    }
+
+    #[test]
+    fn resolve_codex_bin_ignores_the_global_override_cache_without_explicit_test_opt_in() {
+        let _lock = crate::detect::CLI_PATH_OVERRIDE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::detect::replace_cached_cli_paths([]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("codex");
+        std::fs::write(&cli, "test cli").unwrap();
+        crate::detect::set_cached_cli_path("codex", cli.to_str()).unwrap();
+
+        let resolved = resolve_codex_bin().unwrap();
+        crate::detect::replace_cached_cli_paths([]).unwrap();
+
+        assert_eq!(resolved, OsString::from("codex"));
+    }
+
+    #[test]
+    fn resolve_codex_bin_override_short_circuits_automatic_resolution() {
+        let automatic_calls = std::cell::Cell::new(0);
+        let resolved = resolve_codex_bin_from(
+            Some("/custom/bin/codex"),
+            false,
+            |path| path == Path::new("/custom/bin/codex"),
+            || {
+                automatic_calls.set(automatic_calls.get() + 1);
+                Some("/automatic/bin/codex".to_string())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved, OsString::from("/custom/bin/codex"));
+        assert_eq!(automatic_calls.get(), 0);
+    }
+
+    #[test]
+    fn resolve_codex_bin_invalid_override_fails_closed_without_automatic_resolution() {
+        let automatic_calls = std::cell::Cell::new(0);
+        let error = resolve_codex_bin_from(
+            Some("/missing/bin/codex"),
+            false,
+            |_| false,
+            || {
+                automatic_calls.set(automatic_calls.get() + 1);
+                Some("/automatic/bin/codex".to_string())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            r#"AL_ERR:cliPath.invalidPath:{"path":"/missing/bin/codex"}"#
+        );
+        assert_eq!(automatic_calls.get(), 0);
+    }
+
+    #[test]
+    fn resolve_codex_bin_without_override_keeps_automatic_resolution_unchanged() {
+        let automatic_calls = std::cell::Cell::new(0);
+        let resolved = resolve_codex_bin_from(
+            None,
+            false,
+            |_| panic!("override validation must not run"),
+            || {
+                automatic_calls.set(automatic_calls.get() + 1);
+                Some("/automatic/bin/codex".to_string())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved, OsString::from("/automatic/bin/codex"));
+        assert_eq!(automatic_calls.get(), 1);
+    }
+
+    #[test]
+    fn solo_codex_rebuild_preserves_shim_script_once_before_injected_config() {
+        let script = OsString::from(r"C:\npm\node_modules\@openai\codex\bin\codex.js");
+        let mut command = crate::proc::command(r"C:\npm\node.exe");
+        command.args([
+            script.as_os_str(),
+            OsStr::new("-a"),
+            OsStr::new("never"),
+            OsStr::new("exec"),
+            OsStr::new("--json"),
+            OsStr::new("prompt"),
+        ]);
+        let mut profile = borrow_profile();
+        profile.provider = "codex".to_string();
+        profile.access = "native".to_string();
+
+        attach_solo_commit_mcp_argv(&mut command, &profile, 4321).unwrap();
+
+        let rebuilt_args = command
+            .get_args()
+            .map(OsStr::to_os_string)
+            .collect::<Vec<_>>();
+        assert_eq!(command.get_program(), r"C:\npm\node.exe");
+        assert_eq!(rebuilt_args.first(), Some(&script));
+        assert_eq!(rebuilt_args.iter().filter(|arg| *arg == &script).count(), 1);
+        let exec_index = rebuilt_args
+            .windows(2)
+            .position(|pair| pair[0] == "exec" && pair[1] == "--json")
+            .expect("exec --json should survive rebuilding");
+        let injected_config_index = rebuilt_args
+            .iter()
+            .position(|arg| arg == r#"mcp_servers.agentloom.url="http://127.0.0.1:4321/mcp""#)
+            .expect("agentloom MCP config should be injected");
+        assert_eq!(rebuilt_args[injected_config_index - 1], "-c");
+        assert!(injected_config_index < exec_index);
     }
 
     fn write_codex_config(home: &std::path::Path, contents: &str) {

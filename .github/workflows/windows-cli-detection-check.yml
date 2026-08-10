@@ -1,0 +1,247 @@
+name: Check Windows CLI detection on a real runner
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '22.23.1'
+  RUST_TOOLCHAIN: '1.97.0'
+  TARGET_TRIPLE: x86_64-pc-windows-msvc
+  TAURI_CONFIG: '{"bundle":{"externalBin":[]}}'
+
+jobs:
+  detect-installed-clis:
+    name: Detect installed CLIs (${{ matrix.install-method }})
+    runs-on: windows-2025
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        install-method: [native, npm]
+    steps:
+      - name: Check out the dispatched commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install frontend dependencies
+        shell: pwsh
+        run: npm ci --prefix app
+
+      - name: Build the frontend
+        shell: pwsh
+        run: npm run --prefix app build
+
+      - name: Install the pinned Rust toolchain and x64 target
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Set-StrictMode -Version Latest
+
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal
+          rustup target add $env:TARGET_TRIPLE --toolchain $env:RUST_TOOLCHAIN
+          rustup override set $env:RUST_TOOLCHAIN
+
+          $rustcVersion = (rustup run $env:RUST_TOOLCHAIN rustc --version).Trim()
+          $expectedRustcPrefix = "rustc $env:RUST_TOOLCHAIN "
+          if (-not $rustcVersion.StartsWith($expectedRustcPrefix, [StringComparison]::Ordinal)) {
+            throw "Pinned Rust verification failed: expected prefix '$expectedRustcPrefix', found '$rustcVersion'."
+          }
+
+          "RUSTUP_TOOLCHAIN=$env:RUST_TOOLCHAIN" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Run Windows detection unit tests
+        shell: pwsh
+        working-directory: app/src-tauri
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Set-StrictMode -Version Latest
+
+          cargo test --locked --lib detect_ -- --nocapture
+          cargo test --locked --lib windows_ -- --nocapture
+          cargo test --locked --lib fallback -- --nocapture
+
+      - name: Install Claude Code and Codex
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Set-StrictMode -Version Latest
+
+          $claudeNativeDir = Join-Path $env:USERPROFILE '.local\bin'
+          $npmInstallDir = Join-Path $env:APPDATA 'npm'
+          $setupNodeNpmGlobalDir = (npm prefix --global).Trim()
+          if ([string]::IsNullOrWhiteSpace($setupNodeNpmGlobalDir)) {
+            throw 'npm returned an empty global prefix before CLI installation.'
+          }
+          Write-Host "setup-node npm global directory: $setupNodeNpmGlobalDir"
+          "SETUP_NODE_NPM_GLOBAL_DIR=$setupNodeNpmGlobalDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          npm config set prefix $npmInstallDir
+
+          if ('${{ matrix.install-method }}' -eq 'native') {
+            $installerUrl = 'https://claude.ai/install.ps1'
+            try {
+              $installerResponse = Invoke-WebRequest -Uri $installerUrl -UseBasicParsing
+            } catch {
+              $statusCode = 'unavailable'
+              if ($null -ne $_.Exception.Response) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+              }
+              Write-Host "Claude Code installer request failed; HTTP status: $statusCode; URL: $installerUrl"
+              throw
+            }
+            $statusCode = [int]$installerResponse.StatusCode
+            Write-Host "Claude Code installer HTTP status: $statusCode"
+            if ($statusCode -ne 200) {
+              throw "Claude Code installer returned HTTP status $statusCode from $installerUrl"
+            }
+            Invoke-Expression $installerResponse.Content
+          } else {
+            npm install -g @anthropic-ai/claude-code
+          }
+
+          npm install -g @openai/codex
+
+          $expectedClaude = if ('${{ matrix.install-method }}' -eq 'native') {
+            Join-Path $claudeNativeDir 'claude.exe'
+          } else {
+            Join-Path $npmInstallDir 'claude.cmd'
+          }
+          $expectedCodex = Join-Path $npmInstallDir 'codex.cmd'
+          foreach ($expectedCli in @($expectedClaude, $expectedCodex)) {
+            if (-not (Test-Path -LiteralPath $expectedCli -PathType Leaf)) {
+              throw "Expected installed CLI is missing: $expectedCli"
+            }
+            Write-Host "Installed CLI: $expectedCli"
+          }
+
+          "AGENTLOOM_EXPECTED_CLAUDE_PATH=$expectedClaude" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "AGENTLOOM_EXPECTED_CODEX_PATH=$expectedCodex" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $claudeNativeDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $npmInstallDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Prove detection with the normal PATH
+        shell: pwsh
+        working-directory: app/src-tauri
+        run: cargo test --locked --test windows_cli_detection -- --ignored --nocapture
+
+      - name: Prove detection with the install directories removed from PATH
+        shell: pwsh
+        working-directory: app/src-tauri
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Set-StrictMode -Version Latest
+
+          function Split-PathEntries {
+            param([Parameter(Mandatory = $true)][string]$PathValue)
+
+            $entries = [Collections.Generic.List[string]]::new()
+            $current = [Text.StringBuilder]::new()
+            $insideQuotes = $false
+            foreach ($character in $PathValue.ToCharArray()) {
+              if ($character -eq '"') {
+                $insideQuotes = -not $insideQuotes
+                continue
+              }
+              if (($character -eq ';') -and (-not $insideQuotes)) {
+                $entries.Add($current.ToString().Trim())
+                $null = $current.Clear()
+                continue
+              }
+              $null = $current.Append($character)
+            }
+            if ($insideQuotes) {
+              throw 'PATH contains an unterminated quoted entry.'
+            }
+            $entries.Add($current.ToString().Trim())
+            return $entries
+          }
+
+          function Get-TargetClisInDirectory {
+            param([Parameter(Mandatory = $true)][string]$Directory)
+
+            $matches = [Collections.Generic.List[string]]::new()
+            foreach ($targetName in @(
+              'claude.exe', 'claude.cmd', 'claude.bat',
+              'codex.exe', 'codex.cmd', 'codex.bat'
+            )) {
+              $candidate = Join-Path -Path $Directory -ChildPath $targetName
+              if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                $matches.Add($candidate)
+              }
+            }
+            return $matches
+          }
+
+          $pathEntries = @(Split-PathEntries -PathValue $env:PATH | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_)
+          })
+          $filteredEntries = @($pathEntries | Where-Object {
+            $targetClis = @(Get-TargetClisInDirectory -Directory $_)
+            if ($targetClis.Count -ne 0) {
+              Write-Host "Removing PATH entry because it contains a target CLI: $_"
+              $targetClis | ForEach-Object { Write-Host "  $_" }
+              return $false
+            }
+            return $true
+          })
+
+          $serializedEntries = @($filteredEntries | ForEach-Object {
+            if ($_.Contains(';')) {
+              return '"{0}"' -f $_
+            }
+            return $_
+          })
+          $env:PATH = $serializedEntries -join ';'
+          Write-Host 'PATH after removing every entry containing a target CLI:'
+          Write-Host $env:PATH
+
+          $remainingTargets = [Collections.Generic.List[string]]::new()
+          foreach ($entry in @(Split-PathEntries -PathValue $env:PATH)) {
+            if ([string]::IsNullOrWhiteSpace($entry)) {
+              continue
+            }
+            foreach ($targetCli in @(Get-TargetClisInDirectory -Directory $entry)) {
+              $remainingTargets.Add($targetCli)
+            }
+          }
+          if ($remainingTargets.Count -ne 0) {
+            throw "PATH still contains target CLIs after filtering: $($remainingTargets -join ', ')"
+          }
+          Write-Host 'Verified no remaining PATH entry contains claude or codex.'
+
+          cargo test --locked --test windows_cli_detection -- --ignored --nocapture
+
+      - name: Print final CLI lookup and detection diagnostics
+        if: always()
+        shell: pwsh
+        working-directory: app/src-tauri
+        run: |
+          Write-Host 'where.exe claude:'
+          where.exe claude 2>&1 | ForEach-Object { Write-Host $_ }
+          Write-Host "where.exe claude exit code: $LASTEXITCODE"
+
+          Write-Host 'where.exe codex:'
+          where.exe codex 2>&1 | ForEach-Object { Write-Host $_ }
+          Write-Host "where.exe codex exit code: $LASTEXITCODE"
+
+          Write-Host "Expected Claude path: $env:AGENTLOOM_EXPECTED_CLAUDE_PATH"
+          Write-Host "Expected Codex path: $env:AGENTLOOM_EXPECTED_CODEX_PATH"
+          Write-Host 'Current PATH:'
+          Write-Host $env:PATH

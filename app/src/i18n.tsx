@@ -137,8 +137,10 @@ const messages = {
     "settings.agentForm.category.endpointRequired": "请先填写 endpoint",
     "settings.agentForm.category.other": "请求失败",
     "settings.agentForm.group.account": "账号",
-    "settings.agentForm.saveBlocked.nativeMissing":
-      "未安装 {cli} CLI，暂不能保存",
+    "settings.agentForm.saveWarning.nativeMissing":
+      "未检测到 {cli} CLI —— 仍然可以保存，但这个 agent 装好之前跑不起来。",
+    "settings.agentForm.saveWarning.nativeOverrideInvalid":
+      "指定的 {cli} CLI 路径用不了 —— 仍然可以保存，但修好之前这个 agent 跑不起来。",
     "settings.agentForm.saveBlocked.testFailed": "测试未通过，暂不能保存",
     "settings.agentForm.engineStatus.builtIn": "✓ 内置 · 免安装",
     "settings.agentForm.engineStatus.installedLoggedIn": "✓ 已安装 · 已登录",
@@ -152,6 +154,15 @@ const messages = {
       "⚠ {cli} CLI 已安装，未探测到登录凭据；可先保存，若运行报错，在终端跑",
     "settings.agentForm.nativeStatus.installedNoCredsSuffix": "后点",
     "settings.agentForm.nativeStatus.notDetected": "⚠ 未检测到 {cli} CLI",
+    "settings.agentForm.nativeStatus.pathSpecified": "✓ 已指定路径",
+    "settings.agentForm.nativeStatus.specifiedPathInvalid":
+      "⚠ 你指定的 {cli} CLI 路径用不了",
+    "settings.agentForm.nativeStatus.choosePath": "指定路径…",
+    "settings.agentForm.nativeStatus.clearPath": "清除",
+    "settings.agentForm.nativeStatus.notDetectedHelp.claude":
+      "需要的是 Claude Code 命令行工具（不是 Claude 桌面版 App）。刚装好的话，重开一次 AgentLoom 可能会有帮助；还没安装的话，请查看安装指引。",
+    "settings.agentForm.nativeStatus.notDetectedHelp.codex":
+      "如果刚装好 Codex CLI，重开一次 AgentLoom 可能会有帮助；还没安装的话，请查看安装指引。",
     "settings.agentForm.nativeStatus.recheck": "重新检测",
     "settings.agentForm.nativeStatus.viewInstallGuide": "查看安装指引",
     "settings.agentForm.moreSummary.borrow":
@@ -1008,6 +1019,11 @@ const messages = {
     "backend.agent.unknownEngine": "未知引擎：{engine}",
     "backend.agent.configDirCreateFailed": "创建配置目录失败：{detail}",
     "backend.agent.missingEndpoint": "agent {id} 缺少 endpoint",
+    "backend.cliPath.invalidCli": "无法设置 CLI 路径：不支持 {cli}。",
+    "backend.cliPath.invalidPath":
+      "无法使用你选择的路径：{path}。请选择 CLI 的可执行文件；Windows 上请选择 .exe、.cmd 或 .bat 文件。",
+    "backend.cliPath.databaseUnavailable":
+      "设置没有保存成功，请重试。详情：{detail}",
     "backend.member.notInSessionPool": "agent {id} 不在当前会话成员池",
     "backend.member.unavailableMissing": "agent {id} 不可用：不存在",
     "backend.member.unavailableDisabled": "agent {id} 不可用：disabled",
@@ -1567,8 +1583,10 @@ const messages = {
     "settings.agentForm.category.endpointRequired": "Endpoint is required",
     "settings.agentForm.category.other": "Request failed",
     "settings.agentForm.group.account": "Account",
-    "settings.agentForm.saveBlocked.nativeMissing":
-      "{cli} CLI is not installed, so this cannot be saved yet",
+    "settings.agentForm.saveWarning.nativeMissing":
+      "{cli} CLI not detected — you can still save, but this agent will not run until it is installed.",
+    "settings.agentForm.saveWarning.nativeOverrideInvalid":
+      "The specified {cli} CLI path cannot be used — you can still save, but this agent will not run until the path is fixed.",
     "settings.agentForm.saveBlocked.testFailed":
       "Connection test has not passed, so this cannot be saved yet",
     "settings.agentForm.engineStatus.builtIn": "✓ Built in · no install",
@@ -1586,6 +1604,15 @@ const messages = {
     "settings.agentForm.nativeStatus.installedNoCredsSuffix":
       "in a terminal, then",
     "settings.agentForm.nativeStatus.notDetected": "⚠ {cli} CLI not detected",
+    "settings.agentForm.nativeStatus.pathSpecified": "✓ Path specified",
+    "settings.agentForm.nativeStatus.specifiedPathInvalid":
+      "⚠ The {cli} CLI path you specified cannot be used",
+    "settings.agentForm.nativeStatus.choosePath": "Specify path…",
+    "settings.agentForm.nativeStatus.clearPath": "Clear",
+    "settings.agentForm.nativeStatus.notDetectedHelp.claude":
+      "AgentLoom needs the Claude Code command-line tool — not the Claude desktop app. If you just installed it, restarting AgentLoom can help; otherwise, view the installation guide.",
+    "settings.agentForm.nativeStatus.notDetectedHelp.codex":
+      "If you just installed Codex CLI, restarting AgentLoom can help; otherwise, view the installation guide.",
     "settings.agentForm.nativeStatus.recheck": "Recheck",
     "settings.agentForm.nativeStatus.viewInstallGuide": "View install guide",
     "settings.agentForm.moreSummary.borrow":
@@ -2515,6 +2542,12 @@ const messages = {
     "backend.agent.configDirCreateFailed":
       "Failed to create the configuration directory: {detail}",
     "backend.agent.missingEndpoint": "Agent {id} is missing an endpoint",
+    "backend.cliPath.invalidCli":
+      "Cannot set the CLI path: {cli} is not supported.",
+    "backend.cliPath.invalidPath":
+      "The selected path cannot be used: {path}. Choose the CLI executable file. On Windows, choose an .exe, .cmd, or .bat file.",
+    "backend.cliPath.databaseUnavailable":
+      "The setting was not saved. Try again. Details: {detail}",
     "backend.member.notInSessionPool":
       "Agent {id} is not in this session's member pool",
     "backend.member.unavailableMissing":

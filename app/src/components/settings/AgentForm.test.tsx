@@ -8,6 +8,7 @@ import {
 } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { I18nProvider } from "../../i18n";
 import type { AgentProfile, ConnectionTestResult } from "../../types/agent";
@@ -19,6 +20,7 @@ import {
 } from "./agentFormHelpers";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 
 function agent(overrides: Partial<AgentProfile>): AgentProfile {
@@ -152,6 +154,8 @@ describe("AgentForm", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     invokeMock.mockResolvedValue(undefined);
+    vi.mocked(openDialog).mockReset();
+    vi.mocked(openDialog).mockResolvedValue(null);
     vi.mocked(openUrl).mockReset();
     vi.mocked(openUrl).mockResolvedValue(undefined);
     localStorage.clear();
@@ -1898,7 +1902,7 @@ describe("AgentForm", () => {
     expect(calls).not.toContain("upsert_agent");
   });
 
-  it("native 检测未安装会禁用保存，已安装但未探测登录凭据仍可保存", async () => {
+  it("native CLI 未检测到时仍可保存并显示非阻塞警告", async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "detect_runtime") {
         return Promise.resolve({
@@ -1919,17 +1923,392 @@ describe("AgentForm", () => {
       return Promise.resolve();
     });
 
-    render(<AgentForm onCancel={vi.fn()} onSaved={vi.fn()} />);
+    const { unmount } = render(
+      <AgentForm onCancel={vi.fn()} onSaved={vi.fn()} />,
+    );
 
     fireEvent.click(providerChip("Anthropic 账号"));
 
-    expect(await screen.findByText(/未检测到 claude CLI/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "添加" })).toBeDisabled();
+    expect(await screen.findByText("⚠ 未检测到 claude CLI")).toHaveStyle({
+      color: "var(--amber-ink)",
+    });
+    expect(
+      screen.getByText(
+        "未检测到 claude CLI —— 仍然可以保存，但这个 agent 装好之前跑不起来。",
+      ),
+    ).toHaveStyle({ color: "var(--amber-ink)" });
+    expect(screen.getByRole("button", { name: "添加" })).not.toBeDisabled();
 
     clickEngine("Codex CLI");
 
     expect(await screen.findByText(/未探测到登录凭据/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "添加" })).not.toBeDisabled();
+
+    unmount();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "detect_runtime") {
+        return Promise.resolve({
+          claude: {
+            available: true,
+            version: null,
+            path: null,
+            creds_hint: true,
+          },
+          codex: {
+            available: false,
+            version: null,
+            path: null,
+            creds_hint: null,
+          },
+        });
+      }
+      return Promise.resolve();
+    });
+
+    render(<AgentForm onCancel={vi.fn()} onSaved={vi.fn()} />);
+    clickEngine("Codex CLI");
+
+    expect(
+      await screen.findByText(
+        "如果刚装好 Codex CLI，重开一次 AgentLoom 可能会有帮助；还没安装的话，请查看安装指引。",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Claude 桌面版 App/)).toBeNull();
+    expect(screen.getByRole("button", { name: "添加" })).not.toBeDisabled();
+  });
+
+  it("指定 CLI 路径后调用 set_cli_path 并用返回结果刷新界面", async () => {
+    const path = "/opt/custom/bin/claude";
+    vi.mocked(openDialog).mockResolvedValue(path);
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "detect_runtime") {
+        return Promise.resolve({
+          claude: {
+            available: false,
+            version: null,
+            path: null,
+            creds_hint: null,
+            overridden: false,
+          },
+          codex: {
+            available: true,
+            version: null,
+            path: "/usr/local/bin/codex",
+            creds_hint: true,
+            overridden: false,
+          },
+        });
+      }
+      if (cmd === "set_cli_path") {
+        return Promise.resolve({
+          claude: {
+            available: true,
+            version: null,
+            path,
+            creds_hint: true,
+            overridden: true,
+          },
+          codex: {
+            available: true,
+            version: null,
+            path: "/usr/local/bin/codex",
+            creds_hint: true,
+            overridden: false,
+          },
+        });
+      }
+      return Promise.resolve();
+    });
+
+    render(<AgentForm onCancel={vi.fn()} onSaved={vi.fn()} />);
+    fireEvent.click(providerChip("Anthropic 账号"));
+    fireEvent.click(await screen.findByRole("button", { name: "指定路径…" }));
+
+    await waitFor(() => expect(openDialog).toHaveBeenCalledTimes(1));
+    expect(openDialog).toHaveBeenCalledWith({
+      directory: false,
+      multiple: false,
+    });
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_cli_path", {
+        cli: "claude",
+        path,
+      }),
+    );
+    expect(await screen.findByText("✓ 已指定路径")).toBeInTheDocument();
+    expect(screen.getByText(path)).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "未检测到 claude CLI —— 仍然可以保存，但这个 agent 装好之前跑不起来。",
+      ),
+    ).toBeNull();
+  });
+
+  it("set_cli_path 失败时显示后端错误且保留未检测到状态", async () => {
+    const backendError =
+      'AL_ERR:runtime.invalidCliPath:{"detail":"not an executable file"}';
+    vi.mocked(openDialog).mockResolvedValue("/tmp/not-a-cli.txt");
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "detect_runtime") {
+        return Promise.resolve({
+          claude: {
+            available: false,
+            path: null,
+            creds_hint: null,
+            overridden: false,
+          },
+          codex: {
+            available: true,
+            path: "/usr/local/bin/codex",
+            creds_hint: true,
+            overridden: false,
+          },
+        });
+      }
+      if (cmd === "set_cli_path") return Promise.reject(backendError);
+      return Promise.resolve();
+    });
+
+    render(<AgentForm onCancel={vi.fn()} onSaved={vi.fn()} />);
+    fireEvent.click(providerChip("Anthropic 账号"));
+    fireEvent.click(await screen.findByRole("button", { name: "指定路径…" }));
+
+    expect(await screen.findByText(backendError)).toBeInTheDocument();
+    expect(screen.getByText("⚠ 未检测到 claude CLI")).toBeInTheDocument();
+    expect(screen.queryByText("✓ 已指定路径")).toBeNull();
+  });
+
+  it("手动指定的 CLI 路径失效且后端未返回路径时不渲染空路径行", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "detect_runtime") {
+        return Promise.resolve({
+          claude: {
+            available: false,
+            path: null,
+            creds_hint: null,
+            overridden: true,
+          },
+          codex: {
+            available: true,
+            path: "/usr/local/bin/codex",
+            creds_hint: true,
+            overridden: false,
+          },
+        });
+      }
+      return Promise.resolve();
+    });
+
+    render(<AgentForm onCancel={vi.fn()} onSaved={vi.fn()} />);
+    fireEvent.click(providerChip("Anthropic 账号"));
+
+    expect(
+      await screen.findByText("⚠ 你指定的 claude CLI 路径用不了"),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("native-runtime-path")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "指定路径…" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "清除" })).toBeInTheDocument();
+    expect(screen.queryByText("⚠ 未检测到 claude CLI")).toBeNull();
+    expect(
+      screen.queryByText(
+        "需要的是 Claude Code 命令行工具（不是 Claude 桌面版 App）。刚装好的话，重开一次 AgentLoom 可能会有帮助；还没安装的话，请查看安装指引。",
+      ),
+    ).toBeNull();
+  });
+
+  it("手动指定的 CLI 路径失效但后端返回路径时显示该路径", async () => {
+    const path = "C:\\x\\claude.exe";
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "detect_runtime") {
+        return Promise.resolve({
+          claude: {
+            available: false,
+            path,
+            creds_hint: null,
+            overridden: true,
+          },
+          codex: {
+            available: true,
+            path: "C:\\x\\codex.exe",
+            creds_hint: true,
+            overridden: false,
+          },
+        });
+      }
+      return Promise.resolve();
+    });
+
+    render(<AgentForm onCancel={vi.fn()} onSaved={vi.fn()} />);
+    fireEvent.click(providerChip("Anthropic 账号"));
+
+    expect(
+      await screen.findByText("⚠ 你指定的 claude CLI 路径用不了"),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("native-runtime-path")).toHaveTextContent(path);
+  });
+
+  it("已指定可用 CLI 路径时显示路径并可清除 override", async () => {
+    const path = "/Applications/Claude CLI/bin/claude";
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "detect_runtime") {
+        return Promise.resolve({
+          claude: {
+            available: true,
+            path,
+            creds_hint: true,
+            overridden: true,
+          },
+          codex: {
+            available: true,
+            path: "/usr/local/bin/codex",
+            creds_hint: true,
+            overridden: false,
+          },
+        });
+      }
+      if (cmd === "set_cli_path") return Promise.resolve(detectReady());
+      return Promise.resolve();
+    });
+
+    render(<AgentForm onCancel={vi.fn()} onSaved={vi.fn()} />);
+    fireEvent.click(providerChip("Anthropic 账号"));
+
+    expect(await screen.findByText("✓ 已指定路径")).toBeInTheDocument();
+    expect(screen.getByTestId("native-runtime-path")).toHaveTextContent(path);
+    const clearButton = screen.getByRole("button", { name: "清除" });
+    expect(clearButton).toBeEnabled();
+    fireEvent.click(clearButton);
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_cli_path", {
+        cli: "claude",
+        path: null,
+      }),
+    );
+  });
+
+  it("取消 CLI 文件选择时不调用 set_cli_path", async () => {
+    vi.mocked(openDialog).mockResolvedValue(null);
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "detect_runtime") {
+        return Promise.resolve({
+          claude: {
+            available: false,
+            path: null,
+            creds_hint: null,
+            overridden: false,
+          },
+          codex: {
+            available: true,
+            path: "/usr/local/bin/codex",
+            creds_hint: true,
+            overridden: false,
+          },
+        });
+      }
+      return Promise.resolve();
+    });
+
+    render(<AgentForm onCancel={vi.fn()} onSaved={vi.fn()} />);
+    fireEvent.click(providerChip("Anthropic 账号"));
+    fireEvent.click(await screen.findByRole("button", { name: "指定路径…" }));
+
+    await waitFor(() => expect(openDialog).toHaveBeenCalledTimes(1));
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "set_cli_path")).toBe(
+      false,
+    );
+  });
+
+  it("native CLI 未检测到时提交仍会保存", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "detect_runtime") {
+        return Promise.resolve({
+          claude: {
+            available: false,
+            version: null,
+            path: null,
+            creds_hint: null,
+          },
+          codex: {
+            available: true,
+            version: null,
+            path: null,
+            creds_hint: true,
+          },
+        });
+      }
+      return Promise.resolve();
+    });
+    const onSaved = vi.fn();
+
+    render(<AgentForm onCancel={vi.fn()} onSaved={onSaved} />);
+    fireEvent.click(providerChip("Anthropic 账号"));
+
+    await screen.findByText("⚠ 未检测到 claude CLI");
+    fireEvent.click(screen.getByRole("button", { name: "添加" }));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("upsert_agent", {
+        profile: expect.objectContaining({
+          access: "native",
+          provider: "claude",
+        }),
+      }),
+    );
+    expect(onSaved).toHaveBeenCalledTimes(1);
+  });
+
+  it("连接测试未通过时仍会禁用保存", async () => {
+    invokeMock.mockImplementation(invokeWithConnectionOk);
+
+    render(
+      <AgentForm
+        agent={agent({ has_key: true })}
+        onCancel={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+    await screen.findAllByText("✓ 已安装 · 已登录");
+    openMoreOptions();
+    fireEvent.change(screen.getByLabelText("Endpoint"), {
+      target: { value: "https://unverified.example/anthropic" },
+    });
+
+    expect(screen.getByText("测试未通过，暂不能保存")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
+  });
+
+  it("Claude CLI 未检测到时说明需要命令行工具而不是桌面版 App", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "detect_runtime") {
+        return Promise.resolve({
+          claude: {
+            available: false,
+            version: null,
+            path: null,
+            creds_hint: null,
+          },
+          codex: {
+            available: true,
+            version: null,
+            path: null,
+            creds_hint: true,
+          },
+        });
+      }
+      return Promise.resolve();
+    });
+
+    render(<AgentForm onCancel={vi.fn()} onSaved={vi.fn()} />);
+    fireEvent.click(providerChip("Anthropic 账号"));
+
+    expect(
+      await screen.findByText(
+        "需要的是 Claude Code 命令行工具（不是 Claude 桌面版 App）。刚装好的话，重开一次 AgentLoom 可能会有帮助；还没安装的话，请查看安装指引。",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("编辑态锁 access 家族：编辑 harness 只显 harness 组、编辑 borrow 不显 harness 组", () => {

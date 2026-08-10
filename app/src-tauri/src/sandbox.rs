@@ -344,13 +344,41 @@ pub(crate) fn git_write_seatbelt_profile_for_bin(
 
 /// 解析 claude 绝对路径：GUI(launchd 最小 PATH)下 bare claude 找不到(常在 ~/.local/bin)。
 pub fn resolve_claude_bin() -> String {
-    let detected = crate::detect::which_or_fallback("claude", &[]);
-    let home = std::env::var_os("HOME");
-    let user_profile = std::env::var_os("USERPROFILE");
-    let windows = cfg!(target_os = "windows");
-    resolve_claude_bin_with_env(detected, home.as_deref(), user_profile.as_deref(), |path| {
-        crate::detect::executable_candidate_allowed(path, windows) && path.exists()
+    resolve_claude_bin_for_spawn().unwrap_or_else(|_| {
+        crate::cli_path_override_for_spawn("claude")
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty())
+            .unwrap_or_else(|| "claude".to_string())
     })
+}
+
+pub(crate) fn resolve_claude_bin_for_spawn() -> Result<String, String> {
+    let windows = cfg!(target_os = "windows");
+    let override_path = crate::cli_path_override_for_spawn("claude");
+    crate::detect::resolve_cli_path_with_override(override_path.as_deref(), windows, || {
+        let detected = crate::detect::which_or_fallback("claude", &[]);
+        let home = std::env::var_os("HOME");
+        let user_profile = std::env::var_os("USERPROFILE");
+        Some(resolve_claude_bin_with_env(
+            detected,
+            home.as_deref(),
+            user_profile.as_deref(),
+            |path| crate::detect::executable_candidate_allowed(path, windows) && path.exists(),
+        ))
+    })
+    .map(|path| path.unwrap_or_else(|| "claude".to_string()))
+}
+
+fn resolve_claude_bin_with_override_from(
+    override_path: Option<&str>,
+    windows: bool,
+    path_is_file: impl FnMut(&Path) -> bool,
+    mut automatic_path: impl FnMut() -> String,
+) -> Result<String, String> {
+    crate::detect::resolve_cli_path_with_override_from(override_path, windows, path_is_file, || {
+        Some(automatic_path())
+    })
+    .map(|path| path.unwrap_or_else(|| "claude".to_string()))
 }
 
 fn resolve_claude_bin_with_env(
@@ -653,6 +681,86 @@ mod tests {
             ),
             "/Users/windows/.local/bin/claude"
         );
+    }
+
+    #[test]
+    fn resolve_claude_bin_reads_the_spawn_override_cache() {
+        let _guard = crate::detect::CliPathOverrideTestGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("claude");
+        std::fs::write(&cli, "test cli").unwrap();
+        crate::detect::set_cached_cli_path("claude", cli.to_str()).unwrap();
+
+        let resolved = resolve_claude_bin_for_spawn().unwrap();
+        crate::detect::set_cached_cli_path("claude", None).unwrap();
+
+        assert_eq!(resolved, cli.to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_claude_bin_override_short_circuits_automatic_resolution() {
+        let automatic_calls = std::cell::Cell::new(0);
+        let resolved = resolve_claude_bin_with_override_from(
+            Some("/custom/bin/claude"),
+            false,
+            |path| path == Path::new("/custom/bin/claude"),
+            || {
+                automatic_calls.set(automatic_calls.get() + 1);
+                "/automatic/bin/claude".to_string()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved, "/custom/bin/claude");
+        assert_eq!(automatic_calls.get(), 0);
+    }
+
+    #[test]
+    fn resolve_claude_bin_invalid_override_fails_closed_without_automatic_resolution() {
+        let automatic_calls = std::cell::Cell::new(0);
+        let error = resolve_claude_bin_with_override_from(
+            Some("/missing/bin/claude"),
+            false,
+            |_| false,
+            || {
+                automatic_calls.set(automatic_calls.get() + 1);
+                "/automatic/bin/claude".to_string()
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            r#"AL_ERR:cliPath.invalidPath:{"path":"/missing/bin/claude"}"#
+        );
+        assert_eq!(automatic_calls.get(), 0);
+    }
+
+    #[test]
+    fn resolve_claude_bin_compatibility_wrapper_keeps_an_invalid_pinned_path() {
+        let _guard = crate::detect::CliPathOverrideTestGuard::new();
+        let missing = std::env::temp_dir().join("agentloom-missing-pinned-claude");
+        crate::detect::set_cached_cli_path("claude", missing.to_str()).unwrap();
+
+        assert_eq!(resolve_claude_bin(), missing.to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_claude_bin_without_override_keeps_automatic_resolution_unchanged() {
+        let automatic_calls = std::cell::Cell::new(0);
+        let resolved = resolve_claude_bin_with_override_from(
+            None,
+            false,
+            |_| panic!("override validation must not run"),
+            || {
+                automatic_calls.set(automatic_calls.get() + 1);
+                "/automatic/bin/claude".to_string()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved, "/automatic/bin/claude");
+        assert_eq!(automatic_calls.get(), 1);
     }
 
     // ── resolve_git_bin：Xcode 转发壳检测 + 穿透（2026-07-25 dogfood 定罪修复） ──

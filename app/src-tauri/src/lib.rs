@@ -7,7 +7,7 @@ mod conn_test;
 mod continuation;
 pub mod db;
 mod deepseek_proxy;
-mod detect;
+pub mod detect;
 pub mod display_reduce;
 mod event_transport;
 mod fake_runner;
@@ -29,6 +29,7 @@ mod repos_repo;
 mod sandbox;
 mod test_support;
 mod ui_msg;
+mod winshim;
 mod worktree;
 
 use agent::{
@@ -1045,10 +1046,53 @@ fn transition_auth_retry_handoff(
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum AuthRetryHandoff {
+    Continue,
+    Interrupted,
+    Failed { detail: String },
+}
+
+fn classify_auth_retry_handoff(
+    handoff: Result<bool, String>,
+    stop_requested: bool,
+) -> AuthRetryHandoff {
+    match handoff {
+        Ok(true) => AuthRetryHandoff::Continue,
+        Ok(false) if stop_requested => AuthRetryHandoff::Interrupted,
+        Ok(false) => AuthRetryHandoff::Failed {
+            detail: "auth retry lost the run slot".to_string(),
+        },
+        Err(_) if stop_requested => AuthRetryHandoff::Interrupted,
+        Err(error) => AuthRetryHandoff::Failed {
+            detail: format!("auth retry handoff failed: {error}"),
+        },
+    }
+}
+
+fn resolve_auth_retry_handoff<C, S>(
+    handoff: Result<bool, String>,
+    cleanup: C,
+    read_stop: S,
+) -> AuthRetryHandoff
+where
+    C: FnOnce(),
+    S: FnOnce() -> bool,
+{
+    if matches!(&handoff, Ok(true)) {
+        AuthRetryHandoff::Continue
+    } else {
+        cleanup();
+        classify_auth_retry_handoff(handoff, read_stop())
+    }
+}
+
 struct ReservationGuard {
     running: Running,
     sid: String,
     armed: bool,
+    #[cfg(test)]
+    test_on_disarm: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl ReservationGuard {
@@ -1057,10 +1101,16 @@ impl ReservationGuard {
             running,
             sid,
             armed: true,
+            #[cfg(test)]
+            test_on_disarm: None,
         }
     }
 
     fn disarm(&mut self) {
+        #[cfg(test)]
+        if let Some(on_disarm) = self.test_on_disarm.as_mut() {
+            on_disarm();
+        }
         self.armed = false;
     }
 }
@@ -1106,7 +1156,10 @@ where
             Ok(())
         }
         Err(error) => {
-            // 即使槽锁已 poisoned，也必须终止并收割已 spawn 的 child；此时无法证明槽归属，
+            // 槽锁 poisoned 时仍 best-effort 终止已 spawn 的 child，但后续清理有界：超时即返回，
+            // 允许 child 未被收割（Unix 可能留下僵尸；非 Unix 上 kill_process_group 是空操作，
+            // 进程甚至可能继续运行）。这里运行在同步 Tauri command 的调用线程上，无界等待会
+            // 冻住整个 send_message 和 UI；接受泄漏一个句柄也好过冻住 UI。此时无法证明槽归属，
             // 所以不做无锁清理，把错误交给调用方报告。
             kill(pid);
             wait_for_child();
@@ -1820,7 +1873,7 @@ where
     continue_finalizer(outcome)
 }
 
-fn wait_for_auth_retry_cleanup(child: &mut Child, pid: u32) {
+fn wait_for_child_cleanup_bounded(child: &mut Child, pid: u32) {
     finalizer_owner_wait(
         child,
         Instant::now() + FINALIZER_OWNER_WAIT_TIMEOUT,
@@ -3001,6 +3054,9 @@ async fn test_search_service(
 
 // ===== cluster L 新增 IPC：repos 列表 + 检测层 =====
 
+const CLAUDE_CLI_PATH_SETTING: &str = "cli_path.claude";
+const CODEX_CLI_PATH_SETTING: &str = "cli_path.codex";
+
 #[tauri::command]
 fn list_repos(db: State<Db>) -> Result<Vec<repos_repo::RepoMeta>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -3016,13 +3072,138 @@ fn list_repos_by_status(
     repos_repo::list_by_status(&conn, &status).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn detect_runtime() -> serde_json::Value {
+fn cli_path_setting_key(cli: &str) -> Result<&'static str, String> {
+    match cli {
+        "claude" => Ok(CLAUDE_CLI_PATH_SETTING),
+        "codex" => Ok(CODEX_CLI_PATH_SETTING),
+        _ => Err(ui_msg::al_err(
+            "cliPath.invalidCli",
+            &[("cli", cli.to_string())],
+        )),
+    }
+}
+
+fn set_cli_path_in_conn(
+    conn: &Connection,
+    cli: &str,
+    path: Option<&str>,
+    windows: bool,
+) -> Result<(), String> {
+    let key = cli_path_setting_key(cli)?;
+    let path = path.map(str::trim).filter(|path| !path.is_empty());
+    match path {
+        Some(path) => {
+            if !detect::override_path_allowed(std::path::Path::new(path), windows) {
+                return Err(ui_msg::al_err(
+                    "cliPath.invalidPath",
+                    &[("path", path.to_string())],
+                ));
+            }
+            db::set_app_setting(conn, key, path).map_err(|error| {
+                ui_msg::al_err(
+                    "cliPath.databaseUnavailable",
+                    &[("detail", error.to_string())],
+                )
+            })?;
+        }
+        None => {
+            conn.execute("DELETE FROM app_settings WHERE key = ?1", [key])
+                .map_err(|error| {
+                    ui_msg::al_err(
+                        "cliPath.databaseUnavailable",
+                        &[("detail", error.to_string())],
+                    )
+                })?;
+        }
+    }
+    // The database is authoritative. Update it first so a cache failure is surfaced while the
+    // persisted choice remains available to detection and will repopulate the cache on restart.
+    detect::set_cached_cli_path(cli, path)
+        .map_err(|detail| ui_msg::al_err("cliPath.databaseUnavailable", &[("detail", detail)]))
+}
+
+fn load_cli_path_override_cache(conn: &Connection) -> Result<(), String> {
+    let claude = db::get_app_setting(conn, CLAUDE_CLI_PATH_SETTING).map_err(|e| e.to_string())?;
+    let codex = db::get_app_setting(conn, CODEX_CLI_PATH_SETTING).map_err(|e| e.to_string())?;
+    detect::replace_cached_cli_paths([("claude", claude), ("codex", codex)])
+}
+
+fn cli_path_override_for_spawn_from(
+    cli: &str,
+    cached: detect::CachedCliPath,
+    read_database: impl FnOnce(&str) -> Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    match cached {
+        detect::CachedCliPath::Ready(path) => Ok(path),
+        detect::CachedCliPath::Uninitialized => {
+            let path = read_database(cli)?;
+            detect::set_cached_cli_path(cli, path.as_deref())?;
+            Ok(path)
+        }
+    }
+}
+
+pub(crate) fn cli_path_override_for_spawn(cli: &str) -> Option<String> {
+    let cached = detect::cached_cli_path_for_spawn(cli);
+    cli_path_override_for_spawn_from(cli, cached, |cli| {
+        let key = cli_path_setting_key(cli)?;
+        let dir = APP_DATA_DIR
+            .get()
+            .ok_or_else(|| "application data directory is unavailable".to_string())?;
+        let conn = Connection::open(dir.join("agentloom.db")).map_err(|error| error.to_string())?;
+        db::get_app_setting(&conn, key).map_err(|error| error.to_string())
+    })
+    .map_err(|error| {
+        eprintln!(
+            "CLI path override cache is uninitialized and the database fallback failed: {error}"
+        );
+        error
+    })
+    .ok()
+    .flatten()
+}
+
+fn detect_runtime_value(db: &Db) -> serde_json::Value {
+    let (claude_override, codex_override) = match db.0.lock() {
+        Ok(conn) => (
+            db::get_app_setting(&conn, CLAUDE_CLI_PATH_SETTING)
+                .ok()
+                .flatten(),
+            db::get_app_setting(&conn, CODEX_CLI_PATH_SETTING)
+                .ok()
+                .flatten(),
+        ),
+        Err(_) => (None, None),
+    };
+
     // 一次性返 claude + codex 两个 runtime（前端 onboarding step 1 一并显）
     serde_json::json!({
-        "claude": detect::detect_claude(),
-        "codex": detect::detect_codex(),
+        "claude": detect::detect_claude_with_override(claude_override.as_deref()),
+        "codex": detect::detect_codex_with_override(codex_override.as_deref()),
     })
+}
+
+#[tauri::command]
+fn detect_runtime(db: State<Db>) -> serde_json::Value {
+    detect_runtime_value(&db)
+}
+
+#[tauri::command]
+fn set_cli_path(
+    db: State<Db>,
+    cli: String,
+    path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    {
+        let conn = db.0.lock().map_err(|error| {
+            ui_msg::al_err(
+                "cliPath.databaseUnavailable",
+                &[("detail", error.to_string())],
+            )
+        })?;
+        set_cli_path_in_conn(&conn, &cli, path.as_deref(), cfg!(target_os = "windows"))?;
+    }
+    Ok(detect_runtime_value(&db))
 }
 
 #[tauri::command]
@@ -5574,10 +5755,10 @@ fn spawn_and_stream(
     checkpoint_hook::register_agent_pid(&command, pid);
     let handoff = transition_spawn_handoff(&running, &session_id, pid)?;
     if handoff == SpawnHandoffAction::Abort {
-        // Abort 的 kill 已在 handoff 持锁期间完成；先 disarm 旧 reservation 再回收 child，
-        // 避免 wait 窗口内的新 Launching 被旧 guard 的 Drop 误删，且不 double-kill。
+        // Abort 的 kill 已在 handoff 持锁期间完成；先 disarm 旧 reservation 再有界清理 child，
+        // 避免清理窗口内的新 Launching 被旧 guard 的 Drop 误删。
         wait_for_aborted_child(guard, || {
-            let _ = child.wait();
+            wait_for_child_cleanup_bounded(&mut child, pid);
         });
         return Ok(());
     }
@@ -5590,7 +5771,7 @@ fn spawn_and_stream(
             guard,
             kill_process_group,
             || {
-                let _ = child.wait();
+                wait_for_child_cleanup_bounded(&mut child, pid);
             },
         )
         .map_err(|cleanup_error| {
@@ -5838,8 +6019,18 @@ fn spawn_and_stream(
                 {
                     Ok(mut retry_child) => {
                         let retry_pid = retry_child.id();
-                        match transition_auth_retry_handoff(&running_t, &session_id, retry_pid) {
-                            Ok(true) => {
+                        let handoff =
+                            transition_auth_retry_handoff(&running_t, &session_id, retry_pid);
+                        let handoff = resolve_auth_retry_handoff(
+                            handoff,
+                            || {
+                                kill_process_group(retry_pid);
+                                wait_for_child_cleanup_bounded(&mut retry_child, retry_pid);
+                            },
+                            || finalizer_stop_requested(&running_t, &session_id),
+                        );
+                        match handoff {
+                            AuthRetryHandoff::Continue => {
                                 checkpoint_hook::register_agent_pid(&command, retry_pid);
                                 current_pid = retry_pid;
                                 current_first_event_deadline = retry_started_at
@@ -5847,27 +6038,12 @@ fn spawn_and_stream(
                                 child = retry_child;
                                 continue;
                             }
-                            Ok(false) => {
-                                kill_process_group(retry_pid);
-                                wait_for_auth_retry_cleanup(&mut retry_child, retry_pid);
-                                interrupted = finalizer_stop_requested(&running_t, &session_id);
-                                if !interrupted {
-                                    let message = ui_msg::al_err(
-                                        "run.spawnFailed",
-                                        &[("detail", "auth retry lost the run slot".to_string())],
-                                    );
-                                    let event = record_synthetic_cli_error(&mut reducer, message);
-                                    pending_terminals.push(event);
-                                    saw_error = true;
-                                }
+                            AuthRetryHandoff::Interrupted => {
+                                interrupted = true;
                             }
-                            Err(error) => {
-                                kill_process_group(retry_pid);
-                                wait_for_auth_retry_cleanup(&mut retry_child, retry_pid);
-                                let message = ui_msg::al_err(
-                                    "run.spawnFailed",
-                                    &[("detail", format!("auth retry handoff failed: {error}"))],
-                                );
+                            AuthRetryHandoff::Failed { detail } => {
+                                let message =
+                                    ui_msg::al_err("run.spawnFailed", &[("detail", detail)]);
                                 let event = record_synthetic_cli_error(&mut reducer, message);
                                 pending_terminals.push(event);
                                 saw_error = true;
@@ -6224,7 +6400,7 @@ pub(crate) fn claude_sandboxed_cmd_in(
         home
     };
 
-    let claude_bin = sandbox::resolve_claude_bin();
+    let claude_bin = sandbox::resolve_claude_bin_for_spawn()?;
     let mut argv = claude_agent_argv(prompt);
     for a in extra_args {
         argv.push((*a).to_string());
@@ -13504,6 +13680,10 @@ pub fn run() {
             let _ = conn.execute("PRAGMA foreign_keys = ON", []);
             db::init_schema(&conn).expect("建表失败");
             tick!("db::init_schema");
+            if let Err(error) = load_cli_path_override_cache(&conn) {
+                eprintln!("加载 CLI 路径缓存失败；spawn 将直接读取数据库：{error}");
+            }
+            tick!("load CLI path overrides");
             db::seed_builtin_agents(&conn).expect("seed builtin agents 失败");
             tick!("db::seed_builtin_agents");
             db::migrate_remove_placeholder_deepseek(&conn)
@@ -13737,6 +13917,7 @@ pub fn run() {
             list_repos,
             list_repos_by_status,
             detect_runtime,
+            set_cli_path,
             detect_git,
             detect_gh,
             install_gh,
@@ -13825,6 +14006,127 @@ mod tests {
                 result: None,
             },
         }
+    }
+
+    fn cli_path_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_settings (\
+                 key TEXT PRIMARY KEY,\
+                 value TEXT NOT NULL\
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn cli_path_rejects_unknown_cli_with_ui_error() {
+        let conn = cli_path_test_db();
+
+        let error = set_cli_path_in_conn(&conn, "gemini", None, false).unwrap_err();
+
+        assert_eq!(error, r#"AL_ERR:cliPath.invalidCli:{"cli":"gemini"}"#);
+    }
+
+    #[test]
+    fn cli_path_none_and_blank_both_clear_the_setting() {
+        let _guard = detect::CliPathOverrideTestGuard::new();
+        let conn = cli_path_test_db();
+
+        db::set_app_setting(&conn, CLAUDE_CLI_PATH_SETTING, "/old/claude").unwrap();
+        set_cli_path_in_conn(&conn, "claude", None, false).unwrap();
+        assert_eq!(
+            db::get_app_setting(&conn, CLAUDE_CLI_PATH_SETTING).unwrap(),
+            None
+        );
+
+        db::set_app_setting(&conn, CLAUDE_CLI_PATH_SETTING, "/old/claude").unwrap();
+        set_cli_path_in_conn(&conn, "claude", Some("  "), false).unwrap();
+        assert_eq!(
+            db::get_app_setting(&conn, CLAUDE_CLI_PATH_SETTING).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn cli_path_invalid_path_returns_ui_error_without_writing() {
+        let conn = cli_path_test_db();
+        db::set_app_setting(&conn, CODEX_CLI_PATH_SETTING, "/old/codex").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-codex");
+
+        let error = set_cli_path_in_conn(&conn, "codex", missing.to_str(), false).unwrap_err();
+
+        assert!(error.starts_with("AL_ERR:cliPath.invalidPath:"));
+        assert_eq!(
+            db::get_app_setting(&conn, CODEX_CLI_PATH_SETTING)
+                .unwrap()
+                .as_deref(),
+            Some("/old/codex")
+        );
+    }
+
+    #[test]
+    fn cli_path_write_and_clear_keep_spawn_override_cache_in_sync() {
+        let _guard = detect::CliPathOverrideTestGuard::new();
+        let conn = cli_path_test_db();
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("claude");
+        std::fs::write(&cli, "test cli").unwrap();
+
+        set_cli_path_in_conn(&conn, "claude", cli.to_str(), false).unwrap();
+        assert_eq!(detect::cached_cli_path("claude").as_deref(), cli.to_str());
+
+        set_cli_path_in_conn(&conn, "claude", None, false).unwrap();
+        assert_eq!(detect::cached_cli_path("claude"), None);
+    }
+
+    #[test]
+    fn failed_startup_cache_load_falls_back_to_the_database_instead_of_meaning_no_override() {
+        let _guard = detect::CliPathOverrideTestGuard::new();
+        let broken_startup_db = Connection::open_in_memory().unwrap();
+        assert!(load_cli_path_override_cache(&broken_startup_db).is_err());
+
+        let fallback_calls = std::cell::Cell::new(0);
+        let resolved = cli_path_override_for_spawn_from(
+            "codex",
+            detect::cached_cli_path_for_spawn("codex"),
+            |cli| {
+                fallback_calls.set(fallback_calls.get() + 1);
+                assert_eq!(cli, "codex");
+                Ok(Some("/database/codex".to_string()))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved.as_deref(), Some("/database/codex"));
+        assert_eq!(fallback_calls.get(), 1);
+        assert_eq!(
+            detect::cached_cli_path_for_spawn("codex"),
+            detect::CachedCliPath::Ready(Some("/database/codex".to_string()))
+        );
+    }
+
+    #[test]
+    fn startup_cache_load_reaches_the_real_codex_and_claude_resolvers() {
+        let _guard = detect::CliPathOverrideTestGuard::new();
+        let conn = cli_path_test_db();
+        let dir = tempfile::tempdir().unwrap();
+        let codex = dir.path().join("codex");
+        let claude = dir.path().join("claude");
+        std::fs::write(&codex, "test codex").unwrap();
+        std::fs::write(&claude, "test claude").unwrap();
+        db::set_app_setting(&conn, CODEX_CLI_PATH_SETTING, codex.to_str().unwrap()).unwrap();
+        db::set_app_setting(&conn, CLAUDE_CLI_PATH_SETTING, claude.to_str().unwrap()).unwrap();
+
+        load_cli_path_override_cache(&conn).unwrap();
+
+        assert_eq!(agent::resolve_codex_bin().unwrap(), codex.into_os_string());
+        assert_eq!(
+            sandbox::resolve_claude_bin_for_spawn().unwrap(),
+            claude.to_string_lossy()
+        );
     }
 
     #[test]
@@ -14268,8 +14570,14 @@ mod tests {
             }
             let source = std::fs::read_to_string(&path).unwrap();
             let production = source.split(TEST_MODULE_MARKER).next().unwrap();
+            // 只跳过整行注释；若按 `//` 截断，`"http://x"; Command::new(...)` 会藏掉真实调用。
+            let production_without_pure_comments = production
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
             assert!(
-                !production.contains("Command::new"),
+                !production_without_pure_comments.contains("Command::new"),
                 "{} bypasses the shared process command helper",
                 path.display()
             );
@@ -14313,6 +14621,7 @@ mod tests {
             ("sandbox.rs", include_str!("sandbox.rs")),
             ("test_support.rs", include_str!("test_support.rs")),
             ("ui_msg.rs", include_str!("ui_msg.rs")),
+            ("winshim.rs", include_str!("winshim.rs")),
             ("worktree.rs", include_str!("worktree.rs")),
         ];
 
@@ -15626,10 +15935,10 @@ mod tests {
     }
 
     #[test]
-    fn finalizer_owner_wait_auth_retry_cleanup_is_bounded_in_both_handoff_failures() {
+    fn finalizer_owner_wait_auth_retry_cleanup_is_bounded_once_for_handoff_failures() {
         let source = include_str!("lib.rs");
         let helper = source
-            .split("fn wait_for_auth_retry_cleanup(")
+            .split("fn wait_for_child_cleanup_bounded(")
             .nth(1)
             .and_then(|tail| {
                 tail.split("\nfn transition_stdout_closed_to_finalizing(")
@@ -15645,10 +15954,10 @@ mod tests {
             .and_then(|tail| tail.split("\n#[tauri::command]").next())
             .expect("spawn_and_stream source slice");
         assert_eq!(
-            solo.matches("wait_for_auth_retry_cleanup(&mut retry_child, retry_pid)")
+            solo.matches("wait_for_child_cleanup_bounded(&mut retry_child, retry_pid)")
                 .count(),
-            2,
-            "both failed auth retry handoffs must use bounded cleanup"
+            1,
+            "failed auth retry handoffs must share one bounded cleanup call site"
         );
         assert!(!solo.contains("let _ = retry_child.wait();"));
     }
@@ -25700,6 +26009,155 @@ mod tests {
     }
 
     #[test]
+    fn auth_retry_handoff_classification_covers_all_results_and_stop_states() {
+        let cases = [
+            (
+                "success_without_stop",
+                Ok(true),
+                false,
+                AuthRetryHandoff::Continue,
+            ),
+            (
+                "success_with_stop",
+                Ok(true),
+                true,
+                AuthRetryHandoff::Continue,
+            ),
+            (
+                "lost_slot_without_stop",
+                Ok(false),
+                false,
+                AuthRetryHandoff::Failed {
+                    detail: "auth retry lost the run slot".to_string(),
+                },
+            ),
+            (
+                "lost_slot_with_stop",
+                Ok(false),
+                true,
+                AuthRetryHandoff::Interrupted,
+            ),
+            (
+                "poisoned_without_stop",
+                Err("poisoned".to_string()),
+                false,
+                AuthRetryHandoff::Failed {
+                    detail: "auth retry handoff failed: poisoned".to_string(),
+                },
+            ),
+            (
+                "poisoned_with_stop",
+                Err("poisoned".to_string()),
+                true,
+                AuthRetryHandoff::Interrupted,
+            ),
+        ];
+
+        for (label, handoff, stop_requested, expected) in cases {
+            assert_eq!(
+                classify_auth_retry_handoff(handoff, stop_requested),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_retry_resolve_continue_skips_cleanup_and_stop_read() {
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let result = resolve_auth_retry_handoff(
+            Ok(true),
+            || calls.borrow_mut().push("cleanup"),
+            || {
+                calls.borrow_mut().push("read_stop");
+                true
+            },
+        );
+
+        assert_eq!(result, AuthRetryHandoff::Continue);
+        assert_eq!(*calls.borrow(), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn auth_retry_resolve_lost_slot_with_stop_cleans_up_before_reading_stop() {
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let result = resolve_auth_retry_handoff(
+            Ok(false),
+            || calls.borrow_mut().push("cleanup"),
+            || {
+                calls.borrow_mut().push("read_stop");
+                true
+            },
+        );
+
+        assert_eq!(*calls.borrow(), vec!["cleanup", "read_stop"]);
+        assert_eq!(result, AuthRetryHandoff::Interrupted);
+    }
+
+    #[test]
+    fn auth_retry_resolve_lost_slot_without_stop_cleans_up_before_reading_stop() {
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let result = resolve_auth_retry_handoff(
+            Ok(false),
+            || calls.borrow_mut().push("cleanup"),
+            || {
+                calls.borrow_mut().push("read_stop");
+                false
+            },
+        );
+
+        assert_eq!(*calls.borrow(), vec!["cleanup", "read_stop"]);
+        assert_eq!(
+            result,
+            AuthRetryHandoff::Failed {
+                detail: "auth retry lost the run slot".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn auth_retry_resolve_error_with_stop_cleans_up_before_reading_stop() {
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let result = resolve_auth_retry_handoff(
+            Err("poisoned".to_string()),
+            || calls.borrow_mut().push("cleanup"),
+            || {
+                calls.borrow_mut().push("read_stop");
+                true
+            },
+        );
+
+        assert_eq!(*calls.borrow(), vec!["cleanup", "read_stop"]);
+        assert_eq!(result, AuthRetryHandoff::Interrupted);
+    }
+
+    #[test]
+    fn auth_retry_resolve_error_without_stop_cleans_up_before_reading_stop() {
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let result = resolve_auth_retry_handoff(
+            Err("poisoned".to_string()),
+            || calls.borrow_mut().push("cleanup"),
+            || {
+                calls.borrow_mut().push("read_stop");
+                false
+            },
+        );
+
+        assert_eq!(*calls.borrow(), vec!["cleanup", "read_stop"]);
+        assert_eq!(
+            result,
+            AuthRetryHandoff::Failed {
+                detail: "auth retry handoff failed: poisoned".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn abort_handoff_kills_before_unlock_and_preserves_foreign_slot() {
         let running = Running::default();
         running.0.lock().unwrap().insert(
@@ -25756,11 +26214,16 @@ mod tests {
     }
 
     #[test]
-    fn abort_wait_disarms_old_guard_before_new_request_reserves() {
+    fn spawn_abort_cleanup_disarms_guard_before_waiting() {
         let running = Running::default();
         let session_id = "s-abort-wait-reserve";
         try_reserve(&running, session_id).unwrap();
         let mut old_guard = ReservationGuard::new(running.clone(), session_id.to_string());
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let disarm_order = order.clone();
+        old_guard.test_on_disarm = Some(Box::new(move || {
+            disarm_order.lock().unwrap().push("disarm");
+        }));
 
         // 模拟 handoff 前 slot 异常丢失，走 missing-slot Abort。
         running.0.lock().unwrap().remove(session_id);
@@ -25768,15 +26231,19 @@ mod tests {
             transition_spawn_handoff_with_abort_kill(&running, session_id, 4444, |_| {}).unwrap();
         assert_eq!(action, SpawnHandoffAction::Abort);
 
-        let wait_entered = std::cell::Cell::new(false);
+        let wait_order = order.clone();
         wait_for_aborted_child(&mut old_guard, || {
-            wait_entered.set(true);
+            wait_order.lock().unwrap().push("wait");
             assert!(
                 try_reserve(&running, session_id).is_ok(),
                 "a new request may reserve while the killed child is being reaped"
             );
         });
-        assert!(wait_entered.get(), "abort path must still reap the child");
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            ["disarm", "wait"],
+            "the old guard must be disarmed before child cleanup starts"
+        );
 
         drop(old_guard);
         assert!(matches!(
@@ -25788,7 +26255,85 @@ mod tests {
     }
 
     #[test]
-    fn register_run_failure_releases_running_slot_before_later_stop() {
+    fn spawn_abort_register_failure_obeys_slot_ownership() {
+        let cases = [
+            ("running", RunSlot::Running(4545), true),
+            (
+                "finalizing",
+                RunSlot::Finalizing {
+                    stop_requested: true,
+                },
+                true,
+            ),
+            ("foreign", RunSlot::Running(9999), false),
+        ];
+
+        for (label, slot, removes_slot) in cases {
+            let running = Running::default();
+            let session_id = format!("s-register-failed-{label}");
+            running.0.lock().unwrap().insert(session_id.clone(), slot);
+            let mut guard = ReservationGuard::new(running.clone(), session_id.clone());
+            let kills = std::cell::Cell::new(0);
+            let waits = std::cell::Cell::new(0);
+
+            abort_spawn_after_register_failure(
+                &running,
+                &session_id,
+                4545,
+                &mut guard,
+                |pid| {
+                    assert_eq!(pid, 4545);
+                    kills.set(kills.get() + 1);
+                },
+                || waits.set(waits.get() + 1),
+            )
+            .unwrap();
+
+            assert_eq!(kills.get(), 1, "{label}: kill must run exactly once");
+            assert_eq!(waits.get(), 1, "{label}: wait must run exactly once");
+            let slots = running.0.lock().unwrap();
+            assert_eq!(
+                slots.contains_key(&session_id),
+                !removes_slot,
+                "{label}: slot ownership must control removal"
+            );
+            if !removes_slot {
+                assert!(matches!(
+                    slots.get(&session_id),
+                    Some(RunSlot::Running(9999))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn spawn_abort_register_failure_removes_only_the_target_session() {
+        let running = Running::default();
+        let session_id = "s-register-failed-target";
+        let unrelated_session_id = "s-register-failed-unrelated";
+        {
+            let mut slots = running.0.lock().unwrap();
+            slots.insert(session_id.to_string(), RunSlot::Running(4545));
+            slots.insert(unrelated_session_id.to_string(), RunSlot::Running(7878));
+        }
+        let mut guard = ReservationGuard::new(running.clone(), session_id.to_string());
+
+        abort_spawn_after_register_failure(&running, session_id, 4545, &mut guard, |_| {}, || {})
+            .unwrap();
+
+        let slots = running.0.lock().unwrap();
+        assert!(
+            !slots.contains_key(session_id),
+            "the owned target slot must be removed"
+        );
+        assert!(matches!(
+            slots.get(unrelated_session_id),
+            Some(RunSlot::Running(7878))
+        ));
+    }
+
+    #[test]
+    fn spawn_abort_register_failure_kills_then_disarms_and_waits_after_unlock() {
         let running = Running::default();
         let session_id = "s-register-failed";
         try_reserve(&running, session_id).unwrap();
@@ -25796,8 +26341,13 @@ mod tests {
         let action = transition_spawn_handoff(&running, session_id, 4545).unwrap();
         assert_eq!(action, SpawnHandoffAction::Stream);
 
-        let killed = std::cell::Cell::new(false);
-        let waited = std::cell::Cell::new(false);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let disarm_order = order.clone();
+        guard.test_on_disarm = Some(Box::new(move || {
+            disarm_order.lock().unwrap().push("disarm");
+        }));
+        let kill_order = order.clone();
+        let wait_order = order.clone();
         abort_spawn_after_register_failure(
             &running,
             session_id,
@@ -25809,14 +26359,23 @@ mod tests {
                     running.0.try_lock().is_err(),
                     "kill must run under slot lock"
                 );
-                killed.set(true);
+                kill_order.lock().unwrap().push("kill");
             },
-            || waited.set(true),
+            || {
+                assert!(
+                    running.0.try_lock().is_ok(),
+                    "child cleanup must run after releasing the slot lock"
+                );
+                wait_order.lock().unwrap().push("wait");
+            },
         )
         .unwrap();
 
-        assert!(killed.get(), "register failure must kill the spawned child");
-        assert!(waited.get(), "register failure must reap the spawned child");
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            ["kill", "disarm", "wait"],
+            "cleanup ordering must exclude a live child before reopening the slot"
+        );
         assert!(
             !running.0.lock().unwrap().contains_key(session_id),
             "register failure must release its Running slot"
@@ -25828,6 +26387,90 @@ mod tests {
             |_| {},
         )
         .unwrap();
+    }
+
+    #[test]
+    fn spawn_abort_register_failure_poison_still_kills_and_waits() {
+        let running = Running::default();
+        let running_to_poison = running.clone();
+        std::thread::spawn(move || {
+            let _slots = running_to_poison.0.lock().unwrap();
+            panic!("poison Running for register-failure cleanup");
+        })
+        .join()
+        .expect_err("test thread must poison Running");
+        assert!(running.0.is_poisoned());
+
+        let mut guard = ReservationGuard::new(running.clone(), "s-register-poison".into());
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let kill_order = order.clone();
+        let wait_order = order.clone();
+        let result = abort_spawn_after_register_failure(
+            &running,
+            "s-register-poison",
+            4646,
+            &mut guard,
+            |pid| {
+                assert_eq!(pid, 4646);
+                kill_order.lock().unwrap().push("kill");
+            },
+            || wait_order.lock().unwrap().push("wait"),
+        );
+
+        assert!(
+            result.is_err(),
+            "the poisoned lock error must reach the caller"
+        );
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            ["kill", "wait"],
+            "poisoned cleanup must still kill and wait without panicking"
+        );
+    }
+
+    #[test]
+    fn spawn_abort_production_cleanup_uses_bounded_helper_in_both_paths() {
+        let source = include_str!("lib.rs");
+        let solo = source
+            .split("fn spawn_and_stream(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .expect("spawn_and_stream source slice");
+        let abort_cleanup = solo
+            .split("if handoff == SpawnHandoffAction::Abort {")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    if let Err(error)").next())
+            .expect("spawn abort cleanup source slice");
+        assert!(
+            abort_cleanup.contains(concat!(
+                "wait_for_aborted_child(guard, || {\n",
+                "            wait_for_child_cleanup_bounded(&mut child, pid);\n",
+                "        });"
+            )),
+            "spawn abort cleanup must call the shared bounded helper"
+        );
+        assert!(
+            !abort_cleanup.contains("let _ = child.wait();"),
+            "spawn abort cleanup must not restore an unbounded wait"
+        );
+
+        let register_failure_cleanup = solo
+            .split("if let Err(error) = event_transport().register_run")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    guard.disarm();").next())
+            .expect("register-failure cleanup source slice");
+        assert!(
+            register_failure_cleanup.contains(concat!(
+                "|| {\n",
+                "                wait_for_child_cleanup_bounded(&mut child, pid);\n",
+                "            },"
+            )),
+            "register-failure cleanup must call the shared bounded helper"
+        );
+        assert!(
+            !register_failure_cleanup.contains("let _ = child.wait();"),
+            "register-failure cleanup must not restore an unbounded wait"
+        );
     }
 
     #[test]

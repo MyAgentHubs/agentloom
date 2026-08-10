@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
 import { useI18n, type TranslationKey } from "../../i18n";
+import { renderBackendError } from "../../lib/backendMsg";
 import type { AgentProfile, ConnectionTestResult } from "../../types/agent";
 import type { ReasoningTier } from "../../types/agent";
 import {
@@ -35,7 +37,12 @@ import { ModelDropdown } from "./ModelDropdown";
 type AuthMode = "bearer" | "x_api_key" | "";
 type ReasoningDefault = ReasoningTier;
 type TestState = "idle" | "testing" | "ok" | "err";
-type DetectResult = { available: boolean; creds_hint: boolean | null };
+type DetectResult = {
+  available: boolean;
+  creds_hint: boolean | null;
+  overridden: boolean;
+  path: string | null;
+};
 type DetectState = { claude?: DetectResult; codex?: DetectResult };
 
 type FormValues = {
@@ -301,6 +308,18 @@ const styles = {
     gap: 6,
     margin: "2px 0 10px",
   },
+  nativeStatusHelp: {
+    flexBasis: "100%",
+    fontWeight: 400,
+    lineHeight: 1.45,
+  },
+  nativeStatusPath: {
+    flexBasis: "100%",
+    fontWeight: 400,
+    lineHeight: 1.45,
+    minWidth: 0,
+    overflowWrap: "anywhere",
+  },
   statusLink: {
     background: "transparent",
     border: 0,
@@ -313,6 +332,11 @@ const styles = {
   },
   saveWhy: {
     color: "var(--ink-3)",
+    fontSize: 10.5,
+    marginRight: "auto",
+  },
+  saveWarning: {
+    color: "var(--amber-ink)",
     fontSize: 10.5,
     marginRight: "auto",
   },
@@ -724,17 +748,21 @@ export function AgentForm({
   const showProviderGroupLabels = providerGroups.length > 1;
   const nativeRuntimeKey = nativeDetectKey(values.preset);
   const nativeRuntime = isNative ? detect[nativeRuntimeKey] : undefined;
-  const nativeRuntimeBlocked = isNative && nativeRuntime?.available === false;
+  const nativeRuntimeMissing = isNative && nativeRuntime?.available === false;
   const requiresFreshTest = (isBorrow || isHarness) && connDirty;
   const connectionTestBlocked = requiresFreshTest && testState !== "ok";
-  const saveBlocked = nativeRuntimeBlocked || connectionTestBlocked;
-  const saveBlockedReason = nativeRuntimeBlocked
-    ? t("settings.agentForm.saveBlocked.nativeMissing", {
-        cli: nativeRuntimeKey,
-      })
-    : connectionTestBlocked
-      ? t("settings.agentForm.saveBlocked.testFailed")
-      : null;
+  const saveBlocked = connectionTestBlocked;
+  const saveBlockedReason = connectionTestBlocked
+    ? t("settings.agentForm.saveBlocked.testFailed")
+    : null;
+  const nativeRuntimeWarning = nativeRuntimeMissing
+    ? t(
+        nativeRuntime?.overridden
+          ? "settings.agentForm.saveWarning.nativeOverrideInvalid"
+          : "settings.agentForm.saveWarning.nativeMissing",
+        { cli: nativeRuntimeKey },
+      )
+    : null;
 
   function setValue<K extends keyof FormValues>(key: K, value: FormValues[K]) {
     setValues((current) => ({ ...current, [key]: value }));
@@ -803,6 +831,31 @@ export function AgentForm({
     } catch {
       setDetect({});
     }
+  }
+
+  async function setCliPath(cli: "claude" | "codex", path: string | null) {
+    setError(null);
+    try {
+      const result = await invoke<{
+        claude: DetectResult;
+        codex: DetectResult;
+      }>("set_cli_path", { cli, path });
+      setDetect(result);
+    } catch (cause) {
+      setError(renderBackendError(String(cause), t));
+    }
+  }
+
+  async function chooseCliPath(cli: "claude" | "codex") {
+    let selected: string | string[] | null;
+    try {
+      selected = await openDialog({ directory: false, multiple: false });
+    } catch (cause) {
+      setError(renderBackendError(String(cause), t));
+      return;
+    }
+    if (typeof selected !== "string" || selected.trim() === "") return;
+    await setCliPath(cli, selected);
   }
 
   function resetTest(options: { keepLiveModels?: boolean } = {}) {
@@ -1110,6 +1163,64 @@ export function AgentForm({
 
     const cli = nativeRuntimeKey;
     const account = nativeAccountName(values.preset);
+    if (nativeRuntime.overridden && nativeRuntime.available) {
+      return (
+        <div style={{ ...styles.nativeStatus, color: "var(--green)" }}>
+          {t("settings.agentForm.nativeStatus.pathSpecified")}
+          <button
+            type="button"
+            onClick={() => void setCliPath(cli, null)}
+            style={styles.statusLink}
+          >
+            {t("settings.agentForm.nativeStatus.clearPath")}
+          </button>
+          {nativeRuntime.path ? (
+            <code
+              data-testid="native-runtime-path"
+              style={styles.nativeStatusPath}
+            >
+              {nativeRuntime.path}
+            </code>
+          ) : null}
+        </div>
+      );
+    }
+
+    if (nativeRuntime.overridden) {
+      return (
+        <div
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          style={{ ...styles.nativeStatus, color: "var(--amber-ink)" }}
+        >
+          {t("settings.agentForm.nativeStatus.specifiedPathInvalid", { cli })}
+          <button
+            type="button"
+            onClick={() => void chooseCliPath(cli)}
+            style={styles.statusLink}
+          >
+            {t("settings.agentForm.nativeStatus.choosePath")}
+          </button>
+          <button
+            type="button"
+            onClick={() => void setCliPath(cli, null)}
+            style={styles.statusLink}
+          >
+            {t("settings.agentForm.nativeStatus.clearPath")}
+          </button>
+          {nativeRuntime.path ? (
+            <code
+              data-testid="native-runtime-path"
+              style={styles.nativeStatusPath}
+            >
+              {nativeRuntime.path}
+            </code>
+          ) : null}
+        </div>
+      );
+    }
+
     if (nativeRuntime.available && nativeRuntime.creds_hint === true) {
       return (
         <div style={{ ...styles.nativeStatus, color: "var(--green)" }}>
@@ -1138,7 +1249,12 @@ export function AgentForm({
     }
 
     return (
-      <div style={{ ...styles.nativeStatus, color: "var(--red)" }}>
+      <div
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        style={{ ...styles.nativeStatus, color: "var(--amber-ink)" }}
+      >
         {t("settings.agentForm.nativeStatus.notDetected", { cli })}
         <button
           type="button"
@@ -1154,6 +1270,20 @@ export function AgentForm({
         >
           {t("settings.agentForm.nativeStatus.recheck")}
         </button>
+        <button
+          type="button"
+          onClick={() => void chooseCliPath(cli)}
+          style={styles.statusLink}
+        >
+          {t("settings.agentForm.nativeStatus.choosePath")}
+        </button>
+        <span style={styles.nativeStatusHelp}>
+          {t(
+            cli === "claude"
+              ? "settings.agentForm.nativeStatus.notDetectedHelp.claude"
+              : "settings.agentForm.nativeStatus.notDetectedHelp.codex",
+          )}
+        </span>
       </div>
     );
   }
@@ -1831,6 +1961,11 @@ export function AgentForm({
       ) : null}
 
       <div style={styles.actions}>
+        {nativeRuntimeWarning ? (
+          <span id="agent-form-native-warning" style={styles.saveWarning}>
+            {nativeRuntimeWarning}
+          </span>
+        ) : null}
         {saveBlockedReason ? (
           <span style={styles.saveWhy}>{saveBlockedReason}</span>
         ) : null}
@@ -1840,6 +1975,9 @@ export function AgentForm({
         <button
           type="submit"
           className="ob-btn primary"
+          aria-describedby={
+            nativeRuntimeWarning ? "agent-form-native-warning" : undefined
+          }
           disabled={submitting || saveBlocked}
         >
           {agent ? t("settings.agentForm.save") : t("settings.agentForm.add")}

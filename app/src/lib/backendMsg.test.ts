@@ -1,5 +1,5 @@
 // @ts-expect-error - Vitest runs in Node, but this frontend tsconfig has no Node type declarations.
-import { readFileSync } from "fs";
+import { readFileSync, readdirSync } from "fs";
 import { describe, expect, it } from "vitest";
 import type { Locale, TranslationKey } from "../i18n";
 import {
@@ -39,6 +39,170 @@ function loadI18nMessages(): Record<Locale, Record<string, string>> {
 
 const i18nMessages = loadI18nMessages();
 
+// Historical debt only. New codes must never be added to this allowlist.
+const HISTORICAL_MISSING_BACKEND_MESSAGE_CODES = new Set([
+  "project.createDirectoryFailed",
+  "project.databaseUnavailable",
+  "project.emptyName",
+  "project.homeNotFound",
+  "project.invalidPath",
+  "project.pathRequired",
+  "project.renameFailed",
+  "run.globallyStopped",
+  "run.projectPathUnavailable",
+  "wt.cleanup.uncommittedMemberChanges",
+  "wt.cleanup.uncommittedSessionChanges",
+  "wt.reconcile.baseRepoMissing",
+  "wt.reconcile.expectedPathCanonicalizeFailed",
+  "wt.reconcile.gitStatusFailed",
+  "wt.reconcile.gitStatusSpawnFailed",
+  "wt.reconcile.invalidSessionDir",
+  "wt.reconcile.notLinkedWorktree",
+  "wt.reconcile.unexpectedCommonDir",
+  "wt.reconcile.unexpectedHead",
+  "wt.reconcile.unexpectedPath",
+  "wt.reconcile.worktreeCanonicalizeFailed",
+  "wt.write.outsideAppDomain",
+]);
+
+// These codes are being added in the parallel backend task. Keeping them here
+// makes this guard effective before and after that backend commit is combined.
+const CONCURRENT_BACKEND_MESSAGE_CODES = [
+  "cliPath.invalidCli",
+  "cliPath.invalidPath",
+  "cliPath.databaseUnavailable",
+] as const;
+
+const AL_ERR_LITERAL_PATTERN = /\bal_err\s*\(\s*"([^"]+)"/g;
+const AL_ERR_CALL_PATTERN = /\bal_err\s*\(/g;
+const TAURI_SOURCE_ROOT = "src-tauri/src";
+
+const KNOWN_DYNAMIC_AL_ERR_CALLS = [
+  {
+    relativePath: "lead_step.rs",
+    lineIncludes:
+      'crate::ui_msg::al_err(code, &[("detail", format!("{err:?}"))])',
+    // lead_parse_error_envelope can select any of these codes.
+    possibleCodes: [
+      "lead.parseSpawnFailed",
+      "lead.parseNoOutput",
+      "lead.parseFailed",
+    ],
+  },
+  {
+    relativePath: "lib.rs",
+    lineIncludes: 'ui_msg::al_err(code, &[("detail", detail)])',
+    // first_event_watchdog_error receives run.spawnFailed from its caller.
+    possibleCodes: ["run.spawnFailed"],
+  },
+] as const;
+
+type RustSourceFile = {
+  path: string;
+  relativePath: string;
+};
+
+type DirectoryEntry = {
+  name: string;
+  isDirectory: () => boolean;
+  isFile: () => boolean;
+};
+
+type BackendErrorCodeAudit = {
+  literalCodes: Set<string>;
+  codesToCheck: Set<string>;
+  unknownDynamicLocations: string[];
+};
+
+function findRustSourceFiles(
+  directory: string,
+  relativeDirectory = "",
+): RustSourceFile[] {
+  const entries = readdirSync(directory, {
+    withFileTypes: true,
+  }) as DirectoryEntry[];
+  return entries.flatMap((entry) => {
+    const relativePath = `${relativeDirectory}${entry.name}`;
+    if (entry.isDirectory()) {
+      return findRustSourceFiles(
+        `${directory}/${entry.name}`,
+        `${relativePath}/`,
+      );
+    }
+    return entry.isFile() && entry.name.endsWith(".rs")
+      ? [{ path: `${directory}/${entry.name}`, relativePath }]
+      : [];
+  });
+}
+
+function auditBackendErrorSources(
+  sources: Readonly<Record<string, string>>,
+): BackendErrorCodeAudit {
+  const literalCodes = new Set<string>();
+  const unknownDynamicLocations: string[] = [];
+
+  for (const [relativePath, source] of Object.entries(sources)) {
+    for (const match of source.matchAll(AL_ERR_LITERAL_PATTERN)) {
+      literalCodes.add(match[1]);
+    }
+
+    for (const match of source.matchAll(AL_ERR_CALL_PATTERN)) {
+      let firstArgument = (match.index ?? 0) + match[0].length;
+      while (/\s/.test(source[firstArgument] ?? "")) firstArgument += 1;
+      if (source[firstArgument] === '"') continue;
+
+      const lineStart = source.lastIndexOf("\n", match.index) + 1;
+      if (/\bfn\s*$/.test(source.slice(lineStart, match.index))) continue;
+
+      const lineEnd = source.indexOf("\n", match.index);
+      const sourceLine = source.slice(
+        lineStart,
+        lineEnd === -1 ? source.length : lineEnd,
+      );
+      const isKnownDynamicCall = KNOWN_DYNAMIC_AL_ERR_CALLS.some(
+        (knownCall) =>
+          knownCall.relativePath === relativePath &&
+          sourceLine.includes(knownCall.lineIncludes),
+      );
+      if (isKnownDynamicCall) continue;
+
+      const line = source.slice(0, match.index).split("\n").length;
+      unknownDynamicLocations.push(`${relativePath}:${line}`);
+    }
+  }
+
+  return {
+    literalCodes,
+    codesToCheck: new Set([
+      ...literalCodes,
+      ...CONCURRENT_BACKEND_MESSAGE_CODES,
+      ...KNOWN_DYNAMIC_AL_ERR_CALLS.flatMap((call) => call.possibleCodes),
+    ]),
+    unknownDynamicLocations,
+  };
+}
+
+function scanBackendErrorCodes(): BackendErrorCodeAudit {
+  return auditBackendErrorSources(
+    Object.fromEntries(
+      findRustSourceFiles(TAURI_SOURCE_ROOT).map((file) => [
+        file.relativePath,
+        readFileSync(file.path, "utf-8"),
+      ]),
+    ),
+  );
+}
+
+function assertNoUnknownDynamicAlErrCalls(
+  unknownDynamicLocations: readonly string[],
+): void {
+  if (unknownDynamicLocations.length === 0) return;
+  throw new Error(
+    `Unknown non-literal al_err call sites:\n${unknownDynamicLocations.join("\n")}\n` +
+      "New dynamic al_err calls must be added to KNOWN_DYNAMIC_AL_ERR_CALLS, but only after confirming that every code they can produce has both zh and en translations.",
+  );
+}
+
 const localizedT = (locale: Locale) =>
   ((key, values) => {
     let template = i18nMessages[locale][key] ?? key;
@@ -47,6 +211,61 @@ const localizedT = (locale: Locale) =>
     }
     return template;
   }) satisfies typeof t;
+
+describe("backend error translation coverage", () => {
+  it("defines every literal Rust al_err code in both locales", () => {
+    const { literalCodes, codesToCheck, unknownDynamicLocations } =
+      scanBackendErrorCodes();
+
+    if (literalCodes.size === 0) {
+      throw new Error("No literal al_err codes were found; the scanner must fail closed.");
+    }
+    assertNoUnknownDynamicAlErrCalls(unknownDynamicLocations);
+
+    const missing: string[] = [];
+    for (const code of [...codesToCheck].sort()) {
+      if (HISTORICAL_MISSING_BACKEND_MESSAGE_CODES.has(code)) continue;
+      for (const locale of ["zh", "en"] as const) {
+        const key = `backend.${code}`;
+        if (typeof i18nMessages[locale][key] !== "string") {
+          missing.push(`${locale}: ${key}`);
+        }
+      }
+    }
+
+    if (missing.length > 0) {
+      throw new Error(`Missing backend translations:\n${missing.join("\n")}`);
+    }
+  });
+
+  it("fails when a non-literal al_err call is not allowlisted", () => {
+    const { unknownDynamicLocations } = auditBackendErrorSources({
+      "new_runtime.rs": 'fn report(code: &str) {\n    al_err(code, &[]);\n}',
+    });
+
+    expect(() =>
+      assertNoUnknownDynamicAlErrCalls(unknownDynamicLocations),
+    ).toThrow(/Unknown non-literal al_err call sites:\nnew_runtime\.rs:2/);
+  });
+
+  it("accepts the two known dynamic al_err call sites", () => {
+    const { codesToCheck, unknownDynamicLocations } = auditBackendErrorSources({
+      "lead_step.rs":
+        '    crate::ui_msg::al_err(code, &[("detail", format!("{err:?}"))])',
+      "lib.rs": '    ui_msg::al_err(code, &[("detail", detail)])',
+    });
+
+    expect(unknownDynamicLocations).toEqual([]);
+    expect([...codesToCheck]).toEqual(
+      expect.arrayContaining([
+        "lead.parseSpawnFailed",
+        "lead.parseNoOutput",
+        "lead.parseFailed",
+        "run.spawnFailed",
+      ]),
+    );
+  });
+});
 
 describe("parseBackendError", () => {
   it("parses a valid parameterless envelope", () => {

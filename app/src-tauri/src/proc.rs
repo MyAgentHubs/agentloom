@@ -1,6 +1,34 @@
-pub(crate) fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+use crate::winshim::ShimTarget;
+use std::ffi::OsStr;
+use std::path::Path;
+use std::process::Command;
+
+pub(crate) fn command(program: impl AsRef<OsStr>) -> Command {
+    command_with(
+        program,
+        cfg!(target_os = "windows"),
+        crate::winshim::resolve_batch_shim_with_fs,
+    )
+}
+
+fn command_with(
+    program: impl AsRef<OsStr>,
+    windows: bool,
+    resolve_shim: impl Fn(&Path) -> Option<ShimTarget>,
+) -> Command {
+    let program = program.as_ref();
     #[allow(unused_mut)] // Mutability is required only by Windows CommandExt::creation_flags.
-    let mut cmd = std::process::Command::new(program);
+    let mut cmd = if windows {
+        if let Some(target) = resolve_shim(Path::new(program)) {
+            let mut cmd = Command::new(target.program);
+            cmd.args(target.prepend_args);
+            cmd
+        } else {
+            Command::new(program)
+        }
+    } else {
+        Command::new(program)
+    };
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -47,6 +75,61 @@ fn apply_low_priority(cmd: &mut std::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::ffi::OsString;
+
+    fn args(command: &Command) -> Vec<OsString> {
+        command.get_args().map(OsStr::to_os_string).collect()
+    }
+
+    #[test]
+    fn windows_shim_args_precede_caller_args() {
+        let mut command = command_with(r"C:\npm\x.cmd", true, |_| {
+            Some(ShimTarget {
+                program: OsString::from(r"C:\npm\node.exe"),
+                prepend_args: vec![OsString::from(r"C:\npm\x.js")],
+            })
+        });
+        command.args(["-p", "hi"]);
+
+        assert_eq!(command.get_program(), r"C:\npm\node.exe");
+        assert_eq!(
+            args(&command),
+            [r"C:\npm\x.js", "-p", "hi"].map(OsString::from)
+        );
+    }
+
+    #[test]
+    fn windows_unknown_shim_keeps_original_program_and_args() {
+        let mut command = command_with(r"C:\npm\unknown.cmd", true, |_| None);
+        command.args(["-p", "hi"]);
+
+        assert_eq!(command.get_program(), r"C:\npm\unknown.cmd");
+        assert_eq!(args(&command), ["-p", "hi"].map(OsString::from));
+    }
+
+    #[test]
+    fn non_windows_skips_shim_resolution_and_keeps_program() {
+        let calls = Cell::new(0);
+        let command = command_with("codex", false, |_| {
+            calls.set(calls.get() + 1);
+            None
+        });
+
+        assert_eq!(calls.get(), 0);
+        assert_eq!(command.get_program(), "codex");
+    }
+
+    #[test]
+    fn windows_executable_keeps_original_program() {
+        let command = command_with(r"C:\npm\codex.exe", true, |path| {
+            assert_eq!(path, Path::new(r"C:\npm\codex.exe"));
+            None
+        });
+
+        assert_eq!(command.get_program(), r"C:\npm\codex.exe");
+        assert!(args(&command).is_empty());
+    }
 
     /// 经 `crate::proc::command` 包装 spawn 的子进程必须被降到 `LOW_PRIORITY_NICE`
     /// 或更低优先级（nice 值 >= 10）。用 `ps -o ni= -p $$` 让 shell 自报它自己的
