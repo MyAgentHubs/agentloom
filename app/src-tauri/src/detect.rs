@@ -999,15 +999,36 @@ mod tests {
         let user_profile = OsStr::new("/home/profile");
         assert_eq!(
             expand_home("~/x/y", Some(home), Some(user_profile), true),
-            vec!["/home/first/x/y", "/home/profile/x/y"]
+            vec![
+                PathBuf::from(home)
+                    .join("x/y")
+                    .to_string_lossy()
+                    .into_owned(),
+                PathBuf::from(user_profile)
+                    .join("x/y")
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
         );
         assert_eq!(
             expand_home("~/x/y", Some(home), Some(user_profile), false),
-            vec!["/home/first/x/y"]
+            vec![PathBuf::from(home)
+                .join("x/y")
+                .to_string_lossy()
+                .into_owned()]
         );
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(
             expand_home("~\\x\\y", Some(home), Some(user_profile), false),
             vec!["/home/first/x\\y"]
+        );
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            expand_home("~\\x\\y", Some(home), Some(user_profile), false),
+            vec![PathBuf::from(home)
+                .join("x\\y")
+                .to_string_lossy()
+                .into_owned()]
         );
         assert_eq!(
             expand_home("/abs/path", Some(home), Some(user_profile), true),
@@ -1020,20 +1041,19 @@ mod tests {
         let home = OsStr::new("/home/same");
         assert_eq!(
             expand_home("~/x", Some(home), Some(home), true),
-            vec!["/home/same/x"]
+            vec![PathBuf::from(home).join("x").to_string_lossy().into_owned()]
         );
     }
 
     #[test]
     fn expand_home_uses_user_profile_when_home_is_missing_off_windows() {
+        let user_profile = OsStr::new("/profile/fallback");
         assert_eq!(
-            expand_home(
-                "~/.local/bin/claude",
-                None,
-                Some(OsStr::new("/profile/fallback")),
-                false,
-            ),
-            vec!["/profile/fallback/.local/bin/claude"]
+            expand_home("~/.local/bin/claude", None, Some(user_profile), false),
+            vec![PathBuf::from(user_profile)
+                .join(".local/bin/claude")
+                .to_string_lossy()
+                .into_owned()]
         );
     }
 
