@@ -81,8 +81,34 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           Set-StrictMode -Version Latest
 
+          function Find-InstalledCli {
+            param(
+              [Parameter(Mandatory = $true)][string]$Directory,
+              [Parameter(Mandatory = $true)][string]$CliName
+            )
+
+            foreach ($extension in @('exe', 'cmd', 'bat')) {
+              $candidate = Join-Path -Path $Directory -ChildPath "$CliName.$extension"
+              if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                Write-Host "Installed CLI: $candidate"
+                return $candidate
+              }
+            }
+
+            Write-Host "No $CliName executable was found in $Directory. Directory contents:"
+            if (Test-Path -LiteralPath $Directory -PathType Container) {
+              Get-ChildItem -LiteralPath $Directory -Force |
+                Format-Table -AutoSize -Property Mode, Length, LastWriteTime, Name |
+                Out-String |
+                Write-Host
+            } else {
+              Write-Host '(directory does not exist)'
+            }
+            throw "Installed CLI '$CliName' is missing from $Directory (tried .exe, .cmd, and .bat)."
+          }
+
           $claudeNativeDir = Join-Path $env:USERPROFILE '.local\bin'
-          $npmInstallDir = Join-Path $env:APPDATA 'npm'
+          $configuredNpmInstallDir = Join-Path $env:APPDATA 'npm'
           $setupNodeNpmGlobalDir = (npm prefix --global).Trim()
           if ([string]::IsNullOrWhiteSpace($setupNodeNpmGlobalDir)) {
             throw 'npm returned an empty global prefix before CLI installation.'
@@ -90,7 +116,7 @@ jobs:
           Write-Host "setup-node npm global directory: $setupNodeNpmGlobalDir"
           "SETUP_NODE_NPM_GLOBAL_DIR=$setupNodeNpmGlobalDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          npm config set prefix $npmInstallDir
+          npm config set prefix $configuredNpmInstallDir
 
           if ('${{ matrix.install-method }}' -eq 'native') {
             $installerUrl = 'https://claude.ai/install.ps1'
@@ -109,25 +135,38 @@ jobs:
             if ($statusCode -ne 200) {
               throw "Claude Code installer returned HTTP status $statusCode from $installerUrl"
             }
-            Invoke-Expression $installerResponse.Content
+            if ($installerResponse.Content -is [byte[]]) {
+              $installerScript = [Text.Encoding]::UTF8.GetString($installerResponse.Content)
+            } elseif ($installerResponse.Content -is [string]) {
+              $installerScript = $installerResponse.Content
+            } else {
+              $contentType = if ($null -eq $installerResponse.Content) {
+                'null'
+              } else {
+                $installerResponse.Content.GetType().FullName
+              }
+              throw "Claude Code installer returned unsupported content type '$contentType' from $installerUrl"
+            }
+            Invoke-Expression $installerScript
           } else {
             npm install -g @anthropic-ai/claude-code
           }
 
           npm install -g @openai/codex
 
-          $expectedClaude = if ('${{ matrix.install-method }}' -eq 'native') {
-            Join-Path $claudeNativeDir 'claude.exe'
+          $npmInstallDir = (npm prefix --global).Trim()
+          if ([string]::IsNullOrWhiteSpace($npmInstallDir)) {
+            throw 'npm returned an empty global prefix after CLI installation.'
+          }
+          Write-Host "npm global install directory after CLI installation: $npmInstallDir"
+
+          $claudeInstallDir = if ('${{ matrix.install-method }}' -eq 'native') {
+            $claudeNativeDir
           } else {
-            Join-Path $npmInstallDir 'claude.cmd'
+            $npmInstallDir
           }
-          $expectedCodex = Join-Path $npmInstallDir 'codex.cmd'
-          foreach ($expectedCli in @($expectedClaude, $expectedCodex)) {
-            if (-not (Test-Path -LiteralPath $expectedCli -PathType Leaf)) {
-              throw "Expected installed CLI is missing: $expectedCli"
-            }
-            Write-Host "Installed CLI: $expectedCli"
-          }
+          $expectedClaude = Find-InstalledCli -Directory $claudeInstallDir -CliName 'claude'
+          $expectedCodex = Find-InstalledCli -Directory $npmInstallDir -CliName 'codex'
 
           "AGENTLOOM_EXPECTED_CLAUDE_PATH=$expectedClaude" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "AGENTLOOM_EXPECTED_CODEX_PATH=$expectedCodex" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
