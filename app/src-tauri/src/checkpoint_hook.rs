@@ -2850,6 +2850,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     #[ignore = "requires authenticated claude CLI; Stop-block end-to-end evidence"]
     fn real_claude_stop_blocks_until_background_task_done_e2e() {
         // Deliberately does NOT swap HOME (unlike the myagent PreToolUse test above): the claude
