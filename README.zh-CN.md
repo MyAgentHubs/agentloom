@@ -105,6 +105,9 @@ AgentLoom 的前提正好相反：很多项目、很多模型、好几个 agent 
   支持工具调用、plan 模式、checkpoint 和事件流。可以单独当命令行用，也可以交给 AgentLoom 驱动。
 - **给每个模型配上联网搜索** —— 不是每个模型都自带搜索;
   AgentLoom 接了第三方后端(DuckDuckGo 零配置，Brave / Exa 用你自己的 key)，让任何 agent 都能查资料。
+- **远程控制** —— 手机扫码遥控桌面上的会话:实时看直播、发消息、批准某一步、随时喊停。
+  端到端加密，中继只经手密文。app 内置官方中继，扫码即用;
+  [中继服务器已开源](https://github.com/MyAgentHubs/agentloom-remote-control-server)(AGPL-3.0)，想自建随时换。
 - **什么都能自己接** —— OpenAI 兼容、Anthropic 兼容接口，自定义 base URL，本地模型。
 - **多语言** —— 界面目前支持英文和简体中文，后续会加。
 - **跨平台** —— macOS(Apple 芯片和 Intel)，已签名并公证。Windows 目前是未签名的

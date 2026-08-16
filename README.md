@@ -114,6 +114,11 @@ and undo. The sidebar holds every project you work on and every session inside i
 - **Web search for every model** — not every model ships with search; AgentLoom wires up
   third-party backends (DuckDuckGo with zero config, Brave/Exa with your key) so any agent
   can look things up.
+- **Remote control** — scan a QR code and drive a desktop session from your phone: watch it
+  stream live, send input, approve or stop a run. End-to-end encrypted — the relay only ever
+  forwards ciphertext. An official relay is built in, and the
+  [relay server is open source](https://github.com/MyAgentHubs/agentloom-remote-control-server)
+  (AGPL-3.0) if you'd rather run your own.
 - **Bring your own everything** — OpenAI-compatible and Anthropic-compatible endpoints,
   custom base URLs, local models.
 - **i18n** — English and 简体中文 in the UI today, more on the way.
