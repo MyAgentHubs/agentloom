@@ -2117,8 +2117,10 @@ fn publish_session_index_snapshot_on_connect(inner: &Inner, connection_generatio
         Some(sessions) => {
             // M2-4c（a）：Active 模式下快照只含当前 active repo 的会话——见函数文档。
             let sessions = filter_session_index_snapshot_for_active_repo(inner, sessions);
+            // M2-4x：顶层"当前被远程的项目"摘要——见 active_repo_summary_for_snapshot 文档。
+            let repo = active_repo_summary_for_snapshot(inner, &sessions);
             let client_msg_id = try_random_client_msg_id().unwrap_or_default();
-            let payload = build_session_index_snapshot_payload(sessions);
+            let payload = build_session_index_snapshot_payload(sessions, repo);
             enqueue_milestone_with_generation(
                 &inner.state,
                 &inner.milestone_tx,
@@ -3446,6 +3448,33 @@ fn filter_session_index_snapshot_for_active_repo(inner: &Inner, sessions: Value)
     }
 }
 
+/// M2-4x：全量快照顶层的"当前被远程的项目"摘要——手机端设置页切换远程项目会让已配对连接
+/// 断线重连（下一单），重连后收到的第一条全量快照理应明确告诉手机端"你现在连的是哪个项目"，
+/// 不能只靠会话行自己的 `repo_id` 猜。
+///
+/// **设计取舍（不新开一条 provider）**：`id` 直接读 `active_repo_id_for_gating`（这条连接生命
+/// 周期内的单一真相源，同 `filter_session_index_snapshot_for_active_repo`）；`name` 不另开一条
+/// "按 repo id 查名字"的 provider（那要往 `Inner`/`GatewayInnerState` 加新字段、改遍全部测试
+/// 构造点——过度设计），而是从**已经**随快照行过滤出来的 `sessions`（`filter_session_index_
+/// snapshot_for_active_repo` 的返回值，此刻传入的每一行都保证同属 active repo）里取第一行的
+/// `repo_name` 字段——同一个 repo 的所有行这个字段值相同，取哪一行都一样。项目当前零会话时
+/// `sessions` 为空数组，取不到任何行，`name` 退化为 `null`（`id` 仍然可靠，手机端至少知道项目
+/// 换了，只是暂时没有人类可读名字——不是 fail-closed 的例外，是"数据源里本来就没有"）。
+/// `active_repo_id_for_gating` 为 `None`（理论不可达，见 `repo_id_is_active` 文档）时整个摘要
+/// fail-closed 回 `Value::Null`，不把"曾经见过的某个项目"当默认值泄漏出去。
+fn active_repo_summary_for_snapshot(inner: &Inner, sessions: &Value) -> Value {
+    let Some(active_repo_id) = lock(&inner.state.active_repo_id_for_gating).clone() else {
+        return Value::Null;
+    };
+    let name = sessions
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("repo_name"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    serde_json::json!({ "id": active_repo_id, "name": name })
+}
+
 /// M2-4c（B1）：Active 模式下 session.index 的增量 diff（`full == false`，`session` 恒
 /// `None`，走 `drain_milestone_queue` 而非快照过滤）按 `op` 四路分治，不能套用逐条里程碑那套
 /// "按 session 查一次"的通用判定——四种 op 的 payload 形状各不相同，各自要用不同的信息源：
@@ -4075,6 +4104,8 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     static TEST_SESSION_INDEX_ARCHIVED_PAYLOAD_LOG: std::cell::RefCell<Vec<Value>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static TEST_SESSION_INDEX_CREATED_PAYLOAD_LOG: std::cell::RefCell<Vec<Value>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -4098,6 +4129,11 @@ pub(crate) fn test_take_run_status_payload_log() -> Vec<Value> {
 #[cfg(test)]
 pub(crate) fn test_take_session_index_archived_payload_log() -> Vec<Value> {
     TEST_SESSION_INDEX_ARCHIVED_PAYLOAD_LOG.with(|log| log.borrow_mut().drain(..).collect())
+}
+
+#[cfg(test)]
+pub(crate) fn test_take_session_index_created_payload_log() -> Vec<Value> {
+    TEST_SESSION_INDEX_CREATED_PAYLOAD_LOG.with(|log| log.borrow_mut().drain(..).collect())
 }
 
 /// `agent` = 落库时的 `agent_name_snapshot`（如 `"Claude"`/`"Codex"`）——`Some` 时插入
@@ -4202,11 +4238,16 @@ pub(crate) fn publish_run_status_milestone(session_id: &str, status: &str, run_i
     publish_milestone(Some(session_id), "run.status", payload, client_msg_id);
 }
 
+/// `repo_name`：手机端会话列表副标题要的人类可读项目名（M2-4x）——None 时序列化成
+/// `"repo_name": null`（键恒在，值可空），不是整键省略；旧手机端 parseFrame 按未知/可选字段
+/// 处理，新手机端拿到 null 时回退渲染裸 `repo_id`（同 `SessionIndexRow.repo_name` 的既有
+/// optional 惯例）。
 pub(crate) fn build_session_index_created_payload(
     id: &str,
     title: &str,
     repo_id: &str,
     namespace_id: &str,
+    repo_name: Option<&str>,
 ) -> Value {
     serde_json::json!({
         "op": "created",
@@ -4217,6 +4258,7 @@ pub(crate) fn build_session_index_created_payload(
             "repo_id": repo_id,
             "namespace_id": namespace_id,
             "archived": false,
+            "repo_name": repo_name,
         },
     })
 }
@@ -4226,10 +4268,13 @@ pub(crate) fn publish_session_index_created(
     title: &str,
     repo_id: &str,
     namespace_id: &str,
+    repo_name: Option<&str>,
 ) {
     record_test_publish("session.index.created");
     let client_msg_id = try_random_client_msg_id().unwrap_or_default();
-    let payload = build_session_index_created_payload(id, title, repo_id, namespace_id);
+    let payload = build_session_index_created_payload(id, title, repo_id, namespace_id, repo_name);
+    #[cfg(test)]
+    TEST_SESSION_INDEX_CREATED_PAYLOAD_LOG.with(|log| log.borrow_mut().push(payload.clone()));
     publish_milestone(None, "session.index", payload, client_msg_id);
 }
 
@@ -4276,8 +4321,13 @@ pub(crate) fn publish_session_index_archived(ids: &[String], archived: bool) {
     publish_milestone(None, "session.index", payload, client_msg_id);
 }
 
-pub(crate) fn build_session_index_snapshot_payload(sessions: Value) -> Value {
-    serde_json::json!({ "full": true, "sessions": sessions })
+/// `repo`：全量快照顶层的"当前被远程的项目"摘要（M2-4x）——调用方传 `Value::Null`（没有可
+/// 判定的 active repo，理论不可达但 fail-closed）或 `json!({"id":.., "name":..})`（`name` 本身
+/// 也可能是 `null`——active repo 已知但拿不到名字，见 `active_repo_summary_for_snapshot`）。
+/// 键恒在（不是可选省略），手机端 `repo?: {...} | null` 按 optional 解析，兼容旧桌面不带这个
+/// 键的帧。
+pub(crate) fn build_session_index_snapshot_payload(sessions: Value, repo: Value) -> Value {
+    serde_json::json!({ "full": true, "sessions": sessions, "repo": repo })
 }
 
 /// sink 回调契约（`EventTransport::add_sink` doc）：只许非阻塞入队，禁止 send()/网络 I/O/
@@ -8785,7 +8835,7 @@ mod tests {
     #[test]
     fn builds_session_index_created_payload() {
         assert_eq!(
-            build_session_index_created_payload("s1", "Title", "repo-1", "local"),
+            build_session_index_created_payload("s1", "Title", "repo-1", "local", None),
             serde_json::json!({
                 "op": "created",
                 "full": false,
@@ -8795,6 +8845,32 @@ mod tests {
                     "repo_id": "repo-1",
                     "namespace_id": "local",
                     "archived": false,
+                    "repo_name": null,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn builds_session_index_created_payload_with_repo_name() {
+        assert_eq!(
+            build_session_index_created_payload(
+                "s1",
+                "Title",
+                "repo-1",
+                "local",
+                Some("Acme Corp")
+            ),
+            serde_json::json!({
+                "op": "created",
+                "full": false,
+                "session": {
+                    "id": "s1",
+                    "title": "Title",
+                    "repo_id": "repo-1",
+                    "namespace_id": "local",
+                    "archived": false,
+                    "repo_name": "Acme Corp",
                 },
             })
         );
@@ -8848,10 +8924,19 @@ mod tests {
     #[test]
     fn builds_session_index_snapshot_payload_without_op() {
         let sessions = serde_json::json!([{"id": "s1"}, {"id": "s2"}]);
-        let payload = build_session_index_snapshot_payload(sessions.clone());
+        let payload = build_session_index_snapshot_payload(sessions.clone(), Value::Null);
         assert_eq!(payload["full"], true);
         assert_eq!(payload["sessions"], sessions);
+        assert_eq!(payload["repo"], Value::Null);
         assert!(payload.get("op").is_none());
+    }
+
+    #[test]
+    fn builds_session_index_snapshot_payload_with_repo_summary() {
+        let sessions = serde_json::json!([{"id": "s1"}]);
+        let repo = serde_json::json!({"id": "repo-1", "name": "Acme Corp"});
+        let payload = build_session_index_snapshot_payload(sessions, repo.clone());
+        assert_eq!(payload["repo"], repo);
     }
 
     #[test]
@@ -14829,7 +14914,7 @@ mod tests {
         let _guard = ForceClientMsgIdEntropyFailureGuard::new();
 
         publish_run_status_milestone("sess-1", "running", Some("run-1"));
-        publish_session_index_created("sess-1", "Session", "repo-1", "namespace-1");
+        publish_session_index_created("sess-1", "Session", "repo-1", "namespace-1", None);
         publish_session_index_renamed("sess-1", "Renamed");
         publish_session_index_deleted("sess-1");
         publish_session_index_archived(&["sess-1".to_owned()], true);
@@ -17782,6 +17867,78 @@ mod tests {
         );
     }
 
+    /// ④a（M2-4x）：全量快照顶层的 `repo` 摘要——`id` 取自 `active_repo_id_for_gating`，`name`
+    /// 从已过滤出的 sessions 行里取第一行的 `repo_name`（同一个 repo 的所有行值相同）。
+    #[test]
+    fn m2_4c_active_mode_session_index_snapshot_top_level_repo_summary_derived_from_filtered_rows()
+    {
+        let (inner, milestone_rx) = test_inner_with_k_room_and_session_index_provider(
+            || None,
+            |_| Some(Zeroizing::new([1_u8; 32])),
+            || {
+                Some(serde_json::json!([
+                    {
+                        "id": "sess-a", "title": "A", "repo_id": "repo-a",
+                        "archived": false, "status": Value::Null, "run_id": Value::Null,
+                        "updated_at": 1, "repo_name": "Acme Corp",
+                    },
+                    {
+                        "id": "sess-b", "title": "B", "repo_id": "repo-b",
+                        "archived": false, "status": Value::Null, "run_id": Value::Null,
+                        "updated_at": 2, "repo_name": "Other Repo",
+                    },
+                ]))
+            },
+        );
+        *lock(&inner.state.active_repo_id_for_gating) = Some("repo-a".to_owned());
+        let generation = inner.state.advance_generation_and_set_gate(true);
+
+        publish_session_index_snapshot_on_connect(&inner, generation);
+
+        let (_, item) = milestone_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("snapshot must still be enqueued");
+        assert_eq!(
+            item.payload["repo"],
+            serde_json::json!({"id": "repo-a", "name": "Acme Corp"}),
+            "top-level repo summary must reflect the active repo's id/name, not the other \
+             repo's — even though its row also carries a repo_name"
+        );
+    }
+
+    /// ④b（M2-4x）：active repo 已知但该项目当前零会话——`sessions` 过滤后为空数组，取不到任何
+    /// 一行的 `repo_name`，`name` 退化为 `null`；`id` 仍然可靠（不依赖 sessions 是否非空）。
+    #[test]
+    fn m2_4c_active_mode_session_index_snapshot_repo_name_null_when_active_repo_has_no_sessions() {
+        let (inner, milestone_rx) = test_inner_with_k_room_and_session_index_provider(
+            || None,
+            |_| Some(Zeroizing::new([1_u8; 32])),
+            || {
+                Some(serde_json::json!([
+                    {
+                        "id": "sess-b", "title": "B", "repo_id": "repo-b",
+                        "archived": false, "status": Value::Null, "run_id": Value::Null,
+                        "updated_at": 2, "repo_name": "Other Repo",
+                    },
+                ]))
+            },
+        );
+        *lock(&inner.state.active_repo_id_for_gating) = Some("repo-a".to_owned());
+        let generation = inner.state.advance_generation_and_set_gate(true);
+
+        publish_session_index_snapshot_on_connect(&inner, generation);
+
+        let (_, item) = milestone_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("snapshot must still be enqueued, empty sessions array and all");
+        assert_eq!(
+            item.payload["repo"],
+            serde_json::json!({"id": "repo-a", "name": null}),
+            "active repo id is known even with zero sessions; name degrades to null instead \
+             of being fabricated or leaking another repo's name"
+        );
+    }
+
     /// ⑤上行里程碑：active 模式下 B 项目会话的 msg.completed 在 drain 阶段被静默过滤，A 项目
     /// 会话正常出线——覆盖 `drain_milestone_queue` 里新增的 `upstream_session_allowed` 分支。
     #[test]
@@ -17967,6 +18124,13 @@ mod tests {
             "without an active repo the snapshot must fail-closed to empty, not leak every \
              session"
         );
+        // (a2, M2-4x) 顶层 repo 摘要同样必须 fail-closed 到显式 null，不是省略键、也不是留着
+        // 上一次连接残留的项目 id/name。
+        assert_eq!(
+            item.payload["repo"],
+            Value::Null,
+            "without an active repo the top-level repo summary must be explicit null"
+        );
 
         // (b) 逐条里程碑：没有 active repo 时必须被过滤丢弃；provider 仍会被调用，但返回值
         // 不影响结果。
@@ -18108,6 +18272,7 @@ mod tests {
                     "B session",
                     "repo-b",
                     "ns-1",
+                    None,
                 ),
                 client_msg_id: "client-created-b".to_owned(),
             },
@@ -18123,6 +18288,7 @@ mod tests {
                     "A session",
                     "repo-a",
                     "ns-1",
+                    None,
                 ),
                 client_msg_id: "client-created-a".to_owned(),
             },
@@ -19113,6 +19279,7 @@ mod tests {
                 updated_at: 1_765_430_400_123,
                 last_msg_preview: Some("Latest assistant reply".to_owned()),
                 last_activity_at: Some(1_765_430_450),
+                repo_name: None,
             },
             crate::db::SessionIndexSnapshotRow {
                 id: "sess-2".to_owned(),
@@ -19124,19 +19291,20 @@ mod tests {
                 updated_at: 1_765_430_300_000,
                 last_msg_preview: None,
                 last_activity_at: None,
+                repo_name: None,
             },
         ];
         let sessions = serde_json::to_value(&rows).expect("rows must serialize");
         let full_payload = milestone_payload(
             "session.index",
-            build_session_index_snapshot_payload(sessions),
+            build_session_index_snapshot_payload(sessions, Value::Null),
         );
         let expected_full = data_plane_v1_case(&fixture, "session_index_full")["frame"].clone();
         assert_eq!(full_payload, expected_full);
 
         let created_payload = milestone_payload(
             "session.index",
-            build_session_index_created_payload("sess-3", "New session", "repo-a", "ns-1"),
+            build_session_index_created_payload("sess-3", "New session", "repo-a", "ns-1", None),
         );
         assert_eq!(
             created_payload,

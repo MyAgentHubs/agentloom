@@ -3564,7 +3564,20 @@ pub fn create_session(
         "INSERT INTO sessions (id, title, repo_id, namespace_id, created_at) VALUES (?1, ?2, ?3, ?4, strftime('%s','now'))",
         (id, title, repo_id, namespace_id),
     )?;
-    crate::remote_gateway::publish_session_index_created(id, title, repo_id, namespace_id);
+    // 远程控制手机端会话列表副标题要人类可读项目名——顺手带一份，省得手机端拿到 created
+    // 增量后还得等下一次全量快照才补上名字。找不到 repo（理论不可达：repo_id 恒是外键约束
+    // 过的值）时静默落 None，不让这条 lookup 失败拖垮会话创建本身。
+    let repo_name = crate::repos_repo::get_repo_by_id(conn, repo_id)
+        .ok()
+        .flatten()
+        .map(|repo| repo.name);
+    crate::remote_gateway::publish_session_index_created(
+        id,
+        title,
+        repo_id,
+        namespace_id,
+        repo_name.as_deref(),
+    );
     Ok(())
 }
 
@@ -5957,6 +5970,9 @@ pub struct SessionIndexSnapshotRow {
     pub updated_at: i64,
     pub last_msg_preview: Option<String>,
     pub last_activity_at: Option<i64>,
+    /// 手机端人类可读项目名（远程控制会话列表副标题用）——LEFT JOIN repos 取，repo 已被删/
+    /// repo_id 为 None 时落 None，消费方按既有惯例（`repo_id` 兜底显示）回退裸 id。
+    pub repo_name: Option<String>,
 }
 
 const SESSION_INDEX_PREVIEW_CHARS: usize = 80;
@@ -5981,9 +5997,10 @@ pub fn list_session_index_snapshot_rows(
     let mut stmt = conn.prepare(
         "SELECT s.id, s.title, s.repo_id, s.archived, sr.status, sr.run_id, \
                 COALESCE(sr.updated_at, s.created_at) AS updated_at, \
-                latest_message.content, latest_message.created_at \
+                latest_message.content, latest_message.created_at, r.name \
          FROM sessions s \
          LEFT JOIN session_runtime sr ON sr.session_id = s.id \
+         LEFT JOIN repos r ON r.id = s.repo_id \
          LEFT JOIN messages latest_message ON latest_message.id = ( \
              SELECT m.id FROM messages m \
              WHERE m.session_id = s.id AND m.role IN ('user', 'assistant') \
@@ -6006,6 +6023,7 @@ pub fn list_session_index_snapshot_rows(
                 .as_deref()
                 .and_then(session_index_message_preview),
             last_activity_at: r.get(8)?,
+            repo_name: r.get(9)?,
         })
     })?;
     rows.collect()
@@ -8420,6 +8438,28 @@ mod tests {
     }
 
     #[test]
+    fn create_session_publishes_created_payload_with_repo_name() {
+        // 远程控制手机端会话列表副标题要人类可读项目名——created 增量必须带上它，不是只有
+        // 全量快照那一路才有（否则手机端在下一次全量快照到达前，新建会话的副标题会短暂空着）。
+        // `mem()` 固定 seed 'local-default' repo 的 name 为 '我的项目'。
+        let c = mem();
+        crate::remote_gateway::test_take_session_index_created_payload_log();
+
+        create_session(
+            &c,
+            "index-create-repo-name",
+            "Title",
+            "local-default",
+            "local",
+        )
+        .unwrap();
+
+        let payloads = crate::remote_gateway::test_take_session_index_created_payload_log();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["session"]["repo_name"], "我的项目");
+    }
+
+    #[test]
     fn rename_session_publishes_index_only_for_existing_row() {
         let c = mem();
         create_session(&c, "index-rename", "Before", "local-default", "local").unwrap();
@@ -8593,6 +8633,9 @@ mod tests {
             .unwrap();
         assert_eq!(running.title, "Running");
         assert_eq!(running.repo_id.as_deref(), Some("local-default"));
+        // `mem()` 固定 seed 'local-default' repo 的 name 为 '我的项目'——快照行必须真的 LEFT
+        // JOIN repos 带出这份人类可读项目名，不是只有 repo_id。
+        assert_eq!(running.repo_name.as_deref(), Some("我的项目"));
         assert!(!running.archived);
         assert_eq!(running.status.as_deref(), Some("running"));
         assert_eq!(running.run_id.as_deref(), Some("run-1"));
@@ -8604,10 +8647,32 @@ mod tests {
             .unwrap();
         assert_eq!(never_ran.title, "Never ran");
         assert_eq!(never_ran.repo_id.as_deref(), Some("local-default"));
+        assert_eq!(never_ran.repo_name.as_deref(), Some("我的项目"));
         assert!(never_ran.archived);
         assert_eq!(never_ran.status, None);
         assert_eq!(never_ran.run_id, None);
         assert_eq!(never_ran.updated_at, 202);
+    }
+
+    #[test]
+    fn list_session_index_snapshot_rows_repo_name_is_none_when_repo_id_is_none() {
+        // repo_id 为 None 的会话（理论上不该出现——sessions.repo_id 业务层必绑，见 create_session
+        // 头注——但 LEFT JOIN 本身对 NULL repo_id 的行为必须验过，不能只测"有 repo"这一路）。
+        let c = mem();
+        create_session(&c, "snapshot-no-repo", "No repo", "local-default", "local").unwrap();
+        c.execute(
+            "UPDATE sessions SET repo_id = NULL WHERE id = 'snapshot-no-repo'",
+            [],
+        )
+        .unwrap();
+
+        let rows = list_session_index_snapshot_rows(&c).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.id == "snapshot-no-repo")
+            .unwrap();
+        assert_eq!(row.repo_id, None);
+        assert_eq!(row.repo_name, None);
     }
 
     #[test]

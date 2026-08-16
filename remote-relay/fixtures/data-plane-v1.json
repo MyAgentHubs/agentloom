@@ -88,7 +88,7 @@
   "cases": [
     {
       "name": "session_index_full",
-      "desc": "session.index 全量快照——build_session_index_snapshot_payload(sessions)；sessions 逐字段抄自 db::SessionIndexSnapshotRow 的真实 Serialize 输出（id/title/repo_id/archived/status/run_id/updated_at）。",
+      "desc": "session.index 全量快照——build_session_index_snapshot_payload(sessions, repo)；sessions 逐字段抄自 db::SessionIndexSnapshotRow 的真实 Serialize 输出（id/title/repo_id/archived/status/run_id/updated_at/repo_name）；顶层 repo 为 null（builder 层单测场景，未接 active-repo 摘要）。",
       "frame": {
         "t": "session.index",
         "full": true,
@@ -102,7 +102,8 @@
             "run_id": "run-42",
             "updated_at": 1765430400123,
             "last_msg_preview": "Latest assistant reply",
-            "last_activity_at": 1765430450
+            "last_activity_at": 1765430450,
+            "repo_name": null
           },
           {
             "id": "sess-2",
@@ -113,9 +114,11 @@
             "run_id": null,
             "updated_at": 1765430300000,
             "last_msg_preview": null,
-            "last_activity_at": null
+            "last_activity_at": null,
+            "repo_name": null
           }
-        ]
+        ],
+        "repo": null
       },
       "valid": true,
       "consumers": [
@@ -124,7 +127,7 @@
     },
     {
       "name": "session_index_created",
-      "desc": "session.index 增量·created——build_session_index_created_payload(id, title, repo_id, namespace_id)。",
+      "desc": "session.index 增量·created——build_session_index_created_payload(id, title, repo_id, namespace_id, repo_name)。",
       "frame": {
         "t": "session.index",
         "op": "created",
@@ -134,7 +137,8 @@
           "title": "New session",
           "repo_id": "repo-a",
           "namespace_id": "ns-1",
-          "archived": false
+          "archived": false,
+          "repo_name": null
         }
       },
       "valid": true,

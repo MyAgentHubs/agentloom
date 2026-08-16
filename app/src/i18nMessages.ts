@@ -62,6 +62,8 @@ export const messages = {
     "settings.remoteControl.activeProjectUnset": "未设置",
     "settings.remoteControl.activeProjectHint":
       "配对与设备都归属当前活跃项目的房间，请先选择一个项目再开始配对。",
+    "settings.remoteControl.activeProjectSwitchHint":
+      "切换活跃项目会让已配对的手机断开连接，需要在下方重新生成二维码并扫码配对。",
     "settings.remoteControl.pairingTitle": "手机配对",
     "settings.remoteControl.pairingIntro":
       "用手机扫描二维码，与这台电脑建立配对。",
@@ -1575,6 +1577,8 @@ export const messages = {
     "settings.remoteControl.activeProjectUnset": "Not set",
     "settings.remoteControl.activeProjectHint":
       "Pairing and devices belong to the room of the current active project. Choose a project before you start pairing.",
+    "settings.remoteControl.activeProjectSwitchHint":
+      "Switching the active project disconnects any already-paired phones — you'll need to generate a new QR code below and re-pair.",
     "settings.remoteControl.pairingTitle": "Pair a phone",
     "settings.remoteControl.pairingIntro":
       "Scan the QR code with your phone to pair it with this computer.",

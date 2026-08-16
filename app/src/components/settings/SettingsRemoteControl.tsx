@@ -877,7 +877,11 @@ export function SettingsRemoteControl() {
           <span className="st-form-note plain" style={styles.hint}>
             {t("settings.remoteControl.activeProjectHint")}
           </span>
-        ) : null}
+        ) : (
+          <span className="st-form-note plain" style={styles.hint}>
+            {t("settings.remoteControl.activeProjectSwitchHint")}
+          </span>
+        )}
         {activeProjectError ? (
           <span role="alert" style={styles.error}>
             {activeProjectError}
