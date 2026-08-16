@@ -4,9 +4,14 @@
   "coverage": [
     {
       "category": "session.index",
-      "sample_count": 5,
+      "sample_count": 7,
       "consumer_tests": [
-        "data_plane_v1_session_index_variants_match_fixture_and_drive_builders"
+        "data_plane_v1_session_index_variants_match_fixture_and_drive_builders",
+        "data_plane_v1_session_index_filled_variant_matches_fixture_and_drives_builders",
+        "applySessionIndex full snapshot replaces the whole sessions map",
+        "applySessionIndex created/renamed/archived/deleted increments apply on top of a full baseline",
+        "applySessionIndexFull stores the top-level repo summary (M2-4x); defaults to null before any full snapshot",
+        "applySessionIndexCreated carries repo_name onto the new row (M2-4x)"
       ],
       "gap": null
     },
@@ -168,10 +173,7 @@
         "t": "session.index",
         "op": "archived",
         "full": false,
-        "ids": [
-          "sess-1",
-          "sess-2"
-        ]
+        "ids": ["sess-1", "sess-2"]
       },
       "valid": true,
       "consumers": [
@@ -190,6 +192,71 @@
       "valid": true,
       "consumers": [
         "data_plane_v1_session_index_variants_match_fixture_and_drive_builders"
+      ]
+    },
+    {
+      "name": "session_index_full_with_repo_name",
+      "desc": "session.index 全量快照·填充态——同 session_index_full 但行 repo_name 与顶层 repo 都有值（build_session_index_snapshot_payload(sessions, repo)；sessions 逐字段抄自 db::SessionIndexSnapshotRow 的真实 Serialize 输出，repo_name = Some(\"Acme Metrics\")；repo 摘要为 {id, name} 均非 null 的填充态，同一 repo 下所有行的 repo_name 取值一致）。用于两端共享对拍『字段有值时』的形状，防止只对 null 形状测试导致改名悄悄裂开。",
+      "frame": {
+        "t": "session.index",
+        "full": true,
+        "sessions": [
+          {
+            "id": "sess-1",
+            "title": "Fix login bug",
+            "repo_id": "repo-a",
+            "archived": false,
+            "status": "running",
+            "run_id": "run-42",
+            "updated_at": 1765430400123,
+            "last_msg_preview": "Latest assistant reply",
+            "last_activity_at": 1765430450,
+            "repo_name": "Acme Metrics"
+          },
+          {
+            "id": "sess-2",
+            "title": "Update docs",
+            "repo_id": "repo-a",
+            "archived": false,
+            "status": null,
+            "run_id": null,
+            "updated_at": 1765430300000,
+            "last_msg_preview": null,
+            "last_activity_at": null,
+            "repo_name": "Acme Metrics"
+          }
+        ],
+        "repo": {
+          "id": "repo-a",
+          "name": "Acme Metrics"
+        }
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_session_index_filled_variant_matches_fixture_and_drives_builders",
+        "applySessionIndexFull stores the top-level repo summary (M2-4x); defaults to null before any full snapshot"
+      ]
+    },
+    {
+      "name": "session_index_created_with_repo_name",
+      "desc": "session.index 增量·created·填充态——同 session_index_created 但 repo_name 有值（build_session_index_created_payload(id, title, repo_id, namespace_id, Some(\"Acme Metrics\"))）。",
+      "frame": {
+        "t": "session.index",
+        "op": "created",
+        "full": false,
+        "session": {
+          "id": "sess-3",
+          "title": "New session",
+          "repo_id": "repo-a",
+          "namespace_id": "ns-1",
+          "archived": false,
+          "repo_name": "Acme Metrics"
+        }
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_session_index_filled_variant_matches_fixture_and_drives_builders",
+        "applySessionIndexCreated carries repo_name onto the new row (M2-4x)"
       ]
     },
     {
@@ -232,10 +299,7 @@
           "decision_id": "d-1",
           "kind": "ask",
           "question": "Deploy the hotfix to production now?",
-          "options": [
-            "yes",
-            "no"
-          ],
+          "options": ["yes", "no"],
           "recommended": "yes",
           "rationale": "Regression test passes; fix is isolated.",
           "payload": null,

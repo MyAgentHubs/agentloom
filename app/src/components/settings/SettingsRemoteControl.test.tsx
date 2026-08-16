@@ -271,19 +271,48 @@ describe("SettingsRemoteControl", () => {
     ).toBeDisabled();
   });
 
-  it("已设置活跃项目时展示切换会断连的提示，不再展示「先选择项目」的引导文案", async () => {
-    // beforeEach 默认 mock 已经把 active_repo_id 设成 "repo-1"——覆盖这一路不需要另起
-    // invokeMock 实现。
+  it("已设置活跃项目且至少一台配对设备时展示软化后的切换断连提示，不再展示「先选择项目」的引导文案", async () => {
+    // beforeEach 默认 mock 已经把 active_repo_id 设成 "repo-1" 且 remote_devices_list 返回
+    // 一台设备——覆盖这一路不需要另起 invokeMock 实现。
     render(<SettingsRemoteControl />);
 
     expect(
       await screen.findByText(
-        "切换活跃项目会让已配对的手机断开连接，需要在下方重新生成二维码并扫码配对。",
+        "切换活跃项目会让已配对的手机断开连接；切回原项目时，原有配对通常仍然有效——如果连不上，再在下方重新生成二维码扫码配对。",
       ),
     ).toBeInTheDocument();
     expect(
       screen.queryByText(
         "配对与设备都归属当前活跃项目的房间，请先选择一个项目再开始配对。",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("已设置活跃项目但零配对设备时展示原「先选择项目」引导文案，不展示切换断连提示（B5：切换断连这句话零设备时不成立，是文案强于事实）", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_control_get_settings") {
+        return {
+          enabled: true,
+          relay_url: "wss://relay.example.com",
+          active_repo_id: "repo-1",
+        };
+      }
+      if (cmd === "list_repos") return [repoOne, repoTwo];
+      if (cmd === "remote_devices_list") return [];
+      if (cmd === "remote_gateway_status") return gatewayStatus;
+      return undefined;
+    });
+
+    render(<SettingsRemoteControl />);
+
+    expect(
+      await screen.findByText(
+        "配对与设备都归属当前活跃项目的房间，请先选择一个项目再开始配对。",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "切换活跃项目会让已配对的手机断开连接；切回原项目时，原有配对通常仍然有效——如果连不上，再在下方重新生成二维码扫码配对。",
       ),
     ).not.toBeInTheDocument();
   });
@@ -312,7 +341,7 @@ describe("SettingsRemoteControl", () => {
     ).toBeInTheDocument();
     expect(
       screen.queryByText(
-        "切换活跃项目会让已配对的手机断开连接，需要在下方重新生成二维码并扫码配对。",
+        "切换活跃项目会让已配对的手机断开连接；切回原项目时，原有配对通常仍然有效——如果连不上，再在下方重新生成二维码扫码配对。",
       ),
     ).not.toBeInTheDocument();
   });

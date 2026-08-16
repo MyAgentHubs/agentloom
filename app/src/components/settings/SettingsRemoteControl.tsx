@@ -873,7 +873,11 @@ export function SettingsRemoteControl() {
             </option>
           ))}
         </select>
-        {!activeRepoId ? (
+        {!activeRepoId || devices.length === 0 ? (
+          // B5（backlog 跟进）：切换项目会断连"已配对的手机"这件事，只在真的存在已配对
+          // 设备时才成立——零设备时提示切换风险是"文案强于事实"（review 定性），复用
+          // activeProjectHint 这条一直为真的背景说明（配对/设备归属当前活跃项目的房间），
+          // 不展示只在有设备时才有意义的断连警告。
           <span className="st-form-note plain" style={styles.hint}>
             {t("settings.remoteControl.activeProjectHint")}
           </span>

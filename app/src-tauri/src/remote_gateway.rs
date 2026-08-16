@@ -2118,9 +2118,16 @@ fn publish_session_index_snapshot_on_connect(inner: &Inner, connection_generatio
             // M2-4c（a）：Active 模式下快照只含当前 active repo 的会话——见函数文档。
             let sessions = filter_session_index_snapshot_for_active_repo(inner, sessions);
             // M2-4x：顶层"当前被远程的项目"摘要——见 active_repo_summary_for_snapshot 文档。
+            // 摘要取自过滤后（截尾前）的行：截尾只会从尾部丢行，首行（摘要取名字的来源）
+            // 在正常数据规模下恒存活，摘要不需要等截尾完成才能算。
             let repo = active_repo_summary_for_snapshot(inner, &sessions);
+            // B2（backlog 跟进）：过滤后、组装 payload 前的发送前尺寸闸——见
+            // truncate_session_index_snapshot_rows 文档。
+            let (sessions, truncated) =
+                truncate_session_index_snapshot_rows(sessions, SNAPSHOT_SEND_BUDGET_BYTES);
             let client_msg_id = try_random_client_msg_id().unwrap_or_default();
             let payload = build_session_index_snapshot_payload(sessions, repo);
+            let payload = mark_session_index_snapshot_truncated(payload, truncated);
             enqueue_milestone_with_generation(
                 &inner.state,
                 &inner.milestone_tx,
@@ -3462,6 +3469,12 @@ fn filter_session_index_snapshot_for_active_repo(inner: &Inner, sessions: Value)
 /// 换了，只是暂时没有人类可读名字——不是 fail-closed 的例外，是"数据源里本来就没有"）。
 /// `active_repo_id_for_gating` 为 `None`（理论不可达，见 `repo_id_is_active` 文档）时整个摘要
 /// fail-closed 回 `Value::Null`，不把"曾经见过的某个项目"当默认值泄漏出去。
+///
+/// **已知边界（B3 backlog 跟进·纯记档，未修）**：项目改名（`rename_repo`）不发 session.index
+/// 增量——在线手机端的顶部摘要与既有会话行会一直显示旧名，直到下一次断连重连拿到新的全量
+/// 快照才刷新；改名后若又有新会话在同一项目下创建，其 `created` 增量会带新名，此时同一屏可能
+/// 新旧名并存（老会话行仍是旧名，新会话行已是新名）。属低频可接受；如需消除，应在 rename 路径
+/// 主动发一条 session.index 增量或直接触发一次全量快照重发，本条只记档，不在本刀修。
 fn active_repo_summary_for_snapshot(inner: &Inner, sessions: &Value) -> Value {
     let Some(active_repo_id) = lock(&inner.state.active_repo_id_for_gating).clone() else {
         return Value::Null;
@@ -3473,6 +3486,65 @@ fn active_repo_summary_for_snapshot(inner: &Inner, sessions: &Value) -> Value {
         .cloned()
         .unwrap_or(Value::Null);
     serde_json::json!({ "id": active_repo_id, "name": name })
+}
+
+/// B2（backlog 跟进）：`list_session_index_snapshot_rows` 的 SQL 无 `LIMIT`——过滤后的
+/// `sessions` 行数组理论上随会话数增长无上限。`msg.completed` 早已在 `enqueue_milestone_item`
+/// 有发送前尺寸兜底（`SNAPSHOT_SEND_BUDGET_BYTES`，见该处文档），session.index 全量快照此前
+/// 完全没有——超过 relay 的 64KiB 明文帧硬闸会被 `frame_too_large` 断连，断连后客户端重连会
+/// 再请求同一份超大快照，形成死循环（现状单项目最多约 20 个会话、离预算还有约 5 倍余量，
+/// 属于防患于未然，不是已复现故障）。
+///
+/// **度量对象是 `sessions` 行数组自身的序列化字节量**，不是整帧——`repo` 摘要只是
+/// `{id, name}` 两个字段，相对 `sessions` 数组的体积是常数级噪声，`SNAPSHOT_SEND_BUDGET_BYTES`
+/// 本身已经在 relay 64KiB 硬闸前留出信封膨胀（base64/AEAD tag/JSON 转义）的余量，够吸收这点
+/// 常数开销，不需要为此再拉高精度反而把简单问题复杂化。
+///
+/// **保留排序靠前的行**：`list_session_index_snapshot_rows` 的 SQL 已经按 `pinned DESC,
+/// created_at DESC` 排好序，重要行天然排在数组前面——从尾部整行丢弃，直到累计字节量不超
+/// `budget`。`budget` 参数化（生产调用点传 `SNAPSHOT_SEND_BUDGET_BYTES`）只是为了让单测能用
+/// 小预算构造可控场景，不必在测试里堆出真正 44KiB 的 JSON。
+///
+/// 返回 `(截尾后的 sessions, 是否发生了截断)`；未截断时第二个值为 `false`，调用方据此决定
+/// 要不要在 payload 上插 `truncated` 键（键本身只在截断时出现，见
+/// `mark_session_index_snapshot_truncated`）。非数组输入（理论不可达——调用方恒传
+/// `filter_session_index_snapshot_for_active_repo` 的返回值，那个函数已经 fail-closed 成
+/// 数组）原样放行、不截断，不假设契约不会被破坏但也不在这里重新发明一次 fail-closed 逻辑。
+fn truncate_session_index_snapshot_rows(sessions: Value, budget: usize) -> (Value, bool) {
+    let Value::Array(rows) = sessions else {
+        return (sessions, false);
+    };
+    let full_bytes = serde_json::to_vec(&Value::Array(rows.clone()))
+        .map(|json| json.len())
+        .unwrap_or(usize::MAX);
+    if full_bytes <= budget {
+        return (Value::Array(rows), false);
+    }
+    let mut kept: Vec<Value> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut candidate = kept.clone();
+        candidate.push(row);
+        let candidate_bytes = serde_json::to_vec(&Value::Array(candidate.clone()))
+            .map(|json| json.len())
+            .unwrap_or(usize::MAX);
+        if candidate_bytes > budget {
+            break;
+        }
+        kept = candidate;
+    }
+    (Value::Array(kept), true)
+}
+
+/// B2：只在真的发生截断时插入 `truncated: true` 这一键；不截断时该键整个不存在（不是
+/// `false`）——同 `repo`/`repo_name` 系列可选键"键缺失 vs 显式值"的一贯纪律，手机端
+/// `parseFrame` 对未知键本就无视（本任务不改手机端 UI），向后兼容零风险。
+fn mark_session_index_snapshot_truncated(mut payload: Value, truncated: bool) -> Value {
+    if truncated {
+        if let Value::Object(fields) = &mut payload {
+            fields.insert("truncated".to_owned(), Value::Bool(true));
+        }
+    }
+    payload
 }
 
 /// M2-4c（B1）：Active 模式下 session.index 的增量 diff（`full == false`，`session` 恒
@@ -8937,6 +9009,75 @@ mod tests {
         let repo = serde_json::json!({"id": "repo-1", "name": "Acme Corp"});
         let payload = build_session_index_snapshot_payload(sessions, repo.clone());
         assert_eq!(payload["repo"], repo);
+    }
+
+    // B2（backlog 跟进）：session.index 全量快照发送前尺寸闸。
+
+    #[test]
+    fn truncate_session_index_snapshot_rows_passes_through_unchanged_when_within_budget() {
+        let sessions = serde_json::json!([{"id": "s1"}, {"id": "s2"}]);
+        let (result, truncated) = truncate_session_index_snapshot_rows(sessions.clone(), 4096);
+        assert_eq!(result, sessions);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn truncate_session_index_snapshot_rows_empty_array_does_not_panic() {
+        let (result, truncated) = truncate_session_index_snapshot_rows(serde_json::json!([]), 4096);
+        assert_eq!(result, serde_json::json!([]));
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn truncate_session_index_snapshot_rows_drops_tail_rows_when_over_budget() {
+        // 每行序列化后约 30 字节（`{"id":"row-N","pad":"..."}`），budget=100 只够放下前几行——
+        // 断言：① 结果不超预算；② truncated=true；③ 保留的是排在前面的行（SQL 已按
+        // pinned DESC, created_at DESC 排好序，重要行天然在前，这里只需验证"从尾部丢"这个
+        // 截断策略本身，不需要真的模拟 pinned/created_at 排序）。
+        let rows: Vec<Value> = (0..10)
+            .map(|i| serde_json::json!({ "id": format!("row-{i}"), "pad": "xxxxxxxxxx" }))
+            .collect();
+        let sessions = Value::Array(rows.clone());
+        let budget = 100;
+        let full_bytes = serde_json::to_vec(&sessions).expect("must serialize").len();
+        assert!(
+            full_bytes > budget,
+            "test fixture must actually exceed budget"
+        );
+
+        let (result, truncated) = truncate_session_index_snapshot_rows(sessions, budget);
+        assert!(truncated);
+        let result_bytes = serde_json::to_vec(&result).expect("must serialize").len();
+        assert!(result_bytes <= budget);
+
+        let kept = result.as_array().expect("result must be an array");
+        assert!(!kept.is_empty(), "budget must fit at least the first row");
+        assert!(
+            kept.len() < rows.len(),
+            "some tail rows must have been dropped"
+        );
+        // 保留的行必须是原数组的一个前缀（顺序不变、内容不变），不是任意子集。
+        assert_eq!(kept.as_slice(), &rows[..kept.len()]);
+    }
+
+    #[test]
+    fn truncate_session_index_snapshot_rows_non_array_input_passes_through_unchanged() {
+        // 理论不可达（调用方恒传 filter_session_index_snapshot_for_active_repo 的 fail-closed
+        // 数组返回值）——防御性：不假设契约不会被破坏，但也不在这里重新发明一次 fail-closed。
+        let (result, truncated) = truncate_session_index_snapshot_rows(Value::Null, 10);
+        assert_eq!(result, Value::Null);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn marks_session_index_snapshot_truncated_inserts_key_only_when_truncated() {
+        let payload = serde_json::json!({ "full": true, "sessions": [], "repo": null });
+
+        let untruncated = mark_session_index_snapshot_truncated(payload.clone(), false);
+        assert!(untruncated.get("truncated").is_none());
+
+        let truncated = mark_session_index_snapshot_truncated(payload, true);
+        assert_eq!(truncated["truncated"], Value::Bool(true));
     }
 
     #[test]
@@ -19337,6 +19478,71 @@ mod tests {
         assert_eq!(
             deleted_payload,
             data_plane_v1_case(&fixture, "session_index_deleted")["frame"]
+        );
+    }
+
+    /// B1（backlog 跟进）：`session_index_full`/`session_index_created` 样张只钉了 `repo`/
+    /// `repo_name` 恒 `null` 的形状——填充态（字段真有值）两端各自造语料测，样张对拍缺口，
+    /// 字段改名可能「Rust 自测红、手机端全绿」地悄悄裂开。本测试用同一份共享样张的填充态
+    /// case（`session_index_full_with_repo_name`/`session_index_created_with_repo_name`）
+    /// 覆盖：sessions 数组仍抄自 `db::SessionIndexSnapshotRow` 的真实 Serialize 输出（不是
+    /// 手打 JSON），`repo_name` 这次是 `Some(..)`；顶层 `repo` 摘要是 `{id, name}` 均非 null
+    /// 的 `Value`（构造层面等价于 `active_repo_summary_for_snapshot` 在有名字时会产出的形状，
+    /// 不经过那个函数本身——同 `data_plane_v1_session_index_variants_match_fixture_and_drive_
+    /// builders` 只探 builder 契约、不探 `Inner` 状态装配的既有分工）。
+    #[test]
+    fn data_plane_v1_session_index_filled_variant_matches_fixture_and_drives_builders() {
+        let fixture = load_data_plane_v1_fixture();
+
+        let rows = vec![
+            crate::db::SessionIndexSnapshotRow {
+                id: "sess-1".to_owned(),
+                title: "Fix login bug".to_owned(),
+                repo_id: Some("repo-a".to_owned()),
+                archived: false,
+                status: Some("running".to_owned()),
+                run_id: Some("run-42".to_owned()),
+                updated_at: 1_765_430_400_123,
+                last_msg_preview: Some("Latest assistant reply".to_owned()),
+                last_activity_at: Some(1_765_430_450),
+                repo_name: Some("Acme Metrics".to_owned()),
+            },
+            crate::db::SessionIndexSnapshotRow {
+                id: "sess-2".to_owned(),
+                title: "Update docs".to_owned(),
+                repo_id: Some("repo-a".to_owned()),
+                archived: false,
+                status: None,
+                run_id: None,
+                updated_at: 1_765_430_300_000,
+                last_msg_preview: None,
+                last_activity_at: None,
+                repo_name: Some("Acme Metrics".to_owned()),
+            },
+        ];
+        let sessions = serde_json::to_value(&rows).expect("rows must serialize");
+        let repo_summary = serde_json::json!({ "id": "repo-a", "name": "Acme Metrics" });
+        let full_payload = milestone_payload(
+            "session.index",
+            build_session_index_snapshot_payload(sessions, repo_summary),
+        );
+        let expected_full =
+            data_plane_v1_case(&fixture, "session_index_full_with_repo_name")["frame"].clone();
+        assert_eq!(full_payload, expected_full);
+
+        let created_payload = milestone_payload(
+            "session.index",
+            build_session_index_created_payload(
+                "sess-3",
+                "New session",
+                "repo-a",
+                "ns-1",
+                Some("Acme Metrics"),
+            ),
+        );
+        assert_eq!(
+            created_payload,
+            data_plane_v1_case(&fixture, "session_index_created_with_repo_name")["frame"]
         );
     }
 
