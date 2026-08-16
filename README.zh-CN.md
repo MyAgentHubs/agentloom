@@ -91,6 +91,10 @@ AgentLoom 的前提正好相反：很多项目、很多模型、好几个 agent 
 *会话是干活的基本单位：一段专注的对话，产出代码，带 checkpoint 和撤销。
 左栏放着你所有的项目、以及每个项目下面的会话 —— 不用开一排标签页。*
 
+**远程控制** —— 手机扫码配对;relay 地址留空即走官方中继，开箱即用:
+
+![设置 → 远程控制:扫码配对手机、默认官方中继、已配对设备可吊销](docs/screenshots/remote-control.png)
+
 ## 功能
 
 - **Agent team** —— 跨厂商配置任意多个 agent(Claude Code、Codex 这类原生 CLI，

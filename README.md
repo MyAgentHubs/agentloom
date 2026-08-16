@@ -97,6 +97,11 @@ If you run the same 30 instances and get something materially different, please 
 *A session is the unit of work: one focused conversation that ships code, with checkpoints
 and undo. The sidebar holds every project you work on and every session inside it — no tab soup.*
 
+**Remote Control** — pair your phone by scanning a QR code; leave the relay URL empty and the
+official relay is used out of the box:
+
+![Settings → Remote Control: pair a phone by QR code, official relay by default, paired devices with revoke](docs/screenshots/remote-control.png)
+
 ## Features
 
 - **Agent teams** — configure any number of agents across providers (native CLIs like Claude
