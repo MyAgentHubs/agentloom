@@ -33,6 +33,24 @@ pub fn lead_decision_key(event_cursor: &str) -> String {
     format!("lead_decision:{event_cursor}")
 }
 
+/// P0-c：user 消息落库的默认防重复键——`user_dedup_key` IPC 入参为 `None`（本地/续跑/无
+/// command_id 场景）时的兜底，绑定当次 run_id，与 `run_flush_key` 同风格。
+pub fn user_send_key(run_id: &str) -> String {
+    format!("user_send:{run_id}")
+}
+
+/// P0-c：remote inbox 单条指令的防重复键——绑定 `remote_inbox.command_id`（relay
+/// at-least-once 重投时同一 command_id 会再次投递），是 command_id 穿线落库去重的唯一凭据。
+pub fn remote_input_key(command_id: &str) -> String {
+    format!("remote_input:{command_id}")
+}
+
+/// P0-c：迟到答案落库的防重复键——绑定 `decision_id`（`commit_late_answer` CAS 赢家分支
+/// 唯一调用一次，键本身不必再靠 run_id 或 command_id 加持）。
+pub fn late_answer_key(decision_id: &str) -> String {
+    format!("late_answer:{decision_id}")
+}
+
 /// lib.rs 已算好的事实（只传事实、不带判断）——归约器 `finish` 收尾判定的输入。
 pub struct RunOutcome {
     pub run_id: String,
@@ -400,6 +418,15 @@ impl DisplayReducer {
             | AgentEvent::GoalUpdated { .. }
             | AgentEvent::CriteriaUpdated { .. } => {}
         }
+    }
+
+    /// P0-b：非消费只读克隆——原子截取"此刻已归约"的 blocks，供远端 `control.snapshot` 请求
+    /// 使用（M0 §3 v1.8.10 水印契约的 `partial_msg.blocks`）。与消费性的 `finish` 语义不同：
+    /// `finish` 会做收尾清扫（未闭合的 tool 卡置 interrupted、未决审批置 cancelled）并追加
+    /// 结论卡/变更卡/收尾卡；这里不做任何收尾——进行中未闭合的 tool 卡原样按 `Running` 状态
+    /// 返回，因为 run 仍在继续、后续事件还会补全它，收尾逻辑是 run 结束时刻的一次性动作。
+    pub fn snapshot_blocks(&self) -> Vec<Block> {
+        self.blocks.clone()
     }
 
     /// 收尾判定：出全部卡（一次 run flush = 一条 assistant 消息）。

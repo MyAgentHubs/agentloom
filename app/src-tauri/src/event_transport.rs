@@ -28,6 +28,8 @@ pub(crate) struct SequencedEvent {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub(crate) struct RunBatch {
     pub session_id: String,
+    #[serde(skip)]
+    pub run_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dispatch: Option<DispatchMeta>,
     pub events: Vec<SequencedEvent>,
@@ -51,6 +53,7 @@ pub(crate) struct HighWatermarks {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TransportDiagnostics {
     pub protocol_errors: u64,
+    pub sink_panics: u64,
     pub journal_dropped: u64,
     pub journal_write_errors: u64,
     pub retired_runs: u64,
@@ -75,7 +78,8 @@ pub(crate) struct EventTransport {
 struct Inner {
     lanes: Mutex<BTreeMap<String, Arc<Lane>>>,
     emit_serial: Mutex<()>,
-    emitter: Mutex<Option<Arc<EmitFn>>>,
+    started: Mutex<bool>,
+    sinks: Mutex<Vec<Arc<EmitFn>>>,
     journal: JournalTee,
     diagnostics: Arc<DiagnosticCounters>,
     lane_capacity: usize,
@@ -116,6 +120,7 @@ enum Lifecycle {
 #[derive(Default)]
 struct DiagnosticCounters {
     protocol_errors: AtomicU64,
+    sink_panics: AtomicU64,
     journal_dropped: AtomicU64,
     journal_write_errors: AtomicU64,
     retired_runs: AtomicU64,
@@ -180,7 +185,8 @@ impl EventTransport {
             inner: Arc::new(Inner {
                 lanes: Mutex::new(BTreeMap::new()),
                 emit_serial: Mutex::new(()),
-                emitter: Mutex::new(None),
+                started: Mutex::new(false),
+                sinks: Mutex::new(Vec::new()),
                 journal: JournalTee::new(journal_dir, journal_capacity, diagnostics.clone()),
                 diagnostics,
                 lane_capacity,
@@ -290,20 +296,41 @@ impl EventTransport {
         &self,
         emit: impl Fn(BatchPayload) + Send + Sync + 'static,
     ) -> Result<(), TransportError> {
-        {
-            let mut emitter = lock(&self.inner.emitter);
-            if emitter.is_some() {
-                return Err(TransportError::AlreadyStarted);
-            }
-            *emitter = Some(Arc::new(emit));
+        let mut started = lock(&self.inner.started);
+        if *started {
+            return Err(TransportError::AlreadyStarted);
         }
+        *started = true;
+        lock(&self.inner.sinks).push(Arc::new(emit));
 
         let weak = Arc::downgrade(&self.inner);
         thread::Builder::new()
             .name("event-transport-tick".into())
             .spawn(move || tick_loop(weak))
             .expect("failed to start EventTransport tick thread");
+        drop(started);
         Ok(())
+    }
+
+    /// Must be called after `start()` so the app emit sink remains at index 0.
+    /// Each process-local output may be registered only once; sinks cannot be removed. A future
+    /// remote master switch must self-gate inside its sink (for example, with an `AtomicBool`)
+    /// instead of adding or removing transport registrations.
+    ///
+    /// Sink callbacks run sequentially while the emit lock is held and must return quickly. They
+    /// may only enqueue with non-blocking `try_send`; a full queue must drop the item and increment
+    /// a counter, following `JournalTee::record` below. They must never use blocking `send`, perform
+    /// network I/O, acquire EventTransport internal locks (`started`, `sinks`, `emit_serial`,
+    /// `lanes`, or `lane.state`) or any other lock, or panic. Panic isolation is only a last-resort
+    /// safeguard and does not make panicking a valid sink behavior.
+    // backlog：D1 remote_gateway 接线后移除 allow
+    #[allow(dead_code)]
+    pub(crate) fn add_sink(&self, sink: impl Fn(BatchPayload) + Send + Sync + 'static) {
+        debug_assert!(
+            self.is_started(),
+            "start's app.emit sink must remain at index 0; call start before add_sink"
+        );
+        lock(&self.inner.sinks).push(Arc::new(sink));
     }
 
     /// Synchronously establishes the terminal ordering barrier for one run.
@@ -312,7 +339,19 @@ impl EventTransport {
     /// this method (`slot registry -> emit_serial`). EventTransport never invokes
     /// a callback into the slot domain, and neither the tick nor journal writer
     /// acquires an external/slot lock. The emit lock remains held from draining
-    /// the lane until the injected emit callback returns.
+    /// the lane until all sink callbacks have run sequentially and returned.
+    ///
+    /// M1 修复轮 P0-1（2026-08-11·opus 深审）：callers must NOT hold the `db::Db` mutex
+    /// (session_runtime table) across this call either. `TimedMutex`/`std::sync::Mutex` are
+    /// non-reentrant; the release throats (`emit_terminal_after_releasing_run_slot` /
+    /// `emit_lead_error_and_release` / `refresh_session_runtime`, all in lib.rs) take and drop
+    /// that lock in a short, self-contained critical section strictly *before* invoking
+    /// `flush_barrier`, precisely so a later call on the same thread (e.g. `try_autofeed_lead`,
+    /// which re-locks `db::Db`) can never deadlock against a guard still alive in the caller's
+    /// stack frame. (Root cause of the bug this fixes: the old signature accepted an already-
+    /// locked `&Connection` from the caller, which stayed alive across this call and into the
+    /// next `db::Db` lock attempt on the same thread.)
+    /// See `add_sink`'s doc comment for the sink callback contract.
     pub(crate) fn flush_barrier(
         &self,
         run_id: &str,
@@ -347,7 +386,10 @@ impl EventTransport {
         terminal_events: Vec<(Option<DispatchMeta>, AgentEvent)>,
     ) -> Result<bool, TransportError> {
         let _emit_guard = lock(&self.inner.emit_serial);
-        let emitter = self.emitter().ok_or(TransportError::NotStarted)?;
+        let sinks = self.sinks();
+        let Some((last_sink, other_sinks)) = sinks.split_last() else {
+            return Err(TransportError::NotStarted);
+        };
         let lane = self.lane(run_id).ok_or(TransportError::UnknownRun)?;
 
         let (mut streaming, terminal, last_seq) = {
@@ -381,9 +423,13 @@ impl EventTransport {
 
         streaming.extend(terminal);
         if !streaming.is_empty() {
-            emitter(BatchPayload {
+            let payload = BatchPayload {
                 batches: batches_for(&lane, streaming),
-            });
+            };
+            for sink in other_sinks {
+                invoke_sink(sink, payload.clone(), &self.inner.diagnostics);
+            }
+            invoke_sink(last_sink, payload, &self.inner.diagnostics);
         }
         if let Some(seq) = last_seq {
             lane.emitted_seq.store(seq, Ordering::Release);
@@ -422,6 +468,7 @@ impl EventTransport {
                 .diagnostics
                 .protocol_errors
                 .load(Ordering::Relaxed),
+            sink_panics: self.inner.diagnostics.sink_panics.load(Ordering::Relaxed),
             journal_dropped: self
                 .inner
                 .diagnostics
@@ -455,8 +502,12 @@ impl EventTransport {
         lock(&self.inner.lanes).get(run_id).cloned()
     }
 
-    fn emitter(&self) -> Option<Arc<EmitFn>> {
-        lock(&self.inner.emitter).clone()
+    fn is_started(&self) -> bool {
+        *lock(&self.inner.started)
+    }
+
+    fn sinks(&self) -> Vec<Arc<EmitFn>> {
+        lock(&self.inner.sinks).clone()
     }
 
     #[cfg(test)]
@@ -464,7 +515,9 @@ impl EventTransport {
         &self,
         emit: impl Fn(BatchPayload) + Send + Sync + 'static,
     ) {
-        *lock(&self.inner.emitter) = Some(Arc::new(emit));
+        let mut started = lock(&self.inner.started);
+        *started = true;
+        *lock(&self.inner.sinks) = vec![Arc::new(emit)];
     }
 
     #[cfg(test)]
@@ -490,8 +543,8 @@ impl Default for EventTransport {
 }
 
 impl Inner {
-    fn emitter(&self) -> Option<Arc<EmitFn>> {
-        lock(&self.emitter).clone()
+    fn sinks(&self) -> Vec<Arc<EmitFn>> {
+        lock(&self.sinks).clone()
     }
 }
 
@@ -563,7 +616,8 @@ fn tick_loop(inner: Weak<Inner>) {
 
 fn emit_tick(inner: &Arc<Inner>) {
     let _emit_guard = lock(&inner.emit_serial);
-    let Some(emitter) = inner.emitter() else {
+    let sinks = inner.sinks();
+    let Some((last_sink, other_sinks)) = sinks.split_last() else {
         return;
     };
     let tick_sequence = inner.tick_sequence.fetch_add(1, Ordering::AcqRel) + 1;
@@ -622,9 +676,19 @@ fn emit_tick(inner: &Arc<Inner>) {
     if batches.is_empty() {
         return;
     }
-    emitter(BatchPayload { batches });
+    let payload = BatchPayload { batches };
+    for sink in other_sinks {
+        invoke_sink(sink, payload.clone(), &inner.diagnostics);
+    }
+    invoke_sink(last_sink, payload, &inner.diagnostics);
     for (lane, seq) in emitted {
         lane.emitted_seq.store(seq, Ordering::Release);
+    }
+}
+
+fn invoke_sink(sink: &Arc<EmitFn>, payload: BatchPayload, diagnostics: &DiagnosticCounters) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink(payload))).is_err() {
+        diagnostics.sink_panics.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -639,6 +703,7 @@ fn batches_for(lane: &Lane, events: Vec<QueuedEvent>) -> Vec<RunBatch> {
         } else {
             batches.push(RunBatch {
                 session_id: lane.session_id.clone(),
+                run_id: lane.run_id.clone(),
                 dispatch: queued.dispatch,
                 events: vec![queued.sequenced],
             });
@@ -896,6 +961,156 @@ mod tests {
         assert_eq!(payloads.len(), 1);
         assert_eq!(payloads[0].batches.len(), 1);
         payloads[0].batches[0].events.clone()
+    }
+
+    #[test]
+    fn fan_out_sends_identical_payloads_to_sinks_in_registration_order() {
+        let (_root, transport) = test_transport(8);
+        let first_payloads = Arc::new(Mutex::new(Vec::new()));
+        let second_payloads = Arc::new(Mutex::new(Vec::new()));
+        let call_order = Arc::new(Mutex::new(Vec::new()));
+
+        let recorded = first_payloads.clone();
+        let calls = call_order.clone();
+        transport
+            .start(move |payload| {
+                lock(&calls).push("first");
+                lock(&recorded).push(payload);
+            })
+            .unwrap();
+        let recorded = second_payloads.clone();
+        let calls = call_order.clone();
+        transport.add_sink(move |payload| {
+            lock(&calls).push("second");
+            lock(&recorded).push(payload);
+        });
+
+        transport
+            .register_run("r", "s", None, TextGranularity::Token)
+            .unwrap();
+        transport.push("r", text("first"));
+        transport.push("r", text("second"));
+        transport
+            .flush_barrier("r", vec![terminal("done")])
+            .unwrap();
+
+        assert_eq!(*lock(&first_payloads), *lock(&second_payloads));
+        assert_eq!(lock(&first_payloads).len(), 1);
+        assert_eq!(*lock(&call_order), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn tick_fans_out_to_every_sink() {
+        let (_root, transport) = test_transport(8);
+        let a = Arc::new(Mutex::new(Vec::new()));
+        let b = Arc::new(Mutex::new(Vec::new()));
+        let (ra, rb) = (a.clone(), b.clone());
+        transport.start(move |p| lock(&ra).push(p)).unwrap();
+        transport.add_sink(move |p| lock(&rb).push(p));
+        transport
+            .register_run("r", "s", None, TextGranularity::Token)
+            .unwrap();
+        transport.push("r", text("hello"));
+        transport.tick_once_for_test();
+        assert_eq!(*lock(&a), *lock(&b));
+        assert_eq!(lock(&a).len(), 1);
+    }
+
+    #[test]
+    fn run_id_is_available_to_native_sinks_but_skipped_from_serialized_batches() {
+        let (_root, transport) = test_transport(8);
+        let payloads = recorder(&transport);
+        transport
+            .register_run(
+                "run-private",
+                "session-public",
+                None,
+                TextGranularity::Token,
+            )
+            .unwrap();
+        transport.push("run-private", text("hello"));
+        transport.tick_once_for_test();
+
+        let payloads = lock(&payloads);
+        let batch = &payloads[0].batches[0];
+        assert_eq!(batch.run_id, "run-private");
+        let serialized = serde_json::to_value(batch).unwrap();
+        assert_eq!(serialized["session_id"], "session-public");
+        assert!(
+            serialized.get("run_id").is_none(),
+            "run_id must remain private to native sinks"
+        );
+    }
+
+    #[test]
+    fn panicking_sink_does_not_block_other_sinks_or_future_batches() {
+        let (_root, transport) = test_transport(8);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        transport.start(|_| panic!("boom")).unwrap();
+        let recorded = received.clone();
+        transport.add_sink(move |payload| lock(&recorded).push(payload));
+
+        transport
+            .register_run("tick", "tick", None, TextGranularity::Token)
+            .unwrap();
+        transport.push("tick", text("first"));
+        transport.tick_once_for_test();
+        assert_eq!(lock(&received).len(), 1);
+
+        transport
+            .register_run("flush", "flush", None, TextGranularity::Token)
+            .unwrap();
+        transport.push("flush", text("second"));
+        assert!(transport
+            .flush_barrier("flush", vec![terminal("done")])
+            .unwrap());
+        assert_eq!(lock(&received).len(), 2);
+        assert_eq!(transport.high_watermarks("flush").unwrap().emitted_seq, 2);
+        assert!(!transport.flush_barrier("flush", Vec::new()).unwrap());
+        assert_eq!(transport.diagnostics().sink_panics, 2);
+    }
+
+    #[test]
+    fn sink_added_later_only_receives_subsequent_payloads() {
+        let (_root, transport) = test_transport(8);
+        let first_payloads = Arc::new(Mutex::new(Vec::new()));
+        let recorded = first_payloads.clone();
+        transport
+            .start(move |payload| lock(&recorded).push(payload))
+            .unwrap();
+
+        transport
+            .register_run("first", "first", None, TextGranularity::Token)
+            .unwrap();
+        transport.push("first", text("before"));
+        transport
+            .flush_barrier("first", vec![terminal("first done")])
+            .unwrap();
+
+        let second_payloads = Arc::new(Mutex::new(Vec::new()));
+        let recorded = second_payloads.clone();
+        transport.add_sink(move |payload| lock(&recorded).push(payload));
+        transport
+            .register_run("second", "second", None, TextGranularity::Token)
+            .unwrap();
+        transport.push("second", text("after"));
+        transport
+            .flush_barrier("second", vec![terminal("second done")])
+            .unwrap();
+
+        let first_payloads = lock(&first_payloads);
+        let second_payloads = lock(&second_payloads);
+        assert_eq!(first_payloads.len(), 2);
+        assert_eq!(second_payloads.len(), 1);
+        assert_eq!(first_payloads[1], second_payloads[0]);
+        assert_eq!(second_payloads[0].batches[0].session_id, "second");
+    }
+
+    #[test]
+    fn start_still_rejects_a_second_call() {
+        let (_root, transport) = test_transport(8);
+        transport.start(|_| {}).unwrap();
+        assert_eq!(transport.start(|_| {}), Err(TransportError::AlreadyStarted));
     }
 
     #[test]

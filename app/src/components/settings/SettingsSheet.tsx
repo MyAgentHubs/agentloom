@@ -2,6 +2,7 @@ import { useEffect, useRef, type ReactNode } from "react";
 import { SettingsShell, type SettingsPage } from "./SettingsShell";
 import { useI18n } from "../../i18n";
 import { SettingsAbout } from "./SettingsAbout";
+import { SettingsRemoteControl } from "./SettingsRemoteControl";
 
 type Props = {
   open: boolean;
@@ -72,6 +73,8 @@ export function SettingsSheet(props: Props) {
               props.searchContent
             ) : props.page === "language" ? (
               props.languageContent
+            ) : props.page === "remoteControl" ? (
+              <SettingsRemoteControl />
             ) : props.page === "archivedProjects" ? (
               props.archivedProjectsContent
             ) : props.page === "about" ? (

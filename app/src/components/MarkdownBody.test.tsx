@@ -2,6 +2,8 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { clearAttachmentCache } from "../lib/attachmentCache";
+import { AttachmentPortContext } from "../lib/attachmentPortContext";
+import type { AttachmentPort } from "../lib/remoteSessionPort";
 import { MarkdownBody } from "./MarkdownBody";
 
 const invokeMock = vi.fn();
@@ -19,6 +21,15 @@ beforeEach(() => {
   vi.mocked(openUrl).mockClear();
   clearAttachmentCache();
 });
+
+function stubAttachmentPort(overrides: Partial<AttachmentPort> = {}): AttachmentPort {
+  return {
+    resolveImageSrc: vi.fn().mockResolvedValue(null),
+    openExternal: vi.fn().mockResolvedValue(undefined),
+    openUrl: vi.fn().mockResolvedValue(undefined),
+    ...overrides,
+  };
+}
 
 describe("MarkdownBody links", () => {
   it.each([
@@ -393,5 +404,81 @@ describe("MarkdownBody urlTransform scope (img src only)", () => {
         sessionId: null,
       }),
     );
+  });
+});
+
+describe("MarkdownBody — 注入 AttachmentPort", () => {
+  it("外链走注入的 stub.openUrl 而不是 Tauri plugin-opener", () => {
+    const openUrlStub = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <AttachmentPortContext.Provider
+        value={stubAttachmentPort({ openUrl: openUrlStub })}
+      >
+        <MarkdownBody streaming={false}>
+          {"[external](https://example.com/report)"}
+        </MarkdownBody>
+      </AttachmentPortContext.Provider>,
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "external" }));
+
+    expect(openUrlStub).toHaveBeenCalledWith("https://example.com/report");
+    expect(openUrl).not.toHaveBeenCalled();
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("本地 html 链接走注入的 stub.openExternal 而不是 invoke", async () => {
+    const openExternalStub = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <AttachmentPortContext.Provider
+        value={stubAttachmentPort({ openExternal: openExternalStub })}
+      >
+        <MarkdownBody streaming={false} sessionId="session-stub">
+          {"[report](report.html)"}
+        </MarkdownBody>
+      </AttachmentPortContext.Provider>,
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "report" }));
+
+    await waitFor(() =>
+      expect(openExternalStub).toHaveBeenCalledWith(
+        "report.html",
+        "session-stub",
+      ),
+    );
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("图片走注入的 stub.resolveImageSrc；返回 null 时降级不显示图", async () => {
+    const resolveImageSrc = vi.fn().mockResolvedValue(null);
+
+    render(
+      <AttachmentPortContext.Provider
+        value={stubAttachmentPort({ resolveImageSrc })}
+      >
+        <MarkdownBody streaming={false} sessionId="session-stub-img">
+          {"![chart](assets/x.png)"}
+        </MarkdownBody>
+      </AttachmentPortContext.Provider>,
+    );
+
+    await waitFor(() =>
+      expect(resolveImageSrc).toHaveBeenCalledWith(
+        "assets/x.png",
+        "session-stub-img",
+      ),
+    );
+    // 加载态与失败态渲染同一段路径文本（分别在 loading span / 失败态 code 里）——
+    // 先等 loading 态（role="status"）消失，再断言最终降级态，避免误配到转瞬即逝的
+    // loading 节点。
+    await waitFor(() => {
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    });
+    expect(screen.getByText("assets/x.png")).toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 });

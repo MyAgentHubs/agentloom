@@ -543,6 +543,11 @@ export type ChatMessage = {
   // 注：不加数字 id 字段——前端已用 `ChatMessage & { id: string }` 表客户端消息 id，
   // 后端 DB 数字 id 仅供锚点 resolver（backend memory_read_source）·前端暂不需要。
   created_at?: number;
+  // U6：纯前端瞬时「活跃流式尾」标记——ensureStreamTail 造新尾时置 true，
+  // sealStreamTail 在收到终态事件时统一把当时的末条 assistant 封口为 false。
+  // 不入库、不随 get_messages 回传；只用于区分「真在流的尾巴」与「已终结的尾巴」，
+  // 修复 lead-message-appended 插入位把已终结的 UUID id 尾巴误当活尾跳过而错位的问题。
+  stream_live?: boolean;
 };
 
 export type ReviewFileResult = {

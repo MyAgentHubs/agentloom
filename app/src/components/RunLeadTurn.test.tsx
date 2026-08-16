@@ -393,6 +393,28 @@ describe("RunLeadTurn", () => {
     expect(container.querySelector(".pf-list .decision-card")).toBeNull();
   });
 
+  it("pf-tri svg 内联 width/height/fill/stroke，不依赖外部样式表也能正确显示（手机端零 CSS 场景）", () => {
+    const { container } = render(
+      <RunLeadTurn
+        turn={turn({
+          members: [member()],
+          verdict: verdict(),
+          phase: "terminal",
+          outcome: "succeeded",
+          showProcessFold: true,
+        })}
+      />,
+    );
+
+    const triSvg = container.querySelector(".pf-tri svg");
+    expect(triSvg).not.toBeNull();
+    expect(triSvg?.getAttribute("width")).toBe("11");
+    expect(triSvg?.getAttribute("height")).toBe("11");
+    expect(triSvg?.getAttribute("fill")).toBe("none");
+    expect(triSvg?.getAttribute("stroke")).toBe("currentColor");
+    expect(triSvg?.getAttribute("stroke-width")).toBe("2.4");
+  });
+
   it("lead 名字缺失时兜底显示「队长」（走 i18n，非硬编码）", () => {
     const { container } = render(
       <RunLeadTurn

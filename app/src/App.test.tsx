@@ -26,6 +26,13 @@ const { invokeMock, listenMock, openMock, sessionMainProps } = vi.hoisted(
     openMock: vi.fn(),
     sessionMainProps: [] as Array<{
       onOpenPreview?: (path: string) => void;
+      messages?: Array<{
+        role: "user" | "assistant";
+        content: unknown[];
+        engine?: string;
+        agent_id?: string | null;
+        agent_name_snapshot?: string | null;
+      }>;
     }>,
   }),
 );
@@ -868,6 +875,21 @@ describe("App", () => {
       payload: {
         session_id: string;
         message: ChatMessage & { id: number };
+      };
+    }) => void;
+  }
+
+  function decisionCardResolvedCb() {
+    const handler = listenMock.mock.calls.find(
+      (c) => c[0] === "decision-card-resolved",
+    )?.[1];
+    if (!handler) throw new Error("decision-card-resolved listener 未注册");
+    return handler as (e: {
+      payload: {
+        session_id: string;
+        decision_id: string;
+        status: "chosen";
+        chosen_option: string | null;
       };
     }) => void;
   }
@@ -5022,7 +5044,10 @@ describe("App", () => {
     const hint = await screen.findByText(
       "后端显示上一次运行仍未结束（可能已卡住）。请稍候或点停止后重试。",
     );
-    expect(container.querySelectorAll(".turn--assistant")).toHaveLength(1);
+    expect(container.querySelectorAll(".turn--assistant")).toHaveLength(2);
+    expect(container.querySelectorAll(".turn--assistant")[0]).toHaveTextContent(
+      /连续多轮没有实质进展/,
+    );
     expect(container.querySelectorAll(".turn--user")).toHaveLength(1);
     const turns = container.querySelectorAll(".turn");
     expect(turns[turns.length - 1]).toBe(hint.closest(".turn--assistant"));
@@ -5168,12 +5193,18 @@ describe("App", () => {
       emitAgentEventBatch([{ kind: "text_delta", text: "拒绝后正文" }]);
     });
     await waitFor(() =>
-      expect(
-        container.querySelectorAll(".turn--assistant")[
-          container.querySelectorAll(".turn--assistant").length - 1
-        ],
-      ).toHaveTextContent("旧流起点拒绝后正文"),
+      expect(container.querySelectorAll(".turn--assistant")).toHaveLength(
+        assistantTurns.length + 1,
+      ),
     );
+    const updatedAssistantTurns =
+      container.querySelectorAll(".turn--assistant");
+    expect(
+      updatedAssistantTurns[updatedAssistantTurns.length - 1],
+    ).toHaveTextContent("拒绝后正文");
+    expect(
+      updatedAssistantTurns[updatedAssistantTurns.length - 1],
+    ).not.toHaveTextContent("旧流起点");
     expect(hintTurn?.textContent).toBe(hintText);
   });
 
@@ -5557,6 +5588,139 @@ describe("App", () => {
       expect(statusLine?.textContent).not.toContain("工作中");
       expect(statusLine?.textContent).not.toContain("↑");
     });
+  });
+
+  it("session_started · 远程 run 用会话配置 agent 注册 running 身份", async () => {
+    mockBasicApp([
+      agentProfile(),
+      agentProfile({
+        id: "deepseek",
+        name: "DeepSeek",
+        provider: "deepseek",
+        access: "borrow",
+        sort_order: 1,
+      }),
+    ]);
+    const { container } = render(<App />);
+    await screen.findByText("Claude Code");
+    fireEvent.click(screen.getByRole("button", { name: /选择 agent/ }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "DeepSeek" }));
+    await configureTeamLead("DeepSeek");
+
+    act(() => {
+      agentEventCb()({
+        payload: {
+          session_id: "s1",
+          kind: "session_started",
+          conversation_id: "remote-conversation",
+        },
+      });
+      agentEventCb()({
+        payload: {
+          session_id: "s1",
+          kind: "text_delta",
+          text: "remote streaming",
+        },
+      });
+    });
+
+    expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument();
+    expect(
+      container.querySelector('[data-session-id="s1"] .sess__dot'),
+    ).toHaveClass("run");
+    await screen.findByText("remote streaming");
+    const remoteTail = sessionMainProps[
+      sessionMainProps.length - 1
+    ]?.messages?.find((message) =>
+      message.content.some(
+        (block) =>
+          (block as { type?: string; text?: string }).type === "text" &&
+          (block as { text?: string }).text === "remote streaming",
+      ),
+    );
+    expect(remoteTail).toMatchObject({
+      engine: "deepseek",
+      agent_id: "deepseek",
+      agent_name_snapshot: "DeepSeek",
+    });
+  });
+
+  it("session_started · 本地 run 已乐观注册时不覆盖 workingTokens", async () => {
+    const { sendCalls } = mockBasicApp();
+    render(<App />);
+    await screen.findByText("Claude Code");
+
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), {
+      target: { value: "run" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(sendCalls).toHaveLength(1));
+
+    act(() => {
+      agentEventCb()({
+        payload: {
+          session_id: "s1",
+          kind: "usage_delta",
+          input_tokens: 3,
+          output_tokens: 4,
+        },
+      });
+    });
+    expect(
+      within(
+        document.querySelector(".composer__hint-cost") as HTMLElement,
+      ).getByText(/↑ 7 tok/),
+    ).toBeInTheDocument();
+
+    act(() => {
+      agentEventCb()({
+        payload: {
+          session_id: "s1",
+          kind: "session_started",
+          conversation_id: "local-conversation",
+        },
+      });
+    });
+
+    expect(
+      within(
+        document.querySelector(".composer__hint-cost") as HTMLElement,
+      ).getByText(/↑ 7 tok/),
+    ).toBeInTheDocument();
+  });
+
+  it("session_started · 远程 run 收到终态后照常清理 running 态", async () => {
+    mockBasicApp();
+    render(<App />);
+    await screen.findByText("Claude Code");
+
+    act(() => {
+      agentEventCb()({
+        payload: {
+          session_id: "s1",
+          kind: "session_started",
+          conversation_id: "remote-conversation",
+        },
+      });
+    });
+    expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument();
+
+    await act(async () => {
+      agentEventCb()({
+        payload: {
+          session_id: "s1",
+          kind: "completed",
+          cost_usd: null,
+          input_tokens: null,
+          output_tokens: null,
+          final_text: "remote done",
+        },
+      });
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("button", { name: "发送" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "停止" })).toBeNull();
   });
 
   it("Phase cluster05 plan A Task 2 · text_delta 节流：多个 delta 只触发一次 rAF flush", async () => {
@@ -6687,9 +6851,12 @@ describe("App", () => {
         handler({ payload: { session_id: "s1", ...terminal } });
       });
 
-      expect(
-        await screen.findByText(new RegExp(terminalText)),
-      ).toBeInTheDocument();
+      const terminalEl = await screen.findByText(new RegExp(terminalText));
+      expect(terminalEl).toBeInTheDocument();
+      // U6 修复轮 2：终态文案落地时所在的 .turn，就是 run_closeout 的 run_card
+      // 收尾续写理应续灌进的同一条消息——记下来，closeout 到达后核对没被劈开。
+      const terminalTurn = terminalEl.closest(".turn");
+      expect(terminalTurn).not.toBeNull();
       expect(screen.getByRole("button", { name: "发送" })).toBeInTheDocument();
       expect(
         screen.queryByRole("group", { name: "本轮改动" }),
@@ -6714,9 +6881,13 @@ describe("App", () => {
         });
       });
 
-      expect(
-        await screen.findByRole("group", { name: "本轮改动" }),
-      ).toBeInTheDocument();
+      const runCardGroup = await screen.findByRole("group", {
+        name: "本轮改动",
+      });
+      expect(runCardGroup).toBeInTheDocument();
+      // run_closeout 是同一 run 的收尾续写，不是新一轮 delta：run_card 必须落进
+      // 终态文案所在的同一条 .turn，不该另起孤儿气泡（修前的回归症状）。
+      expect(runCardGroup.closest(".turn")).toBe(terminalTurn);
       expect(
         await screen.findByRole("button", { name: "撤销…" }),
       ).toBeInTheDocument();
@@ -6740,6 +6911,123 @@ describe("App", () => {
         expect(dot).toHaveClass("attention");
         expect(dot).not.toHaveClass("done");
       });
+    },
+  );
+
+  it("onStop → blocked → run_closeout(files_changed 非空)：run_card 落进停止文案同一 .turn（U6 修复轮 2）", async () => {
+    const { handler } = await startRunCloseoutLiveUi();
+
+    // U6 修复轮 3（F1）：停止前先有一段已流式文本——这才是 onStop 要保护的场景本体：
+    // 用户点停止时本轮文案还没流完。onStop() 里 sealStreamTail 先把这条消息封了口；
+    // 随后到达的 blocked 若不传 allowSealedTail，会把停止文案劈进另起的孤儿气泡，
+    // 跟已经流出来的这段文本分家（修前的回归症状——F1 定罪的正是这条链路）。
+    act(() => {
+      handler({
+        payload: { session_id: "s1", kind: "text_delta", text: "已经流了一段" },
+      });
+    });
+    const streamedEl = await screen.findByText("已经流了一段");
+    const streamedTurn = streamedEl.closest(".turn");
+    expect(streamedTurn).not.toBeNull();
+
+    // 真走 onStop() 代码路径（点停止按钮），不是像 it.each 那组直接派终态事件：
+    // onStop() 自己先 sweep+seal 一次（无文案）；随后到达的 blocked 事件才带真正
+    // 的停止文案、并再触发一次 ensureStreamTail+sealStreamTail。这条接缝是
+    // it.each 直接派事件那组用例没覆盖到的。
+    fireEvent.click(screen.getByRole("button", { name: "停止" }));
+
+    act(() => {
+      handler({
+        payload: {
+          session_id: "s1",
+          kind: "blocked",
+          message: "USER_STOPPED_MID_RUN",
+        },
+      });
+    });
+
+    const stopText = await screen.findByText(/USER_STOPPED_MID_RUN/);
+    const stopTurn = stopText.closest(".turn");
+    expect(stopTurn).not.toBeNull();
+    // F1：停止文案必须续灌进已流式文本所在的同一条 .turn，不该另起孤儿气泡
+    // （这是现有用例漏掉的归属校验——它此前只断言 run_card 与停止文案同 turn）。
+    expect(stopTurn).toBe(streamedTurn);
+
+    act(() => {
+      handler({
+        payload: {
+          session_id: "s1",
+          kind: "run_closeout",
+          run_id: "run-onstop-closeout",
+          commit_sha: "onstop-sha",
+          files_changed: 3,
+          insertions: 5,
+          deletions: 2,
+          interrupted: true,
+        },
+      });
+    });
+
+    const runCardGroup = await screen.findByRole("group", {
+      name: "本轮改动",
+    });
+    // run_closeout 是这一个 run 的收尾续写，不是新一轮 delta：即便 onStop 已经
+    // 先封过一次口、blocked 又封了一次口，run_card 依旧该续灌进停止文案那条
+    // .turn，不该另起孤儿气泡（修前的回归症状）。
+    expect(runCardGroup.closest(".turn")).toBe(stopTurn);
+  });
+
+  it.each([
+    {
+      terminalKind: "Error",
+      terminal: { kind: "error", message: "USER_STOPPED_ERROR_RACE" },
+      terminalTextRegex: /USER_STOPPED_ERROR_RACE/,
+    },
+    {
+      terminalKind: "NeedsDecision",
+      terminal: {
+        kind: "needs_decision",
+        run_id: "run-onstop-needs-decision",
+        reason: "需要扩大范围",
+        changes: [
+          {
+            proposal_id: "proposal-onstop-1",
+            kind: "scope",
+            detail_text: "必须扩大范围",
+            detail_summary: null,
+          },
+        ],
+      },
+      terminalTextRegex: /必须扩大范围/,
+    },
+  ])(
+    "onStop → $terminalKind：停止前已流式文本与终态文案落同一 .turn（U6 修复轮 3·F1）",
+    async ({ terminal, terminalTextRegex }) => {
+      const { handler } = await startRunCloseoutLiveUi();
+
+      act(() => {
+        handler({
+          payload: {
+            session_id: "s1",
+            kind: "text_delta",
+            text: "已经流了一段",
+          },
+        });
+      });
+      const streamedEl = await screen.findByText("已经流了一段");
+      const streamedTurn = streamedEl.closest(".turn");
+      expect(streamedTurn).not.toBeNull();
+
+      // onStop() 先 sweep+seal 一次（无文案）——随后到达的终态事件若不传
+      // allowSealedTail，会把自己的文案劈进另起的孤儿气泡（F1 回归症状）。
+      fireEvent.click(screen.getByRole("button", { name: "停止" }));
+
+      act(() => {
+        handler({ payload: { session_id: "s1", ...terminal } });
+      });
+
+      const terminalEl = await screen.findByText(terminalTextRegex);
+      expect(terminalEl.closest(".turn")).toBe(streamedTurn);
     },
   );
 
@@ -12961,7 +13249,12 @@ describe("App", () => {
 
     const defaultInvoke = invokeMock.getMockImplementation();
     invokeMock.mockImplementation((cmd: string, args?: any) => {
-      if (cmd === "answer_lead_question") return Promise.resolve();
+      if (cmd === "answer_lead_question")
+        return Promise.resolve({
+          resumed: false,
+          lead_agent_id: null,
+          resume_error: null,
+        });
       return defaultInvoke?.(cmd, args);
     });
 
@@ -12989,7 +13282,7 @@ describe("App", () => {
     expect(invokeMock).not.toHaveBeenCalledWith("lead_step", expect.anything());
   });
 
-  it("onDecisionChoose: solo MCP 卡·run 已收工 → 答复照常落库但不误调 resume_lead_session", async () => {
+  it("onDecisionChoose: solo MCP 卡·run 已收工·后端回 resumed:false → 答复照常落库但不触发续跑绘制", async () => {
     mockBasicApp(
       [
         agentProfile({
@@ -13014,9 +13307,15 @@ describe("App", () => {
 
     const defaultInvoke = invokeMock.getMockImplementation();
     invokeMock.mockImplementation((cmd: string, args?: any) => {
-      if (cmd === "answer_lead_question") return Promise.resolve();
-      if (cmd === "resume_lead_session")
-        return Promise.reject("SOLO_SHOULD_NOT_RESUME");
+      // T3：solo 会话没有持久化 lead 配置——后端 try_resume_after_answer 的门天然关闭，
+      // 回 resumed:false；迟到答案已由 commit_late_answer 落成真实 user 消息，留给下一轮
+      // 普通 run 自然消费。
+      if (cmd === "answer_lead_question")
+        return Promise.resolve({
+          resumed: false,
+          lead_agent_id: null,
+          resume_error: null,
+        });
       return defaultInvoke?.(cmd, args);
     });
 
@@ -13032,14 +13331,76 @@ describe("App", () => {
         answer: "继续",
       }),
     );
+    // 续跑权已收归后端：前端不再自己 invoke resume_lead_session。
     expect(invokeMock).not.toHaveBeenCalledWith(
       "resume_lead_session",
       expect.anything(),
     );
+    // resumed:false → 不做乐观绘制，不该出现「停止」按钮。
+    expect(screen.queryByRole("button", { name: "停止" })).toBeNull();
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
   });
 
-  it("onDecisionChoose: team MCP 卡·run 已收工(不在跑) → answer_lead_question 成功后自动调 resume_lead_session（G3 停摆修复）", async () => {
+  it("onDecisionChoose: answer outcome 带 resume_error → 通过既有 showLeadError 显示错误提示", async () => {
+    mockBasicApp(
+      [
+        agentProfile({
+          cap_lead: "planner",
+          provider: "claude",
+          access: "native",
+        }),
+        agentProfile({
+          id: "deepseek",
+          name: "DeepSeek",
+          provider: "deepseek",
+          sort_order: 1,
+        }),
+      ],
+      {
+        messages: [
+          decisionCardMessage(["继续", "先停下"], {
+            decision_id: "mcp-dc-resume-error",
+            kind: "ask",
+            question: "要不要重试恢复？",
+            recommended: "继续",
+            source_run_id: "mcp-lead-resume-error",
+          }),
+        ],
+      },
+    );
+
+    const defaultInvoke = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation((cmd: string, args?: any) => {
+      if (cmd === "answer_lead_question")
+        return Promise.resolve({
+          resumed: false,
+          lead_agent_id: null,
+          resume_error: "provider unavailable",
+        });
+      return defaultInvoke?.(cmd, args);
+    });
+
+    render(<App />);
+    await screen.findByText("Claude Code");
+    await configureTeamLead();
+
+    fireEvent.click(inlineDecisionCard().getByRole("button", { name: /继续/ }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("answer_lead_question", {
+        sessionId: "s1",
+        decisionId: "mcp-dc-resume-error",
+        answer: "继续",
+      }),
+    );
+
+    // 正向：非结构化错误沿用 showLeadError 的 generic 展示，不再静默吞掉 resume_error。
+    expect(
+      await screen.findByText("队长没想清楚下一步，换个说法再讲一遍？"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("为什么：lead_step 失败")).toBeInTheDocument();
+  });
+
+  it("onDecisionChoose: team MCP 卡·run 已收工(不在跑)·后端回 resumed:true → 乐观绘制 run·不再自己 invoke resume_lead_session（T3 续跑权收归后端）", async () => {
     mockBasicApp(
       [
         agentProfile({
@@ -13069,8 +13430,14 @@ describe("App", () => {
 
     const defaultInvoke = invokeMock.getMockImplementation();
     invokeMock.mockImplementation((cmd: string, args?: any) => {
-      if (cmd === "answer_lead_question") return Promise.resolve();
-      if (cmd === "resume_lead_session") return Promise.resolve();
+      // T3：team 会话（有持久化 lead 配置）——后端 try_resume_after_answer 门开，落库成功
+      // 后自己触发续跑，answer_lead_question 直接回 resumed:true。
+      if (cmd === "answer_lead_question")
+        return Promise.resolve({
+          resumed: true,
+          lead_agent_id: null,
+          resume_error: null,
+        });
       return defaultInvoke?.(cmd, args);
     });
 
@@ -13088,12 +13455,144 @@ describe("App", () => {
         answer: "继续",
       }),
     );
+    // 正向：前端只按 resumed:true 做乐观绘制（setRun + ensureStreamTail），真续跑已经在后端
+    // 发生——不再自己 invoke resume_lead_session（否则本机路径会双触发、撞 busy 弹假错误）。
     await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith(
-        "resume_lead_session",
-        expect.objectContaining({ sessionId: "s1", leadAgentId: "claude" }),
-      ),
+      expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument(),
     );
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "resume_lead_session",
+      expect.anything(),
+    );
+  });
+
+  it("onDecisionChoose: resumed:true 且 outcome 提供 lead_agent_id → 乐观 identity 优先采用后端值", async () => {
+    mockBasicApp(
+      [
+        agentProfile({
+          cap_lead: "planner",
+          provider: "claude",
+          access: "native",
+        }),
+        agentProfile({
+          id: "deepseek",
+          name: "DeepSeek",
+          provider: "deepseek",
+          sort_order: 1,
+        }),
+      ],
+      {
+        messages: [
+          decisionCardMessage(["继续", "先停下"], {
+            decision_id: "mcp-dc-resume-identity",
+            kind: "ask",
+            question: "由谁继续？",
+            recommended: "继续",
+            source_run_id: "mcp-lead-resume-identity",
+          }),
+        ],
+      },
+    );
+
+    const defaultInvoke = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation((cmd: string, args?: any) => {
+      if (cmd === "answer_lead_question")
+        return Promise.resolve({
+          resumed: true,
+          lead_agent_id: "deepseek",
+          resume_error: null,
+        });
+      return defaultInvoke?.(cmd, args);
+    });
+
+    render(<App />);
+    await screen.findByText("Claude Code");
+    await configureTeamLead();
+
+    fireEvent.click(inlineDecisionCard().getByRole("button", { name: /继续/ }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("answer_lead_question", {
+        sessionId: "s1",
+        decisionId: "mcp-dc-resume-identity",
+        answer: "继续",
+      }),
+    );
+
+    // 正向：当前 team effectiveLeadId 是 claude；后端 outcome 明确给 deepseek 时，流尾身份须跟后端。
+    expect(
+      await screen.findByRole("status", { name: "DeepSeek 正在工作" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: "Claude Code 正在工作" }),
+    ).toBeNull();
+    expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument();
+  });
+
+  it("onDecisionChoose: answer 尚未落定时终态抢跑清态 → resumed:true 不得复活幽灵 run", async () => {
+    mockBasicApp(
+      [
+        agentProfile({
+          cap_lead: "planner",
+          provider: "claude",
+          access: "native",
+        }),
+        agentProfile({
+          id: "deepseek",
+          name: "DeepSeek",
+          provider: "deepseek",
+          sort_order: 1,
+        }),
+      ],
+      {
+        messages: [
+          decisionCardMessage(["继续", "先停下"], {
+            decision_id: "mcp-dc-closeout-race",
+            kind: "ask",
+            question: "要不要继续这轮？",
+            recommended: "继续",
+            source_run_id: "mcp-lead-closeout-race",
+          }),
+        ],
+      },
+    );
+
+    const answerDeferred = deferred<{
+      resumed: boolean;
+      lead_agent_id: string | null;
+      resume_error: string | null;
+    }>();
+    const defaultInvoke = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation((cmd: string, args?: any) => {
+      if (cmd === "answer_lead_question") return answerDeferred.promise;
+      return defaultInvoke?.(cmd, args);
+    });
+
+    render(<App />);
+    await screen.findByText("Claude Code");
+    await configureTeamLead();
+
+    await clickDecisionOption("继续");
+    await waitFor(() => {
+      expect(
+        inlineDecisionCard().getByRole("button", { name: /继续/ }),
+      ).toBeDisabled();
+    });
+
+    // 反向时序：IPC 仍 pending 时，lead blocked 终态先抵达并经 setRun(sid, null) 清态。
+    await act(async () => {
+      emitAgentEventBatch([{ kind: "blocked", message: "provider stopped" }]);
+    });
+    await act(async () => {
+      answerDeferred.resolve({
+        resumed: true,
+        lead_agent_id: "deepseek",
+        resume_error: null,
+      });
+      await answerDeferred.promise;
+    });
+
+    // outcome 虽说 resumed:true，也不得在已发生的终态之后重新画出停止按钮。
+    expect(screen.queryByRole("button", { name: "停止" })).toBeNull();
   });
 
   it("onDecisionChoose: MCP 卡·run 仍在跑 → 不调 resume_lead_session（避免撞现有 Running 槽）", async () => {
@@ -13126,8 +13625,14 @@ describe("App", () => {
 
     const defaultInvoke = invokeMock.getMockImplementation();
     invokeMock.mockImplementation((cmd: string, args?: any) => {
-      if (cmd === "answer_lead_question") return Promise.resolve();
-      if (cmd === "resume_lead_session") return Promise.resolve();
+      // 会话已在跑（Delivered 路由，非迟到路径）——commit_late_answer 不会被调用，后端
+      // 天然回 resumed:false；前端也因 runningSessionsRef.current.has(sid) 先命中而不看它。
+      if (cmd === "answer_lead_question")
+        return Promise.resolve({
+          resumed: false,
+          lead_agent_id: null,
+          resume_error: null,
+        });
       return defaultInvoke?.(cmd, args);
     });
 
@@ -13378,10 +13883,7 @@ describe("App", () => {
     expect(matches.length).toBe(1);
   });
 
-  it("lead-message-appended 事件: 实时追加回显消息到会话流·按 message.id 去重", async () => {
-    // 决策打扰收敛刀 T1·症状 B 根修：后端 append_decision_echo 写库成功后 emit
-    // "lead-message-appended"——前端应在停留当前进程时立刻把这条消息插进消息流，
-    // 不必等下次 get_messages 全量拉取。同 id 二次 emit（未来重拉双份的防线）不应重复插入。
+  it("decision-card-resolved 事件: 远端答卡后实时翻成 chosen·重复事件幂等", async () => {
     mockBasicApp(
       [
         agentProfile({
@@ -13403,35 +13905,104 @@ describe("App", () => {
     await screen.findByText("Claude Code");
     await configureTeamLead();
 
-    const cb = leadMessageAppendedCb();
-    const echoText = "已选择「继续」（要不要继续？）";
-    const message: ChatMessage & { id: number } = {
-      id: 42,
-      role: "assistant",
-      content: [{ type: "text", text: echoText }],
-      engine: "decision-echo",
-      agent_id: "lead-claude",
-      agent_name_snapshot: "Claude 队长",
+    const block: Extract<Block, { type: "decision_card" }> = {
+      type: "decision_card",
+      decision_id: "remote-resolved-dc-1",
+      kind: "ask",
+      question: "要继续执行吗？",
+      options: ["继续", "算了"],
+      recommended: "继续",
+      rationale: "需要用户确认",
+      payload: null,
+      source_run_id: "mcp-lead-remote-1",
+      status: "pending",
+      chosen_option: null,
       created_at: 1000,
     };
-
     await act(async () => {
-      cb({ payload: { session_id: "s1", message } });
+      leadDecisionCardCb()({ payload: { session_id: "s1", block } });
+    });
+    await waitFor(() => {
+      expect(document.querySelectorAll(".decision-card")).toHaveLength(1);
+    });
+
+    const payload = {
+      session_id: "s1",
+      decision_id: block.decision_id,
+      status: "chosen" as const,
+      chosen_option: "继续",
+    };
+    const cb = decisionCardResolvedCb();
+    await act(async () => {
+      cb({ payload });
+      cb({ payload });
     });
 
     await waitFor(() => {
-      expect(screen.getByText(echoText)).toBeInTheDocument();
+      expect(document.querySelectorAll(".decision-card")).toHaveLength(0);
+      expect(document.querySelectorAll(".decision-chosen")).toHaveLength(1);
+      expect(document.querySelector(".decision-chosen")?.textContent).toContain(
+        "已选：继续",
+      );
     });
-
-    // 同一条消息（同 id）再 emit 一次——不应产生第二条。
-    await act(async () => {
-      cb({ payload: { session_id: "s1", message } });
-    });
-
-    expect(screen.queryAllByText(echoText).length).toBe(1);
   });
 
-  it("lead-message-appended 事件: 迟到回显按 id 插到无 id 流式尾巴之前", async () => {
+  it("decision-card-resolved 事件: 目标会话未缓存时忽略·不挡后续全量拉取", async () => {
+    mockBasicApp(
+      [
+        agentProfile({
+          cap_lead: "planner",
+          provider: "claude",
+          access: "native",
+        }),
+        agentProfile({
+          id: "deepseek",
+          name: "DeepSeek",
+          provider: "deepseek",
+          sort_order: 1,
+        }),
+      ],
+      { messages: [] },
+    );
+    const fallback = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation((cmd: string, args?: any) => {
+      if (cmd === "list_sessions")
+        return Promise.resolve([
+          makeSession({ id: "s1", title: "会话一" }),
+          makeSession({ id: "s2", title: "会话二" }),
+        ]);
+      return fallback?.(cmd, args);
+    });
+
+    render(<App />);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("get_messages", {
+        sessionId: "s1",
+      }),
+    );
+
+    await act(async () => {
+      decisionCardResolvedCb()({
+        payload: {
+          session_id: "s2",
+          decision_id: "unopened-decision",
+          status: "chosen",
+          chosen_option: "继续",
+        },
+      });
+    });
+
+    fireEvent.click(screen.getByText("会话二"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("get_messages", {
+        sessionId: "s2",
+      }),
+    );
+  });
+
+  it("lead-message-appended 事件: 数字 message.id 归一去重", async () => {
+    // get_messages 的真实 DB id 是 number；后续同 id emit 必须归一比较后去重，
+    // 不能因事件侧 String(message.id) 而把已有消息重复插入。
     mockBasicApp(
       [
         agentProfile({
@@ -13449,20 +14020,78 @@ describe("App", () => {
       {
         messages: [
           {
-            id: "659",
+            id: 42,
+            role: "assistant",
+            content: [{ type: "text", text: "已存在的数字 id 消息" }],
+            engine: "decision-echo",
+            agent_id: "lead-claude",
+            agent_name_snapshot: "Claude 队长",
+            created_at: 900,
+          } as ChatMessage & { id: number },
+        ],
+      },
+    );
+
+    render(<App />);
+    await screen.findByText("Claude Code");
+    await configureTeamLead();
+
+    const cb = leadMessageAppendedCb();
+    const echoText = "不应重复插入的同 id 消息";
+    const message: ChatMessage & { id: number } = {
+      id: 42,
+      role: "assistant",
+      content: [{ type: "text", text: echoText }],
+      engine: "decision-echo",
+      agent_id: "lead-claude",
+      agent_name_snapshot: "Claude 队长",
+      created_at: 1000,
+    };
+
+    await act(async () => {
+      cb({ payload: { session_id: "s1", message } });
+    });
+
+    expect(screen.queryByText(echoText)).toBeNull();
+    expect(screen.getAllByText("已存在的数字 id 消息")).toHaveLength(1);
+  });
+
+  it("lead-message-appended 事件: 迟到 user 插到 UUID 流式尾巴前且后续 delta 续原尾巴", async () => {
+    mockBasicApp(
+      [
+        agentProfile({
+          cap_lead: "planner",
+          provider: "claude",
+          access: "native",
+        }),
+        agentProfile({
+          id: "deepseek",
+          name: "DeepSeek",
+          provider: "deepseek",
+          sort_order: 1,
+        }),
+      ],
+      {
+        messages: [
+          {
+            id: 659,
             role: "assistant",
             content: [{ type: "text", text: "message-659" }],
             engine: "lead-claude",
             agent_id: "lead-claude",
             agent_name_snapshot: "Claude 队长",
-          } as ChatMessage & { id: string },
+          } as ChatMessage & { id: number },
           {
+            id: "stream-tail-uuid",
             role: "assistant",
-            content: [],
+            content: [{ type: "text", text: "stream-before-echo" }],
             engine: "lead-claude",
             agent_id: "lead-claude",
             agent_name_snapshot: "Claude 队长",
-          },
+            // U6：这条 UUID id 尾巴要代表「真在流」的场景（下面还会续 text_delta），
+            // 显式标 stream_live:true——插入位判据现在只跳过真活尾。
+            stream_live: true,
+          } as ChatMessage & { id: string },
         ],
       },
     );
@@ -13488,6 +14117,16 @@ describe("App", () => {
     });
 
     await screen.findByText("message-664");
+    act(() => {
+      agentEventCb()({
+        payload: {
+          session_id: "s1",
+          kind: "text_delta",
+          text: " + stream-after-echo",
+        },
+      });
+    });
+    await screen.findByText("stream-before-echo + stream-after-echo");
     const turns = [
       ...document.querySelectorAll<HTMLElement>(".stream-content > .turn"),
     ];
@@ -13497,9 +14136,186 @@ describe("App", () => {
           ? "659"
           : turn.textContent?.includes("message-664")
             ? "664"
-            : "no-id-tail",
+            : "uuid-tail",
       ),
-    ).toEqual(["659", "664", "no-id-tail"]);
+    ).toEqual(["659", "664", "uuid-tail"]);
+  });
+
+  it("lead-message-appended 事件: 已封口的流式尾巴（stream_live:false）不再被误判为活尾插到其前——U6 症状根修", async () => {
+    // 复现远程控制场景：手机发第 1 条（DB 965 user）→ 桌面回答（UUID id 尾巴 966）→
+    // 桌面收完成事件封口 → 手机发第 2 条（DB 967 user）。修前：末尾 UUID id 的 assistant
+    // 消息不区分「活尾/已终结尾」，967 被插到 966 前面，顺序错成 965、967、966。
+    mockBasicApp(
+      [
+        agentProfile({
+          cap_lead: "planner",
+          provider: "claude",
+          access: "native",
+        }),
+        agentProfile({
+          id: "deepseek",
+          name: "DeepSeek",
+          provider: "deepseek",
+          sort_order: 1,
+        }),
+      ],
+      {
+        messages: [
+          {
+            id: 965,
+            role: "user",
+            content: [{ type: "text", text: "message-965" }],
+          } as ChatMessage & { id: number },
+          {
+            id: "stream-tail-uuid-966",
+            role: "assistant",
+            content: [{ type: "text", text: "message-966" }],
+            engine: "lead-claude",
+            agent_id: "lead-claude",
+            agent_name_snapshot: "Claude 队长",
+            // U6 修复轮：必须显式标 true 才是「真在流」的夹具——否则 undefined 本来
+            // 就不满足插入位判据的 stream_live===true 跳过条件，测试无论封口逻辑
+            // 是否生效都会绿，钉不住 completed 事件真的把它封了口。
+            stream_live: true,
+          } as ChatMessage & { id: string },
+        ],
+      },
+    );
+
+    render(<App />);
+    await screen.findByText("message-966");
+
+    // 桌面这轮已收到完成事件——completed 分支追加完自己的收尾内容后用 sealStreamTail
+    // 把 966 的流式尾巴封口（stream_live:false）。
+    await act(async () => {
+      agentEventCb()({
+        payload: {
+          session_id: "s1",
+          kind: "completed",
+          cost_usd: null,
+          input_tokens: null,
+          output_tokens: null,
+          final_text: null,
+        },
+      });
+      await Promise.resolve();
+    });
+
+    const cb = leadMessageAppendedCb();
+    await act(async () => {
+      cb({
+        payload: {
+          session_id: "s1",
+          message: {
+            id: 967,
+            role: "user",
+            content: [{ type: "text", text: "message-967" }],
+            engine: "decision-echo",
+            agent_id: null,
+            agent_name_snapshot: null,
+          },
+        },
+      });
+    });
+
+    await screen.findByText("message-967");
+    // 966 的内容不该被 completed 事件污染/重复——仍是原样一条。
+    expect(screen.getAllByText("message-966")).toHaveLength(1);
+    const turns = [
+      ...document.querySelectorAll<HTMLElement>(".stream-content > .turn"),
+    ];
+    expect(
+      turns.map((turn) =>
+        turn.textContent?.includes("message-965")
+          ? "965"
+          : turn.textContent?.includes("message-966")
+            ? "966"
+            : "967",
+      ),
+    ).toEqual(["965", "966", "967"]);
+  });
+
+  it("lead-message-appended 事件: 封口尾+新活尾并存的竞态（第 2 轮 delta 抢先到达）——插在封口尾后、活尾前", async () => {
+    // lib.rs 先 start_lead_session 再 emit 的时序下，第 2 轮的 text_delta 可能比
+    // lead-message-appended(967) 先到，此时数组尾部同时有「旧封口尾 966」与「新活尾 968」。
+    mockBasicApp(
+      [
+        agentProfile({
+          cap_lead: "planner",
+          provider: "claude",
+          access: "native",
+        }),
+        agentProfile({
+          id: "deepseek",
+          name: "DeepSeek",
+          provider: "deepseek",
+          sort_order: 1,
+        }),
+      ],
+      {
+        messages: [
+          {
+            id: 965,
+            role: "user",
+            content: [{ type: "text", text: "message-965" }],
+          } as ChatMessage & { id: number },
+          {
+            id: "sealed-tail-966",
+            role: "assistant",
+            content: [{ type: "text", text: "message-966" }],
+            engine: "lead-claude",
+            agent_id: "lead-claude",
+            agent_name_snapshot: "Claude 队长",
+            stream_live: false,
+          } as ChatMessage & { id: string },
+          {
+            id: "live-tail-968",
+            role: "assistant",
+            content: [{ type: "text", text: "message-968" }],
+            engine: "lead-claude",
+            agent_id: "lead-claude",
+            agent_name_snapshot: "Claude 队长",
+            stream_live: true,
+          } as ChatMessage & { id: string },
+        ],
+      },
+    );
+
+    render(<App />);
+    await screen.findByText("message-968");
+
+    const cb = leadMessageAppendedCb();
+    await act(async () => {
+      cb({
+        payload: {
+          session_id: "s1",
+          message: {
+            id: 967,
+            role: "user",
+            content: [{ type: "text", text: "message-967" }],
+            engine: "decision-echo",
+            agent_id: null,
+            agent_name_snapshot: null,
+          },
+        },
+      });
+    });
+
+    await screen.findByText("message-967");
+    const turns = [
+      ...document.querySelectorAll<HTMLElement>(".stream-content > .turn"),
+    ];
+    expect(
+      turns.map((turn) =>
+        turn.textContent?.includes("message-965")
+          ? "965"
+          : turn.textContent?.includes("message-966")
+            ? "966"
+            : turn.textContent?.includes("message-967")
+              ? "967"
+              : "968",
+      ),
+    ).toEqual(["965", "966", "967", "968"]);
   });
 
   it("lead-message-appended 事件: 目标会话没有 messagesRef 缓存时忽略·不挡后续 get_messages 全量拉取", async () => {
@@ -13573,6 +14389,180 @@ describe("App", () => {
     );
     // 全量拉取（mock 返回 []）落地后，那条游离回显依旧不该出现在 s2 里。
     expect(screen.queryByText(strayEchoText)).not.toBeInTheDocument();
+  });
+
+  it("completed 分支：streamed 文本 + run_card 落同一条消息（不劈气泡），封口发生在追加之后（U6 修复轮）", async () => {
+    const { sendCalls } = mockBasicApp();
+    const { container } = render(<App />);
+
+    await screen.findByText("Claude Code");
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), {
+      target: { value: "go" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(sendCalls).toHaveLength(1));
+
+    // 本机乐观 assistant（打了 stream_live:true）就是这轮唯一的 turn。
+    const assistantTurn = container.querySelector(".turn--assistant");
+    expect(assistantTurn).not.toBeNull();
+
+    const handler = agentEventCb();
+    act(() => {
+      handler({
+        payload: { session_id: "s1", kind: "text_delta", text: "已完成改动" },
+      });
+    });
+    await screen.findByText("已完成改动");
+    expect(screen.getByText("已完成改动").closest(".turn")).toBe(assistantTurn);
+
+    act(() => {
+      handler({
+        payload: {
+          session_id: "s1",
+          kind: "completed",
+          cost_usd: null,
+          input_tokens: null,
+          output_tokens: 1,
+          final_text: null,
+          run_id: "run-seal-1",
+          commit_sha: "seal1-sha",
+          files_changed: 2,
+          insertions: 4,
+          deletions: 1,
+          interrupted: false,
+        },
+      });
+    });
+
+    // run_card 追加进的还是同一条消息（同一个 .turn）——修前 sweepRunning 会在追加
+    // final_text/run_card 之前就把尾巴封口，逼 ensureStreamTail 另起新消息，把它们
+    // 劈成两行头像+名字；现在封口挪到追加完之后，不该再劈。
+    const runCardGroup = await screen.findByRole("group", { name: "本轮改动" });
+    expect(runCardGroup.closest(".turn")).toBe(assistantTurn);
+    expect(container.querySelectorAll(".turn")).toHaveLength(2);
+
+    // 封口确实发生了（在追加完之后）：随后到达的远程 user 回显插在这条消息之后，
+    // 不会被误判成「还在流」而插到它前面。
+    const cb = leadMessageAppendedCb();
+    await act(async () => {
+      cb({
+        payload: {
+          session_id: "s1",
+          message: {
+            id: 999,
+            role: "user",
+            content: [{ type: "text", text: "message-999" }],
+            engine: "decision-echo",
+            agent_id: null,
+            agent_name_snapshot: null,
+          },
+        },
+      });
+    });
+    await screen.findByText("message-999");
+    const turnsAfterEcho = [
+      ...container.querySelectorAll<HTMLElement>(".stream-content > .turn"),
+    ];
+    expect(turnsAfterEcho[turnsAfterEcho.length - 1].textContent).toContain(
+      "message-999",
+    );
+  });
+
+  it("新一轮 text_delta 不灌进上一轮已封口的 run_card 消息——另起新尾，下一条远程 user 插在其后（U6 修复轮）", async () => {
+    mockBasicApp(
+      [
+        agentProfile({
+          cap_lead: "planner",
+          provider: "claude",
+          access: "native",
+        }),
+        agentProfile({
+          id: "deepseek",
+          name: "DeepSeek",
+          provider: "deepseek",
+          sort_order: 1,
+        }),
+      ],
+      {
+        messages: [
+          {
+            id: 200,
+            role: "user",
+            content: [{ type: "text", text: "message-200" }],
+          } as ChatMessage & { id: number },
+          {
+            id: "sealed-with-runcard-201",
+            role: "assistant",
+            content: [
+              { type: "text", text: "message-201" },
+              runCard("run-201", 2),
+            ],
+            engine: "lead-claude",
+            agent_id: "lead-claude",
+            agent_name_snapshot: "Claude 队长",
+            // 上一轮已经追加完 run_card 后被 sealStreamTail 封口——模拟改文件轮结束。
+            stream_live: false,
+          } as ChatMessage & { id: string },
+        ],
+      },
+    );
+
+    render(<App />);
+    await screen.findByText("message-201");
+    const sealedTurn = screen.getByText("message-201").closest(".turn");
+
+    act(() => {
+      agentEventCb()({
+        payload: {
+          session_id: "s1",
+          kind: "text_delta",
+          text: "message-202-delta",
+        },
+      });
+    });
+    await screen.findByText("message-202-delta");
+    // 新一轮 delta 不该灌进已封口的上一轮消息——必须另起一条新 turn。
+    expect(screen.getByText("message-202-delta").closest(".turn")).not.toBe(
+      sealedTurn,
+    );
+    // 上一轮内容原样不受污染（run_card 还在、没被拆走）。
+    expect(screen.getByText("message-201")).toBeInTheDocument();
+    expect(
+      screen.getByRole("group", { name: "本轮改动" }).closest(".turn"),
+    ).toBe(sealedTurn);
+
+    const cb = leadMessageAppendedCb();
+    await act(async () => {
+      cb({
+        payload: {
+          session_id: "s1",
+          message: {
+            id: 203,
+            role: "user",
+            content: [{ type: "text", text: "message-203" }],
+            engine: "decision-echo",
+            agent_id: null,
+            agent_name_snapshot: null,
+          },
+        },
+      });
+    });
+    await screen.findByText("message-203");
+
+    const turns = [
+      ...document.querySelectorAll<HTMLElement>(".stream-content > .turn"),
+    ];
+    expect(
+      turns.map((turn) =>
+        turn.textContent?.includes("message-200")
+          ? "200"
+          : turn.textContent?.includes("message-201")
+            ? "201"
+            : turn.textContent?.includes("message-203")
+              ? "203"
+              : "202-new-tail",
+      ),
+    ).toEqual(["200", "201", "203", "202-new-tail"]);
   });
 
   it("onDecisionChoose: MCP 卡点击后先置 submitting(按钮置灰)·非双击失败回滚 pending(可重新点选)", async () => {

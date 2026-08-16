@@ -25,6 +25,9 @@ mod memory_tools;
 mod namespaces_repo;
 mod perf_probe;
 mod proc;
+mod remote_crypto;
+mod remote_gateway;
+mod remote_pairing;
 mod repos_repo;
 mod sandbox;
 mod test_support;
@@ -41,10 +44,10 @@ use keychain::{KeyStore, KeyringStore};
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -59,6 +62,26 @@ static AUTOFEED_PROMPT_BASELINE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLoc
 /// session -> 用户点全局停止时的 MAX(messages.id)。这是进程内静默：进程重启后丢失可接受，
 /// 重启后至多被已落库的 stopped worker report 唤醒一次。
 static AUTOFEED_GLOBAL_STOP: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+/// T-4b（remote control M0 §3/§4b）挂账①：迟到答案续跑（`try_resume_after_answer`）撞上活 run
+/// 时的进程内挂账——形态照 `AUTOFEED_PROMPT_BASELINE`。`finish_resume_after_answer` 的 busy 分支
+/// 负责登记；`drain_after_run_release` 在 run 槽释放后摘除并重试，若重试又 busy，登记分支原样
+/// 再挂回去（同一分支自然复触发，调用方不必自己判 busy）。这是纯进程内 best-effort 挂账，进程
+/// 重启即丢失，也没有自动机制补上这次续跑；但迟到答案已是历史中的真实 user 消息，用户下次手动
+/// 发新消息时，`send_message` / `start_lead_session` 启动的新 run 会自然读到它。它与另有持久化及
+/// 启动重扫的 `remote_inbox` FIFO 是两条独立机制，不能互相兜底。
+static PENDING_ANSWER_RESUME: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// T-4b（remote control M0 §4b）同会话排空互斥：map 值是 `DrainSlot { generation, dirty }`；
+/// `dirty` 合并进行中再次收到的释放通知，当前轮收尾会原子复位并重放一轮，直至无脏位才摘除
+/// session_id。`generation` 标记本轮登记，供 `DrainingGuard::drop` 防止旧 guard 延迟释放时误删
+/// 后来登记的新一代：只在代号仍与自己一致时摘除；panic 展开时也能兜底摘除自己那一代。
+/// map 锁只护这些瞬时状态变更，绝不跨 autofeed / 迟到答案 / remote_inbox 三段耗时操作。
+struct DrainSlot {
+    generation: u64,
+    dirty: bool,
+}
+
+static DRAINING_SESSIONS: OnceLock<Mutex<HashMap<String, DrainSlot>>> = OnceLock::new();
+static NEXT_DRAINING_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// setup 时存一次：Seatbelt 要拿它生成 app 域写拒绝规则，而 claude_sandboxed_cmd_in 拿不到 AppHandle。
 static APP_DATA_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
 /// boot_trace 落盘：标记「本进程是否已经写过一次头行」，只在第一次调用时写。
@@ -83,6 +106,1248 @@ fn initialize_event_transport(app: &AppHandle) {
     EVENT_TRANSPORT
         .set(transport)
         .unwrap_or_else(|_| panic!("EventTransport must initialize exactly once"));
+}
+
+/// T5c1（remote-control M0 §7 事件上行）：从后台 remote-gateway 线程里安全读 app_settings——
+/// 用 `try_state` 而不是 `state`，因为这个闭包理论上可能在 Db 还没 manage 完就被调用（防御性写法，
+/// 跟 lib.rs 里 `MutationGuard`/`app.try_state::<crate::db::Db>()` 那批既有先例同款）。
+fn remote_gateway_settings_reader(app: &AppHandle) -> remote_gateway::SettingsReader {
+    let app = app.clone();
+    Box::new(move |key: &str| {
+        let db = app.try_state::<Db>()?;
+        let conn = db.inner().0.lock().ok()?;
+        db::get_app_setting(&conn, key).ok().flatten()
+    })
+}
+
+/// S1ja §9.7 后门退役：T5c1 曾用一个明文 app_settings key（`remote_dev_token`）当令牌
+/// 来源，给桌面拼进 `?token=` query 走 relay 的 legacy 准入后门——真正的设备身份已经是
+/// S1b 起的 `Authorization: Bearer` 桌面凭据，这个 key 从未被真正的令牌注册表消费过。
+/// relay 侧对应的 legacy `valid_tokens` 准入路径已随本单一并删除，这里停止读取该
+/// app_setting（不再有任何路径会把它用作凭据）；`TokenProvider` 类型本身留着——桌面侧
+/// `evaluate_connection_liveness` 拿它做"凭据材料轮换 → 强制重连"这条通用判活逻辑，
+/// 不是这个已退役 dev 后门专属的。
+fn remote_gateway_token_provider(_app: &AppHandle) -> remote_gateway::TokenProvider {
+    Box::new(|| None)
+}
+
+fn remote_gateway_desktop_credential_provider() -> remote_gateway::DesktopCredentialProvider {
+    Box::new(|room_id: &str| {
+        remote_pairing::store::resolve_desktop_credential(&KeyringStore, room_id)
+    })
+}
+
+fn remote_gateway_claim_client() -> remote_gateway::ClaimClient {
+    Box::new(remote_gateway::claim_room_blocking)
+}
+
+fn remote_gateway_active_device_provider(app: &AppHandle) -> remote_gateway::ActiveDeviceProvider {
+    let app = app.clone();
+    Box::new(move |room_id: &str| {
+        let db = app
+            .try_state::<Db>()
+            .ok_or_else(|| "Db state unavailable".to_owned())?;
+        let conn = db.inner().0.lock().map_err(|error| error.to_string())?;
+        let rows = db::list_remote_devices(&conn).map_err(|error| error.to_string())?;
+        Ok(has_active_remote_device_in_room(&rows, room_id))
+    })
+}
+
+fn has_active_remote_device_in_room(rows: &[db::RemoteDeviceRow], room_id: &str) -> bool {
+    rows.iter().any(|row| {
+        row.revoked_at.is_none()
+            && row
+                .room_id
+                .as_deref()
+                .is_some_and(|stored_room| stored_room == room_id)
+    })
+}
+
+fn load_remote_registry_snapshot(
+    conn: &Connection,
+    room_id: &str,
+    now_ms: u64,
+) -> Result<remote_gateway::RegistrySnapshot, String> {
+    let mut entries = Vec::new();
+    for row in db::list_remote_devices(conn).map_err(|error| error.to_string())? {
+        if row.revoked_at.is_some() || row.room_id.as_deref() != Some(room_id) {
+            continue;
+        }
+        let generation = row.generation.ok_or_else(|| {
+            remote_registry_snapshot_row_error(&row.device_id, "generation_missing")
+        })?;
+        let refresh_until_ms = row.refresh_until.ok_or_else(|| {
+            remote_registry_snapshot_row_error(&row.device_id, "refresh_until_missing")
+        })?;
+        if generation <= 0 {
+            return Err(remote_registry_snapshot_row_error(
+                &row.device_id,
+                "generation_invalid",
+            ));
+        }
+        if refresh_until_ms < 100_000_000_000 {
+            return Err(remote_registry_snapshot_row_error(
+                &row.device_id,
+                "refresh_until_invalid",
+            ));
+        }
+        if row.token_hash.len() != 64
+            || !row.token_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(remote_registry_snapshot_row_error(
+                &row.device_id,
+                "token_hash_invalid",
+            ));
+        }
+        if row.access_expires_at <= 0 {
+            return Err(remote_registry_snapshot_row_error(
+                &row.device_id,
+                "access_expires_invalid",
+            ));
+        }
+        if row.access_expires_at > refresh_until_ms {
+            return Err(remote_registry_snapshot_row_error(
+                &row.device_id,
+                "access_expires_after_refresh_until",
+            ));
+        }
+        let prev = db::load_refresh_journal(conn, &row.device_id)
+            .map_err(|error| error.to_string())?
+            .filter(|journal| {
+                journal.prev_generation > 0
+                    && journal.prev_expires_at > 0
+                    && u64::try_from(journal.prev_expires_at)
+                        .is_ok_and(|expires_ms| now_ms < expires_ms)
+            })
+            .map(|journal| remote_gateway::TokenSyncPrev {
+                token_hash: journal.prev_access_hash,
+                generation: journal.prev_generation,
+                prev_expires: journal.prev_expires_at,
+            });
+        entries.push(remote_gateway::TokenSyncEntry {
+            subject: format!("device:{}", row.device_id),
+            generation,
+            scope: "remote".to_owned(),
+            current: remote_gateway::TokenSyncCurrent {
+                token_hash: row.token_hash,
+                access_expires: row.access_expires_at,
+                refresh_until: Some(refresh_until_ms),
+            },
+            prev,
+        });
+    }
+    Ok(remote_gateway::RegistrySnapshot {
+        revision: db::current_registry_revision(conn, room_id)
+            .map_err(|error| error.to_string())?,
+        entries,
+    })
+}
+
+fn remote_registry_snapshot_row_error(device_id: &str, field: &str) -> String {
+    eprintln!("remote registry snapshot rejected: device_id={device_id}, field={field}");
+    format!("remote registry snapshot rejected for device {device_id}: {field}")
+}
+
+fn remote_gateway_registry_snapshot_provider(
+    app: &AppHandle,
+) -> remote_gateway::RegistrySnapshotProvider {
+    let app = app.clone();
+    Box::new(move |room_id, now_ms| {
+        let db = app
+            .try_state::<Db>()
+            .ok_or_else(|| "Db state unavailable".to_owned())?;
+        let conn = db.inner().0.lock().map_err(|error| error.to_string())?;
+        load_remote_registry_snapshot(&conn, room_id, now_ms)
+    })
+}
+
+fn remote_gateway_registry_rebase_provider(
+    app: &AppHandle,
+) -> remote_gateway::RegistryRebaseProvider {
+    let app = app.clone();
+    Box::new(
+        move |room_id, relay_high_water, now_ms, include_pairing, revoke_subjects| {
+            let db = app
+                .try_state::<Db>()
+                .ok_or_else(|| "Db state unavailable".to_owned())?;
+            let conn = db.inner().0.lock().map_err(|error| error.to_string())?;
+            rebase_remote_registry(
+                &conn,
+                room_id,
+                relay_high_water,
+                now_ms,
+                include_pairing,
+                revoke_subjects,
+            )
+        },
+    )
+}
+
+/// S1h R1 返工：`remote_gateway_registry_high_water_provider` 的可测内核——sync.ack 后无
+/// 条件把桌面计数器抬过 `relay_high_water`（§9.4 计数器吸收），并在同一事务里给
+/// `revoke_subjects`（outbox 里仍待送达、含 rejected 的 token.delete subject 列表）各领一个
+/// 新代号。新代号来自吸收之后的计数器，因此保证严格大于 `relay_high_water`（也就严格大于
+/// 本次 sync 的 revision，因为真实 relay 恒有 `relay_high_water >= revision`）——天然满足
+/// 「delete 的代号必须严格大于本次 sync 的 revision，也必须大于 relay 报回的
+/// relay_high_water」（S1h §9.3 证据链①-④）。不要在 `rebase_remote_registry` 的事务里（快照
+/// revision 固定之前）领 delete 的号：那条路径只在 relay 要求 rebase 时才跑，覆盖不到「首次
+/// sync 就被直接接受、从未触发 rebase」的主用例，正是这条 bug 长期没被测出来的原因。
+fn absorb_registry_high_water_and_reissue_revokes(
+    conn: &Connection,
+    room_id: &str,
+    relay_high_water: i64,
+    revoke_subjects: &[String],
+) -> Result<Vec<(String, i64)>, String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    db::bump_registry_counter_to_in_transaction(&tx, room_id, relay_high_water)
+        .map_err(|error| error.to_string())?;
+    let mut revoke_generations = Vec::with_capacity(revoke_subjects.len());
+    for subject in revoke_subjects {
+        let generation = db::next_registry_generation_in_transaction(&tx, room_id)
+            .map_err(|error| error.to_string())?;
+        revoke_generations.push((subject.clone(), generation));
+    }
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(revoke_generations)
+}
+
+fn remote_gateway_registry_high_water_provider(
+    app: &AppHandle,
+) -> remote_gateway::RegistryHighWaterProvider {
+    let app = app.clone();
+    Box::new(move |room_id, relay_high_water, revoke_subjects| {
+        let db = app
+            .try_state::<Db>()
+            .ok_or_else(|| "Db state unavailable".to_owned())?;
+        let conn = db.inner().0.lock().map_err(|error| error.to_string())?;
+        absorb_registry_high_water_and_reissue_revokes(
+            &conn,
+            room_id,
+            relay_high_water,
+            revoke_subjects,
+        )
+    })
+}
+
+/// `revoke_subjects` = S1h §9.3：outbox 里仍待送达（未 ack，含 rejected）的 revoke
+/// （token.delete）subject 列表；这里在同一事务里给每个 subject 领一个新代号，跟设备/pairing
+/// 的领号共用同一把 `remote_registry_counter`，避免各自独立合成代号（比如都拍
+/// `high_water + 1`）互相撞号。
+fn rebase_remote_registry(
+    conn: &Connection,
+    room_id: &str,
+    relay_high_water: i64,
+    now_ms: u64,
+    include_pairing: bool,
+    revoke_subjects: &[String],
+) -> Result<
+    (
+        remote_gateway::RegistrySnapshot,
+        Option<i64>,
+        Vec<(String, i64)>,
+    ),
+    String,
+> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    db::bump_registry_counter_to_in_transaction(&tx, room_id, relay_high_water)
+        .map_err(|error| error.to_string())?;
+
+    let rows = db::list_remote_devices(&tx).map_err(|error| error.to_string())?;
+    for row in rows.into_iter().filter(|row| {
+        row.revoked_at.is_none()
+            && row.room_id.as_deref() == Some(room_id)
+            && row.generation.is_some_and(|generation| generation > 0)
+            && row
+                .refresh_until
+                .is_some_and(|refresh_until_ms| refresh_until_ms > 0)
+            && row.access_expires_at > 0
+    }) {
+        let generation = db::next_registry_generation_in_transaction(&tx, room_id)
+            .map_err(|error| error.to_string())?;
+        let refresh_until_ms = row.refresh_until.expect("filtered above");
+        if !db::set_remote_device_registry_in_transaction(
+            &tx,
+            &row.device_id,
+            room_id,
+            generation,
+            refresh_until_ms,
+        )
+        .map_err(|error| error.to_string())?
+        {
+            return Err(format!(
+                "remote device {} disappeared during registry rebase",
+                row.device_id
+            ));
+        }
+    }
+    let pairing_generation = if include_pairing {
+        Some(
+            db::next_registry_generation_in_transaction(&tx, room_id)
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    let mut revoke_generations = Vec::with_capacity(revoke_subjects.len());
+    for subject in revoke_subjects {
+        let generation = db::next_registry_generation_in_transaction(&tx, room_id)
+            .map_err(|error| error.to_string())?;
+        revoke_generations.push((subject.clone(), generation));
+    }
+    let snapshot = load_remote_registry_snapshot(&tx, room_id, now_ms)?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok((snapshot, pairing_generation, revoke_generations))
+}
+
+/// M2-4b（M2-4a doc 约束①）：凭据幂等先行——钥匙串已有该房凭据则什么都不做，没有则新建。
+/// 复用 `remote_pairing::store::resolve_desktop_credential` 的既有 check-then-create 幂等
+/// 实现（remote_pairing.rs 本单禁改，只调用），这里只是把返回值收窄成"是否已确保存
+/// 在"——房间解析路径不需要凭据明文本身（明文只在真正建连接 / claim 时，由既有
+/// `desktop_credential_provider` 再读一次）。
+///
+/// 调用时机：`remote_gateway_active_room_resolver` 在 `db::ensure_remote_room_for_project`
+/// 把房间行落库**之后**、把 room_id 交还给 `current_config` 构造 `GatewayConfig` **之前**
+/// 调用这里——crash-safe 用意：进程若崩溃在"房间落库"与"这里创建凭据"之间，下次启动重新
+/// 解析 active project 时，`ensure_remote_room_for_project` 幂等返回同一个 room_id、这里幂等
+/// 创建凭据——外部从未观察到"配置指向一个凭据还不存在的房间"这个中间态（两步都完成前
+/// `current_config` 不会返回 `Some(GatewayConfig)`），因此连接 / claim 永不发生在无凭据状态。
+/// （M2-4d：legacy 全局房间的孪生 crash-safe 写法 `remote_gateway_room_regenerator` 随
+/// legacy 回落一并撤除——它只服务 legacy 换房，见 remote_gateway.rs `ensure_claim` 撤除
+/// 说明。）
+fn ensure_desktop_credential_for_room(
+    key_store: &dyn KeyStore,
+    room_id: &str,
+) -> Result<(), String> {
+    remote_pairing::store::resolve_desktop_credential(key_store, room_id).map(|_credential| ())
+}
+
+/// M2-4b(R2)：`credential_ensured` 缓存命中就跳过钥匙串，未命中（含刚被清空）才真正调
+/// `ensure_desktop_credential_for_room` 并回填。拆成独立函数只吃 `&dyn KeyStore` +
+/// `&Mutex<HashSet<String>>`，不依赖 `AppHandle`，可以直接用 `FakeKeyStore` 单测缓存命中 /
+/// 未命中两条路径，不需要伪造一个真的 Tauri app。
+fn ensure_desktop_credential_for_room_cached(
+    key_store: &dyn KeyStore,
+    credential_ensured: &Mutex<HashSet<String>>,
+    room_id: &str,
+) -> Result<(), String> {
+    let already_ensured = credential_ensured
+        .lock()
+        .map_err(|error| error.to_string())?
+        .contains(room_id);
+    if already_ensured {
+        return Ok(());
+    }
+    ensure_desktop_credential_for_room(key_store, room_id)?;
+    credential_ensured
+        .lock()
+        .map_err(|error| error.to_string())?
+        .insert(room_id.to_owned());
+    Ok(())
+}
+
+/// M2-4b(R2)：`remote_gateway_active_room_resolver` 与 `remote_set_active_project` 命令共享
+/// 同一份"已确认过凭据存在的房间"缓存——切项目 / 清除 active project 成功后必须清空这份缓存
+/// （见 `remote_set_active_project`），保证下次解析必然重新摸一次钥匙串确认凭据仍在，而不是
+/// 信任一个可能已经过期的"已确认过"标记（例如凭据被外部从钥匙串删除、或换项目后旧标记对
+/// 新项目的房间毫无意义）。作为 Tauri managed state 存在，在 `run()` 里创建一次、`Arc::clone`
+/// 分别喂给 resolver 闭包与命令。
+struct ActiveRoomCredentialCache(Arc<Mutex<HashSet<String>>>);
+
+/// M2-4b：project_id → 该 project 的 per-project 房间 id。ensure 语义——
+/// `db::ensure_remote_room_for_project` 有房复用 / 无房新建，紧接着
+/// `ensure_desktop_credential_for_room_cached` 确保该房凭据存在。只应在「remote 已启用 &&
+/// active project 已设」时被调用（`current_config` 负责这层门禁，这里不重复判断）。
+///
+/// R3 resolver 侧防御：ensure 房之前先核实 `project_id` 在 `repos` 表里真的存在——挡「手改 DB /
+/// 旧 setting 绕过 `remote_set_active_project` 命令」这条路（命令写入时已经校验过一次，这里是
+/// 独立的第二道），查无直接 `Err`，让调用方（`current_config`）按既有 fail-closed 分支处理
+/// （不落回 legacy、直接判未配置）。
+fn remote_gateway_active_room_resolver(
+    app: &AppHandle,
+    credential_ensured: Arc<Mutex<HashSet<String>>>,
+) -> remote_gateway::ActiveRoomResolver {
+    let app = app.clone();
+    Box::new(move |project_id: &str| {
+        let room_id = {
+            let db = app
+                .try_state::<Db>()
+                .ok_or_else(|| "Db state unavailable".to_owned())?;
+            let conn = db.inner().0.lock().map_err(|error| error.to_string())?;
+            let exists = repos_repo::get_repo_by_id(&conn, project_id)
+                .map_err(|error| error.to_string())?
+                .is_some();
+            if !exists {
+                return Err(format!(
+                    "remote active room resolution: repo not found: {project_id}"
+                ));
+            }
+            db::ensure_remote_room_for_project(&conn, project_id)?
+        };
+        // R6（opus P2-3 注释锚）：`conn`/`db` 已经在上面那个 `{}` 块结束时被丢弃——此处（乃至
+        // 下面这一行）绝不能有任何 DB 锁守卫存活。`ensure_desktop_credential_for_room_cached`
+        // 会摸钥匙串，钥匙串调用可能阻塞；若日后重构把这段折成 `match`/`if let`
+        // 之类让 `conn` 活到这里，会变成"持着全局 DB 锁等钥匙串 IPC"，其他所有需要这把锁的
+        // 调用（包括 UI 主线程的每一次 IPC）都会被卡住。改动这段前先确认锁已经不在作用域里。
+        ensure_desktop_credential_for_room_cached(&KeyringStore, &credential_ensured, &room_id)?;
+        Ok(room_id)
+    })
+}
+
+/// T5c1：网关每次真正尝试连接时读一次 K_room；进入长连接后，liveness 轮询在已持有 K_room
+/// 时不再读钥匙串，避免钥匙串 IPC 卡住 ws 读线程；尚未持有时则会持续重读以便自愈，读到新
+/// 钥匙后触发 `ConfigStale` 断开并重连，让下一轮连接带上钥匙。key 格式字面量故意跟
+/// `remote_pairing::store` 里的 `k_room_key_id` 私有函数重复（那个函数出不了它所在的模块），
+/// 两处字面量必须保持一致，改动前先确认没有语义漂移。
+/// 钥匙串没有这个房间的条目 = 这台设备还没配对过任何远端 = 上行整体禁用（不在这里自动生成
+/// 新 K_room——生成新 K_room 是 `remote_pairing::store::resolve_k_room` 在真正配对成功时才
+/// 该做的事，网关侧只读不写）。
+fn remote_gateway_k_room_provider() -> remote_gateway::KRoomProvider {
+    Box::new(|room_id: &str| {
+        let key_id = format!("remote-kroom-{room_id}");
+        let stored = zeroize::Zeroizing::new(KeyringStore.get(&key_id).ok().flatten()?);
+        let bytes = zeroize::Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(stored.as_bytes())
+                .ok()?,
+        );
+        if bytes.len() != 32 {
+            return None;
+        }
+        let mut out = zeroize::Zeroizing::new([0u8; 32]);
+        out.copy_from_slice(&bytes);
+        Some(out)
+    })
+}
+
+/// T5c3-e（remote control M0 §2/§6）：连接后全量快照 provider——在独立的
+/// `remote-index-snapshot` 后台线程执行（见 remote_gateway.rs 的
+/// `ensure_snapshot_worker`），不会阻塞 ws 读线程本身。provider 仍须有界：短锁 DB
+/// 读，不碰钥匙串/网络/子进程，失败静默返回 None（不 panic）；同
+/// `remote_gateway_settings_reader` 一样用 `try_state` 防御 Db 还没 manage 完的窗口。
+fn remote_gateway_session_index_snapshot_provider(
+    app: &AppHandle,
+) -> remote_gateway::SessionIndexSnapshotProvider {
+    let app = app.clone();
+    Box::new(move || {
+        let db = app.try_state::<Db>()?;
+        let conn = db.inner().0.lock().ok()?;
+        let rows = db::list_session_index_snapshot_rows(&conn).ok()?;
+        serde_json::to_value(rows).ok()
+    })
+}
+
+/// M2-4c：session → 归属 repo id 查询——包一层 `db::get_session_repo_id`。跟其它 remote_gateway
+/// provider 不同，这个 provider 是从 WebSocket 读线程（`handle_command_envelope`，下行命令
+/// 归属闸）与 drain 循环（`drain_milestone_queue`/`drain_live_queue`，上行归属过滤，走
+/// `run_connection_request` 里连接生命周期的 session→repo 缓存）同步调用的，不在独立后台线程
+/// 上——短锁 DB 读、不碰钥匙串/网络，符合 RN4（Db 锁块内不做钥匙串/网络调用）。M24DR 返工
+/// 修正过期表述：`RoomSource`/`command_gating_active` 那套"只在某种房间来源下才短路调用"的
+/// 开关已随 legacy 全局房回落一并撤除——单活跃房间模型下归属闸恒启用，有连接就恒被调用。
+fn remote_gateway_session_repo_provider(app: &AppHandle) -> remote_gateway::SessionRepoProvider {
+    let app = app.clone();
+    Box::new(move |session_id: &str| {
+        let db = app
+            .try_state::<Db>()
+            .ok_or_else(|| "Db state unavailable".to_owned())?;
+        let lock_result = db.inner().0.lock();
+        let conn = lock_result.map_err(|_| "Db lock poisoned".to_owned())?;
+        db::get_session_repo_id(&conn, session_id).map_err(|error| error.to_string())
+    })
+}
+
+/// `control.history` 的分页读取 provider。与 session 归属 provider 同形：WebSocket 命令线程
+/// 上只持短 DB 锁，不触碰钥匙串、网络或子进程；查询失败显式回传，由命令臂 fail-closed。
+fn remote_gateway_session_history_provider(
+    app: &AppHandle,
+) -> remote_gateway::SessionHistoryProvider {
+    let app = app.clone();
+    Box::new(move |session_id, before_message_id, max_rows| {
+        let rows = {
+            let db = app
+                .try_state::<Db>()
+                .ok_or_else(|| "Db state unavailable".to_owned())?;
+            let lock_result = db.inner().0.lock();
+            let conn = lock_result.map_err(|_| "Db lock poisoned".to_owned())?;
+            db::list_session_history_rows(&conn, session_id, before_message_id, max_rows)
+                .map_err(|error| error.to_string())?
+        };
+        rows.into_iter()
+            .map(|row| {
+                let content_json =
+                    serde_json::from_str(&row.content).map_err(|error| error.to_string())?;
+                Ok(remote_gateway::SessionHistoryRow {
+                    message_id: row.message_id,
+                    role: row.role,
+                    content_json,
+                })
+            })
+            .collect()
+    })
+}
+
+/// T5c2（remote control M0 v1.7.5 §4d）：连接后重发批 provider——同 session-index 快照一样在独立的
+/// `remote-index-snapshot` 后台线程执行，短锁 DB 读，失败静默返回 None（不 panic）。
+fn remote_gateway_milestone_replay_provider(
+    app: &AppHandle,
+) -> remote_gateway::MilestoneReplayProvider {
+    let app = app.clone();
+    Box::new(move || {
+        let db = app.try_state::<Db>()?;
+        let conn = db.inner().0.lock().ok()?;
+        db::list_recent_milestone_replay_rows(&conn, db::RECENT_MILESTONE_REPLAY_LIMIT).ok()
+    })
+}
+
+fn remote_gateway_pair_hello_handler() -> remote_gateway::PairHelloHandler {
+    Box::new(move |frame| {
+        match process_pair_hello(pairing_slot(), &KeyringStore, frame, now_unix_secs()) {
+            Ok(accept) => accept,
+            Err(error) => {
+                eprintln!("remote gateway pair.hello ignored: {error}");
+                None
+            }
+        }
+    })
+}
+
+fn remote_gateway_pair_done_handler(app: &AppHandle) -> remote_gateway::PairDoneHandler {
+    let app = app.clone();
+    Box::new(move |frame| {
+        let Ok(mut registry) = remote_registry().lock() else {
+            eprintln!("remote gateway pair.done ignored: registry lock poisoned");
+            return remote_gateway::PairDoneAction::Rejected;
+        };
+        let Some(db) = app.try_state::<Db>() else {
+            eprintln!("remote gateway pair.done ignored: Db state unavailable");
+            return remote_gateway::PairDoneAction::Rejected;
+        };
+        let Ok(conn) = db.inner().0.lock() else {
+            eprintln!("remote gateway pair.done ignored: Db lock poisoned");
+            return remote_gateway::PairDoneAction::Rejected;
+        };
+        let now_ms = now_unix_millis();
+        let now_secs = now_ms / 1_000;
+        match process_pair_done_with_registry(
+            pairing_slot(),
+            &mut registry,
+            &conn,
+            &KeyringStore,
+            remote_token_book(),
+            frame,
+            now_secs,
+            now_ms,
+        ) {
+            Ok(action) => {
+                let newly_paired_device_id = match &action {
+                    remote_gateway::PairDoneAction::Accepted {
+                        newly_paired_device_id,
+                    } => newly_paired_device_id.clone(),
+                    remote_gateway::PairDoneAction::Rejected
+                    | remote_gateway::PairDoneAction::Ready(_) => None,
+                };
+                drop(conn);
+                drop(registry);
+                if let Some(device_id) = newly_paired_device_id {
+                    let _ = app.emit(
+                        "remote-device-paired",
+                        serde_json::json!({"device_id": device_id, "paired_at": now_secs}),
+                    );
+                }
+                action
+            }
+            Err(error) => {
+                eprintln!("remote gateway pair.done ignored: {error}");
+                remote_gateway::PairDoneAction::Rejected
+            }
+        }
+    })
+}
+
+/// S1i1 §9.6：`token.refresh.forward` 编排内核——registry→db→token_book 锁序与
+/// `remote_device_revoke_inner` 一致。失败路径统一走 `refresh_fail_reply`（累计连续无效计数、
+/// 按需带 close），只有 §2a 命中当前 refresh hash 且未触发配额上限时才真正轮换并挂 outbox。
+fn process_token_refresh_with_registry(
+    registry: &mut remote_gateway::RegistryState,
+    conn: &Connection,
+    key_store: &dyn KeyStore,
+    token_book: &mut remote_pairing::TokenBook,
+    frame: &remote_gateway::RefreshForwardFrame,
+    now_ms: u64,
+) -> remote_gateway::RefreshOutcome {
+    // S1i1 R5-3 返工：subject 是 relay 盖章转发的，不是桌面自己认证过的身份——在还没确认它对应
+    // 一个「DB 里真实存在的设备」之前，一律 count_invalid=false。`refresh_fail_reply` 只在
+    // count_invalid=true 时才调用 `record_refresh_invalid`（会 `.entry(subject).or_default()`
+    // 建条目），下面这几条早退路径如果仍然计数，失控/恶意 relay 换着花样报不同的假 subject
+    // 就能让 `refresh_quota` 这张内存 map 无限增长（内存 DoS）。真实存在的设备数量是有限的、
+    // 由桌面自己的配对流程控制；一旦确认 `row` 存在（下面 `Ok(Some(row))` 分支之后），后续失败
+    // 路径才恢复 count_invalid=true——那时 subject 已经是一个真实设备，计数不会被伪造膨胀。
+    let Some(device_id) = frame.subject.strip_prefix("device:") else {
+        return refresh_fail_reply(
+            registry,
+            &frame.request_id,
+            &frame.subject,
+            "invalid",
+            false,
+        );
+    };
+
+    let row = match db::get_remote_device(conn, device_id) {
+        Ok(Some(row)) if row.revoked_at.is_none() && row.room_id.is_some() => row,
+        Ok(_) => {
+            return refresh_fail_reply(
+                registry,
+                &frame.request_id,
+                &frame.subject,
+                "invalid",
+                false,
+            )
+        }
+        Err(error) => {
+            eprintln!("remote refresh: device lookup failed for {device_id}: {error}");
+            return refresh_fail_reply(
+                registry,
+                &frame.request_id,
+                &frame.subject,
+                "invalid",
+                false,
+            );
+        }
+    };
+    let room_id = row.room_id.clone().expect("checked Some above");
+    let Some(current_generation) = row.generation else {
+        return refresh_fail_reply(registry, &frame.request_id, &frame.subject, "invalid", true);
+    };
+
+    let k_pair = match remote_pairing::store::load_k_pair(key_store, device_id) {
+        Ok(Some(k_pair)) => k_pair,
+        Ok(None) => {
+            return refresh_fail_reply(registry, &frame.request_id, &frame.subject, "invalid", true)
+        }
+        Err(error) => {
+            eprintln!("remote refresh: k_pair load failed for {device_id}: {error}");
+            return refresh_fail_reply(
+                registry,
+                &frame.request_id,
+                &frame.subject,
+                "invalid",
+                true,
+            );
+        }
+    };
+
+    let refresh_token = match remote_pairing::open_token_refresh_request(
+        &k_pair,
+        &room_id,
+        device_id,
+        &frame.request_id,
+        &frame.ct,
+        &frame.n,
+    ) {
+        Ok(token) => token,
+        Err(_) => {
+            return refresh_fail_reply(registry, &frame.request_id, &frame.subject, "invalid", true)
+        }
+    };
+
+    match token_book.matches_current_refresh(device_id, &refresh_token) {
+        remote_pairing::RefreshTokenMatch::Unavailable => {
+            refresh_fail_reply(registry, &frame.request_id, &frame.subject, "invalid", true)
+        }
+        remote_pairing::RefreshTokenMatch::Current => {
+            // §2d：配额只在真要轮换时检查——无效请求/幂等重放/in_flight 都不烧配额。
+            //
+            // S1i1 R5-5：这个分支没有、也不需要 in_flight 检查——每次命中「当前」hash 都无条件
+            // 轮换并覆盖 journal，这不是疏漏。journal 的 prev_generation/prev_access_hash/
+            // prev_expires_at 三个字段同时是 §9.4 registry 快照 prev 别名（`TokenSyncPrev`）的
+            // 唯一数据来源（见本文件顶部 `remote_registry_snapshot_entries` 里
+            // `db::load_refresh_journal(...).map(|journal| TokenSyncPrev {...})`，约 216-228
+            // 行）——每次成功轮换都必须覆盖它，否则下一次 registry 快照发出的 prev 别名会停在
+            // 上一次轮换的旧值，relay/设备侧「prev 命中窗口」随之失真。Mismatch 分支的
+            // 「in_flight 绝不覆盖 journal」规则专属于那边命中 prev 别名的重复请求识别，不能
+            // 挪到这里套用。
+            if registry.refresh_quota_exceeded(&frame.subject, now_ms) {
+                return remote_gateway::RefreshOutcome::Reply(remote_gateway::refresh_fail_json(
+                    &frame.request_id,
+                    &frame.subject,
+                    "rate_limited",
+                    false,
+                ));
+            }
+            match remote_pairing::store::refresh_device_tokens(
+                conn,
+                token_book,
+                device_id,
+                &room_id,
+                current_generation,
+                &row.token_hash,
+                &k_pair,
+                &frame.request_id,
+                &refresh_token,
+                now_ms,
+            ) {
+                Ok(rotated) => {
+                    registry.record_refresh_rotation_success(&frame.subject, now_ms);
+                    let entry = remote_gateway::TokenSyncEntry {
+                        subject: frame.subject.clone(),
+                        generation: rotated.generation,
+                        scope: "remote".to_owned(),
+                        current: remote_gateway::TokenSyncCurrent {
+                            token_hash: rotated.access_token_hash,
+                            access_expires: rotated.access_expires_at_ms,
+                            refresh_until: Some(rotated.refresh_until_ms),
+                        },
+                        prev: Some(remote_gateway::TokenSyncPrev {
+                            token_hash: rotated.prev_access_hash,
+                            generation: rotated.prev_generation,
+                            prev_expires: rotated.prev_expires_at_ms,
+                        }),
+                    };
+                    let refresh_ok = remote_gateway::RefreshOkFrame {
+                        request_id: frame.request_id.clone(),
+                        subject: frame.subject.clone(),
+                        generation: rotated.generation,
+                        ct: rotated.response_ct,
+                        n: rotated.response_n,
+                    };
+                    registry.enqueue_token_put_for_refresh(entry, refresh_ok);
+                    remote_gateway::RefreshOutcome::Pending
+                }
+                Err(error) => {
+                    eprintln!("remote refresh: rotation commit failed for {device_id}: {error}");
+                    // S1i1 R5-2 返工：轮换事务本身失败（DB 报错/落盘失败）是桌面自己的故障，
+                    // 不是设备发来的请求有问题——不该烧手机的连续无效计数（否则桌面连续故障
+                    // 三次，手机侧的合法连接反被 close 打断）。口径与下面锁中毒/DB 不可用几条
+                    // 早退路径（`remote_gateway_refresh_handler` 里硬编码 `close:false` 的那几
+                    // 处）保持一致——它们同样是「桌面自己的问题」，从不计入连续无效计数。
+                    refresh_fail_reply(
+                        registry,
+                        &frame.request_id,
+                        &frame.subject,
+                        "invalid",
+                        false,
+                    )
+                }
+            }
+        }
+        remote_pairing::RefreshTokenMatch::Mismatch => {
+            match db::load_refresh_journal(conn, device_id) {
+                Ok(Some(journal))
+                    if u64::try_from(journal.response_expires)
+                        .is_ok_and(|expires| now_ms < expires) =>
+                {
+                    if !remote_pairing::refresh_token_hash_matches(
+                        &refresh_token,
+                        &journal.prev_refresh_hash,
+                    ) {
+                        return refresh_fail_reply(
+                            registry,
+                            &frame.request_id,
+                            &frame.subject,
+                            "invalid",
+                            true,
+                        );
+                    }
+                    if journal.request_id == frame.request_id {
+                        // §2c：幂等重放——原样吐出同一份回执，不轮换、不领代、不写库、不入 outbox。
+                        //
+                        // S1i1 R1 返工：回执 generation 用本次请求刚读到的设备行「当前代号」
+                        // （`current_generation`，上面第 583 行附近），不用 `journal.generation`
+                        // ——后者是上一次轮换成功那一刻冻结的旧值。轮换与本次重放之间若发生过
+                        // 一次 rebase（§9.3 每台设备重新领号），`journal.generation` 就会过期；
+                        // relay 侧 §9.6 第 246 行的投递谓词是「回执.generation == subject 当前
+                        // generation」，带着旧代号出门必被丢弃。AAD 五元组不含 generation，改这
+                        // 个字段不影响密文体认证——`ct`/`n` 仍然是 `journal.response_ct/n` 原样
+                        // 重放，不重新 seal。
+                        registry.record_refresh_replay(&frame.subject);
+                        remote_gateway::RefreshOutcome::Reply(remote_gateway::refresh_ok_json(
+                            &frame.request_id,
+                            &frame.subject,
+                            current_generation,
+                            &journal.response_ct,
+                            &journal.response_n,
+                        ))
+                    } else {
+                        // §2c/§9.6 第 251 行：in_flight——良性单飞行冲突，不带 close，不烧配额，
+                        // 绝不覆盖 journal（覆盖 = 第一笔的重放保证失效）。
+                        //
+                        // S1i1 R5-5：in_flight 的判定只在这个 prev 分支（Mismatch）触发，不会也
+                        // 不该挪到下面 Current 分支——这里命中的已经是「上一次轮换」产生的 prev
+                        // 别名，本次请求要么是同一 request_id 的合法重放（覆盖 journal = 破坏
+                        // 重放保证）要么是并发的另一个 in-flight 尝试（覆盖 = 丢失第一笔的重放
+                        // 能力），两种情况都不该覆盖 journal。Current 分支命中的是"新鲜"的当前
+                        // 令牌，语义完全不同：见下面 Current 分支调用 `refresh_device_tokens`
+                        // 之前的对应注释。
+                        remote_gateway::RefreshOutcome::Reply(remote_gateway::refresh_fail_json(
+                            &frame.request_id,
+                            &frame.subject,
+                            "in_flight",
+                            false,
+                        ))
+                    }
+                }
+                Ok(_) => {
+                    refresh_fail_reply(registry, &frame.request_id, &frame.subject, "invalid", true)
+                }
+                Err(error) => {
+                    eprintln!("remote refresh: journal load failed for {device_id}: {error}");
+                    refresh_fail_reply(registry, &frame.request_id, &frame.subject, "invalid", true)
+                }
+            }
+        }
+    }
+}
+
+/// 统一的 fail 出口：`count_invalid=false` 用于 in_flight/配额超限/桌面自身故障/subject 尚未
+/// 确认对应真实设备这类"良性"或"不该怪设备"的拒绝（不计入 §9.6 第 251 行的连续无效计数、
+/// 恒不带 close）；`count_invalid=true` 才会真正记一次无效、达到连续 3 次上限时带
+/// `close:true`。
+///
+/// S1i1 R5-1 返工：达到上限那一帧的 `reason` 改成 `invalid_repeated`（与
+/// fixtures/wire-v1.json 的 `token_refresh_fail_valid` 同词），跟前两次非 close 的 `invalid`
+/// 区分开——调用方目前一律传 `"invalid"`，只在这里按 `close` 结果统一改写，不必逐个调用点
+/// 各自判断。
+fn refresh_fail_reply(
+    registry: &mut remote_gateway::RegistryState,
+    request_id: &str,
+    subject: &str,
+    reason: &str,
+    count_invalid: bool,
+) -> remote_gateway::RefreshOutcome {
+    let close = if count_invalid {
+        registry.record_refresh_invalid(subject)
+    } else {
+        false
+    };
+    let reason = if close { "invalid_repeated" } else { reason };
+    remote_gateway::RefreshOutcome::Reply(remote_gateway::refresh_fail_json(
+        request_id, subject, reason, close,
+    ))
+}
+
+fn remote_gateway_refresh_handler(app: &AppHandle) -> remote_gateway::RefreshHandler {
+    let app = app.clone();
+    Box::new(move |frame| {
+        let Ok(mut registry) = remote_registry().lock() else {
+            eprintln!("remote gateway token.refresh ignored: registry lock poisoned");
+            return remote_gateway::RefreshOutcome::Reply(remote_gateway::refresh_fail_json(
+                &frame.request_id,
+                &frame.subject,
+                "invalid",
+                false,
+            ));
+        };
+        let Some(db) = app.try_state::<Db>() else {
+            eprintln!("remote gateway token.refresh ignored: Db state unavailable");
+            return remote_gateway::RefreshOutcome::Reply(remote_gateway::refresh_fail_json(
+                &frame.request_id,
+                &frame.subject,
+                "invalid",
+                false,
+            ));
+        };
+        let Ok(conn) = db.inner().0.lock() else {
+            eprintln!("remote gateway token.refresh ignored: Db lock poisoned");
+            return remote_gateway::RefreshOutcome::Reply(remote_gateway::refresh_fail_json(
+                &frame.request_id,
+                &frame.subject,
+                "invalid",
+                false,
+            ));
+        };
+        let Ok(mut token_book) = remote_token_book().lock() else {
+            eprintln!("remote gateway token.refresh ignored: token book lock poisoned");
+            return remote_gateway::RefreshOutcome::Reply(remote_gateway::refresh_fail_json(
+                &frame.request_id,
+                &frame.subject,
+                "invalid",
+                false,
+            ));
+        };
+        let now_ms = now_unix_millis();
+        process_token_refresh_with_registry(
+            &mut registry,
+            &conn,
+            &KeyringStore,
+            &mut token_book,
+            &frame,
+            now_ms,
+        )
+    })
+}
+
+/// remote input 的 enqueue → 可选即时处理 → 重复行台账终态回读决策内核。
+/// 三个依赖均由调用方注入，测试不需要 AppHandle；enqueue/lookup 返回后各自持有的 DB 锁
+/// 已释放，drain 只在新插入时调用，重复 command_id 保证零处理副作用。
+fn remote_input_send_ack(
+    enqueue: impl FnOnce() -> Result<bool, String>,
+    drain: impl FnOnce(),
+    lookup_terminal_state: impl FnOnce() -> Result<Option<db::RemoteInboxTerminalState>, String>,
+) -> Option<remote_gateway::AckOutcome> {
+    let inserted = match enqueue() {
+        Ok(inserted) => inserted,
+        Err(e) => {
+            eprintln!("remote input enqueue failed (non-fatal): {e}");
+            return None;
+        }
+    };
+
+    if inserted {
+        drain();
+        // v1.7.3 订正：排空移到独立线程后 ack 不再等待投递结果，新行一律 queued。
+        return Some(remote_gateway::AckOutcome::Queued);
+    }
+
+    match lookup_terminal_state() {
+        Ok(Some(db::RemoteInboxTerminalState::Delivered)) => Some(remote_gateway::AckOutcome::Ok),
+        Ok(Some(db::RemoteInboxTerminalState::Pending)) => Some(remote_gateway::AckOutcome::Queued),
+        Ok(Some(db::RemoteInboxTerminalState::Failed)) | Ok(None) => {
+            Some(remote_gateway::AckOutcome::Failed)
+        }
+        Err(e) => {
+            eprintln!("remote input terminal-state lookup failed (non-fatal): {e}");
+            None
+        }
+    }
+}
+
+fn spawn_remote_input_drain(drain: impl FnOnce() + Send + 'static) {
+    let spawned = std::thread::Builder::new()
+        .name("remote-input-drain".into())
+        .spawn(drain);
+    if let Err(e) = spawned {
+        eprintln!("remote input drain thread spawn failed (non-fatal): {e}");
+    }
+}
+
+const REMOTE_ANSWER_SPAWN_FAILED: &str = "REMOTE_ANSWER_SPAWN_FAILED";
+
+fn spawn_remote_answer_processing(work: impl FnOnce() + Send + 'static) -> bool {
+    let spawned = std::thread::Builder::new()
+        .name("remote-answer".into())
+        .spawn(work);
+    match spawned {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("remote answer thread spawn failed (non-fatal): {e}");
+            false
+        }
+    }
+}
+
+fn mark_remote_answer_spawn_failed(app: &AppHandle, command_id: &str) {
+    let db_state = app.state::<Db>();
+    match db_state.0.lock() {
+        Ok(conn) => {
+            if let Err(e) = db::mark_remote_input_failed_by_command_id(
+                &conn,
+                command_id,
+                REMOTE_ANSWER_SPAWN_FAILED,
+            ) {
+                eprintln!(
+                    "remote input.answer spawn-failure mark_failed 写入失败（non-fatal）：command_id={command_id} err={e}"
+                );
+            }
+        }
+        Err(_) => eprintln!(
+            "remote input.answer spawn-failure mark_failed 跳过：db lock poisoned (command_id={command_id})"
+        ),
+    };
+}
+
+fn parse_remote_answer_payload(payload: &str) -> Result<(String, String), String> {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|value| {
+            let decision_id = value.get("decision_id")?.as_str()?.to_string();
+            let option = value.get("option")?.as_str()?.to_string();
+            Some((decision_id, option))
+        })
+        .ok_or_else(|| "REMOTE_INBOX_PAYLOAD_MALFORMED".to_string())
+}
+
+/// pending `input.answer` 启动恢复的纯循环内核：解析与 spawn 决策不碰 AppHandle/DB，
+/// 真实线程与终态写入由薄壳闭包注入，便于覆盖 spawn 失败和畸形 payload 两条终态路径。
+fn recover_pending_remote_answers_loop(
+    entries: Vec<db::RemoteInboxEntry>,
+    mut spawn_answer: impl FnMut(&db::RemoteInboxEntry, String, String) -> bool,
+    mut mark_failed: impl FnMut(&str, &str),
+) {
+    for entry in &entries {
+        match parse_remote_answer_payload(&entry.payload) {
+            Ok((decision_id, option)) => {
+                if !spawn_answer(entry, decision_id, option) {
+                    mark_failed(&entry.command_id, REMOTE_ANSWER_SPAWN_FAILED);
+                }
+            }
+            Err(error) => mark_failed(&entry.command_id, &error),
+        }
+    }
+}
+
+/// pending `input.answer` 启动恢复的 I/O 薄壳：查询只持一次短 DB 锁，随后每条答案
+/// 独立起线程直达既有处理链；畸形台账与线程创建失败都同步写终态，避免永久 pending。
+fn startup_recover_pending_remote_answers(app: &AppHandle, session_id: &str) {
+    let entries = {
+        let db_state = app.state::<Db>();
+        let Ok(conn) = db_state.0.lock() else {
+            eprintln!(
+                "pending input.answer 启动恢复跳过：db lock poisoned (session_id={session_id})"
+            );
+            return;
+        };
+        match db::pending_remote_answers(&conn, session_id) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("pending input.answer 启动恢复查询失败（忽略·不阻塞启动）：{e}");
+                return;
+            }
+        }
+    };
+    if entries.is_empty() {
+        return;
+    }
+
+    let app = app.clone();
+    let session_id = session_id.to_string();
+    recover_pending_remote_answers_loop(
+        entries,
+        |entry, decision_id, option| {
+            let processing_app = app.clone();
+            let processing_session = session_id.clone();
+            let processing_command_id = entry.command_id.clone();
+            spawn_remote_answer_processing(move || {
+                process_remote_answer(
+                    processing_app,
+                    processing_session,
+                    processing_command_id,
+                    decision_id,
+                    option,
+                )
+            })
+        },
+        |command_id, error| {
+            if error == REMOTE_ANSWER_SPAWN_FAILED {
+                mark_remote_answer_spawn_failed(&app, command_id);
+                return;
+            }
+            let db_state = app.state::<Db>();
+            match db_state.0.lock() {
+                Ok(conn) => {
+                    if let Err(e) =
+                        db::mark_remote_input_failed_by_command_id(&conn, command_id, error)
+                    {
+                        eprintln!(
+                            "pending input.answer mark_failed 写入失败（non-fatal）：command_id={command_id} err={e}"
+                        );
+                    }
+                }
+                Err(_) => eprintln!(
+                    "pending input.answer mark_failed 跳过：db lock poisoned (command_id={command_id})"
+                ),
+            };
+        },
+    );
+}
+
+fn remote_answer_terminal(
+    answer: impl FnOnce() -> Result<AnswerLeadQuestionOutcome, String>,
+    mark_delivered: impl FnOnce(),
+    mark_failed: impl FnOnce(&str),
+) {
+    match answer() {
+        Ok(_outcome) => mark_delivered(),
+        Err(error) => mark_failed(&error),
+    }
+}
+
+fn process_remote_answer(
+    app: AppHandle,
+    session_id: String,
+    command_id: String,
+    decision_id: String,
+    option: String,
+) {
+    let delivered_command_id = command_id.clone();
+    let failed_command_id = command_id;
+    remote_answer_terminal(
+        || {
+            answer_lead_question(
+                app.clone(),
+                app.state::<LeadQuestions>(),
+                app.state::<Db>(),
+                session_id,
+                decision_id,
+                option,
+            )
+        },
+        || {
+            let db_state = app.state::<Db>();
+            let Ok(conn) = db_state.0.lock() else {
+                eprintln!(
+                    "remote input.answer mark_delivered skipped for command_id={delivered_command_id}: db lock poisoned"
+                );
+                return;
+            };
+            if let Err(e) =
+                db::mark_remote_input_delivered_by_command_id(&conn, &delivered_command_id)
+            {
+                eprintln!(
+                    "remote input.answer mark_delivered failed for command_id={delivered_command_id} (non-fatal): {e}"
+                );
+            }
+        },
+        |error| {
+            let db_state = app.state::<Db>();
+            let Ok(conn) = db_state.0.lock() else {
+                eprintln!(
+                    "remote input.answer mark_failed skipped for command_id={failed_command_id}: db lock poisoned"
+                );
+                return;
+            };
+            if let Err(e) =
+                db::mark_remote_input_failed_by_command_id(&conn, &failed_command_id, error)
+            {
+                eprintln!(
+                    "remote input.answer mark_failed failed for command_id={failed_command_id} (non-fatal): {e}"
+                );
+            }
+        },
+    );
+}
+
+fn remote_gateway_input_send_handler(app: &AppHandle) -> remote_gateway::InputSendHandler {
+    let app = app.clone();
+    Box::new(move |frame| {
+        let remote_gateway::InputSendFrame {
+            session,
+            command_id,
+            text,
+        } = frame;
+        let payload = serde_json::json!({ "text": text }).to_string();
+        remote_input_send_ack(
+            || {
+                let db_state = app.state::<Db>();
+                let conn = db_state.0.lock().map_err(|e| e.to_string())?;
+                db::enqueue_remote_input(&conn, &session, &command_id, "input.send", &payload)
+                    .map_err(|e| e.to_string())
+            },
+            || {
+                let Some(guard) = try_begin_draining(&session) else {
+                    return;
+                };
+                let app = app.clone();
+                let session = session.clone();
+                spawn_remote_input_drain(move || drain_owned(app, session, guard));
+            },
+            || {
+                let db_state = app.state::<Db>();
+                let conn = db_state.0.lock().map_err(|e| e.to_string())?;
+                db::remote_inbox_terminal_state_by_command_id(&conn, &command_id)
+                    .map_err(|e| e.to_string())
+            },
+        )
+    })
+}
+
+fn remote_gateway_input_answer_handler(app: &AppHandle) -> remote_gateway::InputAnswerHandler {
+    let app = app.clone();
+    Box::new(move |frame| {
+        let remote_gateway::InputAnswerFrame {
+            session,
+            command_id,
+            decision_id,
+            option,
+        } = frame;
+        let payload = serde_json::json!({
+            "decision_id": &decision_id,
+            "option": &option,
+        })
+        .to_string();
+        let processing_app = app.clone();
+        let processing_session = session.clone();
+        let processing_command_id = command_id.clone();
+        let processing_decision_id = decision_id.clone();
+        let processing_option = option.clone();
+        let spawn_failure_app = app.clone();
+        let spawn_failure_command_id = command_id.clone();
+        remote_input_send_ack(
+            || {
+                let db_state = app.state::<Db>();
+                let conn = db_state.0.lock().map_err(|e| e.to_string())?;
+                db::enqueue_remote_input(&conn, &session, &command_id, "input.answer", &payload)
+                    .map_err(|e| e.to_string())
+            },
+            || {
+                if !spawn_remote_answer_processing(move || {
+                    process_remote_answer(
+                        processing_app,
+                        processing_session,
+                        processing_command_id,
+                        processing_decision_id,
+                        processing_option,
+                    )
+                }) {
+                    mark_remote_answer_spawn_failed(&spawn_failure_app, &spawn_failure_command_id);
+                }
+            },
+            || {
+                let db_state = app.state::<Db>();
+                let conn = db_state.0.lock().map_err(|e| e.to_string())?;
+                db::remote_inbox_terminal_state_by_command_id(&conn, &command_id)
+                    .map_err(|e| e.to_string())
+            },
+        )
+    })
+}
+
+fn remote_gateway_control_stop_handler(app: &AppHandle) -> remote_gateway::ControlStopHandler {
+    let app = app.clone();
+    Box::new(move |frame| {
+        let db = app.state::<Db>();
+        let running = app.state::<Running>();
+        let team_running = app.state::<member_runner::TeamRunning>();
+        let session_id = frame.session.clone();
+        let result = stop_session_with_background_inspection(
+            &db,
+            &running,
+            &team_running,
+            &session_id,
+            current_locale(&app),
+            kill_process_group,
+            inspect_background_processes_for_stop,
+            |notice| emit_background_stop_notice(&app, &session_id, notice),
+            |event| emit_agent_event(&app, &session_id, None, event),
+        );
+        match result {
+            Ok(()) => remote_gateway::AckOutcome::Ok,
+            Err(e) => {
+                eprintln!("remote control.stop failed (non-fatal): {e}");
+                remote_gateway::AckOutcome::Failed
+            }
+        }
+    })
+}
+
+fn remote_gateway_control_replay_handler(app: &AppHandle) -> remote_gateway::ControlReplayHandler {
+    let app = app.clone();
+    Box::new(move |session_id, command_id| {
+        let db = app.state::<Db>();
+        let Ok(conn) = db.0.lock() else {
+            eprintln!("remote control replay ledger rejected command: db lock poisoned");
+            return false;
+        };
+        match db::record_control_command_seen(&conn, session_id, command_id, "{}") {
+            Ok(is_new) => is_new,
+            Err(e) => {
+                eprintln!("remote control replay ledger failed closed (non-fatal): {e}");
+                false
+            }
+        }
+    })
 }
 
 fn process_elapsed_ms() -> f64 {
@@ -297,9 +1562,9 @@ fn collect_assistant_text(stdout: &[u8], parse: ParseFn) -> String {
 }
 
 fn make_backend(
-    conn: &Connection,
     profile: &db::AgentProfile,
     key: Option<String>,
+    search: HarnessSearchCreds,
     locale: Locale,
 ) -> Result<Box<dyn AgentBackend>, String> {
     match profile.access.as_str() {
@@ -316,13 +1581,11 @@ fn make_backend(
         }
         "harness" => {
             validate_harness_agent_key(profile, key.as_deref(), locale)?;
-            let (search_api_key, search_backend) =
-                resolve_harness_search(conn, &crate::keychain::KeyringStore);
             Ok(Box::new(HarnessBackend {
                 profile: profile.clone(),
                 api_key: key,
-                search_api_key,
-                search_backend,
+                search_api_key: search.key,
+                search_backend: search.backend,
             }))
         }
         other => Err(ui_msg::al_err(
@@ -350,16 +1613,59 @@ fn validate_harness_agent_key(
     Ok(())
 }
 
+/// 预解析好的 harness 搜索凭据——由调用方在锁外完成钥匙串 IPC 后传给 `make_backend`。
+/// `backend` = 当前生效的搜索后端名（"brave" 兜底同前）；`key` = 该后端配置的 API key（未配置则 None）。
+#[derive(Debug, Default, Clone)]
+struct HarnessSearchCreds {
+    key: Option<String>,
+    backend: Option<String>,
+}
+
+/// 读当前生效的搜索后端名（DB 读·可在锁内调用；"brave" 兜底语义与原 `resolve_harness_search` 一致）。
+fn active_search_backend_name(conn: &Connection) -> String {
+    db::get_active_search_backend(conn).unwrap_or_else(|_| "brave".to_string())
+}
+
+/// 按后端名取搜索 key（真实钥匙串 IPC·调用方必须保证在锁外调用；trim/filter 空字符串语义与原函数一致）。
+fn resolve_search_key(store: &dyn KeyStore, backend: &str) -> Option<String> {
+    crate::keychain::get_search_key_with_store(store, backend)
+        .ok()
+        .flatten()
+        .filter(|k| !k.trim().is_empty())
+}
+
 fn resolve_harness_search(
     conn: &Connection,
     store: &dyn KeyStore,
 ) -> (Option<String>, Option<String>) {
-    let active = db::get_active_search_backend(conn).unwrap_or_else(|_| "brave".to_string());
-    let key = crate::keychain::get_search_key_with_store(store, &active)
-        .ok()
-        .flatten()
-        .filter(|k| !k.trim().is_empty());
+    let active = active_search_backend_name(conn);
+    let key = resolve_search_key(store, &active);
     (key, Some(active))
+}
+
+/// harness profile 的搜索凭据·锁外解析入口（N-2 收窄项）。非 harness profile 直接返回默认值、
+/// 不产生任何 DB 读或钥匙串 IPC（`profile.access` 判断必须先做——这是"非 harness profile 不得
+/// 新增任何钥匙串 IPC"这条硬不变量的落点）。harness profile 时：只在读后端名这一步短暂拿锁
+/// （`db.0.lock()`，读完立即释放），取 key 的钥匙串 IPC 严格在锁外发生。
+/// 调用方硬前提：调用本函数时不得已经持有 `db.0` 锁；`TimedMutex` 包装的是不可重入的
+/// `std::sync::Mutex`，同一线程重入 `lock()` 会立即死锁。
+pub(crate) fn resolve_harness_search_creds(
+    db: &Db,
+    profile: &db::AgentProfile,
+    store: &dyn KeyStore,
+) -> Result<HarnessSearchCreds, String> {
+    if profile.access != "harness" {
+        return Ok(HarnessSearchCreds::default());
+    }
+    let backend = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        active_search_backend_name(&conn)
+    };
+    let key = resolve_search_key(store, &backend);
+    Ok(HarnessSearchCreds {
+        key,
+        backend: Some(backend),
+    })
 }
 
 fn parser_for_parse_fn(parse_fn: ParseFn) -> fn(&str) -> Vec<agent_event::AgentEvent> {
@@ -469,6 +1775,8 @@ fn codex_image_tool_events(
     ]
 }
 
+/// `key` / `search` 必须由调用方在不持有 `db.0` 锁时预先解析，再传入本函数。正常路径的参数与
+/// 返回值不变；极少数最终重拿锁失败的路径上，agent key IPC 现在会先发生（此前拿锁失败时不会发生）。
 fn build_lead_backend_command(
     conn: &rusqlite::Connection,
     session_id: &str,
@@ -479,13 +1787,10 @@ fn build_lead_backend_command(
     mode: agent::BuildMode,
     locale: Locale,
     reasoning_tier: Option<&str>,
+    key: Option<String>,
+    search: HarnessSearchCreds,
 ) -> Result<(Command, ParseFn), String> {
-    let key = if profile.access == "borrow" || profile.access == "harness" {
-        KeyringStore.get(&profile.id)?
-    } else {
-        None
-    };
-    let backend = make_backend(conn, profile, key, locale)?;
+    let backend = make_backend(profile, key, search, locale)?;
     let parse_fn = backend.parse_fn();
     let command = backend.build_command(&agent::BuildContext {
         prompt,
@@ -523,6 +1828,9 @@ type BuiltMemberCommand = (
 /// 直接分段调用三个子函数（把钥匙串 IPC + git worktree 这两个慢操作挪出全局 DB 锁），不再调用
 /// 这个一次性版本——它现在只作为测试的「参考实现」保留（`#[allow(dead_code)]`，同仓已有先例，
 /// 如 `run_single_worker` 自己的 `#[allow(dead_code)]`）。
+/// 它内部仍按 profile→key→search→wt→command 一次性直调，刻意保留 RN4-a 已从 4 个 lead 调用点
+/// 消灭的锁内解析反模式作为等价基准，并非生产推荐写法；新代码应照抄
+/// `build_member_command_with` 或这 4 个 lead 调用点的三段式，勿照抄本函数。
 #[allow(dead_code)]
 pub(crate) fn build_member_command(
     conn: &rusqlite::Connection,
@@ -542,9 +1850,20 @@ pub(crate) fn build_member_command(
     // 顺序，如实记在这里。
     let profile = get_member_agent_profile(conn, &spec.agent_id)?;
     let key = resolve_member_key(&profile)?;
+    let search = if profile.access == "harness" {
+        let backend = active_search_backend_name(conn);
+        let key = resolve_search_key(&crate::keychain::KeyringStore, &backend);
+        HarnessSearchCreds {
+            key,
+            backend: Some(backend),
+        }
+    } else {
+        HarnessSearchCreds::default()
+    };
     let wt = resolve_member_wt(conn, session_id, &spec.assignment_id)?;
-    let (command, parser, parse_fn, granularity) =
-        build_member_command_with(conn, session_id, run_id, spec, &profile, key, &wt, locale)?;
+    let (command, parser, parse_fn, granularity) = build_member_command_with(
+        conn, session_id, run_id, spec, &profile, key, search, &wt, locale,
+    )?;
     Ok((command, parser, parse_fn, wt, granularity))
 }
 
@@ -567,22 +1886,21 @@ pub(crate) fn resolve_member_key(profile: &db::AgentProfile) -> Result<Option<St
     }
 }
 
-/// build_member_command 第③段：用已解析好的 profile/key/wt 拼最终 Command（需要 conn）。
-/// **口径更正（opus 对抗审 F3① 后改判·别再说这段「不含子进程/IPC 等待」）**：`make_backend`
-/// 的 "native"/"borrow" 分支确实只做内存计算 + `checkpoint_hook::install` 的一次快速 DB 读写；
-/// 但 "harness" 分支会调 `resolve_harness_search` → `keychain::get_search_key_with_store`，
-/// 这是**真实的钥匙串 IPC**（取搜索后端的 API key，与 `resolve_member_key` 取的 agent 自身
-/// key 是两把不同的钥匙）——A2「把钥匙串挪出锁」这个卖点对 harness 型 agent **只挪掉了一半**，
-/// 这一段仍在锁内。之所以本轮不把它也挪出去：`resolve_harness_search` 内嵌在 `make_backend`
-/// 里，`make_backend` 是共享函数——**4 个直接调用点**（D4 后核实更正：不是「A1 + build_send_plan +
-/// propose_team_plan」，`propose_team_plan` 其实是经 `build_lead_backend_command` 间接调、不直接
-/// 调 `make_backend`）：`build_lead_backend_command`（本文件 473 行，A1 用）、
-/// `build_member_command_with`（本文件 586 行，本函数自己）、`build_send_plan`（本文件 635 行）、
-/// `lead_summarize`（本文件 6624 行）——要把这段挪出锁，得改 `make_backend` 的签名（让调用方先
-/// 在锁外解析好搜索凭据、再传进来），这会牵动全部 4 个调用点，是比本轮「纯挪一个函数调用顺序」
-/// 大得多的改动，风险和验证成本都对不上「只做锁作用域」这轮的范围。留作后续独立收窄项（同一份
-/// 搜索后端凭据对同一次 team run 的所有 harness 型 member 是共享的，理论上只需要解析一次，收益
-/// 比逐 member 都大，值得单独立案）。
+/// build_member_command 第③段：用已解析好的 profile/key/search/wt 拼最终 Command（需要 conn）。
+/// **F3① 历史口径更正（opus 对抗审后改判）**：改造前 `make_backend` 的 "harness" 分支会调
+/// `resolve_harness_search` → `keychain::get_search_key_with_store`，在锁内做一次真实钥匙串 IPC；
+/// 它取的是搜索后端 API key，与 `resolve_member_key` 取的 agent 自身 key 是两把不同的钥匙。
+/// T5d-b.1-RN3-b 新增 `HarnessSearchCreds` + `resolve_harness_search_creds`，只把搜索 key 的解析移到
+/// 锁外；`build_lead_backend_command` 内联的 agent 自身 key 解析当时仍留在锁内。RN4-a 又把这
+/// 一半移出锁，4 个调用点 `start_repo_generation` / `propose_team_plan` / `lead_step` /
+/// `generate_handoff_doc` 现在都在拿最终 Command 构建锁之前解析好 agent key 与搜索凭据。
+/// `start_continuation_session` 的 solo 续会话分支原来经 `build_send_plan` 在锁内做两次 IPC，
+/// RN4-a 已改走 `build_send_plan_with`；`build_send_plan` 自此没有生产调用者并降为 `#[cfg(test)]`。
+///
+/// 仍留两笔账：① 同一次 team run 内所有 harness 型 member 目前仍逐 member 独立解析搜索凭据，
+/// 共享一份、只解析一次的优化不在本轮范围；② `start_lead_session` 还有一个不经过 `make_backend`
+/// 的直接 `resolve_harness_search` 调用，仍发生在 `db.0.lock()` 持有期间。它是本轮盘点出的同类
+/// 调用点，但不属于上述 4 个直接调用点，本轮未改，留作后续独立小项。
 pub(crate) fn build_member_command_with(
     conn: &rusqlite::Connection,
     session_id: &str,
@@ -590,6 +1908,7 @@ pub(crate) fn build_member_command_with(
     spec: &member_runner::MemberSpec,
     profile: &db::AgentProfile,
     key: Option<String>,
+    search: HarnessSearchCreds,
     wt: &std::path::Path,
     locale: Locale,
 ) -> Result<
@@ -601,7 +1920,7 @@ pub(crate) fn build_member_command_with(
     ),
     String,
 > {
-    let backend = make_backend(conn, profile, key, locale)?;
+    let backend = make_backend(profile, key, search, locale)?;
     let command = backend.build_command(&agent::BuildContext {
         prompt: &spec.prompt,
         session_id,
@@ -629,28 +1948,21 @@ struct SendPlan {
     parse_fn: ParseFn,
 }
 
-fn build_send_plan(
-    conn: &rusqlite::Connection,
+fn build_send_plan_with(
+    conn: &Connection,
     session_id: &str,
     run_id: &str,
-    agent_id: &str,
+    profile: db::AgentProfile,
+    key: Option<String>,
+    search: HarnessSearchCreds,
     message: &str,
     reasoning_tier: Option<&str>,
     criteria: &[String],
-    key_store: &dyn KeyStore,
     locale: Locale,
 ) -> Result<SendPlan, String> {
-    let profile = db::get_agent(conn, agent_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| ui_msg::al_err("agent.notFound", &[]))?;
     let plan_agent_id = profile.id.clone();
     let name_snapshot = profile.name.clone();
-    let key = if profile.access == "borrow" || profile.access == "harness" {
-        key_store.get(&plan_agent_id)?
-    } else {
-        None
-    };
-    let backend = make_backend(conn, &profile, key, locale)?;
+    let backend = make_backend(&profile, key, search, locale)?;
     let prompt = if profile.access == "harness" && agent::harness_plan_mode_enabled() {
         build_agent_prompt(&profile, &[], message, locale)
     } else {
@@ -680,6 +1992,51 @@ fn build_send_plan(
         command,
         parse_fn,
     })
+}
+
+/// **测试基准·锁内 IPC 反模式·生产禁用**：保留原始一次性路径供等价性测试使用。
+#[cfg(test)]
+fn build_send_plan(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    run_id: &str,
+    agent_id: &str,
+    message: &str,
+    reasoning_tier: Option<&str>,
+    criteria: &[String],
+    key_store: &dyn KeyStore,
+    locale: Locale,
+) -> Result<SendPlan, String> {
+    let profile = db::get_agent(conn, agent_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| ui_msg::al_err("agent.notFound", &[]))?;
+    let key = if profile.access == "borrow" || profile.access == "harness" {
+        key_store.get(&profile.id)?
+    } else {
+        None
+    };
+    let search = if profile.access == "harness" {
+        let backend = active_search_backend_name(conn);
+        let search_key = resolve_search_key(key_store, &backend);
+        HarnessSearchCreds {
+            key: search_key,
+            backend: Some(backend),
+        }
+    } else {
+        HarnessSearchCreds::default()
+    };
+    build_send_plan_with(
+        conn,
+        session_id,
+        run_id,
+        profile,
+        key,
+        search,
+        message,
+        reasoning_tier,
+        criteria,
+        locale,
+    )
 }
 
 fn require_agent_id(agent_id: String) -> Result<String, String> {
@@ -961,6 +2318,15 @@ fn reserve_new_session_run(
             &[("detail", detail.to_string())],
         ));
     }
+    // M1-T1（remote control M0 §4c）：占槽咽喉——`reserved` 到这里已确认为 true（否则上面
+    // 已 `?`/`return Err` 提前退出），这是 solo/lead 共用的 send_message 唯一占槽成功出口
+    // （`try_reserve` 本身无 conn·这里是离 conn 最近的成功点）。run_id 此刻尚未现场生成，
+    // 写 None——这张表只服务"忙/闲"这一比特，调用方后续自己的 run_id 不再回填。这是「reserve」
+    // 类写口（不是「release/摘槽」类），不走 refresh_session_runtime——见该函数文档分工。
+    // 失败非致命但不再全吞（P3-1）。
+    if let Err(e) = db::set_session_runtime(conn, session_id, db::SESSION_RUNTIME_RUNNING, None) {
+        eprintln!("session_runtime running write failed (non-fatal): {e}");
+    }
     Ok(())
 }
 
@@ -981,14 +2347,25 @@ enum SpawnHandoffAction {
 
 fn transition_spawn_handoff(
     running: &Running,
+    team_running: &member_runner::TeamRunning,
+    db: Option<&crate::db::Db>,
     session_id: &str,
     pid: u32,
 ) -> Result<SpawnHandoffAction, String> {
-    transition_spawn_handoff_with_abort_kill(running, session_id, pid, kill_process_group)
+    transition_spawn_handoff_with_abort_kill(
+        running,
+        team_running,
+        db,
+        session_id,
+        pid,
+        kill_process_group,
+    )
 }
 
 fn transition_spawn_handoff_with_abort_kill<F>(
     running: &Running,
+    team_running: &member_runner::TeamRunning,
+    db: Option<&crate::db::Db>,
     session_id: &str,
     pid: u32,
     kill_abort_process_group: F,
@@ -1022,6 +2399,13 @@ where
             // 子进程仍未收到终止信号时重新 reserve；异常既有槽可能属于别的运行，不能误删。
             eprintln!("handoff: slot 异常 {other:?} · killpg 防泄漏");
             kill_abort_process_group(pid);
+            drop(slots);
+            // M1 修复轮 P1-2：这条异常分支本身不动 Running 槽（既有防御性设计——不确定归属，
+            // 不能误删别人的槽），但既然已经打破了「正常 handoff」假设，顺手重算一次
+            // session_runtime 兜底，避免这条极端路径下表状态跟内存真相脱节。
+            if let Some(db) = db {
+                refresh_session_runtime(db, running, team_running, session_id);
+            }
             Ok(SpawnHandoffAction::Abort)
         }
     }
@@ -1092,6 +2476,12 @@ struct ReservationGuard {
     running: Running,
     sid: String,
     armed: bool,
+    // M1 修复轮 P1-2（opus 深审·2026-08-11）：早失败 unwind 路径此前从不碰 session_runtime
+    // 表——`disarm()` 一旦调用（正常 handoff 成功）这条覆盖就用不上，只有「reserve 成功后、
+    // 还没来得及 disarm 就提前 `?` 失败」这段窗口才会走到这里。`None` = 没挂 refresh 句柄
+    // （测试调用点的默认状态，Drop 只做原有的槽清理、不碰 db，零测试改动）；生产调用点用
+    // `with_refresh` 挂上后，Drop 摘槽后会重算 session_runtime。
+    refresh: Option<(member_runner::TeamRunning, AppHandle)>,
     #[cfg(test)]
     test_on_disarm: Option<Box<dyn FnMut() + Send>>,
 }
@@ -1102,9 +2492,17 @@ impl ReservationGuard {
             running,
             sid,
             armed: true,
+            refresh: None,
             #[cfg(test)]
             test_on_disarm: None,
         }
+    }
+
+    /// 生产调用点在拿到 guard 后立刻挂上——早失败 unwind 触发 Drop 摘槽时，用它重算并写回
+    /// session_runtime（P1-2 覆盖面补齐）。测试调用点不调用本方法，`refresh` 保持 `None`。
+    fn with_refresh(mut self, team_running: member_runner::TeamRunning, app: AppHandle) -> Self {
+        self.refresh = Some((team_running, app));
+        self
     }
 
     fn disarm(&mut self) {
@@ -1128,6 +2526,8 @@ where
 
 fn abort_spawn_after_register_failure<K, W>(
     running: &Running,
+    team_running: &member_runner::TeamRunning,
+    db: Option<&crate::db::Db>,
     session_id: &str,
     pid: u32,
     guard: &mut ReservationGuard,
@@ -1153,6 +2553,14 @@ where
                 slots.remove(session_id);
             }
             drop(slots);
+            // M1 修复轮 P1-2：只在真摘了槽（owns_slot）时才重算——`running.0` 的锁已经在上面
+            // `drop(slots)` 释放，refresh_session_runtime 内部会重新加锁，此处若还攥着就是
+            // P0-1 那类同线程重入死锁。
+            if owns_slot {
+                if let Some(db) = db {
+                    refresh_session_runtime(db, running, team_running, session_id);
+                }
+            }
             wait_for_child();
             Ok(())
         }
@@ -1174,14 +2582,23 @@ impl Drop for ReservationGuard {
         if !self.armed {
             return;
         }
-        let Ok(mut m) = self.running.0.lock() else {
-            return;
-        };
-        // 不变量：accepted spawn handoff 会立即 disarm；armed drop 路径通常只见自己刚占的
-        // Launching。快速 Stop handoff 会先转 Finalizing 再 disarm，所以即便异常 unwind，
-        // 这里也只移除 Launching、不误放仍需统一 finalizer 收尾的 Finalizing/Running。
-        if matches!(m.get(&self.sid), Some(RunSlot::Launching { .. })) {
-            m.remove(&self.sid);
+        match self.running.0.lock() {
+            Ok(mut m) => {
+                // 不变量：accepted spawn handoff 会立即 disarm；armed drop 路径通常只见自己刚占的
+                // Launching。快速 Stop handoff 会先转 Finalizing 再 disarm，所以即便异常 unwind，
+                // 这里也只移除 Launching、不误放仍需统一 finalizer 收尾的 Finalizing/Running。
+                if matches!(m.get(&self.sid), Some(RunSlot::Launching { .. })) {
+                    m.remove(&self.sid);
+                }
+            }
+            Err(_) => return,
+        }
+        // `m`（running.0 的锁）已在上面的 match 分支结束时 drop——refresh_session_runtime 内部
+        // 会重新获取同一把锁，这里若还攥着就是 P0-1 那类同线程重入死锁。
+        if let Some((team_running, app)) = &self.refresh {
+            if let Some(db) = app.try_state::<crate::db::Db>() {
+                refresh_session_runtime(db.inner(), &self.running, team_running, &self.sid);
+            }
         }
     }
 }
@@ -1280,6 +2697,10 @@ struct TeamRunSlotGuard {
     running: Running,
     session_id: String,
     armed: bool,
+    // M1 修复轮 P1-2：同 `ReservationGuard::refresh`——`None` = 测试默认态（Drop 只清 Running
+    // 槽、不碰 db）；生产调用点用 `with_refresh` 挂上后，Drop 摘槽后重算 session_runtime
+    // （覆盖 `start_team_run` 起跑准备期提前 `?` 失败、guard 从未 disarm 的窗口）。
+    refresh: Option<(member_runner::TeamRunning, AppHandle)>,
 }
 
 impl TeamRunSlotGuard {
@@ -1288,7 +2709,13 @@ impl TeamRunSlotGuard {
             running,
             session_id,
             armed: true,
+            refresh: None,
         }
+    }
+
+    fn with_refresh(mut self, team_running: member_runner::TeamRunning, app: AppHandle) -> Self {
+        self.refresh = Some((team_running, app));
+        self
     }
 
     fn disarm(&mut self) {
@@ -1298,8 +2725,16 @@ impl TeamRunSlotGuard {
 
 impl Drop for TeamRunSlotGuard {
     fn drop(&mut self) {
-        if self.armed {
-            release_team_run_slot(&self.running, &self.session_id);
+        if !self.armed {
+            return;
+        }
+        // release_team_run_slot 内部自己短锁 running.0 并在返回前 drop——这里调用 refresh 前
+        // 无需额外处理，锁已经不在手上了（P0-1 教训：refresh_session_runtime 会重新加锁）。
+        release_team_run_slot(&self.running, &self.session_id);
+        if let Some((team_running, app)) = &self.refresh {
+            if let Some(db) = app.try_state::<crate::db::Db>() {
+                refresh_session_runtime(db.inner(), &self.running, team_running, &self.session_id);
+            }
         }
     }
 }
@@ -1395,7 +2830,8 @@ pub(crate) fn wait_for_answer(
 /// 答案走哪条路。纯内存判定（不碰 DB），下游 `answer_question_inner` 据此再决定要不要落库。
 enum AnswerRoute {
     /// 槽位仍 Live：已经把答案 send 给还在阻塞的 handler——handler 自己的原路（prompt_user
-    /// 收到答案后)会去落卡状态，这里不用再管 DB。
+    /// 收到答案后）会去落卡状态；这里不管 DB、也不再 emit，翻卡广播由 handler 在 CAS
+    /// 落库成功后自己触发。
     Delivered,
     /// 槽位是 TimedOut：handler 早就体面退出了，答案要靠迟到路径落库（落卡 chosen + 转一条
     /// 真实用户消息喂给 lead 下一轮）。
@@ -1464,7 +2900,13 @@ fn commit_late_answer(
         Locale::Zh => format!("[用户对『{question}』的回答] {answer}"),
         Locale::En => format!("[User's answer to ‘{question}’] {answer}"),
     };
-    db::append_message(
+    // P0-c：dedup 版落库——键绑 decision_id（CAS 已经保证这条分支每个 decision_id 只会被
+    // 走到一次，late_answer_key 本身不必再靠 run_id/command_id 加持）。conn 在本函数两条
+    // 调用方（answer_question_inner 的 Late/Missing 分支）里都是裸 `db.0.lock()`、无显式
+    // 事务，autocommit，符合 append_message_dedup_and_publish 的姊妹契约（db.rs:3734/3784）
+    // ——插入执行成功后即可立即 publish()。
+    let dedup_key = display_reduce::late_answer_key(decision_id);
+    let milestone = db::append_message_dedup(
         conn,
         session_id,
         "user",
@@ -1472,9 +2914,16 @@ fn commit_late_answer(
         None,
         None,
         None,
+        &dedup_key,
     )
     .map_err(|e| e.to_string())?;
+    // 插中才读回行；理论不可达的 dedup 碰撞（同 decision_id 被 CAS 挡了两次仍走到这里）
+    // 防御性地当「没有新消息可 emit」处理，不 panic。
+    let Some(milestone) = milestone else {
+        return Ok(None);
+    };
     let id = conn.last_insert_rowid();
+    milestone.publish();
     db::get_message_by_id(conn, id).map_err(|e| e.to_string())
 }
 
@@ -1495,9 +2944,19 @@ fn clip_chars_for_echo(s: &str, max: usize) -> String {
 /// 迟到答案补落库；卡已经 chosen（真双击 / 已回答）就维持 NO_PENDING_QUESTION（防双发语义
 /// 不放松：第二次答同一问题绝不再产生第二条落库消息）。
 ///
-/// T3：返回值改为 `Result<Option<db::Message>, String>`——Late/Missing-pending 两条落库
-/// 路径把 `commit_late_answer` 读回的完整消息原样透传，供外层 `answer_lead_question` 薄壳
-/// emit `"lead-message-appended"`（当场可见，不必等下次 `get_messages` 全量拉取）。
+/// 返回值同时携带可选的迟到回答消息与本次调用是否确定赢下决策卡。Delivered 本次调用不落库，
+/// 也不能同步确认 handler 随后的 CAS 结果，因此 resolved 恒为 false；翻卡广播转交
+/// `lead_tools::prompt_user`，由它收到答案且 CAS 落库返回 `Ok(true)` 后自己 emit。Late/Missing
+/// 只有 CAS 真正从 pending 翻成 chosen、并返回刚追加的消息时才 resolved=true。
+/// 本内核不触发续跑；新调用方（尤其未来的 remote_gateway 等远端入口）若复用它，必须自己
+/// 接上 `try_resume_after_answer`，或改调已接好 emit + 续跑的 `answer_lead_question` 薄壳，
+/// 否则远端答卡会在答案落库后静默退回停摆。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AnswerQuestionResult {
+    appended: Option<db::Message>,
+    resolved: bool,
+}
+
 pub(crate) fn answer_question_inner(
     questions: &LeadQuestions,
     db: &db::Db,
@@ -1505,12 +2964,19 @@ pub(crate) fn answer_question_inner(
     decision_id: &str,
     answer: String,
     locale: Locale,
-) -> Result<Option<db::Message>, String> {
+) -> Result<AnswerQuestionResult, String> {
     match take_question_route(questions, decision_id, &answer)? {
-        AnswerRoute::Delivered => Ok(None),
+        AnswerRoute::Delivered => Ok(AnswerQuestionResult {
+            appended: None,
+            resolved: false,
+        }),
         AnswerRoute::Late => {
             let conn = db.0.lock().map_err(|e| e.to_string())?;
-            commit_late_answer(&conn, session_id, decision_id, &answer, locale)
+            let appended = commit_late_answer(&conn, session_id, decision_id, &answer, locale)?;
+            Ok(AnswerQuestionResult {
+                resolved: appended.is_some(),
+                appended,
+            })
         }
         AnswerRoute::Missing => {
             let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -1518,10 +2984,38 @@ pub(crate) fn answer_question_inner(
                 .map_err(|e| e.to_string())?
             {
                 Some((_, status)) if status == "pending" => {
-                    commit_late_answer(&conn, session_id, decision_id, &answer, locale)
+                    let appended =
+                        commit_late_answer(&conn, session_id, decision_id, &answer, locale)?;
+                    Ok(AnswerQuestionResult {
+                        resolved: appended.is_some(),
+                        appended,
+                    })
                 }
                 _ => Err("NO_PENDING_QUESTION".to_string()),
             }
+        }
+    }
+}
+
+/// T3（AgentLoom remote control M0 §4a·别与「决策打扰收敛刀」旧 T1 系列内部的 T3 子步骤
+/// 混淆）：`answer_lead_question` 的返回值——`resumed` 告诉前端「后端是否已经自己触发了
+/// 续跑」，成功时 `lead_agent_id` 是实际用于启动的 saved lead；非 busy 启动失败才通过
+/// `resume_error` 回传原始错误。前端据此只做乐观绘制，绝不再自己 invoke
+/// `resume_lead_session`（否则本机路径会双触发：后端先占槽、前端随后 resume 撞 busy，给
+/// 用户弹假错误）。
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct AnswerLeadQuestionOutcome {
+    resumed: bool,
+    lead_agent_id: Option<String>,
+    resume_error: Option<String>,
+}
+
+impl AnswerLeadQuestionOutcome {
+    fn quietly_not_resumed() -> Self {
+        Self {
+            resumed: false,
+            lead_agent_id: None,
+            resume_error: None,
         }
     }
 }
@@ -1534,8 +3028,9 @@ fn answer_lead_question(
     session_id: String,
     decision_id: String,
     answer: String,
-) -> Result<(), String> {
-    let appended = answer_question_inner(
+) -> Result<AnswerLeadQuestionOutcome, String> {
+    let chosen_answer = answer.clone();
+    let AnswerQuestionResult { appended, resolved } = answer_question_inner(
         questions.inner(),
         db.inner(),
         &session_id,
@@ -1543,10 +3038,21 @@ fn answer_lead_question(
         answer,
         current_locale(&app),
     )?;
+    use tauri::Emitter;
+    if resolved {
+        let _ = app.emit(
+            "decision-card-resolved",
+            serde_json::json!({
+                "session_id": session_id,
+                "decision_id": decision_id,
+                "status": "chosen",
+                "chosen_option": chosen_answer,
+            }),
+        );
+    }
     // T3·薄壳 emit：commit_late_answer 落库成功时才有消息可发；DB 层已经落定，emit 失败
     // 只影响「当场可见」这层体验（下次 get_messages 全量拉取仍会带上），best-effort 不重试。
-    if let Some(message) = appended {
-        use tauri::Emitter;
+    let outcome = if let Some(message) = appended {
         let _ = app.emit(
             "lead-message-appended",
             serde_json::json!({
@@ -1554,8 +3060,133 @@ fn answer_lead_question(
                 "message": message,
             }),
         );
+        // T3（remote control M0 §4a）：emit 之后才触发续跑——保前端先看到答案消息、
+        // 再看到 run 启动事件；appended=None（Delivered 或 CAS 没赢的双击）绝不触发。
+        try_resume_after_answer(&app, &session_id)
+    } else {
+        AnswerLeadQuestionOutcome::quietly_not_resumed()
+    };
+    Ok(outcome)
+}
+
+/// T3（remote control M0 §4a）：迟到答案落库成功后，续跑权收归后端——不再依赖前端自己
+/// invoke `resume_lead_session`。起因：「远程控制」答卡走的是同一条 `answer_lead_question`
+/// IPC，背后没有前端替它触发续跑，若续跑权仍留在前端，远程答卡后 lead 会永远停摆。
+///
+/// 短锁读 `SessionAgentConfig` 判门（`resume_after_answer_candidate`，纯内核·team 会话才续，
+/// solo 会话——没有 lead_agent_id——留给下一轮普通 run 自然消费答案，不续），锁在判门块结束
+/// 时立即释放，绝不带着 db 锁进 `start_lead_session`（M1-T1 死锁血案同款红线：
+/// `std::sync::Mutex` 不可重入，同线程二次 `db.0.lock()` 直接死锁；写法学
+/// `try_autofeed_lead` 的「短锁短放」块状作用域）。
+///
+/// 去重不新造锁：`commit_late_answer` 的 CAS 保证只有一个调用者能拿到 `Some(message)`（并发
+/// 双击/多路径同时落库时，第二个必然拿到 `Ok(None)`，本函数根本不会被调用）；
+/// `start_lead_session` 自己的 `reserve_new_session_run` 占槽闸兜底并发启动——占槽被抢
+/// （`autofeed_busy_error` 命中）静默收敛为「会话已在跑」，非 busy 的失败打一行非致命日志，
+/// 不 panic、不把 `Err` 冒泡成 command 失败；返回值携带是否续跑、实际 saved lead 与非 busy
+/// 错误原文。
+fn try_resume_after_answer(app: &AppHandle, session_id: &str) -> AnswerLeadQuestionOutcome {
+    let mut recheck_after_busy = true;
+    loop {
+        let db_state = app.state::<Db>();
+        let candidate = {
+            let Ok(conn) = db_state.0.lock() else {
+                return AnswerLeadQuestionOutcome::quietly_not_resumed();
+            };
+            let Ok(config) = db::get_session_agent_config(&conn, session_id) else {
+                return AnswerLeadQuestionOutcome::quietly_not_resumed();
+            };
+            resume_after_answer_candidate(&config)
+        };
+        let Some((lead_agent_id, member_agent_ids)) = candidate else {
+            return AnswerLeadQuestionOutcome::quietly_not_resumed();
+        };
+
+        // 判门锁已在上面的块结束时释放；绝不持 db 锁进入 lead 启动路径。
+        let result = start_lead_session(
+            app.clone(),
+            app.state::<Db>(),
+            app.state::<Running>(),
+            app.state::<member_runner::TeamRunning>(),
+            session_id.to_string(),
+            lead_agent_id.clone(),
+            None,
+            member_agent_ids,
+            None,
+            // 迟到答案续跑：message=None，dedup_key 不会被用到（persist_lead_start_message
+            // 提前返回），无需真实 user_dedup_key。
+            None,
+        );
+        let was_busy = matches!(&result, Err(e) if autofeed_busy_error(e));
+        let outcome = finish_resume_after_answer(session_id, lead_agent_id, result);
+
+        // F6：旧 run 可能恰在「start 看见 busy」之后、「finish 登记 pending」之前释放；它的
+        // drain 会先扫过空集合，随后才补上的登记便再也等不到释放事件。busy 已经由 finish 登记后，
+        // 这里立即 take 一次；拿得到就完整重判门、重启动一次，正好接住这个丢唤醒窗口。
+        // 重试闸在 take 前先关闭：第二轮若仍 busy，finish 会把账重新挂回，留给未来真实释放消费；
+        // 绝不能原地第三轮，否则持续 busy 会退化成无限热循环。若登记已被并发 drain 摘走，take
+        // 返回 false，说明续跑责任已交给那条 drain，本调用也不重复启动。
+        if was_busy && recheck_after_busy {
+            recheck_after_busy = false;
+            if take_pending_answer_resume(session_id) {
+                continue;
+            }
+        }
+        return outcome;
     }
-    Ok(())
+}
+
+/// T-4b（remote control M0 §3/§4b）挂账①收口：busy 分支新增登记 `PENDING_ANSWER_RESUME`——
+/// 此前这里纯静默，答案落库后若正撞活 run 就永久丢续跑，没人再回头补喂。
+/// `drain_after_run_release` 会在 run 槽释放后摘除并重试。门/占槽语义不变。
+fn finish_resume_after_answer(
+    session_id: &str,
+    lead_agent_id: String,
+    result: Result<(), String>,
+) -> AnswerLeadQuestionOutcome {
+    match result {
+        Ok(()) => AnswerLeadQuestionOutcome {
+            resumed: true,
+            lead_agent_id: Some(lead_agent_id),
+            resume_error: None,
+        },
+        Err(e) => {
+            if !autofeed_busy_error(&e) {
+                eprintln!("resume after late answer failed (non-fatal): {e}");
+                return AnswerLeadQuestionOutcome {
+                    resumed: false,
+                    lead_agent_id: None,
+                    resume_error: Some(e),
+                };
+            }
+            register_pending_answer_resume(session_id);
+            AnswerLeadQuestionOutcome::quietly_not_resumed()
+        }
+    }
+}
+
+fn register_pending_answer_resume(session_id: &str) {
+    let set = PENDING_ANSWER_RESUME.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = set.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.insert(session_id.to_string());
+}
+
+/// check-and-remove：命中返回 `true` 并清除登记，未命中返回 `false`。
+/// `drain_after_run_release` 用它做「先摘除、再重试」；重试若又撞 busy，
+/// `finish_resume_after_answer` 的既有分支会自己重新登记，这里不需要二次判断。
+fn take_pending_answer_resume(session_id: &str) -> bool {
+    let set = PENDING_ANSWER_RESUME.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = set.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.remove(session_id)
+}
+
+/// `try_resume_after_answer` 的判门可测纯内核：team 会话（`session_agent_configs` 有
+/// `lead_agent_id`）续跑门开，返回 `Some((lead_agent_id, member_agent_ids))`；solo 会话
+/// （无该行 / `lead_agent_id` 为 `NULL`）不续，返回 `None`——迟到答案已由 `commit_late_answer`
+/// 落成真实 user 消息，留给下一轮普通 run 自然消费，不能把它误当 team 续跑触发。
+fn resume_after_answer_candidate(config: &db::SessionAgentConfig) -> Option<(String, Vec<String>)> {
+    let lead_agent_id = config.lead_agent_id.clone()?;
+    Some((lead_agent_id, config.member_agent_ids.clone()))
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -3008,6 +4639,176 @@ async fn fetch_agent_models(
 
 // ===== T1：联网搜索后端设置 IPC（active backend 存 DB；API key 存 keychain）=====
 
+#[derive(Debug, Clone, Serialize)]
+struct RemoteControlSettings {
+    enabled: bool,
+    /// 存储的原始值——可为空（空 = 未自定义，网关/配对侧会自行兜底到
+    /// `remote_gateway::DEFAULT_PUBLIC_RELAY_URL`，语义不在这里改写）。
+    relay_url: String,
+    /// relay 地址留空时实际生效的官方公共中继地址（恒为 `remote_gateway::
+    /// DEFAULT_PUBLIC_RELAY_URL` 常量值）——设置页据此展示"留空即用官方中继"的缺省值，
+    /// 不是另一份可写状态。
+    default_relay_url: String,
+    /// M2-4d：当前"网关活跃房间"绑定的 project——同一个 app_settings key
+    /// (`REMOTE_ACTIVE_REPO_ID_SETTING`) 是 `remote_set_active_project_in_conn` 写入、
+    /// `remote_gateway.rs` 的 `current_config` 读取那个；这里只是把它同一份读出来喂给设置页
+    /// UI，不改写语义。`None` = 未设置活跃项目。
+    active_repo_id: Option<String>,
+}
+
+fn remote_control_get_settings_in_conn(conn: &Connection) -> Result<RemoteControlSettings, String> {
+    let enabled = db::get_app_setting(conn, "remote_control_enabled")
+        .map_err(|e| e.to_string())?
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let relay_url = db::get_app_setting(conn, "remote_relay_url")
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    // M24DF 项 4：读侧 trim+filter，跟写侧 `remote_set_active_project_in_conn` 与网关读侧
+    // `remote_gateway.rs::current_config`（R4）对称——这三处之前唯独这里裸返回，DB 里手工
+    // 塞进去的纯空白值会被前端读成"已设置活跃项目"，穿透"未选项目不能配对"这道 UI 门槛。
+    let active_repo_id = db::get_app_setting(conn, REMOTE_ACTIVE_REPO_ID_SETTING)
+        .map_err(|e| e.to_string())?
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    Ok(RemoteControlSettings {
+        enabled,
+        relay_url,
+        default_relay_url: remote_gateway::DEFAULT_PUBLIC_RELAY_URL.to_owned(),
+        active_repo_id,
+    })
+}
+
+fn remote_control_set_settings_in_conn(
+    conn: &Connection,
+    enabled: bool,
+    relay_url: &str,
+) -> Result<(), String> {
+    let trimmed = relay_url.trim();
+    if !trimmed.is_empty() {
+        // M24DF 项 3：`starts_with("wss://")` 单独一条挡不住 `wss://user:pass@host`、
+        // `wss://host/room`、`wss://host?x=1`、`wss://host#x` 这类形态——前端
+        // `parseValidRelayUrl` 已经堵了这些，但后端是最终防线，独立收紧一遍。纯拒绝式
+        // 字符存在性检查，不引入 URL 解析依赖、不手写"解析提取 host"：`wss://` 之后的
+        // 剩余串必须非空、不含 `@`/`?`/`#`，`/` 只允许作为结尾的至多一个尾随字符（收
+        // `wss://host` 与 `wss://host/`，拒 `wss://host/room`、`wss://host//`）。
+        let invalid_relay_url = match trimmed.strip_prefix("wss://") {
+            None => true,
+            Some(rest) => {
+                rest.is_empty()
+                    || rest.contains('@')
+                    || rest.contains('?')
+                    || rest.contains('#')
+                    || rest.find('/').is_some_and(|idx| idx != rest.len() - 1)
+            }
+        };
+        if invalid_relay_url {
+            return Err(ui_msg::al_err(
+                "remoteControl.invalidRelayUrl",
+                &[("url", trimmed.to_string())],
+            ));
+        }
+    }
+    db::set_app_setting(
+        conn,
+        "remote_control_enabled",
+        if enabled { "true" } else { "false" },
+    )
+    .map_err(|e| e.to_string())?;
+    db::set_app_setting(conn, "remote_relay_url", trimmed).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remote_control_get_settings(db: State<'_, Db>) -> Result<RemoteControlSettings, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    remote_control_get_settings_in_conn(&conn)
+}
+
+#[tauri::command]
+fn remote_control_set_settings(
+    db: State<'_, Db>,
+    enabled: bool,
+    relay_url: String,
+) -> Result<(), String> {
+    let result = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        remote_control_set_settings_in_conn(&conn, enabled, &relay_url)
+    };
+    if result.is_ok() {
+        remote_gateway::request_settings_reload();
+    }
+    result
+}
+
+/// M2-4b：哪个 project 是当前"网关活跃房间"的来源——与 `remote_gateway.rs` 里
+/// `current_config` 读的 `(inner.settings)("remote_active_repo_id")` 是同一个 app_settings
+/// key（remote_gateway.rs 那边故意用字面量而不是共享这个 const，跟 `REMOTE_ROOM_ID_SETTING`
+/// 已有的跨文件字面量对齐纪律一致），字面量必须保持一致，改动前先确认没有语义漂移。
+const REMOTE_ACTIVE_REPO_ID_SETTING: &str = "remote_active_repo_id";
+
+/// M2-4b：`None`/空白 = 清除（`DELETE`，不留空字符串行——跟 `set_cli_path_in_conn` 的
+/// "None 时删行"惯例一致，而不是写一个空字符串然后指望调用方自己判断"空即未设"）。
+///
+/// R3：写入前在同一个 `conn` 锁内核实 `repo_id` 真的存在于 `repos` 表——不这样做的话，一个
+/// 手误 / 陈旧的 repo_id 会静默把网关的 active project 指向一个不存在的项目，`current_config`
+/// 每次解析都会摸一次 DB 拿到 `Err`（fail-closed 变成"永远解析失败"而不是"一开始就拒绝写
+/// 入"）。M2-4d：查无返回 `ui_msg::al_err("remoteControl.activeProjectMissing", ...)`——
+/// zh/en 文案在 `app/src/i18n.tsx`（`backend.remoteControl.activeProjectMissing`）。
+fn remote_set_active_project_in_conn(
+    conn: &Connection,
+    repo_id: Option<&str>,
+) -> Result<(), String> {
+    match repo_id.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(repo_id) => {
+            let exists = repos_repo::get_repo_by_id(conn, repo_id)
+                .map_err(|error| error.to_string())?
+                .is_some();
+            if !exists {
+                return Err(ui_msg::al_err(
+                    "remoteControl.activeProjectMissing",
+                    &[("repoId", repo_id.to_string())],
+                ));
+            }
+            db::set_app_setting(conn, REMOTE_ACTIVE_REPO_ID_SETTING, repo_id)
+                .map_err(|error| error.to_string())
+        }
+        None => conn
+            .execute(
+                "DELETE FROM app_settings WHERE key = ?1",
+                [REMOTE_ACTIVE_REPO_ID_SETTING],
+            )
+            .map(|_rows| ())
+            .map_err(|error| error.to_string()),
+    }
+}
+
+/// M2-4b（任务 1）：实勘结论——`last_active_repo_id`（`namespaces` 表列，`set_last_active_repo`
+/// 命令，`resolve_active_repo_for_namespace` 解析）是**按 namespace**记的"切回这个
+/// namespace 时该选哪个 repo"UI 回忆便利，不是"当前哪个 project 在被远程控制"这个全局单值
+/// 概念——两者语义不同、不冲突，这里新开一个独立 app_setting key 而不是复用它。
+///
+/// R2：写入成功后清空 `ActiveRoomCredentialCache`——网关那边的 `active_room_resolver` 命中的
+/// 是同一个 `Arc`，清空后它下一次解析必然重新摸一次钥匙串确认凭据仍在，而不是继续信任一个
+/// 针对旧 active project（或旧凭据状态）打上的"已确认过"标记。
+#[tauri::command]
+fn remote_set_active_project(
+    db: State<'_, Db>,
+    cache: State<'_, ActiveRoomCredentialCache>,
+    repo_id: Option<String>,
+) -> Result<(), String> {
+    let result = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        remote_set_active_project_in_conn(&conn, repo_id.as_deref())
+    };
+    if result.is_ok() {
+        if let Ok(mut credential_ensured) = cache.0.lock() {
+            credential_ensured.clear();
+        }
+        remote_gateway::request_settings_reload();
+    }
+    result
+}
+
 #[tauri::command]
 fn get_active_backend(db: State<'_, Db>) -> Result<String, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -3303,6 +5104,13 @@ pub(crate) fn create_session_business(
     repo_id: Option<&str>,
     namespace_id: Option<&str>,
 ) -> Result<(), String> {
+    // 远端指令通道会拒绝含 `|` 的 session，创建这种会话后远端也无法使用。
+    if id.contains('|') {
+        return Err(ui_msg::al_err(
+            "session.idContainsPipe",
+            &[("id", id.to_string())],
+        ));
+    }
     let repo_id = match repo_id {
         Some(s) if !s.is_empty() => s,
         _ => "local-default",
@@ -3844,6 +5652,23 @@ fn delete_repo_forever_inner(conn: &rusqlite::Connection, id: &str) -> Result<()
     for sid in &session_ids {
         db::delete_session(conn, sid).map_err(|e| e.to_string())?;
     }
+    // R5（opus P1-2 最小半）：若这个项目正是当前 remote 网关的 active project，删除项目时把
+    // active 指针一并清掉——不清的话 `current_config` 会一直朝一个已经不存在的 project_id
+    // 解析（resolver 侧 R3 存在性检查会让它每次都 fail-closed，但指针本身应该跟着项目一起
+    // 消失，不该留一个指向虚空的孤儿 setting）。**这只是最小半**：`project_remote_rooms` 行 /
+    // `remote_devices` / 钥匙串凭据的全量清理是 M2-4d 的活（见 db.rs
+    // `ensure_remote_room_for_project` doc 前瞻约束 3），本单不做。
+    if db::get_app_setting(conn, REMOTE_ACTIVE_REPO_ID_SETTING)
+        .map_err(|e| e.to_string())?
+        .as_deref()
+        == Some(id)
+    {
+        conn.execute(
+            "DELETE FROM app_settings WHERE key = ?1",
+            [REMOTE_ACTIVE_REPO_ID_SETTING],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     conn.execute("DELETE FROM repos WHERE id = ?1", [id])
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -3863,15 +5688,22 @@ fn update_session_repo(
     session_id: String,
     repo_id: Option<String>,
 ) -> Result<(), String> {
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE sessions SET repo_id = ?2 WHERE id = ?1",
-        (&session_id, &repo_id),
-    )
-    .map_err(|e| e.to_string())?;
-    if let Some(rid) = repo_id {
-        repos_repo::touch_last_used(&conn, &rid).map_err(|e| e.to_string())?;
+    {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE sessions SET repo_id = ?2 WHERE id = ?1",
+            (&session_id, &repo_id),
+        )
+        .map_err(|e| e.to_string())?;
+        if let Some(rid) = &repo_id {
+            repos_repo::touch_last_used(&conn, rid).map_err(|e| e.to_string())?;
+        }
     }
+    // M2-4c(B3)：这条 IPC 改绑了 session→repo 归属——通知 remote_gateway 的 M2-4c 归属缓存
+    // 这一代已经作废，防止同一条远端连接在剩余生命周期里继续把旧归属当真（详见
+    // remote_gateway.rs `SESSION_REPO_EPOCH` 文档）。锁已经在上面的 block 结尾释放，这里只是
+    // 一次无 I/O 的原子自增，不违反 RN4。
+    remote_gateway::note_session_repo_reassignment();
     Ok(())
 }
 
@@ -4802,9 +6634,10 @@ fn start_repo_generation(
     let run_id = new_run_id();
     // H1/A3 锁作用域收窄：原来两个 git 子进程（rev-parse HEAD / log -n 20）+ 两次文件读
     // （README.md / CLAUDE.md）都跟 DB 读写挤在同一把锁里——这四步都只需要 `root` 这一个路径，
-    // 不需要一直攥着 conn。拆成三段：①锁内只读 root（快）；②锁外做两个 git 调用 + 两次文件读
-    // （慢·不需要 conn）；③锁内拼最终 Command（快：daily_session_material 的 DB 查询 + get_agent +
-    // build_lead_backend_command）。每步的输入/输出/错误分支与原来逐位相同，只是不再全程持锁。
+    // 不需要一直攥着 conn。拆段后：①锁内只读 root（快）；②锁外做两个 git 调用 + 两次文件读
+    // （慢·不需要 conn）；③锁内做 daily_session_material + get_agent，随后锁外解析 agent 自身 key +
+    // harness 搜索凭据；④重新短暂拿锁拼最终 Command。正常路径每步的输入/输出与原来逐位相同；
+    // 极少数第④步重拿锁失败时，agent key IPC 现在已经发生（此前不会发生），除此之外只是锁边界重排。
     let root = {
         let db = app.state::<Db>();
         let conn = db.0.lock().map_err(|error| error.to_string())?;
@@ -4825,8 +6658,8 @@ fn start_repo_generation(
     )?;
     let readme = optional_repo_material_at(&root, "README.md");
     let claude_md = optional_repo_material_at(&root, "CLAUDE.md");
-    let (mut command, parse_fn) = {
-        let db = app.state::<Db>();
+    let db = app.state::<Db>();
+    let (prompt, profile) = {
         let conn = db.0.lock().map_err(|error| error.to_string())?;
         let sessions = if feature == "daily" {
             daily_session_material(&conn, &repo_id)?
@@ -4834,18 +6667,28 @@ fn start_repo_generation(
             String::new()
         };
         let prompt = generation_prompt(feature, &readme, &claude_md, &commits, &sessions);
+        let profile = db::get_agent(&conn, &agent_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| ui_msg::al_err("agent.notFound", &[]))?;
+        (prompt, profile)
+    };
+    let search =
+        resolve_harness_search_creds(db.inner(), &profile, &crate::keychain::KeyringStore)?;
+    let key = resolve_member_key(&profile)?;
+    let (mut command, parse_fn) = {
+        let conn = db.0.lock().map_err(|error| error.to_string())?;
         build_lead_backend_command(
             &conn,
             &format!("repo-summary-{repo_id}"),
             &run_id,
-            &db::get_agent(&conn, &agent_id)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| ui_msg::al_err("agent.notFound", &[]))?,
+            &profile,
             &prompt,
             &root,
             agent::BuildMode::Summarize,
             current_locale(&app),
             None,
+            key,
+            search,
         )?
     };
 
@@ -5503,6 +7346,8 @@ fn lead_terminal_events_for_barrier(
 
 fn transition_lead_spawn_handoff<K, F>(
     running: &Running,
+    team_running: &member_runner::TeamRunning,
+    db: Option<&crate::db::Db>,
     terminated: &AtomicBool,
     session_id: &str,
     pid: u32,
@@ -5547,28 +7392,42 @@ where
                 Action::Abort
             }
         }
+        // `slots`（running.0 的锁）在这个块结束时 drop——下面 match action 分支里调用
+        // refresh_session_runtime 会重新加锁，P0-1 教训：绝不能带着这把锁走过去。
     };
 
     match action {
         Action::Stream => Ok(true),
         Action::Stopped => {
+            // M1 修复轮 P1-2：Stopped 分支真摘了槽（上面 slots.remove），补上 refresh。
+            if let Some(db) = db {
+                refresh_session_runtime(db, running, team_running, session_id);
+            }
             let event =
                 build_lead_terminal_release_event(run_id, &LeadTerminal::EmitRunCloseout, true)
                     .expect("stopped lead 必须生成终态释放事件");
             emit_terminal_release(&event);
             Ok(false)
         }
-        Action::Abort => Ok(false),
+        Action::Abort => {
+            // 同上：Abort 分支也真摘了槽。
+            if let Some(db) = db {
+                refresh_session_runtime(db, running, team_running, session_id);
+            }
+            Ok(false)
+        }
     }
 }
 
 fn emit_lead_error_and_release(
     running: &Running,
+    team_running: &member_runner::TeamRunning,
     terminated: &AtomicBool,
     session_id: &str,
     run_id: &str,
     transport: &event_transport::EventTransport,
     message: String,
+    runtime_db: Option<&crate::db::Db>,
 ) {
     terminated.store(true, Ordering::SeqCst);
     let terminal_release = build_terminal_release_event(
@@ -5582,10 +7441,12 @@ fn emit_lead_error_and_release(
     );
     let _ = emit_terminal_after_releasing_run_slot(
         running,
+        team_running,
         session_id,
         run_id,
         vec![agent_event::AgentEvent::Error { message }, terminal_release],
         transport,
+        runtime_db,
     );
 }
 
@@ -5666,7 +7527,7 @@ fn persist_lead_prespawn_failure_with_conn(
         localize_reduced_message(locale, &mut msg);
         if let Some(conn) = conn {
             reconcile_running_dispatch_cards(conn, session_id, &mut msg.blocks);
-            let _ = db::append_message_dedup(
+            let _ = db::append_message_dedup_and_publish(
                 conn,
                 session_id,
                 "assistant",
@@ -5760,11 +7621,21 @@ fn begin_lead_finalizing(running: &Running, terminated: &AtomicBool, session_id:
 
 fn run_lead_worker_with_dispatch_intent<T>(
     team_running: &member_runner::TeamRunning,
+    running: &Running,
+    app: Option<&AppHandle>,
     session_id: &str,
     terminated: &AtomicBool,
     run: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    let _intent = team_running.begin_dispatch_intent(session_id)?;
+    // M1 修复轮 P1-2：这是「team 从忙转闲」的真正时点之一——本 intent 的 guard 随本函数栈帧
+    // 存活到 `run()` 返回（即该队员真正执行完，见 `DispatchIntentGuard::drop` 文档），
+    // 生产调用点（`app` 为 `Some`）挂上 refresh；测试调用点传 `None` 跳过。
+    let _intent = match app {
+        Some(app) => team_running
+            .begin_dispatch_intent(session_id)?
+            .with_refresh(running.clone(), app.clone()),
+        None => team_running.begin_dispatch_intent(session_id)?,
+    };
 
     // 此 intent 登记与 reserve_new_session_run 的「查 member ∪ intent + 占 Running」由
     // TeamRunning 同一把锁全序化，且 terminated 总在旧 lead 释放 Running 槽前置位：
@@ -5777,12 +7648,76 @@ fn run_lead_worker_with_dispatch_intent<T>(
     run()
 }
 
+/// M1 修复轮 P1-1（opus 深审·2026-08-11）：唯一的「session 运行态判断」纯函数——
+/// `refresh_session_runtime` 及以下所有摘槽/收尾路径必须调它重算，不再各自硬编码
+/// 'running'/'idle' 字面量。判定口径：solo/lead 的 `Running` 槽存在（任一 `RunSlot` 变体，
+/// 即既有 busy-gate 语义）∪ `team_running` 认定该 session 有活跃队员或未清零的 dispatch
+/// intent（`TeamRunning::is_session_running`）——后一项正是补上「lead 已释放 Running 槽、
+/// 但队员派单 intent 仍在途」这扇 P1-1 窗口：旧写口在此刻会把 session_runtime 错写成 idle，
+/// 新写口会看见 intent 仍在而正确留 running。两把锁若中毒，保守判定为 running——宁可多留一次
+/// 「忙」的误判（顶多让 UI/远端晚一拍看到空闲），也不能在真忙时错写 idle（那会让别的地方
+/// 误判可以安全删除/归档/重新占槽）。
+fn compute_session_runtime(
+    running: &Running,
+    team_running: &member_runner::TeamRunning,
+    session_id: &str,
+) -> &'static str {
+    let running_slot_present = running
+        .0
+        .lock()
+        .map(|slots| slots.contains_key(session_id))
+        .unwrap_or(true);
+    let team_active = team_running.is_session_running(session_id).unwrap_or(true);
+    if running_slot_present || team_active {
+        db::SESSION_RUNTIME_RUNNING
+    } else {
+        db::SESSION_RUNTIME_IDLE
+    }
+}
+
+/// M1 修复轮 P1-1+P1-2：所有「摘槽/收尾」写口统一改走这里——短锁 db 连接、用
+/// `compute_session_runtime` 重算真实状态后 `db::upsert_session_runtime_status`，写完立刻
+/// drop 连接（不跨 `flush_barrier`/`app.emit`，同时消掉 P2-1「db 锁被拉长到跨 emit」）。
+/// run_id 列不动——调用方大多是"释放"场景，run_id 早在 reserve 时已经写过，这里没有新值
+/// 也不该覆盖成 NULL（细节见 `db::upsert_session_runtime_status` 文档）。
+///
+/// **调用方必须在调用前确保没有持有 `running.0` 的锁**——内部会重新获取，同一线程重入会
+/// 死锁（P0-1 那类 bug 的教训：`std::sync::Mutex` 不可重入）。
+pub(crate) fn refresh_session_runtime(
+    db: &crate::db::Db,
+    running: &Running,
+    team_running: &member_runner::TeamRunning,
+    session_id: &str,
+) {
+    let status = compute_session_runtime(running, team_running, session_id);
+    match db.0.lock() {
+        Ok(conn) => {
+            if let Err(e) = db::upsert_session_runtime_status(&conn, session_id, status) {
+                eprintln!("session_runtime refresh failed (non-fatal, session={session_id}): {e}");
+            }
+        }
+        Err(_) => {
+            eprintln!("session_runtime refresh skipped: db lock poisoned (session={session_id})");
+        }
+    }
+}
+
+/// M1-T1：释放咽喉（solo 正常收尾 · lead 正常收尾 · lead 预 spawn 失败）共用的收口——先摘
+/// `Running` 槽（锁在摘完立刻 drop，见下），再经 `refresh_session_runtime` 重算 session_runtime
+/// （`runtime_db` 传 `Some` 时才写；测试调用点传 `None` 跳过，不关心运行态表），最后才
+/// `flush_barrier`。P0-1（2026-08-11 opus 深审）：db 锁必须在这里短锁短放——旧版本调用方在
+/// 外层预先锁住 db 再传一个裸 `&Connection` 进来，锁会一路存活到 `try_autofeed_lead` 重新
+/// 加锁那一刻，同线程二次 lock 直接死锁；现在函数签名收 `&crate::db::Db`（未锁的句柄），
+/// 锁的获取/释放完全封在 `refresh_session_runtime` 内部，调用方拿到的从来不是一个存活的
+/// guard，天然不可能带出去撞车。
 fn emit_terminal_after_releasing_run_slot(
     running: &Running,
+    team_running: &member_runner::TeamRunning,
     session_id: &str,
     run_id: &str,
     terminal_events: Vec<agent_event::AgentEvent>,
     transport: &event_transport::EventTransport,
+    runtime_db: Option<&crate::db::Db>,
 ) -> bool {
     let mut slots = match running.0.lock() {
         Ok(slots) => slots,
@@ -5790,6 +7725,9 @@ fn emit_terminal_after_releasing_run_slot(
     };
     slots.remove(session_id);
     drop(slots);
+    if let Some(db) = runtime_db {
+        refresh_session_runtime(db, running, team_running, session_id);
+    }
     transport
         .flush_barrier(run_id, terminal_events)
         .unwrap_or(false)
@@ -5815,7 +7753,7 @@ fn persist_normal_finalizer(
         }
     }
     if let Some(msg) = msg {
-        let _ = db::append_message_dedup(
+        let _ = db::append_message_dedup_and_publish(
             conn,
             session_id,
             "assistant",
@@ -5929,6 +7867,7 @@ fn attach_solo_commit_mcp(
 fn spawn_and_stream(
     app: AppHandle,
     running: Running,
+    team_running: member_runner::TeamRunning,
     session_id: String,
     run_id: String,
     wt: std::path::PathBuf,
@@ -5938,6 +7877,7 @@ fn spawn_and_stream(
     parse_fn: ParseFn,
     guard: &mut ReservationGuard,
 ) -> Result<(), String> {
+    let runtime_db_state = app.state::<crate::db::Db>();
     let solo_mcp_server =
         attach_solo_commit_mcp(&app, &session_id, &run_id, &wt, &engine, &mut command)?;
     // 与 TextGranularity::for_parse_fn 同源（2026-07-24 dogfood 回归修复：claude 子行 token 片段
@@ -5966,7 +7906,13 @@ fn spawn_and_stream(
 
     let pid = child.id();
     checkpoint_hook::register_agent_pid(&command, pid);
-    let handoff = transition_spawn_handoff(&running, &session_id, pid)?;
+    let handoff = transition_spawn_handoff(
+        &running,
+        &team_running,
+        Some(runtime_db_state.inner()),
+        &session_id,
+        pid,
+    )?;
     if handoff == SpawnHandoffAction::Abort {
         // Abort 的 kill 已在 handoff 持锁期间完成；先 disarm 旧 reservation 再有界清理 child，
         // 避免清理窗口内的新 Launching 被旧 guard 的 Drop 误删。
@@ -5979,6 +7925,8 @@ fn spawn_and_stream(
         let register_error = format!("EventTransport register_run failed: {error:?}");
         abort_spawn_after_register_failure(
             &running,
+            &team_running,
+            Some(runtime_db_state.inner()),
             &session_id,
             pid,
             guard,
@@ -5999,6 +7947,7 @@ fn spawn_and_stream(
         kill_process_group(pid);
     }
     let running_t = running.clone();
+    let team_running_t = team_running.clone();
     let app_t = app.clone();
     let transport = event_transport().clone();
     std::thread::spawn(move || {
@@ -6385,15 +8334,23 @@ fn spawn_and_stream(
                 // RunCloseout / metadata-bearing Completed 是唯一 release 信号：ledger + reducer
                 // 都持久化完、slot 真释放后才 emit，避免 composer 抢跑出新旧 run 交错窗口。
                 pending_terminals.push(terminal_release_event);
+                // M1-T1：释放咽喉——P0-1（2026-08-11）之后签名收 `&Db`（未锁句柄），锁的获取/
+                // 释放完全封在 emit_terminal_after_releasing_run_slot 内部，这里不再预先加锁。
                 let _ = emit_terminal_after_releasing_run_slot(
                     &running_t,
+                    &team_running_t,
                     &session_id,
                     &run_id,
                     pending_terminals,
                     &transport,
+                    Some(db.inner()),
                 );
             },
         );
+        // T-4b-fix：solo run 收尾同样是一次「run 槽释放」——drain_after_run_release 之前遗漏了
+        // 这条路径，导致 solo 会话的 pending remote input 永远等不到排空。持锁窗口已在上面
+        // emit_terminal_after_releasing_run_slot 内部完全关闭，这里调用不跨锁。
+        drain_after_run_release(app_t.clone(), session_id.clone());
     });
 
     Ok(())
@@ -6878,6 +8835,9 @@ async fn propose_team_plan(
         let driver_parser = parser_for_parse_fn(parse_fn_for_profile(&driver));
         let hook_run_id = new_run_id();
         let spawn = || -> Result<std::process::Child, String> {
+            let search =
+                resolve_harness_search_creds(db.inner(), &driver, &crate::keychain::KeyringStore)?;
+            let key = resolve_member_key(&driver)?;
             // 锁作用域收窄（H1/A3·可做可不做项）：与 A1 同款——build 完立即释放 guard 再 spawn。
             let mut cmd = {
                 let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -6891,6 +8851,8 @@ async fn propose_team_plan(
                     agent::BuildMode::LeadDraft,
                     locale,
                     None,
+                    key,
+                    search,
                 )?;
                 cmd
             };
@@ -6963,6 +8925,7 @@ fn lead_step_budget_action(locale: Locale) -> lead_action::LeadAction {
 async fn lead_step(
     app: tauri::AppHandle,
     running: tauri::State<'_, Running>,
+    team_running: tauri::State<'_, member_runner::TeamRunning>,
     session_id: String,
     lead_agent_id: String,
     last_event: String,
@@ -6975,9 +8938,12 @@ async fn lead_step(
     let locale = current_locale(&app);
     let running_inner = running.inner().clone();
     try_reserve(&running_inner, &session_id)?;
-    let guard = ReservationGuard::new(running_inner, session_id.clone());
+    let guard = ReservationGuard::new(running_inner, session_id.clone())
+        .with_refresh(team_running.inner().clone(), app.clone());
+    let session_id_for_drain = session_id.clone();
+    let app_for_drain = app.clone();
 
-    tauri::async_runtime::spawn_blocking(move || {
+    let join_result = tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
         let db = app.state::<db::Db>();
 
@@ -7033,8 +8999,9 @@ async fn lead_step(
                     &action,
                     now,
                 );
+                let mut msg_completed_milestone = None;
                 if let Some(b) = &decision_card {
-                    db::append_message_dedup(
+                    msg_completed_milestone = db::append_message_dedup(
                         &tx,
                         &session_id,
                         "assistant",
@@ -7047,6 +9014,9 @@ async fn lead_step(
                     .map_err(|e| e.to_string())?;
                 }
                 tx.commit().map_err(|e| e.to_string())?;
+                if let Some(milestone) = msg_completed_milestone {
+                    milestone.publish();
+                }
                 return Ok(LeadStepOutcome::Decided {
                     action,
                     decision_card,
@@ -7067,6 +9037,9 @@ async fn lead_step(
                 Some(h) => format!("{prompt}\n\n【上次输出错误】{h}\n请修正后只输出一个 JSON。"),
                 None => prompt.to_string(),
             };
+            let search =
+                resolve_harness_search_creds(db.inner(), &driver, &crate::keychain::KeyringStore)?;
+            let key = resolve_member_key(&driver)?;
             let (mut cmd, parse_fn) = {
                 // 锁作用域收窄（H1/A1）：build_lead_backend_command 只在函数体内借用 conn
                 // 构造 Command（读 profile/history 等 DB 只读数据），返回的 Command 不持有
@@ -7083,6 +9056,8 @@ async fn lead_step(
                     agent::BuildMode::LeadAction,
                     locale,
                     reasoning_tier.as_deref(),
+                    key,
+                    search,
                 )?
             };
             cmd.stdout(std::process::Stdio::piped());
@@ -7115,8 +9090,22 @@ async fn lead_step(
             decision_card,
         })
     })
-    .await
-    .map_err(|e| e.to_string())?
+    .await;
+    // T-4b-fix：lead_step 用 ReservationGuard 占槽（不走 emit_terminal_after_releasing_run_slot
+    // 那条 run 收尾路径），guard 在 spawn_blocking 闭包结束时随闭包退出而 drop、槽位随之释放——
+    // `.await` 完成即意味着闭包已整体退出、guard 已经 drop。这里在命令返回前补一次排空，
+    // 覆盖「lead_step 释放槽位却没人触发 pending remote input 排空」的缺口。
+    // 即便结果为 JoinError，槽也已释放（guard 在 unwind 中 drop），所以排空不能被 `?` 提前
+    // return 跳过，否则已经排队等待这次释放的远端消息会等不到触发。
+    // T-4b-fix 补刀：不能直接在 tokio 异步运行时线程上调 drain_after_run_release——链路里有
+    // git 磁盘操作/钥匙串读取（keychain 可能弹系统授权窗阻塞调用线程）/子进程 spawn，会堵住
+    // 异步 worker 线程；包进独立 OS 线程 fire-and-forget，与本文件其余 4 处 drain_after_run_release
+    // 调用点（均跑在 std::thread::spawn 里）的执行环境拉齐。
+    std::thread::spawn(move || {
+        drain_after_run_release(app_for_drain, session_id_for_drain);
+    });
+    let outcome = join_result.map_err(|e| e.to_string())?;
+    outcome
 }
 
 #[tauri::command]
@@ -7658,11 +9647,12 @@ async fn lead_summarize(
     } else {
         None
     };
+    let search = resolve_harness_search_creds(&db, &profile, &KeyringStore)?;
     let hook_run_id = new_run_id();
     let (command, parse_fn) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         let (_, wt) = ensure_session_workspace(&conn, &session_id)?;
-        let backend = make_backend(&conn, &profile, key, locale)?;
+        let backend = make_backend(&profile, key, search, locale)?;
         let parse_fn = backend.parse_fn();
         let command = backend.build_command(&BuildContext {
             prompt: &prompt,
@@ -8591,6 +10581,11 @@ fn get_messages(db: State<Db>, session_id: String) -> Result<Vec<db::Message>, S
     db::get_messages(&conn, &session_id).map_err(|e| e.to_string())
 }
 
+/// P0-c 记档：前端三处非 reply 动作（非通过 send_message/start_lead_session 的用户消息落库
+/// 路径，如手工插入的旁路场景）走的是这条 IPC，仍调非 dedup 版 `db::append_message`——本刀
+/// 不动：这条旁路落的 user 行仍无 dedup_key、不会产生 msg.completed 里程碑，远端补发批看
+/// 不到它。留给后续刀（本单 SCOPE 只覆盖 send_message / start_lead_session / commit_late_answer
+/// / 续会话种子四源 + remote inbox command_id 穿线）。
 #[tauri::command]
 fn append_message(
     db: State<Db>,
@@ -8646,6 +10641,11 @@ fn send_message(
     message: String,
     reasoning_tier: Option<String>,
     criteria: Option<Vec<String>>,
+    // P0-c：user 消息落库防重复键——前端手打消息不传（Tauri 对缺失的 Option 入参解析为
+    // None），None 时用 `display_reduce::user_send_key(&run_id)` 兜底；remote inbox 投递路
+    // （`deliver_remote_inbox_entry`）传 `remote_input_key(command_id)`，供 at-least-once
+    // 重投去重。
+    user_dedup_key: Option<String>,
 ) -> Result<(), String> {
     let locale = current_locale(&app);
     {
@@ -8667,7 +10667,8 @@ fn send_message(
             locale,
         )?;
     }
-    let mut guard = ReservationGuard::new(running_inner.clone(), session_id.clone());
+    let mut guard = ReservationGuard::new(running_inner.clone(), session_id.clone())
+        .with_refresh(team_running_inner.clone(), app.clone());
     clear_session_stop_state(&team_running_inner, &session_id);
 
     // 先解析 cwd。旧 gate/reconcile 谓词留待 T7 清理；in-place 模式不调用它，
@@ -8683,17 +10684,30 @@ fn send_message(
 
     let key_store = KeyringStore;
     let run_id = new_run_id();
+    let profile = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        db::get_agent(&conn, &id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| ui_msg::al_err("agent.notFound", &[]))?
+    };
+    let key = if profile.access == "borrow" || profile.access == "harness" {
+        key_store.get(&profile.id)?
+    } else {
+        None
+    };
+    let search = resolve_harness_search_creds(&db, &profile, &key_store)?;
     let plan = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        build_send_plan(
+        build_send_plan_with(
             &conn,
             &session_id,
             &run_id,
-            &id,
+            profile,
+            key,
+            search,
             &message,
             reasoning_tier.as_deref(),
             &criteria,
-            &key_store,
             locale,
         )?
     };
@@ -8708,7 +10722,12 @@ fn send_message(
     } = plan;
     {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        db::append_message(
+        // P0-c：dedup 版落库——`user_dedup_key` 是 None 时（本机手打）兜底
+        // `user_send_key(&run_id)`；conn 全程 autocommit（无显式事务），符合
+        // `append_message_dedup_and_publish` 的调用契约（db.rs:3784），落库成功即自动发布
+        // msg.completed 里程碑。
+        let dedup_key = user_dedup_key.unwrap_or_else(|| display_reduce::user_send_key(&run_id));
+        db::append_message_dedup_and_publish(
             &conn,
             &session_id,
             "user",
@@ -8718,15 +10737,28 @@ fn send_message(
             None,
             Some(agent_id.as_str()),
             Some(name_snapshot.as_str()),
+            &dedup_key,
         )
         .map_err(|e| e.to_string())?;
         // run_commits.engine 是旧列名；Task 10 起这里存 agent_id 以兼容既有 ledger schema。
         prepare_run_ledger(&conn, &session_id, &run_id, &agent_id, &wt)?;
+        // M1-T1：run_id 回填——`reserve_new_session_run` 已把本咽喉写成 running(run_id=None)
+        // （占槽当时 run_id 还没现场生成）；这里 upsert 同一 session_id 补上真实 run_id，
+        // 非独立咽喉，只是同一条 running 行的字段补全。失败非致命但不再全吞（P3-1）。
+        if let Err(e) = db::set_session_runtime(
+            &conn,
+            &session_id,
+            db::SESSION_RUNTIME_RUNNING,
+            Some(&run_id),
+        ) {
+            eprintln!("session_runtime run_id backfill failed (non-fatal): {e}");
+        }
     }
     let parser = parser_for_parse_fn(parse_fn);
     spawn_and_stream(
         app,
         running_inner.clone(),
+        team_running_inner.clone(),
         session_id.clone(),
         run_id.clone(),
         wt,
@@ -9459,6 +11491,8 @@ fn resume_lead_session(
         None,
         member_ids,
         None,
+        // message=None 续跑：dedup_key 不会被用到。
+        None,
     )
 }
 
@@ -9749,6 +11783,13 @@ pub(crate) fn clear_session_stop_state(
 
 /// Normal lead run 的占槽后停止门。停止标记命中时返回可辨识 Err；返回的 guard 则继续守护
 /// 刚占到的 slot。
+///
+/// P0-2（opus delta 复核·2026-08-11）：本函数不再自己挂 `.with_refresh()`——调用方在这里仍
+/// 持有 `conn`（`db.0.lock()` 借出的 `&Connection`，函数返回前调用方那把锁不会释放）；下面
+/// globally-stopped 分支的 `drop(guard)` 若带着 refresh 句柄，会在 conn 仍锁着的同一线程上
+/// 再次 `db.0.lock()`，与 P0-1 同款不可重入死锁。refresh 改由调用方在明确释放 `conn` 之后
+/// 自己补（早退分支 `return Err` 前补一次、正常继续分支等 conn 块结束后再把 refresh 句柄
+/// 挂回 guard），本函数只管占槽/摘槽，不碰 db/app。
 fn reserve_lead_start_after_globalstop(
     conn: &Connection,
     running: &Running,
@@ -9772,8 +11813,9 @@ fn reserve_lead_start_after_globalstop(
     // 因而 message=None 的 autofeed 与 resume 共用此门，不再有“预检通过、占槽前双拍落空”窗口。
     if team_running.is_session_stopped(session_id) {
         drop(guard);
-        // App.tsx 的 MCP 决策卡路径会先乐观 setRun；必须 reject 才会进入既有 catch 清 run，
-        // 否则静默 Ok 会把会话永久留在“运行中”。autofeed 的静默 catch 也已能兜住此 Err。
+        // App.tsx 的常规 send 等路径会先乐观 setRun；必须 reject 才会进入既有 catch 清 run，
+        // 否则静默 Ok 会把会话永久留在“运行中”。MCP 决策卡已改为 answer resolve 后才按
+        // resumed 乐观绘制；autofeed 的静默 catch 也已能兜住此 Err。
         return Err(ui_msg::al_err(
             "run.globallyStopped",
             &[("session", session_id.to_string())],
@@ -9846,6 +11888,8 @@ fn try_autofeed_lead(app: AppHandle, session_id: String) {
         None,
         member_agent_ids,
         None,
+        // autofeed 续跑：message=None，dedup_key 不会被用到。
+        None,
     );
     if let Err(error) = result {
         let mut guard = started_reports
@@ -9856,6 +11900,1094 @@ fn try_autofeed_lead(app: AppHandle, session_id: String) {
             eprintln!("autofeed lead start failed (non-fatal): {error}");
         }
     }
+}
+
+/// T-4b（remote control M0 §3/§4b）：run 槽释放后的统一排空咽喉——原来 5 处直接调
+/// `try_autofeed_lead` 的触发点全部改调这里。排空序固定三段，顺序即语义，不可调换（见结构断言
+/// `drain_after_run_release_runs_autofeed_before_pending_answer_before_inbox`）：
+///   a) autofeed（worker report 续喂，原有语义、原有函数完全不动）；
+///   b) 迟到答案占槽被抢的挂账续跑——`take_pending_answer_resume` 先摘除，命中才重试
+///      `try_resume_after_answer`；若又撞 busy，`finish_resume_after_answer` 的既有 busy 分支
+///      会自己把登记放回去，这里不需要额外处理；
+///   c) remote_inbox FIFO 排空——撞忙即停，留给下次释放。
+/// 同 session 排空进行中若再次收到释放通知，不并发进入三段排空，而是合并为脏位；当前轮收尾
+/// 原子消费脏位并原地重放，直至某轮收尾确认无脏位后摘除互斥登记。
+/// 每段各自短锁短放，段与段之间、循环各迭代之间绝不跨锁——绝不持 db 锁调 start_lead_session /
+/// send_message 内核（M1-T1/M1-T3 死锁血案红线同款）。
+fn drain_after_run_release(app: AppHandle, session_id: String) {
+    let Some(guard) = try_begin_draining(&session_id) else {
+        return;
+    };
+    drain_owned(app, session_id, guard);
+}
+
+fn drain_owned(app: AppHandle, session_id: String, _guard: DrainingGuard) {
+    drain_with_dirty_replay(&session_id, || {
+        try_autofeed_lead(app.clone(), session_id.clone());
+
+        if take_pending_answer_resume(&session_id) {
+            try_resume_after_answer(&app, &session_id);
+        }
+
+        drain_remote_inbox(&app, &session_id);
+    });
+}
+
+/// 纯循环内核：每轮排空后原子消费脏位，必要时原地重放；不依赖 AppHandle/DB，可直接测试。
+fn drain_with_dirty_replay<F: FnMut()>(session_id: &str, mut run_round: F) {
+    loop {
+        run_round();
+        if !drain_round_dirty_and_continue(session_id) {
+            break;
+        }
+    }
+}
+
+struct DrainingGuard {
+    session_id: String,
+    generation: u64,
+}
+
+impl Drop for DrainingGuard {
+    fn drop(&mut self) {
+        // 正常路径可能已摘除自己的登记，并由其它线程登记了新一代；旧 guard 不得误删新登记。
+        // panic unwind 时自己的登记仍在且 generation 匹配，仍会在这里兜底摘除。
+        if let Some(sessions) = DRAINING_SESSIONS.get() {
+            let mut guard = sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard
+                .get(&self.session_id)
+                .is_some_and(|slot| slot.generation == self.generation)
+            {
+                guard.remove(&self.session_id);
+            }
+        }
+    }
+}
+
+fn try_begin_draining(session_id: &str) -> Option<DrainingGuard> {
+    let sessions = DRAINING_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let session_id = session_id.to_string();
+    let generation = {
+        let mut guard = sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(slot) = guard.get_mut(&session_id) {
+            slot.dirty = true;
+            return None;
+        }
+        let generation = NEXT_DRAINING_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        guard.insert(
+            session_id.clone(),
+            DrainSlot {
+                generation,
+                dirty: false,
+            },
+        );
+        generation
+    };
+    Some(DrainingGuard {
+        session_id,
+        generation,
+    })
+}
+
+fn drain_round_dirty_and_continue(session_id: &str) -> bool {
+    let sessions = DRAINING_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match guard.get_mut(session_id) {
+        Some(slot) if slot.dirty => {
+            slot.dirty = false;
+            true
+        }
+        _ => {
+            guard.remove(session_id);
+            false
+        }
+    }
+}
+
+/// remote_inbox 排空的真实 I/O 接线：db 读写各自短锁短放；循环控制流本身在纯函数
+/// `drain_remote_inbox_loop` 里（可测，不依赖 AppHandle/DB）。
+fn drain_remote_inbox(app: &AppHandle, session_id: &str) {
+    drain_remote_inbox_loop(
+        || {
+            let db_state = app.state::<Db>();
+            let conn = db_state.0.lock().ok()?;
+            db::next_pending_remote_input(&conn, session_id)
+                .ok()
+                .flatten()
+                .map(|entry| (entry.id, entry.command_id, entry.kind, entry.payload))
+        },
+        |kind, payload, command_id| {
+            deliver_remote_inbox_entry(app, session_id, kind, payload, command_id)
+        },
+        |id, command_id| {
+            let db_state = app.state::<Db>();
+            let Ok(conn) = db_state.0.lock() else {
+                eprintln!(
+                    "remote_inbox mark_delivered skipped for command_id={command_id}: db lock poisoned"
+                );
+                return false;
+            };
+            match db::mark_remote_input_delivered(&conn, id) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!(
+                        "remote_inbox mark_delivered failed for command_id={command_id} (non-fatal): {e}"
+                    );
+                    false
+                }
+            }
+        },
+        |id, command_id, error| {
+            let db_state = app.state::<Db>();
+            let Ok(conn) = db_state.0.lock() else {
+                eprintln!(
+                    "remote_inbox record_failure skipped for command_id={command_id}: db lock poisoned"
+                );
+                return None;
+            };
+            match db::record_remote_input_failure(&conn, id, error) {
+                Ok(attempts) => Some(attempts),
+                Err(e) => {
+                    eprintln!(
+                        "remote_inbox record_failure failed for command_id={command_id} (non-fatal): {e}"
+                    );
+                    None
+                }
+            }
+        },
+        |id, command_id, error| {
+            let db_state = app.state::<Db>();
+            let Ok(conn) = db_state.0.lock() else {
+                eprintln!(
+                    "remote_inbox mark_failed skipped for command_id={command_id}: db lock poisoned"
+                );
+                return false;
+            };
+            match db::mark_remote_input_failed(&conn, id, error) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!(
+                        "remote_inbox mark_failed failed for command_id={command_id} (non-fatal): {e}"
+                    );
+                    false
+                }
+            }
+        },
+    );
+}
+
+/// 纯循环内核：只管「取下一条 → 投递 → 按结果继续/停」的控制流，不碰 AppHandle/DB——真实接线在
+/// `drain_remote_inbox`，测试直接喂 stub 闭包。错误按 busy / parse / 真实投递失败三分：busy
+/// 零副作用立即停；parse 直接标失败终态后继续；真实投递失败累计 attempts，未满 3 次留 pending
+/// 并就地停，满 3 次标失败终态后继续。两道既有安全阀仍生效：任何 mark 写失败立即停；
+/// next_pending 连续返回同一 id 时在第二次投递前立即停。新加的“留 pending 并 break”与同 id
+/// 二连阀不冲突：break 后本轮不会再取同一条，只会在下次释放时重新排空。
+///
+/// 两条关键不变量（M0 §4b）：① busy 只可能来自 `reserve_new_session_run`，且 reserve 先于
+/// `append_message`，所以 busy 必然零副作用；② 这里刻意采用 at-least-once——投递成功与
+/// mark_delivered 之间若崩溃可能重投一次。若改成 claim-first（先 mark 再投）会退化成
+/// at-most-once，崩溃时直接丢消息，代价更坏。
+fn drain_remote_inbox_loop(
+    mut next_pending: impl FnMut() -> Option<(i64, String, String, String)>,
+    mut deliver: impl FnMut(&str, &str, &str) -> Result<(), String>,
+    mut mark_delivered: impl FnMut(i64, &str) -> bool,
+    mut record_failure: impl FnMut(i64, &str, &str) -> Option<i64>,
+    mut mark_failed: impl FnMut(i64, &str, &str) -> bool,
+) {
+    let mut last_id: Option<i64> = None;
+    loop {
+        let Some((id, command_id, kind, payload)) = next_pending() else {
+            break;
+        };
+        if last_id == Some(id) {
+            // 安全阀：同一条第二次出现，说明游标没推进——即便这是真实 bug，也绝不无限热循环。
+            break;
+        }
+        last_id = Some(id);
+        match deliver(&kind, &payload, &command_id) {
+            Ok(()) => {
+                if !mark_delivered(id, &command_id) {
+                    // 安全阀：mark 写失败就停，留给下次释放重试，别继续往下投可能已经投过的队列。
+                    break;
+                }
+            }
+            Err(e) if autofeed_busy_error(&e) => break,
+            Err(e) => match classify_remote_inbox_error(&e) {
+                RemoteInboxErrorClass::Parse => {
+                    eprintln!(
+                        "remote_inbox parse failed for command_id={command_id} (terminal): {e}"
+                    );
+                    if !mark_failed(id, &command_id, &e) {
+                        break;
+                    }
+                }
+                RemoteInboxErrorClass::Delivery => {
+                    eprintln!(
+                        "remote_inbox delivery failed for command_id={command_id} (non-fatal): {e}"
+                    );
+                    let Some(attempts) = record_failure(id, &command_id, &e) else {
+                        break;
+                    };
+                    if attempts < 3 {
+                        // 保 FIFO：这条仍 pending，本轮不能越过它投递同会话后续条目。
+                        break;
+                    }
+                    if !mark_failed(id, &command_id, &e) {
+                        break;
+                    }
+                }
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteInboxErrorClass {
+    Parse,
+    Delivery,
+}
+
+fn classify_remote_inbox_error(error: &str) -> RemoteInboxErrorClass {
+    if error == "REMOTE_INBOX_PAYLOAD_MALFORMED"
+        || error == "REMOTE_INBOX_KIND_NOT_SUPPORTED_YET"
+        || error.starts_with("UNKNOWN_REMOTE_INBOX_KIND:")
+    {
+        RemoteInboxErrorClass::Parse
+    } else {
+        RemoteInboxErrorClass::Delivery
+    }
+}
+
+fn parse_remote_input(kind: &str, payload: &str) -> Result<String, String> {
+    match kind {
+        "input.send" => serde_json::from_str::<serde_json::Value>(payload)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("text")
+                    .and_then(|text| text.as_str())
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| "REMOTE_INBOX_PAYLOAD_MALFORMED".to_string()),
+        // M0 §4a：答卡应即刻投递、绝不入队；这里只是理论上不可达的防御位。
+        "input.answer" => Err("REMOTE_INBOX_KIND_NOT_SUPPORTED_YET".to_string()),
+        _ => Err(format!("UNKNOWN_REMOTE_INBOX_KIND:{kind}")),
+    }
+}
+
+/// remote inbox 的回显读回内核：emit 判据是消息是否真的新落库，而不是投递整体成败。
+/// 投递前已存在说明本轮只是 at-least-once 重投，绝不再次 emit；此前不存在时，按
+/// `(session_id, dedup_key)` 读回刚落库的完整消息。保持纯 DB 函数，让 AppHandle 薄壳只负责
+/// best-effort emit。
+fn remote_inbox_message_to_emit(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    dedup_key: &str,
+    existed_before: bool,
+) -> Result<Option<db::Message>, String> {
+    if existed_before {
+        return Ok(None);
+    }
+    db::get_message_by_session_and_dedup_key(conn, session_id, dedup_key).map_err(|e| e.to_string())
+}
+
+fn remote_inbox_message_existed_before(app: &AppHandle, session_id: &str, dedup_key: &str) -> bool {
+    let db_state = app.state::<Db>();
+    let existed = match db_state.0.lock() {
+        Ok(conn) => db::get_message_by_session_and_dedup_key(&conn, session_id, dedup_key)
+            .map(|message| message.is_some())
+            .unwrap_or(true),
+        Err(_) => true,
+    };
+    existed
+}
+
+fn emit_remote_inbox_message_if_new(
+    app: &AppHandle,
+    session_id: &str,
+    dedup_key: &str,
+    existed_before: bool,
+) {
+    let message = {
+        let db_state = app.state::<Db>();
+        let Ok(conn) = db_state.0.lock() else {
+            return;
+        };
+        remote_inbox_message_to_emit(&conn, session_id, dedup_key, existed_before)
+            .ok()
+            .flatten()
+    };
+    if let Some(message) = message {
+        let _ = app.emit(
+            "lead-message-appended",
+            serde_json::json!({
+                "session_id": session_id,
+                "message": message,
+            }),
+        );
+    }
+}
+
+/// 单条 `input.send` 投递内核——team 会话（saved lead 存在）走 `start_lead_session`，
+/// 与前端手打消息同款；solo 会话仍走 `resolve_session_run_agent` + `send_message`。
+/// 判门直接复用 `resume_after_answer_candidate`，且短锁必须在跨调用前释放，遵守 M1-T1
+/// 死锁红线；kind/payload 先经纯函数 `parse_remote_input` 分类，解析失败原样透传给循环标失败终态。
+/// P0-c：`command_id` 由 `drain_remote_inbox_loop` 逐条穿线到这里，派生
+/// `display_reduce::remote_input_key(command_id)` 作为 `user_dedup_key` 传给
+/// `start_lead_session`/`send_message`——at-least-once 重投（mark_delivered 落库前崩溃/断连）
+/// 同一 command_id 会被这把键在 DB 层去重，绝不产生第二条落库消息或第二次 msg.completed 里程碑。
+fn deliver_remote_inbox_entry(
+    app: &AppHandle,
+    session_id: &str,
+    kind: &str,
+    payload: &str,
+    command_id: &str,
+) -> Result<(), String> {
+    let text = parse_remote_input(kind, payload)?;
+    let dedup_key = display_reduce::remote_input_key(command_id);
+    // 只用来判断本轮是否真的新落库；通知侧查询失败时保守按“已存在”处理，避免误发重复
+    // 回显，且绝不改变 input.send 的真实投递结果。
+    let existed_before = remote_inbox_message_existed_before(app, session_id, &dedup_key);
+    let team_candidate = {
+        let config = {
+            let db_state = app.state::<Db>();
+            let conn = db_state.0.lock().map_err(|e| e.to_string())?;
+            db::get_session_agent_config(&conn, session_id).map_err(|e| e.to_string())?
+        };
+        resume_after_answer_candidate(&config)
+    };
+    if let Some((lead_agent_id, member_agent_ids)) = team_candidate {
+        let result = start_lead_session(
+            app.clone(),
+            app.state::<Db>(),
+            app.state::<Running>(),
+            app.state::<member_runner::TeamRunning>(),
+            session_id.to_string(),
+            lead_agent_id,
+            Some(text),
+            member_agent_ids,
+            None,
+            Some(display_reduce::remote_input_key(command_id)),
+        );
+        emit_remote_inbox_message_if_new(app, session_id, &dedup_key, existed_before);
+        return result;
+    }
+    let agent_id = {
+        let db_state = app.state::<Db>();
+        let conn = db_state.0.lock().map_err(|e| e.to_string())?;
+        resolve_session_run_agent(&conn, session_id)?.id
+    };
+    let result = send_message(
+        app.clone(),
+        app.state::<Db>(),
+        app.state::<Running>(),
+        app.state::<member_runner::TeamRunning>(),
+        session_id.to_string(),
+        agent_id,
+        text,
+        None,
+        None,
+        Some(display_reduce::remote_input_key(command_id)),
+    );
+    emit_remote_inbox_message_if_new(app, session_id, &dedup_key, existed_before);
+    result
+}
+
+// ---------------------------------------------------------------------------------------
+// T5d-a/T5e2（remote control M0 §5）：配对状态机、存储与命令接线。K_room/K_pair 真密钥的存取全走
+// `remote_pairing::store`（钥匙串），设备清单/令牌哈希走 `db::remote_devices`（app 数据
+// DB）；gateway 回调在 hello 时只暂存 `AcceptOutcome`，done 时才落设备并更新 TokenBook。
+// ---------------------------------------------------------------------------------------
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn now_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// M2-4d：`remote_gateway.rs` 的 `current_config` 已经不再读这个 app_settings key 了（legacy
+/// 全局房回落已撤，网关只认 `remote_active_repo_id` 解出的 per-project 房）。M24DR 返工收口：
+/// `remote_pairing_cancel_inner`/`remote_device_revoke_inner` 也已经改用
+/// `resolve_active_pairing_room_id_readonly` 领当前 active 房的 generation（详见该函数
+/// doc），不再读这个 legacy 全局房间——这个常量与 `resolve_remote_room_id` 在生产路径上因此
+/// 已经没有调用方了，只被下面它自己的单测（`resolve_remote_room_id_generates_once_and_
+/// reuses`）覆盖。特意保留而不删：这个 app_settings 行本身存量数据不迁移、一行不动（见设计稿
+/// §0.5 决策 1），删掉读它的函数会让这份存量数据彻底没有代码路径解释它的来历。
+#[allow(dead_code)] // 生产路径已无调用方（M24DR 返工撤了 cancel/revoke 对它的依赖）；同仓已
+                    // 有先例（`run_single_worker` 等），保留只为下方 `resolve_remote_room_id` 自身单测 + 存量
+                    // app_settings 行的历史可读性，见上方 doc。
+const REMOTE_ROOM_ID_SETTING: &str = "remote_room_id";
+
+/// 取得当前房间 id（legacy 全局房，M24DR 返工后仅供自身单测覆盖，见上方 `REMOTE_ROOM_ID_
+/// SETTING` doc）：app_settings 已有则复用；没有就生成一个新的、写回 app_settings 再返回。
+/// room_id 一旦生成就是这台桌面的永久房间号，配对流程不会每次都换房间——换的只是一次性
+/// `pairing_token`。
+///
+/// M24DR 返工收口（原 M2-4d 遗留缺口，如今已修）：`remote_pairing_cancel_inner`/
+/// `remote_device_revoke_inner` 曾经调用这个函数取 legacy 全局房间的 generation 计数器，而
+/// `remote_pairing_begin` 早就改用 active project 的 per-project 房间——两边取号对不上房，
+/// `next_registry_generation`（按 room_id 分表持久计数）领到的代号跟手机实际连接的房间不
+/// 匹配，relay CAS 恒拒，cancel/revoke 静默失灵（Blocker，详见两个调用方现在改用的
+/// `resolve_active_pairing_room_id_readonly` 的 doc）。审查裁定的修法是让 cancel/revoke 都
+/// 改成领「当前 active 房」的号（**不是**这里原先设想的"cancel 认 `PairingSession` 自带的
+/// room_id / revoke 认设备自己的 `remote_devices.room_id` 列"那条路——那条路要求
+/// room-scoped outbox 才撑得住，双路审判定过度设计）。
+#[allow(dead_code)] // 见 REMOTE_ROOM_ID_SETTING 的 doc：生产路径已无调用方，只被自身单测覆盖。
+fn resolve_remote_room_id(conn: &Connection) -> Result<String, String> {
+    if let Some(existing) =
+        db::get_app_setting(conn, REMOTE_ROOM_ID_SETTING).map_err(|e| e.to_string())?
+    {
+        return Ok(existing);
+    }
+    let generated = remote_pairing::generate_room_id();
+    db::set_app_setting(conn, REMOTE_ROOM_ID_SETTING, &generated).map_err(|e| e.to_string())?;
+    Ok(generated)
+}
+
+/// 桌面侧进程内配对状态槽。同一时刻只允许一份 Waiting 或 SentAccept；begin/cancel 直接
+/// 覆盖当前值，因而会丢弃尚未收到 done 的内存 outcome，且绝不会为它创建设备记录。
+enum PairingSlot {
+    Idle,
+    Waiting(remote_pairing::PairingSession),
+    SentAccept {
+        outcome: remote_pairing::AcceptOutcome,
+        room_id: String,
+        sent_at_secs: u64,
+        k_room: zeroize::Zeroizing<[u8; 32]>,
+        origin_connection_id: String,
+    },
+    Done {
+        room_id: String,
+        device_id: String,
+        completed_at_secs: u64,
+    },
+}
+
+static PAIRING_SLOT: OnceLock<Mutex<PairingSlot>> = OnceLock::new();
+static REMOTE_TOKEN_BOOK: OnceLock<Mutex<remote_pairing::TokenBook>> = OnceLock::new();
+static REMOTE_REGISTRY: OnceLock<Arc<Mutex<remote_gateway::RegistryState>>> = OnceLock::new();
+const PAIR_ACCEPT_LIFETIME_SECS: u64 = remote_pairing::PAIRING_LIFETIME_SECS;
+
+fn pairing_slot() -> &'static Mutex<PairingSlot> {
+    PAIRING_SLOT.get_or_init(|| Mutex::new(PairingSlot::Idle))
+}
+
+fn remote_token_book() -> &'static Mutex<remote_pairing::TokenBook> {
+    REMOTE_TOKEN_BOOK.get_or_init(|| Mutex::new(remote_pairing::TokenBook::new()))
+}
+
+fn remote_registry() -> &'static Arc<Mutex<remote_gateway::RegistryState>> {
+    REMOTE_REGISTRY.get_or_init(|| Arc::new(Mutex::new(remote_gateway::RegistryState::default())))
+}
+
+fn initialize_remote_token_book(conn: &Connection) {
+    let book = match remote_pairing::store::load_token_book(conn) {
+        Ok(book) => book,
+        Err(error) => {
+            eprintln!(
+                "load remote TokenBook failed due to database error; starting empty: {error}"
+            );
+            remote_pairing::TokenBook::new()
+        }
+    };
+    let _ = REMOTE_TOKEN_BOOK.set(Mutex::new(book));
+}
+
+/// `PAIRING_SLOT` is held from state validation through the state write. In particular, the done
+/// path also holds it across persistence and TokenBook insertion, so cancel/re-begin cannot slip
+/// between a stale state check and device creation.
+fn process_pair_hello(
+    slot: &Mutex<PairingSlot>,
+    key_store: &dyn KeyStore,
+    frame: remote_gateway::PairHelloFrame,
+    now_secs: u64,
+) -> Result<Option<remote_gateway::PairAcceptFrame>, String> {
+    let mut slot = slot.lock().map_err(|e| e.to_string())?;
+    let PairingSlot::Waiting(session) = &mut *slot else {
+        return Ok(None);
+    };
+    if session.room_id != frame.room {
+        return Ok(None);
+    }
+
+    let room_id = session.room_id.clone();
+    let hello = remote_pairing::HelloFrame {
+        remote_pub: frame.remote_pub,
+        token_ct_b64: frame.token_ct,
+        token_n_b64: frame.token_n,
+    };
+    let (outcome, k_room) =
+        remote_pairing::remote_pairing_authenticate_hello(key_store, session, &hello, now_secs)?;
+    let k_room = zeroize::Zeroizing::new(k_room);
+    let (tokens_ct, tokens_n) = remote_pairing::seal_pair_accept_tokens(
+        &outcome.device_record.k_pair,
+        &room_id,
+        &outcome.device_record.device_id,
+        &outcome.capability_token,
+        &outcome.refresh_token,
+    );
+    let accept = remote_gateway::PairAcceptFrame {
+        room: room_id.clone(),
+        device_id: outcome.device_record.device_id.clone(),
+        k_room_ct: outcome.k_room_wrapped_ct.clone(),
+        k_room_n: outcome.k_room_wrapped_n.clone(),
+        tokens_ct,
+        tokens_n,
+        k_room: k_room.clone(),
+    };
+    *slot = PairingSlot::SentAccept {
+        outcome,
+        room_id,
+        sent_at_secs: now_secs,
+        k_room,
+        origin_connection_id: frame.origin_connection_id,
+    };
+    Ok(Some(accept))
+}
+
+fn process_pair_done_with_registry(
+    slot: &Mutex<PairingSlot>,
+    registry: &mut remote_gateway::RegistryState,
+    conn: &Connection,
+    key_store: &dyn KeyStore,
+    token_book: &Mutex<remote_pairing::TokenBook>,
+    frame: remote_gateway::PairDoneFrame,
+    now_secs: u64,
+    now_ms: u64,
+) -> Result<remote_gateway::PairDoneAction, String> {
+    let mut slot = slot.lock().map_err(|e| e.to_string())?;
+    if let PairingSlot::Done {
+        room_id,
+        device_id,
+        completed_at_secs,
+    } = &*slot
+    {
+        if now_secs >= completed_at_secs.saturating_add(remote_pairing::PAIRING_LIFETIME_SECS) {
+            *slot = PairingSlot::Idle;
+            return Ok(remote_gateway::PairDoneAction::Rejected);
+        }
+        if frame.room != *room_id || frame.device_id != *device_id {
+            return Ok(remote_gateway::PairDoneAction::Rejected);
+        }
+        let subject = format!("device:{device_id}");
+        return Ok(match registry.replay_pair_ready(&subject) {
+            Some(ready) => remote_gateway::PairDoneAction::Ready(ready),
+            None => remote_gateway::PairDoneAction::Accepted {
+                newly_paired_device_id: None,
+            },
+        });
+    }
+    let PairingSlot::SentAccept {
+        outcome,
+        room_id,
+        sent_at_secs,
+        k_room,
+        origin_connection_id,
+    } = &*slot
+    else {
+        return Ok(remote_gateway::PairDoneAction::Rejected);
+    };
+    if now_secs >= sent_at_secs.saturating_add(PAIR_ACCEPT_LIFETIME_SECS) {
+        *slot = PairingSlot::Idle;
+        return Ok(remote_gateway::PairDoneAction::Rejected);
+    }
+    if frame.room != *room_id
+        || frame.device_id != outcome.device_record.device_id
+        || frame.origin_connection_id != *origin_connection_id
+    {
+        return Ok(remote_gateway::PairDoneAction::Rejected);
+    }
+    let (Some(confirm_ct), Some(confirm_n)) =
+        (frame.confirm_ct.as_deref(), frame.confirm_n.as_deref())
+    else {
+        return Ok(remote_gateway::PairDoneAction::Rejected);
+    };
+    if !remote_pairing::verify_pair_done_confirm(
+        k_room,
+        room_id,
+        &outcome.device_record.device_id,
+        confirm_ct,
+        confirm_n,
+    ) {
+        return Ok(remote_gateway::PairDoneAction::Rejected);
+    }
+
+    let mut token_book = token_book.lock().map_err(|e| e.to_string())?;
+    let generation = db::next_registry_generation(conn, room_id).map_err(|e| e.to_string())?;
+    remote_pairing::store::persist_pairing_outcome(
+        conn, key_store, room_id, outcome, now_secs, now_ms,
+    )?;
+    let device_id = outcome.device_record.device_id.clone();
+    let access_expires_ms = remote_pairing::device_access_expires_at_ms(now_ms)?;
+    let refresh_until_ms = remote_pairing::device_refresh_until_ms(now_ms)?;
+    if !db::set_remote_device_registry(conn, &device_id, room_id, generation, refresh_until_ms)
+        .map_err(|e| e.to_string())?
+    {
+        return Err(format!(
+            "paired remote device {device_id} disappeared before registry assignment"
+        ));
+    }
+    token_book.insert(
+        device_id.clone(),
+        &outcome.capability_token,
+        &outcome.refresh_token,
+        now_ms,
+    );
+    let (ready_ct, ready_n) =
+        remote_pairing::seal_pair_ready(&*outcome.device_record.k_pair, room_id, &device_id);
+    let ready = remote_gateway::PairReadyFrame {
+        room: room_id.clone(),
+        device_id: device_id.clone(),
+        ct: ready_ct,
+        n: ready_n,
+    };
+    registry.enqueue_token_put(
+        remote_gateway::TokenSyncEntry {
+            subject: format!("device:{device_id}"),
+            generation,
+            scope: "remote".to_owned(),
+            current: remote_gateway::TokenSyncCurrent {
+                token_hash: outcome.device_record.token_hash.clone(),
+                access_expires: access_expires_ms,
+                refresh_until: Some(refresh_until_ms),
+            },
+            prev: None,
+        },
+        Some(ready),
+    );
+    *slot = PairingSlot::Done {
+        room_id: room_id.clone(),
+        device_id: device_id.clone(),
+        completed_at_secs: now_secs,
+    };
+    Ok(remote_gateway::PairDoneAction::Accepted {
+        newly_paired_device_id: Some(device_id),
+    })
+}
+
+#[cfg(test)]
+fn process_pair_done(
+    slot: &Mutex<PairingSlot>,
+    conn: &Connection,
+    key_store: &dyn KeyStore,
+    token_book: &Mutex<remote_pairing::TokenBook>,
+    frame: remote_gateway::PairDoneFrame,
+    now_secs: u64,
+    now_ms: u64,
+) -> Result<Option<String>, String> {
+    let mut registry = remote_gateway::RegistryState::default();
+    match process_pair_done_with_registry(
+        slot,
+        &mut registry,
+        conn,
+        key_store,
+        token_book,
+        frame,
+        now_secs,
+        now_ms,
+    )? {
+        remote_gateway::PairDoneAction::Accepted {
+            newly_paired_device_id,
+        } => Ok(newly_paired_device_id),
+        remote_gateway::PairDoneAction::Rejected | remote_gateway::PairDoneAction::Ready(_) => {
+            Ok(None)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "state")]
+enum RemotePairingStatus {
+    Idle,
+    WaitingForHello { expires_at: u64 },
+    WaitingForDone { expires_at: u64 },
+    Done { device_id: String },
+}
+
+/// 纯函数内核（可测，不依赖全局槽）：Waiting 按 QR 时钟过期；SentAccept 和 Done 分别从
+/// accept/done 时刻保留五分钟。任一到期都自动降级 Idle，再映射成 IPC 状态。
+fn compute_pairing_status(slot: &mut PairingSlot, now_secs: u64) -> RemotePairingStatus {
+    let expired = match slot {
+        PairingSlot::Waiting(session) => now_secs >= session.expires_at_secs,
+        PairingSlot::SentAccept { sent_at_secs, .. } => {
+            now_secs >= sent_at_secs.saturating_add(PAIR_ACCEPT_LIFETIME_SECS)
+        }
+        PairingSlot::Done {
+            completed_at_secs, ..
+        } => now_secs >= completed_at_secs.saturating_add(remote_pairing::PAIRING_LIFETIME_SECS),
+        PairingSlot::Idle => false,
+    };
+    if expired {
+        *slot = PairingSlot::Idle;
+    }
+    match slot {
+        PairingSlot::Idle => RemotePairingStatus::Idle,
+        PairingSlot::Waiting(session) => RemotePairingStatus::WaitingForHello {
+            expires_at: session.expires_at_secs,
+        },
+        PairingSlot::SentAccept { sent_at_secs, .. } => RemotePairingStatus::WaitingForDone {
+            expires_at: sent_at_secs.saturating_add(PAIR_ACCEPT_LIFETIME_SECS),
+        },
+        PairingSlot::Done { device_id, .. } => RemotePairingStatus::Done {
+            device_id: device_id.clone(),
+        },
+    }
+}
+
+/// M2-4d（接缝 P0·双路审抓出）：配对必须用「当前活跃项目」的 per-project 房间，不能再走
+/// legacy 全局 `remote_room_id`——网关 `current_config` 在 active project 已设时连的是
+/// `project_remote_rooms` 里的房间，若二维码继续写 legacy 房，桌面网关压根不会去认领它，
+/// 配对必死。这里复用 M2-4a 的 `db::ensure_remote_room_for_project`（有房复用 / 无房新建），
+/// 判定语义与网关 `current_config` 同源：先核 `remote_control_enabled`（M24DR 返工·审查 nit
+/// F6：跟 `current_config` "active 已设 **且** remote 已启用" 才调用 resolver 的纪律对齐——
+/// remote 未启用时不该顺手建房 + 烧一个 generation），再 trim+filter `remote_active_repo_id`
+/// （跟 `remote_set_active_project_in_conn`/`current_config` 一致，纯空白不算"已设"），最后
+/// 核实 repo 真的存在于 `repos` 表（挡"手改 DB / 陈旧 setting"）。remote 未启用与 active
+/// 未设/空白归并成同一条拒绝路径（都还没到"能配对"的地步，没有专门的"remote 未启用"配对
+/// 错误码，不新造一份文案）；用户点了"开始配对"这个显式动作，值得一个看得懂的错误，而不是
+/// 二维码消失不见。active 指向的 repo 查无，复用 `remote_set_active_project_in_conn` 已经
+/// 建立的 `remoteControl.activeProjectMissing` 错误码（同一场景，不新造一份前端文案——前端
+/// i18n 不在本单 scope）。
+fn resolve_active_pairing_room_id(conn: &Connection) -> Result<String, String> {
+    let enabled = db::get_app_setting(conn, "remote_control_enabled")
+        .map_err(|error| error.to_string())?
+        .is_some_and(|value| value == "true");
+    let active_repo_id_raw = db::get_app_setting(conn, REMOTE_ACTIVE_REPO_ID_SETTING)
+        .map_err(|error| error.to_string())?;
+    let active_repo_id = active_repo_id_raw
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let repo_id = match (enabled, active_repo_id) {
+        (true, Some(repo_id)) => repo_id,
+        _ => {
+            return Err(ui_msg::al_err(
+                "remoteControl.pairingNeedsActiveProject",
+                &[],
+            ))
+        }
+    };
+    let exists = repos_repo::get_repo_by_id(conn, repo_id)
+        .map_err(|error| error.to_string())?
+        .is_some();
+    if !exists {
+        return Err(ui_msg::al_err(
+            "remoteControl.activeProjectMissing",
+            &[("repoId", repo_id.to_string())],
+        ));
+    }
+    db::ensure_remote_room_for_project(conn, repo_id)
+}
+
+/// M24DR 返工·项 1：cancel/revoke 领「当前 active 房」generation 号用的只读变体——跟
+/// `resolve_active_pairing_room_id`（begin 用）语义同源但**不做 ensure**。Blocker 背景：
+/// `remote_pairing_cancel_inner`/`remote_device_revoke_inner` 此前一直调用 legacy 的
+/// `resolve_remote_room_id` 领号，而 `remote_pairing_begin` 早就改用 active project 的
+/// per-project 房——两边取的是两本互不相通的 generation 计数器（`db::next_registry_generation`
+/// 按 room_id 分表），cancel/revoke 排的 `token.delete` 带着 legacy 房的（必然落后的）代号发进
+/// 手机实际连接的 active 房，relay CAS 恒拒（`generation_too_low` 族），撤销静默失灵。双路审
+/// 裁定的修法就是让 cancel/revoke 都改成领「当前 active 房」的号（**不是**曾经设想的"cancel
+/// 认 `PairingSession` 自带的 room_id / revoke 认设备自己的 `remote_devices.room_id` 列"那条
+/// 路——那条路要求 room-scoped outbox 才撑得住，双路审判定过度设计）。
+///
+/// 不做 ensure 是因为 cancel/revoke 只是想知道"现在连的是哪个房"，不该有"顺手建一个新房 + 烧
+/// 一个 generation"这个副作用——尤其是 active 已经指向一个刚被清空/切走的项目时，ensure 会
+/// 凭空造一个没人会用的孤儿房。语义：先核 `remote_control_enabled`（跟 `resolve_active_
+/// pairing_room_id`/网关 `current_config` 的判定纪律对齐——未启用=未配置，同一条"解析不到"
+/// 路径，不新造分支；未启用直接 `Ok(None)`，不再往下读 active repo）→ 读 `remote_active_
+/// repo_id` → trim+filter →（未设直接 `Ok(None)`）→ 核实 repo 仍存在于 `repos` 表（→ 查无
+/// `Ok(None)`）→ 只读 `project_remote_rooms` 既有行（`db::remote_room_for_project`，没有就是
+/// 没有，不新建 → `Ok(None)`）。四种落空场景（未启用/未设/repo 已删/无房行）对调用方而言是
+/// 同一件事——"解析不到 active 房"，调用方各自决定怎么兜底，见 `remote_pairing_cancel_inner`/
+/// `remote_device_revoke_inner` 的 doc。
+///
+/// M24DR 返工·DEVLIST 返工项 1：补了 `remote_control_enabled` 检查后，这四种落空场景
+/// 对**全部消费方**（设备列表 `remote_devices_list_in_conn` / `remote_pairing_cancel_inner` /
+/// `remote_device_revoke_inner`）都归同一条路径。语义变化：remote 未启用时，cancel/revoke
+/// **不排** relay 的 `token.delete`（跟未设 active project 时的行为一致，见各自 doc）——本地
+/// 清态/撤销效果（DB revoke + TokenBook 失效 / pairing 状态清理）照常发生，只是不发 outbox
+/// delete；relay 侧靠既有 `synchronize_registry` reconcile 省略机制在下次启用连接时补撤（该
+/// 兜底路径经双路审核实为真，见 `remote_device_revoke_inner` doc 的 reconcile 说明）。
+fn resolve_active_pairing_room_id_readonly(conn: &Connection) -> Result<Option<String>, String> {
+    let enabled = db::get_app_setting(conn, "remote_control_enabled")
+        .map_err(|error| error.to_string())?
+        .is_some_and(|value| value == "true");
+    if !enabled {
+        return Ok(None);
+    }
+    let active_repo_id_raw = db::get_app_setting(conn, REMOTE_ACTIVE_REPO_ID_SETTING)
+        .map_err(|error| error.to_string())?;
+    let active_repo_id = active_repo_id_raw
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(repo_id) = active_repo_id else {
+        return Ok(None);
+    };
+    let exists = repos_repo::get_repo_by_id(conn, repo_id)
+        .map_err(|error| error.to_string())?
+        .is_some();
+    if !exists {
+        return Ok(None);
+    }
+    db::remote_room_for_project(conn, repo_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn remote_pairing_begin(
+    db: State<Db>,
+    relay_url: String,
+) -> Result<remote_pairing::QrPayload, String> {
+    // relay 地址留空（前端未填/纯空白）时兜底到官方公共中继，跟网关连接侧
+    // （`remote_gateway::current_config`）同一份缺省逻辑——见 `effective_relay_url` doc。
+    let relay_url = remote_gateway::effective_relay_url(Some(relay_url))
+        .expect("effective_relay_url always returns Some");
+    let mut registry = remote_registry().lock().map_err(|e| e.to_string())?;
+    let (room_id, generation) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let room_id = resolve_active_pairing_room_id(&conn)?;
+        let generation =
+            db::next_registry_generation(&conn, &room_id).map_err(|e| e.to_string())?;
+        (room_id, generation)
+    };
+    let now_ms = now_unix_millis();
+    let now_secs = now_ms / 1_000;
+    let (session, qr_payload) =
+        remote_pairing::PairingSession::begin(&relay_url, &room_id, now_secs);
+    let token_hash = remote_pairing::pairing_connect_token_hash(&session.pairing_token)?;
+    let access_expires_ms = remote_pairing::pairing_access_expires_at_ms(now_ms)?;
+
+    let mut slot = pairing_slot().lock().map_err(|e| e.to_string())?;
+    *slot = PairingSlot::Waiting(session);
+    let entry = remote_gateway::TokenSyncEntry {
+        subject: "pairing".to_owned(),
+        generation,
+        scope: "pairing".to_owned(),
+        current: remote_gateway::TokenSyncCurrent {
+            token_hash,
+            access_expires: access_expires_ms,
+            refresh_until: None,
+        },
+        prev: None,
+    };
+    registry.set_pairing_entry(entry.clone());
+    registry.enqueue_token_put(entry, None);
+    drop(slot);
+    drop(registry);
+    remote_gateway::request_registry_publish();
+    Ok(qr_payload)
+}
+
+/// S1i3 F3：`remote_pairing_cancel` 命令本身吃 Tauri `State<Db>`，不便在单测里直调——同
+/// `remote_device_revoke_inner`（S1h R5 返工）的做法，把「清 pairing 状态 + 领号入 revoke
+/// 通道 + slot 归 Idle」这套必须原子发生的纯逻辑抽成只吃已解锁引用的内核函数，命令层退化
+/// 成取锁薄壳转调。
+///
+/// M24DR 返工·项 1：领号改用 `resolve_active_pairing_room_id_readonly`（当前 active 房），
+/// 不再用 legacy 的 `resolve_remote_room_id`（Blocker 详见前者的 doc）。**解析不到 active
+/// 房时**（remote 未启用 / 未设 active project / repo 已删 / 该 project 还没有房行）：本地
+/// 配对态照常清干净（`clear_pairing_entry`/`discard_staged_pairing_k_room`/slot 归 Idle 三步
+/// 不受影响），但**不排** relay 的 `token.delete`——没有房可发，也没必要因此拒绝本地清理；正在进行中的
+/// pairing token 本身有 300s（QR 时钟）自然过期兜底（`remote_pairing::PairingSession`），
+/// relay 侧不会一直误认这轮已取消的配对仍然有效。
+fn remote_pairing_cancel_inner(
+    conn: &Connection,
+    registry: &mut remote_gateway::RegistryState,
+    slot: &mut PairingSlot,
+) -> Result<(), String> {
+    let generation = match resolve_active_pairing_room_id_readonly(conn)? {
+        Some(room_id) => {
+            Some(db::next_registry_generation(conn, &room_id).map_err(|e| e.to_string())?)
+        }
+        None => None,
+    };
+    registry.clear_pairing_entry();
+    registry.discard_staged_pairing_k_room();
+    if let Some(generation) = generation {
+        registry.enqueue_token_delete("pairing".to_owned(), generation, true);
+    }
+    *slot = PairingSlot::Idle;
+    Ok(())
+}
+
+/// S1i3 F3（BLOCKER 批次审修补）：`remote_pairing_begin`/`remote_device_revoke` 都在释放锁
+/// 后唤醒连接主循环（`request_registry_publish()`），让停机/退避态下也能尽快把新排的
+/// outbox 项送出去；`remote_pairing_cancel` 之前漏了这一步——活连接下 outbox 仍会在
+/// ≤500ms 内被既有 drain 轮询兜住，但停机/退避态下取消配对排的 `token.delete` 会一直堵到
+/// 下次连接主循环自然醒来，送不出去。这里补上，跟另外两个命令保持同一套「取锁→改
+/// 状态→放锁→唤醒」结构。
+#[tauri::command]
+fn remote_pairing_cancel(db: State<Db>) -> Result<(), String> {
+    let mut registry = remote_registry().lock().map_err(|e| e.to_string())?;
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut slot = pairing_slot().lock().map_err(|e| e.to_string())?;
+    remote_pairing_cancel_inner(&conn, &mut registry, &mut slot)?;
+    drop(slot);
+    drop(conn);
+    drop(registry);
+    remote_gateway::request_registry_publish();
+    Ok(())
+}
+
+#[tauri::command]
+fn remote_pairing_status() -> Result<RemotePairingStatus, String> {
+    let mut registry = remote_registry().lock().map_err(|e| e.to_string())?;
+    let mut slot = pairing_slot().lock().map_err(|e| e.to_string())?;
+    let status = compute_pairing_status(&mut slot, now_unix_secs());
+    if matches!(status, RemotePairingStatus::Idle) {
+        registry.clear_pairing_entry();
+        registry.discard_staged_pairing_k_room();
+    }
+    Ok(status)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RemoteGatewayStatus {
+    running: bool,
+    stopped_reason: Option<String>,
+    last_error: Option<String>,
+    counters: remote_gateway::GatewayCounters,
+}
+
+fn remote_gateway_status_view(status: remote_gateway::GatewayStatus) -> RemoteGatewayStatus {
+    RemoteGatewayStatus {
+        running: !matches!(status.state, remote_gateway::GatewayState::Disabled),
+        stopped_reason: status.stopped_reason,
+        last_error: status.last_error,
+        counters: status.counters,
+    }
+}
+
+#[tauri::command]
+fn remote_gateway_status() -> RemoteGatewayStatus {
+    remote_gateway_status_view(remote_gateway::status())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RemoteDeviceView {
+    device_id: String,
+    name: String,
+    created_at: i64,
+    /// S1c2 §9.2：IPC 原样透传 DB 的 unix 毫秒值。
+    access_expires_at: i64,
+    revoked_at: Option<i64>,
+}
+
+impl From<db::RemoteDeviceRow> for RemoteDeviceView {
+    fn from(row: db::RemoteDeviceRow) -> Self {
+        // token_hash/refresh_hash 故意不进 IPC 视图——即使是哈希，也没有理由把它们递给
+        // 前端（同款克制见 keychain.rs「IPC must expose configured state only」）。
+        Self {
+            device_id: row.device_id,
+            name: row.name,
+            created_at: row.created_at,
+            access_expires_at: row.access_expires_at,
+            revoked_at: row.revoked_at,
+        }
+    }
+}
+
+/// M24D-DEVLIST：设备归属房间——列表只显示当前 active 项目房间的设备，跨房设备须切到对应
+/// 项目管理。领房用 `resolve_active_pairing_room_id_readonly`（不 ensure，不烧 generation，
+/// 语义与 cancel/revoke 一致，见该函数 doc）；解析不到（remote 未启用 / 未设 active project /
+/// repo 已删 / 该 project 还没有房行）时返回空列表——没有 active 房可展示，UI 也不该再列出
+/// 别的房间的设备（那些设备此前可在 UI 上点撤销，但 revoke 解析不到 active 房时不排 relay
+/// `token.delete`，撤销只在本地生效，UI 会谎报"已撤干净"，见 `remote_device_revoke_inner`
+/// doc——这正是本次收口要关掉的口子）。过滤在 lib.rs 层做（`db::list_remote_devices`/db.rs
+/// 不动），`db::list_remote_devices` 仍是全量查询，只是这里按 `room_id` 收窄。
+///
+/// DEVLIST 返工·项 1：`resolve_active_pairing_room_id_readonly` 补了 `remote_control_enabled`
+/// 检查后，remote 未启用时这里同样落空列表（跟网关「未启用=未配置」语义对齐，不用单独判断）。
+fn remote_devices_list_in_conn(conn: &Connection) -> Result<Vec<RemoteDeviceView>, String> {
+    let Some(active_room_id) = resolve_active_pairing_room_id_readonly(conn)? else {
+        return Ok(Vec::new());
+    };
+    let rows = db::list_remote_devices(conn).map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| row.room_id.as_deref() == Some(active_room_id.as_str()))
+        .map(RemoteDeviceView::from)
+        .collect())
+}
+
+#[tauri::command]
+fn remote_devices_list(db: State<Db>) -> Result<Vec<RemoteDeviceView>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    remote_devices_list_in_conn(&conn)
+}
+
+/// S1h 2a：撤销一个设备时，除既有 DB revoke + TokenBook 失效外，还要把 `token.delete`
+/// （`close:true`）领号入 outbox revoke 通道——停机/退避态的连接也要能把撤销意图送出去
+/// （S1g1 机制复用）。锁序 registry→db→（token_book，与既有顺序一致）。
+///
+/// S1h R5 返工：`remote_device_revoke` 命令本身吃 Tauri `State<Db>`，不便在单测里直调；这里
+/// 把「省略即撤销兜底」（DB revoke + TokenBook 失效）与「显式 token.delete 入 revoke 通道」
+/// 这两件必须原子发生的事抽成一个只吃已解锁引用的内核函数，命令层退化成取锁薄壳转调——
+/// 双保险测试打这个内核，才是真的在验两件事同一次调用里都发生了的那条接缝，而不是手工复刻
+/// 一遍动作序列。
+///
+/// M24DR 返工·项 1：领号改用 `resolve_active_pairing_room_id_readonly`（当前 active 房），
+/// 不再用 legacy 的 `resolve_remote_room_id`（Blocker 详见前者的 doc）。**解析不到 active
+/// 房时**（remote 未启用 / 未设 active project / repo 已删 / 该 project 还没有房行）：DB
+/// revoke + TokenBook 失效（省略即撤销兜底）照常发生，**不排**显式 `token.delete`——没有房
+/// 可发。兜底依据：下次连接时 `synchronize_registry` 的 reconcile 省略机制会把本地快照里
+/// 已经省略的 subject 在 relay 侧补标 revoked（`room-store.js:463-478` 的 non-reset 分支），
+/// 显式 delete 只是加速手段，不是撤销生效的唯一路径。
+fn remote_device_revoke_inner(
+    conn: &Connection,
+    registry: &mut remote_gateway::RegistryState,
+    token_book: &mut remote_pairing::TokenBook,
+    key_store: &dyn KeyStore,
+    device_id: &str,
+    now_secs: i64,
+) -> Result<(), String> {
+    let generation = match resolve_active_pairing_room_id_readonly(conn)? {
+        Some(room_id) => {
+            Some(db::next_registry_generation(conn, &room_id).map_err(|e| e.to_string())?)
+        }
+        None => None,
+    };
+    remote_pairing::store::revoke_device_and_sync(
+        conn, key_store, token_book, device_id, now_secs,
+    )?;
+    if let Some(generation) = generation {
+        registry.enqueue_token_delete(format!("device:{device_id}"), generation, true);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn remote_device_revoke(db: State<Db>, device_id: String) -> Result<(), String> {
+    let mut registry = remote_registry().lock().map_err(|e| e.to_string())?;
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut token_book = remote_token_book().lock().map_err(|e| e.to_string())?;
+    remote_device_revoke_inner(
+        &conn,
+        &mut registry,
+        &mut token_book,
+        &KeyringStore,
+        &device_id,
+        now_unix_secs() as i64,
+    )?;
+    drop(token_book);
+    drop(conn);
+    drop(registry);
+    remote_gateway::request_registry_publish();
+    Ok(())
 }
 
 /// 会话没有任何 memory goal block 时才会用到的兜底种子文本——目前唯一走得到这条分支的
@@ -9878,17 +13010,22 @@ fn should_seed_goal(has_existing_goal: bool, has_message: bool) -> bool {
 /// `commit_late_answer` 落过一条 `[用户对『问题』的回答] X` 消息，这里若再落一条，答案就
 /// 在 transcript 里重复出现两次。拆成纯 `&Connection` 函数，直接用 `test_db()` 断言
 /// `db::get_messages` 前后行数，不必绕 Tauri `State`/`AppHandle` 起停整套命令。
+/// P0-c：`dedup_key` 由调用方 `start_lead_session` 算好传入（`user_dedup_key` IPC 入参
+/// 或其 `user_send_key(&run_id)` 兜底）——conn 是 autocommit（无显式事务），符合
+/// `append_message_dedup_and_publish` 调用契约（db.rs:3784），落库成功即自动发布
+/// msg.completed 里程碑。message=None 分支提前返回，dedup_key 不会被用到。
 fn persist_lead_start_message(
     conn: &rusqlite::Connection,
     session_id: &str,
     lead_agent_id: &str,
     lead_agent_name: &str,
     message: Option<&str>,
+    dedup_key: &str,
 ) -> Result<(), String> {
     let Some(text) = message else {
         return Ok(());
     };
-    db::append_message(
+    db::append_message_dedup_and_publish(
         conn,
         session_id,
         "user",
@@ -9898,7 +13035,9 @@ fn persist_lead_start_message(
         None,
         Some(lead_agent_id),
         Some(lead_agent_name),
+        dedup_key,
     )
+    .map(|_inserted| ())
     .map_err(|e| e.to_string())
 }
 
@@ -9916,6 +13055,11 @@ fn start_lead_session(
     message: Option<String>,
     member_ids: Vec<String>,
     reasoning_tier: Option<String>,
+    // P0-c：user 消息落库防重复键——前端不传（Tauri 对缺失的 Option 入参解析为 None），
+    // None 时用 `display_reduce::user_send_key(&run_id)` 兜底；remote inbox 投递路
+    // （`deliver_remote_inbox_entry`）传 `remote_input_key(command_id)`，供 at-least-once
+    // 重投去重。message=None 时这把键不会被用到（`persist_lead_start_message` 提前返回）。
+    user_dedup_key: Option<String>,
 ) -> Result<(), String> {
     use std::sync::atomic::Ordering;
 
@@ -9960,7 +13104,12 @@ fn start_lead_session(
     // 2. 防同会话重入（lead 槽 + 上轮 member 活跃态）
     let running_inner = running.inner().clone();
     let team_running_inner = team_running.inner().clone();
-    let guard = {
+    // P0-2（opus delta 复核）：`reserve_lead_start_after_globalstop` 不再自己挂 refresh（见其
+    // 文档注释）——这里让 `conn` 随下面这个块结束自然释放，再显式补 refresh：早退分支
+    // （globally-stopped/busy）在 `return Err` 前补一次，让 session_runtime 追上刚才占槽又
+    // 摘槽的瞬间；正常继续分支等 conn 块结束之后，才把 refresh 句柄挂回 guard，保证它后续
+    // 任何早退 drop 都发生在 db 锁已经放开之后（不然就是 P0-1 那类同线程重入死锁）。
+    let reserved = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         reserve_lead_start_after_globalstop(
             &conn,
@@ -9970,10 +13119,18 @@ fn start_lead_session(
             current_locale(&app),
             message.is_some(),
         )
-    }?;
+    };
+    let guard = match reserved {
+        Ok(g) => g,
+        Err(e) => {
+            refresh_session_runtime(db.inner(), &running_inner, &team_running_inner, &session_id);
+            return Err(e);
+        }
+    };
     let Some(mut guard) = guard else {
         return Ok(());
     };
+    guard = guard.with_refresh(team_running_inner.clone(), app.clone());
 
     // 3. 取用户项目 cwd
     let wt = {
@@ -9982,9 +13139,20 @@ fn start_lead_session(
         wt
     };
 
+    // 4a. P0-c：lead run_id 生成时机从原步骤 6 上移到这里——早于步骤 4 的用户消息持久化。
+    // `new_run_id()` 是纯内存生成（时间戳 + pid + 进程内计数器，无 IO/DB 副作用，见其
+    // 定义），上移不改变任何可观察行为；上移前已实勘上移前后这段区间（原步骤 5 构造
+    // member_pool）不读不写 run_id，无消费方依赖它「还没生成」，故上移安全。上移原因：
+    // 步骤 4 落库需要 dedup_key，`user_dedup_key` 为 None（本地/续跑路）时要用
+    // `user_send_key(run_id)` 兜底，run_id 必须提前就绪。
+    let run_id = new_run_id();
+
     // 4. 持久化用户消息（message=None 时跳过——T3 续跑路径迟到答案已经落过库，绝不能
     // 在这里再落第二条，否则答案在 transcript 里重复）。P1-②：判定逻辑拆进
-    // `persist_lead_start_message`（可测内核，见其上方注释）。
+    // `persist_lead_start_message`（可测内核，见其上方注释）。dedup_key：remote inbox 投递
+    // 路传 `user_dedup_key`（= `remote_input_key(command_id)`）；本地/续跑路 None 时兜底
+    // `user_send_key(run_id)`。
+    let dedup_key = user_dedup_key.unwrap_or_else(|| display_reduce::user_send_key(&run_id));
     {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         persist_lead_start_message(
@@ -9993,6 +13161,7 @@ fn start_lead_session(
             &lead_agent_id,
             &profile.name,
             message.as_deref(),
+            &dedup_key,
         )?;
     }
 
@@ -10013,8 +13182,7 @@ fn start_lead_session(
             .collect()
     };
 
-    // 6. 生成 lead run_id、done 与终结标志（worker 每次现场生成独立 run_id）
-    let run_id = new_run_id();
+    // 6. done 与终结标志（lead run_id 已在步骤 4a 生成）
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let terminated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -10022,6 +13190,9 @@ fn start_lead_session(
     let app_ctx = app.clone();
     let session_id_ctx = session_id.clone();
     let team_running_ctx: member_runner::TeamRunning = team_running.inner().clone();
+    // M1 修复轮 P1-2：`run_worker` 内部再登记一次 dispatch intent 时（`run_lead_worker_with_
+    // dispatch_intent`）要挂 refresh 句柄，需要一份 Running 克隆——见该函数调用点。
+    let running_ctx = running_inner.clone();
     let done_ctx = done.clone();
     let terminated_ctx = terminated.clone();
     // T2 防重派闸探针：另开一份 TeamRunning + session_id 克隆（run_worker 闭包会 move 掉上面那份）。
@@ -10051,7 +13222,7 @@ fn start_lead_session(
             );
         }),
         on_worker_settled: std::sync::Arc::new(move || {
-            try_autofeed_lead(autofeed_app.clone(), autofeed_session_id.clone());
+            drain_after_run_release(autofeed_app.clone(), autofeed_session_id.clone());
         }),
         member_pool,
         done: done_ctx,
@@ -10085,6 +13256,8 @@ fn start_lead_session(
         run_worker: std::sync::Arc::new(move |member_input: member_runner::MemberInput| {
             run_lead_worker_with_dispatch_intent(
                 &team_running_ctx,
+                &running_ctx,
+                Some(&app_ctx),
                 &session_id_ctx,
                 &terminated_ctx,
                 || {
@@ -10413,10 +13586,20 @@ fn start_lead_session(
     // 9. disarm guard — thread owns the Running slot from here
     guard.disarm();
 
+    // G3：旧清理若放在 spawn 之后，会有 ABA 窗口：runner 可能已读完历史快照，随后落库并因
+    // busy 新登记的迟到答案，会被旧清理误删。改在 spawn 前清理后，reserve 占槽至 runner 读
+    // 快照前已落库的答案必在历史中，无需挂账续跑；清理后才落库并登记的答案不会再被误删，会在
+    // run 释放时由 drain_after_run_release 摘到并续跑。极少数答案已进历史却仍留登记的交错，至多
+    // 多触发一次无害续跑，不会丢答案，比误删更安全。此处在所有短锁块及 spawn 闭包之外，不跨锁执行。
+    let _ = take_pending_answer_resume(&session_id);
+
     // 10. 专用 lead runner 线程：McpServer 持在线程栈活到 child 退出
     let app_t = app.clone();
     let session_id_t = session_id.clone();
     let running_t = running_inner.clone();
+    // M1 修复轮 P0-1/P1-1：session_runtime 重算需要 team_running（compute_session_runtime 的
+    // 「Running 槽 ∪ team 活跃」判据）——四处释放咽喉（下方三处 spawn 前失败 + 正常收尾）都要用。
+    let team_running_t = team_running.inner().clone();
     let done_t = done.clone();
     let terminated_t = lead_ctx.terminated.clone();
     let transport = event_transport().clone();
@@ -10454,15 +13637,22 @@ fn start_lead_session(
                     &profile_t.name,
                     message.clone(),
                 );
+                // M1 修复轮 P0-1（2026-08-11）：释放咽喉——不再预先加锁。`emit_lead_error_and_release`
+                // 签名收 `&crate::db::Db`（未锁句柄），内部短锁短放；旧版本这里预锁的 guard 会
+                // 一路存活到下面 `try_autofeed_lead` 重新加锁那一刻，同线程二次 lock 直接死锁
+                // （TimedMutex/std::sync::Mutex 不可重入）——这正是本轮要修的死锁。
+                let runtime_db = app_t.state::<crate::db::Db>();
                 emit_lead_error_and_release(
                     &running_t,
+                    &team_running_t,
                     &terminated_t,
                     &session_id_t,
                     &lead_run_id,
                     &transport,
                     message,
+                    Some(runtime_db.inner()),
                 );
-                try_autofeed_lead(app_t.clone(), session_id_t.clone());
+                drain_after_run_release(app_t.clone(), session_id_t.clone());
                 return;
             }
         };
@@ -10593,15 +13783,22 @@ fn start_lead_session(
                     &profile_t.name,
                     message.clone(),
                 );
+                // M1 修复轮 P0-1（2026-08-11）：释放咽喉——不再预先加锁。`emit_lead_error_and_release`
+                // 签名收 `&crate::db::Db`（未锁句柄），内部短锁短放；旧版本这里预锁的 guard 会
+                // 一路存活到下面 `try_autofeed_lead` 重新加锁那一刻，同线程二次 lock 直接死锁
+                // （TimedMutex/std::sync::Mutex 不可重入）——这正是本轮要修的死锁。
+                let runtime_db = app_t.state::<crate::db::Db>();
                 emit_lead_error_and_release(
                     &running_t,
+                    &team_running_t,
                     &terminated_t,
                     &session_id_t,
                     &lead_run_id,
                     &transport,
                     message,
+                    Some(runtime_db.inner()),
                 );
-                try_autofeed_lead(app_t.clone(), session_id_t.clone());
+                drain_after_run_release(app_t.clone(), session_id_t.clone());
                 drop(mcp_srv);
                 return;
             }
@@ -10643,15 +13840,22 @@ fn start_lead_session(
                     &profile_t.name,
                     message.clone(),
                 );
+                // M1 修复轮 P0-1（2026-08-11）：释放咽喉——不再预先加锁。`emit_lead_error_and_release`
+                // 签名收 `&crate::db::Db`（未锁句柄），内部短锁短放；旧版本这里预锁的 guard 会
+                // 一路存活到下面 `try_autofeed_lead` 重新加锁那一刻，同线程二次 lock 直接死锁
+                // （TimedMutex/std::sync::Mutex 不可重入）——这正是本轮要修的死锁。
+                let runtime_db = app_t.state::<crate::db::Db>();
                 emit_lead_error_and_release(
                     &running_t,
+                    &team_running_t,
                     &terminated_t,
                     &session_id_t,
                     &lead_run_id,
                     &transport,
                     message,
+                    Some(runtime_db.inner()),
                 );
-                try_autofeed_lead(app_t.clone(), session_id_t.clone());
+                drain_after_run_release(app_t.clone(), session_id_t.clone());
                 drop(mcp_srv);
                 return;
             }
@@ -10661,8 +13865,11 @@ fn start_lead_session(
 
         let pid = child.id();
         // Transition Launching -> Running (or abort if stop was requested)
+        let handoff_runtime_db = app_t.state::<crate::db::Db>();
         let proceed = match transition_lead_spawn_handoff(
             &running_t,
+            &team_running_t,
+            Some(handoff_runtime_db.inner()),
             &terminated_t,
             &session_id_t,
             pid,
@@ -10935,7 +14142,7 @@ fn start_lead_session(
                 reconcile_running_dispatch_cards(&conn, &session_id_t, &mut msg.blocks);
                 // 决策打扰收敛刀 T4：lead 收尾归约消息同样带身份快照（profile_t/lead_agent_id_t
                 // 此处仍是借用·未被移动，见上方 identity 已声明处的确认注释）。
-                let _ = db::append_message_dedup(
+                let _ = db::append_message_dedup_and_publish(
                     &conn,
                     &session_id_t,
                     "assistant",
@@ -10987,15 +14194,20 @@ fn start_lead_session(
             };
         }
 
+        // M1 修复轮 P0-1（2026-08-11）：释放咽喉——同上，不再预先加锁（旧版本会跟下面
+        // try_autofeed_lead 的重新加锁死锁）。
+        let runtime_db = app_t.state::<crate::db::Db>();
         let _ = emit_terminal_after_releasing_run_slot(
             &running_t,
+            &team_running_t,
             &session_id_t,
             &lead_run_id,
             pending_terminals,
             &transport,
+            Some(runtime_db.inner()),
         );
         // 续喂必须在 run 槽释放之后调用，否则会自撞 SESSION_BUSY 并丢失本次续喂。
-        try_autofeed_lead(app_t.clone(), session_id_t.clone());
+        drain_after_run_release(app_t.clone(), session_id_t.clone());
 
         // drop McpServer last — stops accept loop (Drop impl calls server.unblock())
         drop(mcp_srv);
@@ -13218,6 +16430,9 @@ async fn generate_handoff_doc(
     };
     // 注意：这里没有 native-claude 闸——provider 无关，直接用会话自己的 agent
 
+    let search = resolve_harness_search_creds(&db, &profile, &crate::keychain::KeyringStore)?;
+    let key = resolve_member_key(&profile)?;
+
     let (prompt, truncated) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         continuation::build_handoff_doc_prompt(locale, &conn, &session_id, &files_changed)?
@@ -13237,6 +16452,8 @@ async fn generate_handoff_doc(
             agent::BuildMode::Summarize,
             locale,
             None,
+            key,
+            search,
         )?
     };
 
@@ -13686,56 +16903,100 @@ fn start_continuation_session(
                 Some(message.to_string()),
                 member_ids,
                 None,
+                // 续会话种子：本地生成、非 remote inbox 投递，None 时兜底
+                // user_send_key(&run_id)。
+                None,
             )
         },
         move |child_session_id, agent_id, seed| -> Result<(), String> {
-            let conn = db_for_start_solo.0.lock().map_err(|e| e.to_string())?;
-            ensure_session_not_continued(&conn, child_session_id, locale)?;
+            // P0-2（opus delta 复核·2026-08-11）：`ensure_session_not_continued` 单独占一次短
+            // 锁，在 try_reserve / 建 guard 之前就释放——不跟下面依赖 conn 的读写共用同一把锁，
+            // 避免把锁一路带过 guard 的生命周期。
+            {
+                let conn = db_for_start_solo.0.lock().map_err(|e| e.to_string())?;
+                ensure_session_not_continued(&conn, child_session_id, locale)?;
+            }
             let running_inner = running_for_start_solo.inner().clone();
             try_reserve(&running_inner, child_session_id)?;
+            // P0-2：这里先不挂 `.with_refresh()`——下面 profile 读取及 build_send_plan_with/
+            // append_message/prepare_run_ledger 都要用到 `conn`。原实现在这里就挂上了 refresh
+            // 句柄，若这几步任意一步 `?` 早退，guard 的 Drop 会在 conn 仍持锁的同一线程上重新
+            // `db.0.lock()`，与 P0-1 同款不可重入死锁。refresh 改到下面内层闭包（它自己的局部
+            // 变量 `conn`）确定已经析构之后再挂。
             let mut guard =
                 ReservationGuard::new(running_inner.clone(), child_session_id.to_string());
             clear_session_stop_state(team_running_for_solo.inner(), child_session_id);
             let key_store = KeyringStore;
             let run_id = new_run_id();
-            let plan = build_send_plan(
-                &conn,
-                child_session_id,
-                &run_id,
-                agent_id,
-                seed,
-                None,
-                &[],
-                &key_store,
-                locale,
-            )?;
+            let profile = {
+                let conn = db_for_start_solo.0.lock().map_err(|e| e.to_string())?;
+                db::get_agent(&conn, agent_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| ui_msg::al_err("agent.notFound", &[]))?
+            };
+            let key = resolve_member_key(&profile)?;
+            let search = resolve_harness_search_creds(&db_for_start_solo, &profile, &key_store)?;
+            // 正常路径的 profile/key/search 参数与原来逐位相同；极少数下面重拿锁失败时，key/search
+            // IPC 现在已经发生（此前不会发生），这是本次锁边界重排唯一新增的失败路径副作用顺序。
+            // 剩余依赖 conn 的读写收进这个内层闭包：它一返回，`conn`（闭包自己的局部变量）就
+            // 析构释放锁——不管闭包内部是 Ok 还是提前 `?` 失败，因为调用它的这行代码本身不用
+            // `?`（`prepared` 只是拿到一个 `Result` 值，不触发提前返回），外层 guard 因而绝不
+            // 会在 conn 仍持锁时被这里的早退牵连 drop。
+            let prepared: Result<SendPlan, String> = (|| -> Result<SendPlan, String> {
+                let conn = db_for_start_solo.0.lock().map_err(|e| e.to_string())?;
+                let plan = build_send_plan_with(
+                    &conn,
+                    child_session_id,
+                    &run_id,
+                    profile,
+                    key,
+                    search,
+                    seed,
+                    None,
+                    &[],
+                    locale,
+                )?;
+                // P0-c：dedup 版落库——键用本闭包已有的 run_id（早于此处生成，见上方
+                // `let run_id = new_run_id();`）；conn 全程 autocommit，符合
+                // `append_message_dedup_and_publish` 调用契约（db.rs:3784）。
+                db::append_message_dedup_and_publish(
+                    &conn,
+                    child_session_id,
+                    "user",
+                    &[Block::Text {
+                        text: seed.to_string(),
+                    }],
+                    None,
+                    Some(&plan.agent_id),
+                    Some(&plan.name_snapshot),
+                    &display_reduce::user_send_key(&run_id),
+                )
+                .map_err(|e| e.to_string())?;
+                prepare_run_ledger(&conn, child_session_id, &run_id, &plan.agent_id, &plan.wt)?;
+                Ok(plan)
+            })();
+            // 走到这里，内层闭包已经返回、它的 conn 早就析构了——现在挂 refresh 安全：guard
+            // 后续任何 drop（无论紧接着下面 `prepared?` 早退，还是 spawn_and_stream 之后的正常/
+            // 异常收尾）都不会撞上仍持有的 db 锁。
+            guard = guard.with_refresh(
+                team_running_for_solo.inner().clone(),
+                app_for_start_solo.clone(),
+            );
+            let plan = prepared?;
             let SendPlan {
                 agent_id: aid,
-                name_snapshot,
+                name_snapshot: _name_snapshot,
                 wt,
                 command,
                 parse_fn,
                 profile: _profile,
                 prompt: _prompt,
             } = plan;
-            db::append_message(
-                &conn,
-                child_session_id,
-                "user",
-                &[Block::Text {
-                    text: seed.to_string(),
-                }],
-                None,
-                Some(&aid),
-                Some(&name_snapshot),
-            )
-            .map_err(|e| e.to_string())?;
-            prepare_run_ledger(&conn, child_session_id, &run_id, &aid, &wt)?;
-            drop(conn);
             let parser = parser_for_parse_fn(parse_fn);
             spawn_and_stream(
                 app_for_start_solo,
                 running_inner.clone(),
+                team_running_for_solo.inner().clone(),
                 child_session_id.to_string(),
                 run_id,
                 wt,
@@ -13953,6 +17214,35 @@ pub fn run() {
             let _ = conn.execute("PRAGMA foreign_keys = ON", []);
             db::init_schema(&conn).expect("建表失败");
             tick!("db::init_schema");
+            // M1-T1（remote control M0 §4c）：启动 reconcile——上一轮崩溃/强杀遗留的
+            // session_runtime.running 脏行洗成 idle（此时 Running/TeamRunning 均未 manage，
+            // 无并发运行会话，reconcile 与任何咽喉写入不可能撞车）。
+            if let Err(error) = db::reconcile_session_runtime_on_startup(&conn) {
+                eprintln!("session_runtime 启动 reconcile 失败（忽略·不阻塞启动）：{error}");
+            }
+            tick!("reconcile session_runtime");
+            // T-4b（remote control M0 §3/§4b）：重启重扫——此刻 conn 还是裸连接（Db 尚未 manage），
+            // 先查出待投递会话列表存好；真正触发排空要等下面 app.manage(Db(...))/Running/TeamRunning
+            // 都就绪、拿到 AppHandle 之后（drain_after_run_release 需要 app.state::<Db>() 等托管状态）。
+            let pending_remote_sessions = match db::sessions_with_pending_remote_input(&conn) {
+                Ok(sessions) => sessions,
+                Err(error) => {
+                    eprintln!("remote_inbox 启动重扫查询失败（忽略·不阻塞启动）：{error}");
+                    Vec::new()
+                }
+            };
+            tick!("scan pending remote_inbox sessions");
+            let pending_remote_answer_sessions =
+                match db::sessions_with_pending_remote_answer(&conn) {
+                    Ok(sessions) => sessions,
+                    Err(error) => {
+                        eprintln!(
+                            "remote_inbox pending answer 启动重扫查询失败（忽略·不阻塞启动）：{error}"
+                        );
+                        Vec::new()
+                    }
+                };
+            tick!("scan pending remote_inbox answer sessions");
             if let Err(error) = load_cli_path_override_cache(&conn) {
                 eprintln!("加载 CLI 路径缓存失败；spawn 将直接读取数据库：{error}");
             }
@@ -14014,6 +17304,14 @@ pub fn run() {
                 Err(e) => eprintln!("migrate_null_repo_id_to_local_default 失败（忽略）：{e}"),
             }
             tick!("migrate NULL repo_id");
+            match db::migrate_backfill_dedup_keys(&conn) {
+                Ok(n) if n > 0 => {
+                    eprintln!("migrate: {n} 条存量 user/assistant 消息已回填 dedup_key")
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("migrate_backfill_dedup_keys 失败（忽略）：{e}"),
+            }
+            tick!("backfill message dedup_key");
             match db::migrate_local_default_name(&conn) {
                 Ok(n) if n > 0 => eprintln!("migrate: local-default 已改名为“我的项目”"),
                 Ok(_) => {}
@@ -14103,6 +17401,7 @@ pub fn run() {
                 Err(e) => eprintln!("gc_expired_trash 失败（忽略·不阻塞启动）：{e}"),
             }
             tick!("gc expired trash");
+            initialize_remote_token_book(&conn);
             app.manage(Db(crate::perf_probe::TimedMutex::new(conn)));
             app.manage(Running::default());
             app.manage(HandoffProcesses::default());
@@ -14110,6 +17409,42 @@ pub fn run() {
             app.manage(LeadQuestions::default());
             app.manage(UiLocale::default());
             initialize_event_transport(app.handle());
+            // R2：先建一份 active-room 凭据缓存并 manage 进 Tauri state，再把同一个 Arc 的克隆喂给
+            // `remote_gateway_active_room_resolver`——`remote_set_active_project` 命令与网关闭包
+            // 由此共享同一份缓存，写 setting 成功后命令那边才清得掉网关这边看到的缓存。
+            let active_room_credential_cache: Arc<Mutex<HashSet<String>>> =
+                Arc::new(Mutex::new(HashSet::new()));
+            app.manage(ActiveRoomCredentialCache(Arc::clone(
+                &active_room_credential_cache,
+            )));
+            remote_gateway::setup(
+                remote_gateway_settings_reader(app.handle()),
+                remote_gateway_token_provider(app.handle()),
+                remote_gateway_desktop_credential_provider(),
+                remote_gateway_claim_client(),
+                remote_gateway_active_device_provider(app.handle()),
+                remote_gateway_active_room_resolver(
+                    app.handle(),
+                    Arc::clone(&active_room_credential_cache),
+                ),
+                remote_gateway_k_room_provider(),
+                remote_gateway_session_index_snapshot_provider(app.handle()),
+                remote_gateway_milestone_replay_provider(app.handle()),
+                remote_gateway_pair_hello_handler(),
+                remote_gateway_pair_done_handler(app.handle()),
+                Arc::clone(remote_registry()),
+                remote_gateway_registry_snapshot_provider(app.handle()),
+                remote_gateway_registry_rebase_provider(app.handle()),
+                remote_gateway_registry_high_water_provider(app.handle()),
+                remote_gateway_refresh_handler(app.handle()),
+                remote_gateway_input_send_handler(app.handle()),
+                remote_gateway_input_answer_handler(app.handle()),
+                remote_gateway_control_replay_handler(app.handle()),
+                remote_gateway_control_stop_handler(app.handle()),
+                remote_gateway_session_repo_provider(app.handle()),
+                remote_gateway_session_history_provider(app.handle()),
+            );
+            remote_gateway::install_event_sink(event_transport());
             // 白屏修复兜底：窗口以 visible:false 创建（tauri.conf.json）·正常路径 =
             // 前端 main.tsx 起始处 show；前端加载失败/卡死时 3 秒后强制显示，
             // 保证窗口绝不永久隐身。show 两次无害·is_visible 只为少一次冗余调用。
@@ -14123,6 +17458,27 @@ pub fn run() {
                     }
                 }
             });
+            // T-4b-fix：启动重扫排空挪到白屏兜底注册之后 + 独立线程跑（原实现在 .setup() 主线程
+            // 同步跑，排在白屏兜底注册之前——排空链路可能触碰 keychain 读取，keychain 读取可能弹
+            // 系统授权窗阻塞调用线程，本仓有白屏血案前科，绝不能让它卡住 .setup() 主线程/挡在白屏
+            // 兜底注册之前）。只调 drain_remote_inbox，不调 drain_after_run_release——启动重扫
+            // 不带 autofeed 段，避免有 pending remote input 的会话开机自动拉起 lead run 烧 token。
+            // 启动重扫仍须复用同 session 排空互斥，避免与正常 run-release 排空并发消费同一 FIFO。
+            let drain_app = app.handle().clone();
+            std::thread::spawn(move || {
+                for session_id in pending_remote_sessions {
+                    let Some(_startup_draining_guard) = try_begin_draining(&session_id) else {
+                        // drain_after_run_release 正在排空；本次撞互斥已由 G2 给它置脏位，
+                        // 它会在收尾时原子消费并重放，启动路径无需在此复刻重放逻辑。
+                        continue;
+                    };
+                    drain_remote_inbox(&drain_app, &session_id);
+                }
+                for session_id in pending_remote_answer_sessions {
+                    startup_recover_pending_remote_answers(&drain_app, &session_id);
+                }
+            });
+            tick!("drain pending remote_inbox on startup (spawned)");
             tick!("setup end");
             Ok(())
         })
@@ -14247,6 +17603,15 @@ pub fn run() {
             read_attachment,
             open_attachment_external,
             save_pasted_image,
+            remote_pairing_begin,
+            remote_pairing_cancel,
+            remote_pairing_status,
+            remote_gateway_status,
+            remote_devices_list,
+            remote_device_revoke,
+            remote_control_get_settings,
+            remote_control_set_settings,
+            remote_set_active_project,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -14257,6 +17622,892 @@ mod tests {
     use super::*;
     use crate::agent::{AgentBackend, BorrowClaudeBackend, BuildContext, NativeBackend, ParseFn};
     use crate::keychain::FakeKeyStore;
+    use crate::remote_crypto::{derive_k_pair, generate_x25519_keypair, open, seal, EnvelopeMeta};
+
+    const PAIR_TEST_NOW: u64 = 1_700_000_000;
+    const PAIR_TEST_NOW_MS: u64 = 1_700_000_000_000;
+    const PAIR_TEST_ROOM: &str = "0123456789abcdef0123456789abcdef";
+
+    fn pairing_gateway_hello(
+        session: &remote_pairing::PairingSession,
+        plaintext: &[u8],
+    ) -> remote_gateway::PairHelloFrame {
+        let (remote_secret, remote_public) = generate_x25519_keypair();
+        let remote_k_pair = derive_k_pair(
+            &remote_secret,
+            &session.desktop_public,
+            &session.pairing_token,
+        )
+        .unwrap();
+        let meta = EnvelopeMeta {
+            v: 1,
+            room: session.room_id.clone(),
+            epoch: 0,
+            kind: "control".to_owned(),
+            session: None,
+            command_id: None,
+        };
+        let (token_ct, token_n) = seal(&remote_k_pair, &meta, plaintext);
+        remote_gateway::PairHelloFrame {
+            room: session.room_id.clone(),
+            remote_pub: remote_public,
+            token_ct,
+            token_n,
+            origin_connection_id: "conn-pairing-test".to_owned(),
+        }
+    }
+
+    fn fresh_pairing_slot() -> Mutex<PairingSlot> {
+        let (session, _) = remote_pairing::PairingSession::begin(
+            "wss://relay.example.test",
+            PAIR_TEST_ROOM,
+            PAIR_TEST_NOW,
+        );
+        Mutex::new(PairingSlot::Waiting(session))
+    }
+
+    fn decrypt_pair_accept_tokens(
+        slot: &Mutex<PairingSlot>,
+        accept: &remote_gateway::PairAcceptFrame,
+    ) -> (String, String) {
+        let guard = slot.lock().unwrap();
+        let PairingSlot::SentAccept { outcome, .. } = &*guard else {
+            panic!("pair.accept tokens require a SentAccept slot")
+        };
+        let plaintext = open(
+            &outcome.device_record.k_pair,
+            &remote_pairing::pair_accept_tokens_meta(&accept.room, &accept.device_id),
+            &accept.tokens_ct,
+            &accept.tokens_n,
+        )
+        .expect("pair.accept token body must decrypt under K_pair");
+        let tokens: serde_json::Value =
+            serde_json::from_slice(&plaintext).expect("pair.accept token body must be JSON");
+        (
+            tokens["capability_token"].as_str().unwrap().to_owned(),
+            tokens["refresh_token"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    fn pairing_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn remote_registry_snapshot_filters_room_and_keeps_unexpired_prev_alias() {
+        let conn = pairing_test_db();
+        for (device_id, room_id, token_hash) in [
+            (
+                "11111111-1111-4111-8111-111111111111",
+                "room-current",
+                "aa".repeat(32),
+            ),
+            (
+                "22222222-2222-4222-8222-222222222222",
+                "room-other",
+                "bb".repeat(32),
+            ),
+        ] {
+            db::insert_remote_device(
+                &conn,
+                device_id,
+                Some(room_id),
+                "",
+                &token_hash,
+                &"cc".repeat(32),
+                1_700_003_600_000,
+                1_700_000_000,
+            )
+            .unwrap();
+            let generation = db::next_registry_generation(&conn, room_id).unwrap();
+            db::set_remote_device_registry(
+                &conn,
+                device_id,
+                room_id,
+                generation,
+                1_702_592_000_000,
+            )
+            .unwrap();
+        }
+        db::store_refresh_journal(
+            &conn,
+            "11111111-1111-4111-8111-111111111111",
+            &db::RemoteRefreshJournal {
+                request_id: "request-1".to_owned(),
+                generation: 9,
+                prev_generation: 7,
+                prev_access_hash: "dd".repeat(32),
+                prev_refresh_hash: "ee".repeat(32),
+                response_ct: "ct".to_owned(),
+                response_n: "n".to_owned(),
+                prev_expires_at: 1_700_172_800_000,
+                response_expires: 1_700_003_600_000,
+            },
+        )
+        .unwrap();
+
+        let snapshot =
+            load_remote_registry_snapshot(&conn, "room-current", 1_700_000_000_000).unwrap();
+
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(
+            snapshot.entries[0].subject,
+            "device:11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(snapshot.entries[0].current.token_hash, "aa".repeat(32));
+        assert_eq!(
+            snapshot.entries[0].prev,
+            Some(remote_gateway::TokenSyncPrev {
+                token_hash: "dd".repeat(32),
+                generation: 7,
+                prev_expires: 1_700_172_800_000,
+            })
+        );
+    }
+
+    #[test]
+    fn remote_registry_snapshot_rejects_invalid_token_hash() {
+        let conn = pairing_test_db();
+        let device_id = "11111111-1111-4111-8111-111111111111";
+        db::insert_remote_device(
+            &conn,
+            device_id,
+            Some("room-current"),
+            "",
+            "not-a-sha256-hash",
+            &"bb".repeat(32),
+            1_700_003_600_000,
+            1_700_000_000,
+        )
+        .unwrap();
+        let generation = db::next_registry_generation(&conn, "room-current").unwrap();
+        db::set_remote_device_registry(
+            &conn,
+            device_id,
+            "room-current",
+            generation,
+            1_702_592_000_000,
+        )
+        .unwrap();
+
+        let error =
+            load_remote_registry_snapshot(&conn, "room-current", 1_700_000_000_000).unwrap_err();
+
+        assert!(error.contains(device_id));
+        assert!(error.contains("token_hash_invalid"));
+        assert!(!error.contains("not-a-sha256-hash"));
+    }
+
+    #[test]
+    fn remote_registry_snapshot_rejects_access_after_refresh_until() {
+        let conn = pairing_test_db();
+        let device_id = "11111111-1111-4111-8111-111111111111";
+        db::insert_remote_device(
+            &conn,
+            device_id,
+            Some("room-current"),
+            "",
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            1_702_592_000_001,
+            1_700_000_000,
+        )
+        .unwrap();
+        let generation = db::next_registry_generation(&conn, "room-current").unwrap();
+        db::set_remote_device_registry(
+            &conn,
+            device_id,
+            "room-current",
+            generation,
+            1_702_592_000_000,
+        )
+        .unwrap();
+
+        let error =
+            load_remote_registry_snapshot(&conn, "room-current", 1_700_000_000_000).unwrap_err();
+
+        assert!(error.contains(device_id));
+        assert!(error.contains("access_expires_after_refresh_until"));
+    }
+
+    #[test]
+    fn remote_active_device_filter_does_not_treat_null_room_as_current_room() {
+        let conn = pairing_test_db();
+        db::insert_remote_device(
+            &conn,
+            "legacy-null-room",
+            None,
+            "",
+            "access-hash",
+            "refresh-hash",
+            1_700_003_600_000,
+            1_700_000_000,
+        )
+        .unwrap();
+        let rows = db::list_remote_devices(&conn).unwrap();
+        assert!(!has_active_remote_device_in_room(&rows, "room-current"));
+    }
+
+    #[test]
+    fn remote_registry_rebase_bumps_counter_reassigns_devices_and_preserves_prev_alias() {
+        let conn = pairing_test_db();
+        let room_id = "room-current";
+        let device_id = "11111111-1111-4111-8111-111111111111";
+        db::insert_remote_device(
+            &conn,
+            device_id,
+            Some(room_id),
+            "",
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            1_700_003_600_000,
+            1_700_000_000,
+        )
+        .unwrap();
+        let original_generation = db::next_registry_generation(&conn, room_id).unwrap();
+        db::set_remote_device_registry(
+            &conn,
+            device_id,
+            room_id,
+            original_generation,
+            1_702_592_000_000,
+        )
+        .unwrap();
+        let journal = db::RemoteRefreshJournal {
+            request_id: "request-1".to_owned(),
+            generation: original_generation,
+            prev_generation: 77,
+            prev_access_hash: "cc".repeat(32),
+            prev_refresh_hash: "dd".repeat(32),
+            response_ct: "ct".to_owned(),
+            response_n: "n".to_owned(),
+            prev_expires_at: 1_700_172_800_000,
+            response_expires: 1_700_003_600_000,
+        };
+        db::store_refresh_journal(&conn, device_id, &journal).unwrap();
+
+        let (snapshot, pairing_generation, revoke_generations) =
+            rebase_remote_registry(&conn, room_id, 100, 1_700_000_000_000, true, &[]).unwrap();
+        assert!(
+            revoke_generations.is_empty(),
+            "no revoke subjects were requested"
+        );
+
+        let row = db::list_remote_devices(&conn).unwrap().remove(0);
+        assert_eq!(row.generation, Some(101));
+        assert_eq!(pairing_generation, Some(102));
+        assert_eq!(db::current_registry_revision(&conn, room_id).unwrap(), 103);
+        assert_eq!(snapshot.revision, 103);
+        assert_eq!(snapshot.entries[0].generation, 101);
+        assert_eq!(snapshot.entries[0].prev.as_ref().unwrap().generation, 77);
+        assert_eq!(
+            db::load_refresh_journal(&conn, device_id).unwrap(),
+            Some(journal),
+            "rebase must not rewrite the journal's actual prev alias generation"
+        );
+    }
+
+    #[test]
+    fn remote_registry_rebase_failure_rolls_back_counter_and_all_device_generations() {
+        let conn = pairing_test_db();
+        let room_id = "room-current";
+        for (index, device_id) in [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            db::insert_remote_device(
+                &conn,
+                device_id,
+                Some(room_id),
+                "",
+                &"aa".repeat(32),
+                &"bb".repeat(32),
+                1_700_003_600_000,
+                1_700_000_000 + index as i64,
+            )
+            .unwrap();
+            let generation = db::next_registry_generation(&conn, room_id).unwrap();
+            db::set_remote_device_registry(
+                &conn,
+                device_id,
+                room_id,
+                generation,
+                1_702_592_000_000,
+            )
+            .unwrap();
+        }
+        let rows_before = db::list_remote_devices(&conn).unwrap();
+        let revision_before = db::current_registry_revision(&conn, room_id).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_second_registry_rebase \
+             BEFORE UPDATE OF generation ON remote_devices \
+             WHEN NEW.device_id = '22222222-2222-4222-8222-222222222222' \
+             BEGIN SELECT RAISE(ABORT, 'injected rebase failure'); END;",
+        )
+        .unwrap();
+
+        let error =
+            rebase_remote_registry(&conn, room_id, 100, 1_700_000_000_000, true, &[]).unwrap_err();
+
+        assert!(error.contains("injected rebase failure"));
+        assert_eq!(db::list_remote_devices(&conn).unwrap(), rows_before);
+        assert_eq!(
+            db::current_registry_revision(&conn, room_id).unwrap(),
+            revision_before
+        );
+    }
+
+    /// S1h 2b：rebase 时 revoke subject 的新代号必须跟设备/pairing 的领号共用同一把
+    /// `remote_registry_counter`——避免各自独立合成代号互相撞号（比如都拍 `high_water + 1`）。
+    #[test]
+    fn remote_registry_rebase_allocates_fresh_non_colliding_generations_for_revoke_subjects() {
+        let conn = pairing_test_db();
+        let room_id = "room-current";
+        let device_id = "11111111-1111-4111-8111-111111111111";
+        db::insert_remote_device(
+            &conn,
+            device_id,
+            Some(room_id),
+            "",
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            1_700_003_600_000,
+            1_700_000_000,
+        )
+        .unwrap();
+        let original_generation = db::next_registry_generation(&conn, room_id).unwrap();
+        db::set_remote_device_registry(
+            &conn,
+            device_id,
+            room_id,
+            original_generation,
+            1_702_592_000_000,
+        )
+        .unwrap();
+
+        let revoke_subjects = vec!["device:revoked-a".to_owned(), "device:revoked-b".to_owned()];
+        let (_, pairing_generation, revoke_generations) = rebase_remote_registry(
+            &conn,
+            room_id,
+            100,
+            1_700_000_000_000,
+            true,
+            &revoke_subjects,
+        )
+        .unwrap();
+
+        let row = db::list_remote_devices(&conn).unwrap().remove(0);
+        assert_eq!(row.generation, Some(101), "存活设备照旧最先领号");
+        assert_eq!(pairing_generation, Some(102));
+        assert_eq!(
+            revoke_generations,
+            vec![
+                ("device:revoked-a".to_owned(), 103),
+                ("device:revoked-b".to_owned(), 104),
+            ],
+            "revoke subject 按传入顺序各领一个新代号，且不与设备/pairing 撞号"
+        );
+        assert_eq!(db::current_registry_revision(&conn, room_id).unwrap(), 105);
+    }
+
+    /// S1h 2c 一致性测试：撤销后设备既从快照里省略（S1f2 兜底），又有显式 token.delete 排进
+    /// revoke 通道——双保险互不冲突。S1h R5 返工：原先手工复刻 `remote_device_revoke` 的动作
+    /// 序列（领号→revoke_device→enqueue_token_delete 三步分开手写），没有验到「这三步必须
+    /// 在同一次调用里原子发生」这条真接缝；改成直接打 `remote_device_revoke_inner`（命令层
+    /// 抽出来的可测内核），断言的就是真实撤销路径本身的产物。
+    ///
+    /// M24DR 返工·陷阱测试（审查点名）：原版本靠 `set_app_setting(REMOTE_ROOM_ID_SETTING, ...)`
+    /// 把「legacy 房领号」钉成了「正确行为」——领号改成 active 房之后，这条测试原样保留旧
+    /// fixture 也会全绿（legacy 房照样能领到号），全绿会掩盖没改对。这里改造 fixture：设
+    /// active repo + per-project 房，设备也挂在这间 active 房下；另把一个 legacy 房的计数器
+    /// 抬到明显更高的位置（连领 5 次），断言撤销真正领到的代号必须是「active 房计数器的下一
+    /// 个号」（2：设备自己先占 1），不是「legacy 房计数器的下一个号」（6）——如果代码退回去
+    /// 读 legacy 房，这条数值断言必挂。
+    #[test]
+    fn remote_device_revoke_omits_from_snapshot_and_queues_explicit_delete() {
+        let conn = remote_active_project_test_db();
+        let store = FakeKeyStore::default();
+        let device_id = "revoke-consistency-dev";
+
+        // legacy 房：故意抬得比 active 房快，制造两本计数器可辨识的落差——退回去读 legacy 房
+        // 会领到 6，而不是下面断言的 2。
+        let legacy_room_id = "room-legacy-decoy";
+        db::set_app_setting(&conn, REMOTE_ROOM_ID_SETTING, legacy_room_id).unwrap();
+        for _ in 0..5 {
+            db::next_registry_generation(&conn, legacy_room_id).unwrap();
+        }
+
+        db::set_app_setting(&conn, "remote_control_enabled", "true").unwrap();
+        remote_set_active_project_in_conn(&conn, Some("repo-1")).unwrap();
+        let active_room_id = db::ensure_remote_room_for_project(&conn, "repo-1").unwrap();
+
+        db::insert_remote_device(
+            &conn,
+            device_id,
+            Some(active_room_id.as_str()),
+            "",
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            1_700_003_600_000,
+            1_700_000_000,
+        )
+        .unwrap();
+        let generation = db::next_registry_generation(&conn, &active_room_id).unwrap();
+        assert_eq!(
+            generation, 1,
+            "前置条件：设备自己先占 active 房计数器的第 1 个号"
+        );
+        db::set_remote_device_registry(
+            &conn,
+            device_id,
+            &active_room_id,
+            generation,
+            1_702_592_000_000,
+        )
+        .unwrap();
+        let before =
+            load_remote_registry_snapshot(&conn, &active_room_id, 1_700_000_000_000).unwrap();
+        assert!(
+            before
+                .entries
+                .iter()
+                .any(|entry| entry.subject == format!("device:{device_id}")),
+            "撤销前设备理应出现在快照里"
+        );
+
+        let mut registry = remote_gateway::RegistryState::default();
+        let mut token_book = remote_pairing::TokenBook::new();
+        remote_device_revoke_inner(
+            &conn,
+            &mut registry,
+            &mut token_book,
+            &store,
+            device_id,
+            1_700_001_000,
+        )
+        .unwrap();
+
+        let after =
+            load_remote_registry_snapshot(&conn, &active_room_id, 1_700_000_000_000).unwrap();
+        assert!(
+            !after
+                .entries
+                .iter()
+                .any(|entry| entry.subject == format!("device:{device_id}")),
+            "省略即撤销兜底：撤销后设备不该再出现在快照里"
+        );
+        let outbox = registry.outbox_snapshot_for_test();
+        assert_eq!(
+            outbox.len(),
+            1,
+            "显式 delete 必须入 revoke 通道，跟省略兜底双保险一致"
+        );
+        assert_eq!(outbox[0].frame["t"], "token.delete");
+        assert_eq!(outbox[0].frame["subject"], format!("device:{device_id}"));
+        assert_eq!(outbox[0].frame["close"], true);
+        assert_eq!(
+            outbox[0].generation, 2,
+            "领的必须是 active 房计数器的下一个号，不是被抬到 6 的 legacy 房计数器——退回去读\
+             legacy 房这条断言必挂"
+        );
+        assert!(!outbox[0].acked);
+        assert!(!outbox[0].rejected);
+        assert_eq!(outbox[0].attempts, 0);
+    }
+
+    /// M24DR 返工·项 1 附加分支：active project 解析不到（这里用「未设」代表未设/repo 已删/
+    /// 无房行这三种同归一路的落空场景，见 `resolve_active_pairing_room_id_readonly` doc）时，
+    /// 撤销必须照常在本地生效（DB revoke + TokenBook 失效），但绝不排显式 relay
+    /// `token.delete`——没有房可发。
+    #[test]
+    fn remote_device_revoke_without_active_project_skips_relay_delete_but_still_revokes_locally() {
+        let conn = pairing_test_db();
+        let store = FakeKeyStore::default();
+        let device_id = "revoke-no-active-dev";
+        // 故意不设 remote_active_repo_id / remote_control_enabled——active 解析不到。设备挂在
+        // 一个跟 active 无关的任意 room_id 下（撤销路径不该再关心它是哪个房）。
+        db::insert_remote_device(
+            &conn,
+            device_id,
+            Some("room-irrelevant"),
+            "",
+            &"cc".repeat(32),
+            &"dd".repeat(32),
+            1_700_003_600_000,
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let mut registry = remote_gateway::RegistryState::default();
+        let mut token_book = remote_pairing::TokenBook::new();
+        remote_device_revoke_inner(
+            &conn,
+            &mut registry,
+            &mut token_book,
+            &store,
+            device_id,
+            1_700_001_000,
+        )
+        .unwrap();
+
+        let outbox = registry.outbox_snapshot_for_test();
+        assert!(
+            outbox.is_empty(),
+            "active 解析不到时不该排任何 relay token.delete，实际={outbox:?}"
+        );
+        let device = db::list_remote_devices(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.device_id == device_id)
+            .expect("设备行必须仍然存在");
+        assert!(
+            device.revoked_at.is_some(),
+            "本地 DB 撤销必须照常发生，不能因为 active 解析不到就连本地也不撤"
+        );
+    }
+
+    /// DEVLIST 返工·项 1：active project 已设、该 project 房行也确实存在，但
+    /// `remote_control_enabled` 未启用——这是补的新分支（区别于上面「active 未设」那条），跟
+    /// `remote_pairing_begin` 用的 `resolve_active_pairing_room_id` 判定纪律对齐（enabled 检查
+    /// 前置）。撤销必须照常在本地生效（DB revoke + TokenBook 失效），但不排显式 relay
+    /// `token.delete`——没有房可发；relay 侧靠既有 reconcile 省略机制在下次启用连接时补撤
+    /// （见 `remote_device_revoke_inner` doc）。
+    #[test]
+    fn remote_device_revoke_when_disabled_skips_relay_delete_but_still_revokes_locally() {
+        let conn = remote_active_project_test_db();
+        let store = FakeKeyStore::default();
+        let device_id = "revoke-disabled-dev";
+
+        db::set_app_setting(&conn, "remote_control_enabled", "false").unwrap();
+        remote_set_active_project_in_conn(&conn, Some("repo-1")).unwrap();
+        let active_room_id = db::ensure_remote_room_for_project(&conn, "repo-1").unwrap();
+
+        db::insert_remote_device(
+            &conn,
+            device_id,
+            Some(active_room_id.as_str()),
+            "",
+            &"cc".repeat(32),
+            &"dd".repeat(32),
+            1_700_003_600_000,
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let mut registry = remote_gateway::RegistryState::default();
+        let mut token_book = remote_pairing::TokenBook::new();
+        remote_device_revoke_inner(
+            &conn,
+            &mut registry,
+            &mut token_book,
+            &store,
+            device_id,
+            1_700_001_000,
+        )
+        .unwrap();
+
+        let outbox = registry.outbox_snapshot_for_test();
+        assert!(
+            outbox.is_empty(),
+            "remote 未启用时不该排任何 relay token.delete，即便 active 房行确实存在，实际={outbox:?}"
+        );
+        let device = db::list_remote_devices(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.device_id == device_id)
+            .expect("设备行必须仍然存在");
+        assert!(
+            device.revoked_at.is_some(),
+            "本地 DB 撤销必须照常发生，不能因为 remote 未启用就连本地也不撤"
+        );
+    }
+
+    /// M24D-DEVLIST：设备列表必须只列当前 active 房间的设备——两房各挂一台设备的 fixture，
+    /// active 指向 repo-1，返回结果必须只含 repo-1 房间那台，repo-2 房间那台（哪怕它没被
+    /// 吊销）绝不能出现在列表里。
+    #[test]
+    fn remote_devices_list_filters_to_active_room() {
+        let conn = remote_active_project_test_db();
+        db::set_app_setting(&conn, "remote_control_enabled", "true").unwrap();
+        remote_set_active_project_in_conn(&conn, Some("repo-1")).unwrap();
+
+        let room_one = db::ensure_remote_room_for_project(&conn, "repo-1").unwrap();
+        let room_two = db::ensure_remote_room_for_project(&conn, "repo-2").unwrap();
+        assert_ne!(room_one, room_two, "前置条件：两个 project 各自的房间必须不同");
+
+        db::insert_remote_device(
+            &conn,
+            "device-room-one",
+            Some(&room_one),
+            "Room One Phone",
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            1_700_003_600_000,
+            1_700_000_000,
+        )
+        .unwrap();
+        db::insert_remote_device(
+            &conn,
+            "device-room-two",
+            Some(&room_two),
+            "Room Two Phone",
+            &"cc".repeat(32),
+            &"dd".repeat(32),
+            1_700_003_600_000,
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let devices = remote_devices_list_in_conn(&conn).unwrap();
+        let device_ids: Vec<&str> = devices.iter().map(|d| d.device_id.as_str()).collect();
+        assert_eq!(
+            device_ids,
+            vec!["device-room-one"],
+            "active 房是 repo-1 的房间，跨房（repo-2）设备不该出现在列表里，实际={device_ids:?}"
+        );
+    }
+
+    /// M24D-DEVLIST 附加分支：active project 未设（未设/repo 已删/无房行三种同归一路，见
+    /// `resolve_active_pairing_room_id_readonly` doc）时，设备列表必须返回空——不该把「解析
+    /// 不到当前房」当作「回落展示所有房间的设备」。
+    ///
+    /// DEVLIST 返工·项 1：这里显式把 `remote_control_enabled` 设成 `"true"`，跟下面的
+    /// `remote_devices_list_when_disabled_returns_empty` 拆成两条各自独立断言的分支——此前
+    /// 「未设 remote_active_repo_id」和「未设 remote_control_enabled」两个落空成因耦合在同一
+    /// 条测试里（都靠"故意不设"达成），补了 enabled 检查之后如果两者中任一个分支实现错了，
+    /// 这条耦合测试都测不出来，必须拆开各自钉一个分支。
+    #[test]
+    fn remote_devices_list_without_active_project_returns_empty() {
+        let conn = pairing_test_db();
+        db::set_app_setting(&conn, "remote_control_enabled", "true").unwrap();
+        // 故意不设 remote_active_repo_id——只测「active project 未设」这一条分支，
+        // remote_control_enabled 已显式设为 true，不再耦合「未启用」分支。设备挂在一个跟
+        // active 无关的任意 room_id 下。
+        db::insert_remote_device(
+            &conn,
+            "device-orphan-room",
+            Some("room-irrelevant"),
+            "Orphan Phone",
+            &"ee".repeat(32),
+            &"ff".repeat(32),
+            1_700_003_600_000,
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let devices = remote_devices_list_in_conn(&conn).unwrap();
+        assert!(
+            devices.is_empty(),
+            "active project 未设时必须返回空列表，实际={devices:?}"
+        );
+    }
+
+    /// DEVLIST 返工·项 1：active project 已设、且该 project 已有房行（`ensure_remote_room_
+    /// for_project` 建过），但 `remote_control_enabled` 未启用——这是补的新分支，跟上面
+    /// 「active project 未设」那条测试各自独立断言，不耦合。补 enabled 检查之前，这种场景会
+    /// 穿透到 `remote_room_for_project` 查到真实房间、把该房设备列出来，即使 remote 总开关是
+    /// 关的——跟网关「未启用=未配置」的语义不一致（`resolve_active_pairing_room_id` 那条 ensure
+    /// 变体早就挡了这个场景，readonly 变体此前没挡）。
+    #[test]
+    fn remote_devices_list_when_disabled_returns_empty() {
+        let conn = remote_active_project_test_db();
+        db::set_app_setting(&conn, "remote_control_enabled", "false").unwrap();
+        remote_set_active_project_in_conn(&conn, Some("repo-1")).unwrap();
+        let room_one = db::ensure_remote_room_for_project(&conn, "repo-1").unwrap();
+
+        db::insert_remote_device(
+            &conn,
+            "device-room-one",
+            Some(&room_one),
+            "Room One Phone",
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            1_700_003_600_000,
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let devices = remote_devices_list_in_conn(&conn).unwrap();
+        assert!(
+            devices.is_empty(),
+            "remote 未启用时即便 active 房行确实存在，也必须返回空列表，实际={devices:?}"
+        );
+    }
+
+    /// S1i3 F3：验证 `remote_pairing_cancel_inner`（`remote_pairing_cancel` 命令抽出来的可测
+    /// 内核，同 `remote_device_revoke_inner` 的做法）真的把一轮进行中的配对状态清干净——
+    /// pairing 从 slot 回到 Idle、且撤销意图（`token.delete{subject:"pairing",close:true}`）
+    /// 领到一个严格高于 begin 时那个旧代号的新代号入 revoke 通道。命令层薄壳唯一多做的事
+    /// （`request_registry_publish()` 唤醒连接主循环）无法在纯单测里直接驱动——它读写的是
+    /// `remote_gateway::GATEWAY` 那个进程级 `OnceLock`，只有真实 `remote_gateway::setup()`
+    /// 跑过之后才不是空操作，而 `cargo test` 全程没有任何测试调用过 `setup()`（`State<Db>`
+    /// 也没有可用的测试构造路径）——`remote_device_revoke_inner` 的既有测试同样止步于此，
+    /// 这里保持同一条边界，不假装能测到命令层那一行。
+    ///
+    /// M24DR 返工·陷阱测试（审查点名）：原版本靠 `set_app_setting(REMOTE_ROOM_ID_SETTING, ...)`
+    /// 把「legacy 房领号」钉成了「正确行为」——领号改成 active 房之后必须换 fixture，不然
+    /// 旧断言（只查"代号严格递增"，不查是哪个房的代号）照样能在退回 legacy 房时全绿，掩盖没
+    /// 改对。这里改造成 active repo + per-project 房 fixture，另把一个 legacy 房的计数器抬到
+    /// 明显更高的位置（连领 5 次），断言取消真正领到的代号必须是「active 房计数器的下一个
+    /// 号」（2：begin 先占 1），不是「legacy 房计数器的下一个号」（6）。
+    #[test]
+    fn remote_pairing_cancel_inner_clears_state_and_queues_close_delete() {
+        let conn = remote_active_project_test_db();
+
+        // legacy 房：故意抬得比 active 房快，制造两本计数器可辨识的落差——退回去读 legacy 房
+        // 会领到 6，而不是下面断言的 2。
+        let legacy_room_id = "room-legacy-decoy";
+        db::set_app_setting(&conn, REMOTE_ROOM_ID_SETTING, legacy_room_id).unwrap();
+        for _ in 0..5 {
+            db::next_registry_generation(&conn, legacy_room_id).unwrap();
+        }
+
+        db::set_app_setting(&conn, "remote_control_enabled", "true").unwrap();
+        remote_set_active_project_in_conn(&conn, Some("repo-1")).unwrap();
+        let active_room_id = db::ensure_remote_room_for_project(&conn, "repo-1").unwrap();
+
+        let mut registry = remote_gateway::RegistryState::default();
+        let begin_generation = db::next_registry_generation(&conn, &active_room_id).unwrap();
+        assert_eq!(
+            begin_generation, 1,
+            "前置条件：begin 先占 active 房计数器的第 1 个号"
+        );
+        registry.set_pairing_entry(remote_gateway::TokenSyncEntry {
+            subject: "pairing".to_owned(),
+            generation: begin_generation,
+            scope: "pairing".to_owned(),
+            current: remote_gateway::TokenSyncCurrent {
+                token_hash: "9".repeat(64),
+                access_expires: 1_700_000_060_000,
+                refresh_until: None,
+            },
+            prev: None,
+        });
+        let (session, _qr_payload) = remote_pairing::PairingSession::begin(
+            "wss://relay.example",
+            &active_room_id,
+            1_700_000_000,
+        );
+        let mut slot = PairingSlot::Waiting(session);
+
+        remote_pairing_cancel_inner(&conn, &mut registry, &mut slot).unwrap();
+
+        assert!(
+            matches!(slot, PairingSlot::Idle),
+            "取消后 slot 必须回到 Idle，而不是继续挂在 Waiting"
+        );
+        let outbox = registry.outbox_snapshot_for_test();
+        assert_eq!(
+            outbox.len(),
+            1,
+            "取消一轮进行中的配对必须把 token.delete 排进 revoke 通道"
+        );
+        assert_eq!(outbox[0].frame["t"], "token.delete");
+        assert_eq!(outbox[0].frame["subject"], "pairing");
+        assert_eq!(outbox[0].frame["close"], true);
+        assert_eq!(
+            outbox[0].generation, 2,
+            "领的必须是 active 房计数器的下一个号（begin 已占 1、cancel 领 2），不是被抬到 6\
+             的 legacy 房计数器——退回去读 legacy 房这条断言必挂"
+        );
+        assert!(!outbox[0].acked);
+        assert!(!outbox[0].rejected);
+    }
+
+    /// M24DR 返工·项 1 附加分支：active project 解析不到（这里用「未设」代表未设/repo 已删/
+    /// 无房行这三种同归一路的落空场景，见 `resolve_active_pairing_room_id_readonly` doc）时，
+    /// 取消必须照常把本地配对态清干净（slot 归 Idle、registry 的 pairing entry 清空），但绝
+    /// 不排显式 relay `token.delete`——没有房可发。
+    #[test]
+    fn remote_pairing_cancel_inner_without_active_project_skips_relay_delete_but_clears_local_state(
+    ) {
+        let conn = pairing_test_db();
+        // 故意不设 remote_active_repo_id / remote_control_enabled——active 解析不到。
+        let mut registry = remote_gateway::RegistryState::default();
+        registry.set_pairing_entry(remote_gateway::TokenSyncEntry {
+            subject: "pairing".to_owned(),
+            generation: 1,
+            scope: "pairing".to_owned(),
+            current: remote_gateway::TokenSyncCurrent {
+                token_hash: "9".repeat(64),
+                access_expires: 1_700_000_060_000,
+                refresh_until: None,
+            },
+            prev: None,
+        });
+        let (session, _qr_payload) = remote_pairing::PairingSession::begin(
+            "wss://relay.example",
+            "room-irrelevant-to-cancel",
+            1_700_000_000,
+        );
+        let mut slot = PairingSlot::Waiting(session);
+
+        remote_pairing_cancel_inner(&conn, &mut registry, &mut slot).unwrap();
+
+        assert!(
+            matches!(slot, PairingSlot::Idle),
+            "active 解析不到时，本地配对态照常清理——slot 仍须归 Idle"
+        );
+        let outbox = registry.outbox_snapshot_for_test();
+        assert!(
+            outbox.is_empty(),
+            "active 解析不到时不该排任何 relay token.delete，实际={outbox:?}"
+        );
+    }
+
+    /// S1h R1 返工：验证 `absorb_registry_high_water_and_reissue_revokes` 真的用 DB 权威计数器
+    /// 领号，而不是本地拍一个 `high_water + 1`——领到的代号必须严格大于 `relay_high_water`，
+    /// 且计数器要前移到刚发出的代号之后（下一次领号不会撞上它）。
+    #[test]
+    fn remote_registry_high_water_absorption_mints_revoke_generations_above_the_floor() {
+        let conn = pairing_test_db();
+        let room_id = "room-current";
+        // 撤销时最初领到的代号（1）早于这次重连要吸收的 relay_high_water（100）——复刻 S1h
+        // 证据链②-④描述的「断线撤销、重连后旧代号被拒」场景。
+        let stale_generation = db::next_registry_generation(&conn, room_id).unwrap();
+        assert_eq!(stale_generation, 1);
+
+        let revoke_generations = absorb_registry_high_water_and_reissue_revokes(
+            &conn,
+            room_id,
+            100,
+            &["device:revoked".to_owned()],
+        )
+        .unwrap();
+
+        assert_eq!(revoke_generations.len(), 1);
+        let (subject, generation) = &revoke_generations[0];
+        assert_eq!(subject, "device:revoked");
+        assert!(
+            *generation > 100,
+            "重新领的代号必须严格大于 relay_high_water"
+        );
+        assert!(*generation > stale_generation);
+        assert_eq!(
+            db::current_registry_revision(&conn, room_id).unwrap(),
+            generation + 1,
+            "领号后计数器要前移到刚发出的代号之后，不能被下一次领号撞上"
+        );
+    }
+
+    /// 没有待送达 revoke 时只做计数器吸收本身：返回空列表，不额外领号浪费代号空间。
+    #[test]
+    fn remote_registry_high_water_absorption_without_revoke_subjects_only_bumps_counter() {
+        let conn = pairing_test_db();
+        let room_id = "room-current";
+
+        let revoke_generations =
+            absorb_registry_high_water_and_reissue_revokes(&conn, room_id, 50, &[]).unwrap();
+
+        assert!(revoke_generations.is_empty());
+        assert_eq!(db::current_registry_revision(&conn, room_id).unwrap(), 51);
+    }
 
     #[test]
     fn windows_kill_command_targets_process_tree_forcefully() {
@@ -14426,6 +18677,2221 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn resolve_remote_room_id_generates_once_and_reuses() {
+        let conn = cli_path_test_db();
+
+        let first = resolve_remote_room_id(&conn).unwrap();
+        let second = resolve_remote_room_id(&conn).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 32);
+        assert!(first
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    // ---------------------------------------------------------------------------------
+    // M2-4b：active project setting 读写 + 凭据幂等 ensure
+    // ---------------------------------------------------------------------------------
+
+    /// R3 起，`remote_set_active_project_in_conn` 要求 repo 真的存在于 `repos` 表——
+    /// `pairing_test_db()`（`db::init_schema` 全量建表）本身不会自动 seed 'local' namespace /
+    /// 任何 repo 行（`db.rs` 自己的 `mem()` 测试帮手也要手动补这一步，同一原因：
+    /// `init_schema` 不负责建示例数据），这里补齐 FK 前置条件后插入两个可用的测试 repo。
+    fn remote_active_project_test_db() -> Connection {
+        let conn = pairing_test_db();
+        conn.execute(
+            "INSERT OR IGNORE INTO namespaces (id, kind, name, is_builtin, added_at) \
+             VALUES ('local', 'local', 'Local', 1, 0)",
+            [],
+        )
+        .unwrap();
+        repos_repo::add_repo(
+            &conn,
+            "repo-1",
+            "local",
+            "local",
+            None,
+            "repo-1",
+            "/tmp/m24b-repo-1",
+            None,
+        )
+        .unwrap();
+        repos_repo::add_repo(
+            &conn,
+            "repo-2",
+            "local",
+            "local",
+            None,
+            "repo-2",
+            "/tmp/m24b-repo-2",
+            None,
+        )
+        .unwrap();
+        conn
+    }
+
+    // ---------------------------------------------------------------------------------
+    // M24DR 返工·项 3/5/6：`resolve_active_pairing_room_id`（配对 begin 领号路径）此前零
+    // 覆盖——下面补齐 active 已设/未设/repo 已删/空白/remote 未启用五条分支。
+    // ---------------------------------------------------------------------------------
+
+    /// 项 3①：active 已设时，`resolve_active_pairing_room_id` 解出的房间必须是该 project 的
+    /// per-project 房——跟 `db::ensure_remote_room_for_project` 回读同一个值（不是另生成的
+    /// 随机房），且这个 room_id 就是 `remote_pairing_begin` 会喂进 QR payload 的那个值
+    /// （`PairingSession::begin` 原样把它塞进 `QrPayload::room`，这里直接验证这条传递关系）。
+    #[test]
+    fn resolve_active_pairing_room_id_uses_active_project_per_project_room() {
+        let conn = remote_active_project_test_db();
+        db::set_app_setting(&conn, "remote_control_enabled", "true").unwrap();
+        remote_set_active_project_in_conn(&conn, Some("repo-1")).unwrap();
+
+        let room_id = resolve_active_pairing_room_id(&conn).unwrap();
+
+        let expected_room_id = db::ensure_remote_room_for_project(&conn, "repo-1").unwrap();
+        assert_eq!(
+            room_id, expected_room_id,
+            "配对必须用 active project 的 per-project 房间，跟 ensure_remote_room_for_project \
+             回读同一个值"
+        );
+        let (_session, qr_payload) = remote_pairing::PairingSession::begin(
+            "wss://relay.example.com",
+            &room_id,
+            1_700_000_000,
+        );
+        assert_eq!(
+            qr_payload.room, room_id,
+            "remote_pairing_begin 的 QR payload.room 必须是 resolve_active_pairing_room_id \
+             解出的房间"
+        );
+    }
+
+    /// relay 内置公共中继单：`remote_pairing_begin` 收到空 `relay_url`（前端未填/纯空白）时
+    /// 必须以官方公共中继开始这轮配对会话——`remote_pairing_begin` 本体对 relay_url 唯一做的
+    /// 事就是 `remote_gateway::effective_relay_url(Some(relay_url))` 再喂给
+    /// `PairingSession::begin`，这里原样复刻这两行生产逻辑（同上一个测试"手工重放 QR payload
+    /// 构造流程"的做法一致——命令层吃 `State<Db>` 不便直调）。
+    #[test]
+    fn remote_pairing_begin_falls_back_to_default_relay_when_relay_url_empty() {
+        let relay_url = remote_gateway::effective_relay_url(Some(String::new()))
+            .expect("effective_relay_url always returns Some");
+        let (_session, qr_payload) = remote_pairing::PairingSession::begin(
+            &relay_url,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            1_700_000_000,
+        );
+        assert_eq!(
+            qr_payload.relay_url,
+            remote_gateway::DEFAULT_PUBLIC_RELAY_URL,
+            "relay_url 留空时，配对会话必须以官方公共中继开始"
+        );
+    }
+
+    /// 项 3②：active project 未设时，配对必须拒绝——`AL_ERR:remoteControl.
+    /// pairingNeedsActiveProject` 信封开头，不是静默判"未配置"（用户点了"开始配对"这个显式
+    /// 动作，值得一个看得懂的错误）。
+    #[test]
+    fn resolve_active_pairing_room_id_rejects_when_active_project_unset() {
+        let conn = remote_active_project_test_db();
+        db::set_app_setting(&conn, "remote_control_enabled", "true").unwrap();
+        // 故意不设 REMOTE_ACTIVE_REPO_ID_SETTING。
+
+        let error = resolve_active_pairing_room_id(&conn).unwrap_err();
+
+        assert!(
+            error.starts_with("AL_ERR:remoteControl.pairingNeedsActiveProject"),
+            "active 未设时配对必须拒绝，实际={error}"
+        );
+    }
+
+    /// 项 3③：active 指向的 repo 在 `repos` 表里查无（手改 DB / repo 已被删但 setting 是陈旧
+    /// 值）时必须拒绝——复用 `remoteControl.activeProjectMissing` 错误码，跟
+    /// `remote_set_active_project_in_conn` 的既有场景一致。绕开 `remote_set_active_project_
+    /// in_conn`（它自己会校验存在性、根本写不进去这个值）直接摆 app_setting，模拟"曾经存在、
+    /// 后来被删"的陈旧值。
+    #[test]
+    fn resolve_active_pairing_room_id_rejects_when_active_project_repo_missing() {
+        let conn = remote_active_project_test_db();
+        db::set_app_setting(&conn, "remote_control_enabled", "true").unwrap();
+        db::set_app_setting(&conn, REMOTE_ACTIVE_REPO_ID_SETTING, "repo-does-not-exist").unwrap();
+
+        let error = resolve_active_pairing_room_id(&conn).unwrap_err();
+
+        assert!(
+            error.starts_with("AL_ERR:remoteControl.activeProjectMissing:"),
+            "active 指向的 repo 查无时必须拒绝，实际={error}"
+        );
+    }
+
+    /// 项 6②：纯空白 `remote_active_repo_id`（跟 `remote_control_get_settings_in_conn_treats_
+    /// whitespace_active_repo_id_as_unset` 同一类"手改库留下的陈旧空白值"场景）必须按"未设"
+    /// 处理，配对路径要拒绝——不能被 trim 前的非空字符串长度骗过去当成"已设置"。
+    #[test]
+    fn resolve_active_pairing_room_id_rejects_when_active_project_is_whitespace() {
+        let conn = remote_active_project_test_db();
+        db::set_app_setting(&conn, "remote_control_enabled", "true").unwrap();
+        db::set_app_setting(&conn, REMOTE_ACTIVE_REPO_ID_SETTING, "   ").unwrap();
+
+        let error = resolve_active_pairing_room_id(&conn).unwrap_err();
+
+        assert!(
+            error.starts_with("AL_ERR:remoteControl.pairingNeedsActiveProject"),
+            "纯空白 active repo id 必须按未设处理，配对路径要拒绝，实际={error}"
+        );
+    }
+
+    /// 项 5（审查 nit F6）：remote 未启用时，即使 active project 已设，配对也必须拒绝——跟
+    /// active 未设走同一条错误路径（都还没到"能配对"的地步，没有专门的"remote 未启用"配对
+    /// 错误码）。更关键的是**不能顺手建房**：`db::remote_room_for_project` 之后必须仍然查无
+    /// 这个 project 的房间——不然每次用户手滑点"开始配对"却没先启用 remote，都会白白在
+    /// `project_remote_rooms` 里烧一行 + 在 `remote_registry_counter` 里烧一个 generation，
+    /// 这行房从此再也用不上（跟同 commit `current_config_does_not_ensure_active_room_when_
+    /// remote_control_disabled` 是同一条纪律，配对路径此前漏了）。
+    #[test]
+    fn resolve_active_pairing_room_id_rejects_and_does_not_create_room_when_remote_control_disabled(
+    ) {
+        let conn = remote_active_project_test_db();
+        remote_set_active_project_in_conn(&conn, Some("repo-1")).unwrap();
+        // remote_control_enabled 故意不设（等价 "false"）。
+
+        let error = resolve_active_pairing_room_id(&conn).unwrap_err();
+
+        assert!(
+            error.starts_with("AL_ERR:remoteControl.pairingNeedsActiveProject"),
+            "remote 未启用时必须走跟 active 未设一样的拒绝路径，实际={error}"
+        );
+        assert_eq!(
+            db::remote_room_for_project(&conn, "repo-1").unwrap(),
+            None,
+            "remote 未启用时绝不能顺手建房——同 commit 的『未启用不白白建房』纪律，配对路径也\
+             要遵守"
+        );
+    }
+
+    #[test]
+    fn remote_set_active_project_in_conn_write_read_roundtrip_and_clear() {
+        let conn = remote_active_project_test_db();
+
+        remote_set_active_project_in_conn(&conn, Some("repo-1")).unwrap();
+        assert_eq!(
+            db::get_app_setting(&conn, REMOTE_ACTIVE_REPO_ID_SETTING).unwrap(),
+            Some("repo-1".to_owned())
+        );
+
+        // None = 清除（DELETE，不留空字符串行）。
+        remote_set_active_project_in_conn(&conn, None).unwrap();
+        assert_eq!(
+            db::get_app_setting(&conn, REMOTE_ACTIVE_REPO_ID_SETTING).unwrap(),
+            None,
+            "None 必须清除该 app_setting 行，而不是写空字符串"
+        );
+
+        // 空白字符串同样按"清除"处理（对齐 `set_cli_path_in_conn` 的 trim+filter 惯例）。
+        remote_set_active_project_in_conn(&conn, Some("repo-2")).unwrap();
+        remote_set_active_project_in_conn(&conn, Some("   ")).unwrap();
+        assert_eq!(
+            db::get_app_setting(&conn, REMOTE_ACTIVE_REPO_ID_SETTING).unwrap(),
+            None,
+            "空白字符串按清除处理"
+        );
+    }
+
+    /// R3/R7③：垃圾 repo id（`repos` 表里查无）必须整体拒写——命令返回 `Err`，且
+    /// `remote_active_repo_id` 这个 app_setting 一行都不写。M2-4d：错误必须走
+    /// `ui_msg::al_err` 信封（不是普通 `format!` 字符串），前端才拿得到 zh/en 文案。
+    #[test]
+    fn remote_set_active_project_in_conn_rejects_repo_id_that_does_not_exist() {
+        let conn = remote_active_project_test_db();
+
+        let result = remote_set_active_project_in_conn(&conn, Some("repo-does-not-exist"));
+
+        let error = result.unwrap_err();
+        assert!(
+            error.starts_with("AL_ERR:remoteControl.activeProjectMissing:"),
+            "校验失败必须返回 al_err 信封，实际={error}"
+        );
+        assert!(
+            error.contains("repo-does-not-exist"),
+            "al_err 信封必须带上 repoId 参数，实际={error}"
+        );
+        assert_eq!(
+            db::get_app_setting(&conn, REMOTE_ACTIVE_REPO_ID_SETTING).unwrap(),
+            None,
+            "校验失败必须整体不落库，不能先写 setting 再报错"
+        );
+    }
+
+    /// M2-4a doc 约束①·M2-4b 任务 3：凭据幂等——已有不重建、丢失重建。直接窥探钥匙串里的
+    /// 原始 key（不经过 `resolve_desktop_credential`，那个函数本身也是"查无则建"语义，用它
+    /// 来验证会失去"ensure 之前真的还没有凭据"这个前置条件的证明力）。
+    #[test]
+    fn remote_ensure_desktop_credential_for_room_creates_when_missing_and_is_idempotent_when_present(
+    ) {
+        let store = FakeKeyStore::default();
+        let room_id = "0123456789abcdef0123456789abcdef";
+        // key 格式字面量故意跟 remote_pairing::store 里的私有 `desktop_credential_key_id`
+        // 重复（同 `remote_gateway_k_room_provider` 附近注释对 `k_room_key_id` 的既有先例）——
+        // 只是为了在测试里直接窥探钥匙串到底有没有这一条，不经过任何"顺带创建"的 ensure 语义。
+        let raw_key_id = format!("remote-desktop-credential-{room_id}");
+
+        assert_eq!(
+            store.get(&raw_key_id).unwrap(),
+            None,
+            "前置条件：钥匙串里还没有这个房间的凭据"
+        );
+
+        ensure_desktop_credential_for_room(&store, room_id).unwrap();
+        let created = store
+            .get(&raw_key_id)
+            .unwrap()
+            .expect("ensure 必须在缺失时新建凭据");
+        assert_eq!(created.len(), 64, "凭据必须是 256-bit → 64 位 hex");
+
+        // 再 ensure 一次：已有凭据必须原样保留，不重建。
+        ensure_desktop_credential_for_room(&store, room_id).unwrap();
+        let after_second_ensure = store.get(&raw_key_id).unwrap().unwrap();
+        assert_eq!(
+            after_second_ensure, created,
+            "已有凭据时 ensure 不得重建，credential 必须原样保留"
+        );
+    }
+
+    /// R7④ 用的哨兵：包一层 `FakeKeyStore`，数 `.get()` 被调用了几次——
+    /// `ensure_desktop_credential_for_room`/`resolve_desktop_credential` 的"已有则返回"分支
+    /// 必经 `.get()`，缓存命中时这个数字不该再涨；缓存被清后再 ensure 一次，数字必须涨。
+    #[derive(Default)]
+    struct CountingKeyStore {
+        inner: FakeKeyStore,
+        get_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl KeyStore for CountingKeyStore {
+        fn set(&self, id: &str, key: &str) -> Result<(), String> {
+            self.inner.set(id, key)
+        }
+        fn get(&self, id: &str) -> Result<Option<String>, String> {
+            self.get_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get(id)
+        }
+        fn delete(&self, id: &str) -> Result<(), String> {
+            self.inner.delete(id)
+        }
+    }
+
+    /// R2/R7④：`ensure_desktop_credential_for_room_cached` 缓存命中期间不得重复摸钥匙串；
+    /// 缓存被清空（模拟 `remote_set_active_project` 写入成功后的清空动作）后，下一次 ensure
+    /// 必须重新真的摸一次钥匙串——不能继续信任一个可能已经过期的"已确认过"标记。
+    #[test]
+    fn remote_ensure_desktop_credential_for_room_cached_reconfirms_after_cache_cleared() {
+        let store = CountingKeyStore::default();
+        let credential_ensured: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+        let room_id = "0123456789abcdef0123456789abcdef";
+
+        ensure_desktop_credential_for_room_cached(&store, &credential_ensured, room_id).unwrap();
+        let calls_after_first = store.get_calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(calls_after_first >= 1, "首次 ensure 必须真的摸一次钥匙串");
+
+        ensure_desktop_credential_for_room_cached(&store, &credential_ensured, room_id).unwrap();
+        assert_eq!(
+            store.get_calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_after_first,
+            "缓存命中期间重复 ensure 不得再碰钥匙串"
+        );
+
+        // R2：清缓存——模拟 remote_set_active_project 写入成功后的清空动作。
+        credential_ensured.lock().unwrap().clear();
+
+        ensure_desktop_credential_for_room_cached(&store, &credential_ensured, room_id).unwrap();
+        assert!(
+            store.get_calls.load(std::sync::atomic::Ordering::SeqCst) > calls_after_first,
+            "缓存被清空后，下一次 ensure 必须重新摸一次钥匙串确认凭据仍在"
+        );
+    }
+
+    #[test]
+    fn compute_pairing_status_idle_by_default() {
+        let mut slot = PairingSlot::Idle;
+        assert_eq!(
+            compute_pairing_status(&mut slot, 1_700_000_000),
+            RemotePairingStatus::Idle
+        );
+    }
+
+    #[test]
+    fn gateway_status_ipc_view_maps_memory_status() {
+        let counters = remote_gateway::GatewayCounters {
+            frames_seen: 1,
+            frames_sent: 2,
+            keepalive_pings_sent: 19,
+            bad_frames: 3,
+            upstream_dropped: 4,
+            upstream_stale_generation_dropped: 5,
+            upstream_budget_dropped: 6,
+            milestone_dropped: 7,
+            session_index_snapshot_unavailable: 8,
+            snapshot_worker_spawn_count: 9,
+            tool_correlation_dropped: 10,
+            classify_skipped: 11,
+            connection_failures: 12,
+            panics: 13,
+            disconnect_config_stale: 20,
+            disconnect_closed_by_peer: 21,
+            disconnect_error: 22,
+            last_disconnect_reason: "read failed: redacted diagnostic".to_owned(),
+            upstream_repo_filtered: 14,
+            partial_snapshot_capacity_dropped: 15,
+            snapshot_oversized_dropped: 16,
+            history_oversized_dropped: 17,
+            replay_oversized_dropped: 18,
+        };
+        let memory_status = remote_gateway::GatewayStatus {
+            state: remote_gateway::GatewayState::Disabled,
+            last_error: Some("redacted diagnostic".to_owned()),
+            stopped_reason: Some("room_tombstoned".to_owned()),
+            counters: counters.clone(),
+        };
+
+        let ipc_status = remote_gateway_status_view(memory_status);
+        assert_eq!(
+            ipc_status,
+            RemoteGatewayStatus {
+                running: false,
+                stopped_reason: Some("room_tombstoned".to_owned()),
+                last_error: Some("redacted diagnostic".to_owned()),
+                counters: counters.clone(),
+            }
+        );
+        let serialized = serde_json::to_value(&ipc_status).unwrap();
+        assert!(serialized["counters"].is_object());
+        assert_eq!(serialized["counters"]["frames_seen"], 1);
+        assert_eq!(serialized["counters"]["replay_oversized_dropped"], 18);
+        assert_eq!(serialized["last_error"], "redacted diagnostic");
+
+        let memory_status = remote_gateway::status();
+        assert_eq!(
+            remote_gateway_status(),
+            remote_gateway_status_view(memory_status)
+        );
+    }
+
+    #[test]
+    fn compute_pairing_status_reports_waiting_before_expiry() {
+        let (session, _) = remote_pairing::PairingSession::begin(
+            "wss://relay.example.test",
+            "room-x",
+            1_700_000_000,
+        );
+        let expires_at = session.expires_at_secs;
+        let mut slot = PairingSlot::Waiting(session);
+
+        assert_eq!(
+            compute_pairing_status(&mut slot, 1_700_000_000),
+            RemotePairingStatus::WaitingForHello { expires_at }
+        );
+    }
+
+    #[test]
+    fn compute_pairing_status_auto_expires_waiting_to_idle() {
+        let (session, _) = remote_pairing::PairingSession::begin(
+            "wss://relay.example.test",
+            "room-x",
+            1_700_000_000,
+        );
+        let expires_at = session.expires_at_secs;
+        let mut slot = PairingSlot::Waiting(session);
+
+        let status = compute_pairing_status(&mut slot, expires_at);
+
+        assert_eq!(status, RemotePairingStatus::Idle);
+        assert!(
+            matches!(slot, PairingSlot::Idle),
+            "过期的等待态必须把槽本身也降级为 Idle"
+        );
+    }
+
+    #[test]
+    fn pairing_gateway_rejects_bad_token_without_accept_or_device_persistence() {
+        let conn = pairing_test_db();
+        let key_store = FakeKeyStore::default();
+        let slot = fresh_pairing_slot();
+        let hello = {
+            let guard = slot.lock().unwrap();
+            let PairingSlot::Waiting(session) = &*guard else {
+                unreachable!()
+            };
+            pairing_gateway_hello(session, b"wrong-token")
+        };
+
+        let result = process_pair_hello(&slot, &key_store, hello, PAIR_TEST_NOW);
+
+        assert!(result.is_err(), "bad token must not produce pair.accept");
+        assert!(matches!(*slot.lock().unwrap(), PairingSlot::Waiting(_)));
+        assert!(db::list_remote_devices(&conn).unwrap().is_empty());
+        assert!(key_store
+            .get(&format!("remote-kroom-{PAIR_TEST_ROOM}"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn pairing_gateway_rejects_expired_hello_without_side_effects() {
+        let conn = pairing_test_db();
+        let key_store = FakeKeyStore::default();
+        let slot = fresh_pairing_slot();
+        let (hello, expired_now) = {
+            let guard = slot.lock().unwrap();
+            let PairingSlot::Waiting(session) = &*guard else {
+                unreachable!()
+            };
+            (
+                pairing_gateway_hello(session, session.pairing_token.as_bytes()),
+                session.expires_at_secs + 1,
+            )
+        };
+
+        let result = process_pair_hello(&slot, &key_store, hello, expired_now);
+
+        assert!(
+            result.is_err(),
+            "expired hello must not produce pair.accept"
+        );
+        assert!(matches!(*slot.lock().unwrap(), PairingSlot::Waiting(_)));
+        assert!(db::list_remote_devices(&conn).unwrap().is_empty());
+        assert!(key_store
+            .get(&format!("remote-kroom-{PAIR_TEST_ROOM}"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn pairing_gateway_rejects_non_contributory_hello_without_side_effects() {
+        let conn = pairing_test_db();
+        let key_store = FakeKeyStore::default();
+        let slot = fresh_pairing_slot();
+        let hello = remote_gateway::PairHelloFrame {
+            room: PAIR_TEST_ROOM.to_owned(),
+            remote_pub: [0_u8; 32],
+            token_ct: "not-base64".to_owned(),
+            token_n: "also-not-base64".to_owned(),
+            origin_connection_id: "conn-pairing-test".to_owned(),
+        };
+
+        let result = process_pair_hello(&slot, &key_store, hello, PAIR_TEST_NOW);
+
+        assert!(
+            result.is_err(),
+            "non-contributory hello must not produce pair.accept"
+        );
+        assert!(matches!(*slot.lock().unwrap(), PairingSlot::Waiting(_)));
+        assert!(db::list_remote_devices(&conn).unwrap().is_empty());
+        assert!(key_store
+            .get(&format!("remote-kroom-{PAIR_TEST_ROOM}"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn process_pair_hello_ignores_hello_when_slot_is_idle() {
+        let key_store = FakeKeyStore::default();
+        let slot = fresh_pairing_slot();
+        let hello = {
+            let guard = slot.lock().unwrap();
+            let PairingSlot::Waiting(session) = &*guard else {
+                unreachable!()
+            };
+            pairing_gateway_hello(session, session.pairing_token.as_bytes())
+        };
+        *slot.lock().unwrap() = PairingSlot::Idle;
+
+        let result = process_pair_hello(&slot, &key_store, hello, PAIR_TEST_NOW).unwrap();
+
+        assert!(result.is_none());
+        assert!(matches!(*slot.lock().unwrap(), PairingSlot::Idle));
+    }
+
+    #[test]
+    fn process_pair_hello_ignores_hello_when_slot_is_done() {
+        let key_store = FakeKeyStore::default();
+        let slot = fresh_pairing_slot();
+        let hello = {
+            let guard = slot.lock().unwrap();
+            let PairingSlot::Waiting(session) = &*guard else {
+                unreachable!()
+            };
+            pairing_gateway_hello(session, session.pairing_token.as_bytes())
+        };
+        let completed_device_id = "already-paired-device".to_owned();
+        *slot.lock().unwrap() = PairingSlot::Done {
+            room_id: PAIR_TEST_ROOM.to_owned(),
+            device_id: completed_device_id.clone(),
+            completed_at_secs: PAIR_TEST_NOW,
+        };
+
+        let result = process_pair_hello(&slot, &key_store, hello, PAIR_TEST_NOW).unwrap();
+
+        assert!(result.is_none());
+        assert!(matches!(
+            &*slot.lock().unwrap(),
+            PairingSlot::Done { device_id, .. } if device_id == &completed_device_id
+        ));
+    }
+
+    #[test]
+    fn process_pair_hello_ignores_second_hello_while_waiting_for_done() {
+        let key_store = FakeKeyStore::default();
+        let slot = fresh_pairing_slot();
+        let first_hello = {
+            let guard = slot.lock().unwrap();
+            let PairingSlot::Waiting(session) = &*guard else {
+                unreachable!()
+            };
+            pairing_gateway_hello(session, session.pairing_token.as_bytes())
+        };
+        let first_accept = process_pair_hello(&slot, &key_store, first_hello, PAIR_TEST_NOW)
+            .unwrap()
+            .expect("first hello should produce pair.accept");
+        let (capability_token, refresh_token) = decrypt_pair_accept_tokens(&slot, &first_accept);
+        let (second_session, _) = remote_pairing::PairingSession::begin(
+            "wss://relay.example.test",
+            PAIR_TEST_ROOM,
+            PAIR_TEST_NOW + 1,
+        );
+        let second_hello =
+            pairing_gateway_hello(&second_session, second_session.pairing_token.as_bytes());
+
+        let result =
+            process_pair_hello(&slot, &key_store, second_hello, PAIR_TEST_NOW + 1).unwrap();
+
+        assert!(result.is_none());
+        let guard = slot.lock().unwrap();
+        let PairingSlot::SentAccept {
+            outcome,
+            room_id,
+            sent_at_secs,
+            ..
+        } = &*guard
+        else {
+            panic!("second hello must leave the original SentAccept in place")
+        };
+        assert_eq!(outcome.device_record.device_id, first_accept.device_id);
+        assert_eq!(outcome.k_room_wrapped_ct, first_accept.k_room_ct);
+        assert_eq!(outcome.k_room_wrapped_n, first_accept.k_room_n);
+        assert_eq!(outcome.capability_token, capability_token);
+        assert_eq!(outcome.refresh_token, refresh_token);
+        assert_eq!(room_id, &first_accept.room);
+        assert_eq!(*sent_at_secs, PAIR_TEST_NOW);
+    }
+
+    #[test]
+    fn process_pair_done_ignores_done_when_slot_is_idle_without_side_effects() {
+        let conn = pairing_test_db();
+        let key_store = FakeKeyStore::default();
+        let token_book = Mutex::new(remote_pairing::TokenBook::new());
+        let slot = Mutex::new(PairingSlot::Idle);
+        let device_id = "unexpected-device";
+
+        let result = process_pair_done(
+            &slot,
+            &conn,
+            &key_store,
+            &token_book,
+            remote_gateway::PairDoneFrame {
+                room: PAIR_TEST_ROOM.to_owned(),
+                device_id: device_id.to_owned(),
+                ..Default::default()
+            },
+            PAIR_TEST_NOW,
+            PAIR_TEST_NOW_MS,
+        )
+        .unwrap();
+
+        assert!(result.is_none());
+        assert!(matches!(*slot.lock().unwrap(), PairingSlot::Idle));
+        assert!(db::list_remote_devices(&conn).unwrap().is_empty());
+        assert_eq!(
+            token_book
+                .lock()
+                .unwrap()
+                .verify_access(device_id, "unused-token", PAIR_TEST_NOW_MS),
+            Err(remote_pairing::PairingError::NotFound)
+        );
+    }
+
+    #[test]
+    fn process_pair_done_ignores_done_when_slot_is_waiting_without_side_effects() {
+        let conn = pairing_test_db();
+        let key_store = FakeKeyStore::default();
+        let token_book = Mutex::new(remote_pairing::TokenBook::new());
+        let slot = fresh_pairing_slot();
+        let original_token = {
+            let guard = slot.lock().unwrap();
+            let PairingSlot::Waiting(session) = &*guard else {
+                unreachable!()
+            };
+            session.pairing_token.clone()
+        };
+        let device_id = "unexpected-device";
+
+        let result = process_pair_done(
+            &slot,
+            &conn,
+            &key_store,
+            &token_book,
+            remote_gateway::PairDoneFrame {
+                room: PAIR_TEST_ROOM.to_owned(),
+                device_id: device_id.to_owned(),
+                ..Default::default()
+            },
+            PAIR_TEST_NOW,
+            PAIR_TEST_NOW_MS,
+        )
+        .unwrap();
+
+        assert!(result.is_none());
+        assert!(matches!(
+            &*slot.lock().unwrap(),
+            PairingSlot::Waiting(session) if session.pairing_token == original_token
+        ));
+        assert!(db::list_remote_devices(&conn).unwrap().is_empty());
+        assert_eq!(
+            token_book
+                .lock()
+                .unwrap()
+                .verify_access(device_id, "unused-token", PAIR_TEST_NOW_MS),
+            Err(remote_pairing::PairingError::NotFound)
+        );
+    }
+
+    #[test]
+    fn process_pair_done_ignores_mismatched_done_without_side_effects() {
+        let conn = pairing_test_db();
+        let key_store = FakeKeyStore::default();
+        let token_book = Mutex::new(remote_pairing::TokenBook::new());
+        let slot = fresh_pairing_slot();
+        let hello = {
+            let guard = slot.lock().unwrap();
+            let PairingSlot::Waiting(session) = &*guard else {
+                unreachable!()
+            };
+            pairing_gateway_hello(session, session.pairing_token.as_bytes())
+        };
+        let accept = process_pair_hello(&slot, &key_store, hello, PAIR_TEST_NOW)
+            .unwrap()
+            .expect("valid hello should produce pair.accept");
+        let (capability_token, refresh_token) = decrypt_pair_accept_tokens(&slot, &accept);
+        let mismatched_device_id = "different-device";
+
+        let result = process_pair_done(
+            &slot,
+            &conn,
+            &key_store,
+            &token_book,
+            remote_gateway::PairDoneFrame {
+                room: accept.room.clone(),
+                device_id: mismatched_device_id.to_owned(),
+                ..Default::default()
+            },
+            PAIR_TEST_NOW + 1,
+            PAIR_TEST_NOW_MS + 1_000,
+        )
+        .unwrap();
+
+        assert!(result.is_none());
+        assert!(db::list_remote_devices(&conn).unwrap().is_empty());
+        assert_eq!(
+            token_book.lock().unwrap().verify_access(
+                &accept.device_id,
+                &capability_token,
+                PAIR_TEST_NOW_MS + 1_000,
+            ),
+            Err(remote_pairing::PairingError::NotFound)
+        );
+        assert_eq!(
+            token_book.lock().unwrap().verify_access(
+                mismatched_device_id,
+                &capability_token,
+                PAIR_TEST_NOW_MS + 1_000,
+            ),
+            Err(remote_pairing::PairingError::NotFound)
+        );
+        let guard = slot.lock().unwrap();
+        let PairingSlot::SentAccept {
+            outcome,
+            room_id,
+            sent_at_secs,
+            ..
+        } = &*guard
+        else {
+            panic!("mismatched done must leave SentAccept in place")
+        };
+        assert_eq!(outcome.device_record.device_id, accept.device_id);
+        assert_eq!(outcome.k_room_wrapped_ct, accept.k_room_ct);
+        assert_eq!(outcome.k_room_wrapped_n, accept.k_room_n);
+        assert_eq!(outcome.capability_token, capability_token);
+        assert_eq!(outcome.refresh_token, refresh_token);
+        assert_eq!(room_id, &accept.room);
+        assert_eq!(*sent_at_secs, PAIR_TEST_NOW);
+    }
+
+    #[test]
+    fn pairing_gateway_persists_and_authorizes_only_after_done() {
+        let conn = pairing_test_db();
+        let key_store = FakeKeyStore::default();
+        let token_book = Mutex::new(remote_pairing::TokenBook::new());
+        let slot = fresh_pairing_slot();
+        let hello = {
+            let guard = slot.lock().unwrap();
+            let PairingSlot::Waiting(session) = &*guard else {
+                unreachable!()
+            };
+            pairing_gateway_hello(session, session.pairing_token.as_bytes())
+        };
+
+        let accept = process_pair_hello(&slot, &key_store, hello, PAIR_TEST_NOW)
+            .unwrap()
+            .expect("valid hello should produce pair.accept");
+        let (capability_token, _) = decrypt_pair_accept_tokens(&slot, &accept);
+        assert!(matches!(
+            *slot.lock().unwrap(),
+            PairingSlot::SentAccept { .. }
+        ));
+        assert!(db::list_remote_devices(&conn).unwrap().is_empty());
+        assert_eq!(
+            token_book.lock().unwrap().verify_access(
+                &accept.device_id,
+                &capability_token,
+                PAIR_TEST_NOW_MS,
+            ),
+            Err(remote_pairing::PairingError::NotFound)
+        );
+        let k_room = remote_pairing::store::resolve_k_room(&key_store, PAIR_TEST_ROOM).unwrap();
+        let (confirm_ct, confirm_n) =
+            remote_pairing::seal_pair_done_confirm(&k_room, &accept.room, &accept.device_id);
+
+        let completed = process_pair_done(
+            &slot,
+            &conn,
+            &key_store,
+            &token_book,
+            remote_gateway::PairDoneFrame {
+                room: accept.room.clone(),
+                device_id: accept.device_id.clone(),
+                confirm_ct: Some(confirm_ct),
+                confirm_n: Some(confirm_n),
+                origin_connection_id: "conn-pairing-test".to_owned(),
+            },
+            PAIR_TEST_NOW + 1,
+            PAIR_TEST_NOW_MS + 1_000,
+        )
+        .unwrap();
+
+        assert_eq!(completed.as_deref(), Some(accept.device_id.as_str()));
+        let devices = db::list_remote_devices(&conn).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].device_id, accept.device_id);
+        assert_eq!(
+            token_book.lock().unwrap().verify_access(
+                &accept.device_id,
+                &capability_token,
+                PAIR_TEST_NOW_MS + 1_000,
+            ),
+            Ok(())
+        );
+        assert!(matches!(
+            &*slot.lock().unwrap(),
+            PairingSlot::Done { device_id, .. } if device_id == &accept.device_id
+        ));
+    }
+
+    #[test]
+    fn remote_pair_done_waits_for_token_ack_then_replays_ready_idempotently() {
+        let conn = pairing_test_db();
+        let key_store = FakeKeyStore::default();
+        let token_book = Mutex::new(remote_pairing::TokenBook::new());
+        let slot = fresh_pairing_slot();
+        let hello = {
+            let guard = slot.lock().unwrap();
+            let PairingSlot::Waiting(session) = &*guard else {
+                unreachable!()
+            };
+            pairing_gateway_hello(session, session.pairing_token.as_bytes())
+        };
+        let accept = process_pair_hello(&slot, &key_store, hello, PAIR_TEST_NOW)
+            .unwrap()
+            .expect("valid hello should produce pair.accept");
+        let k_room = remote_pairing::store::resolve_k_room(&key_store, PAIR_TEST_ROOM).unwrap();
+        let (confirm_ct, confirm_n) =
+            remote_pairing::seal_pair_done_confirm(&k_room, &accept.room, &accept.device_id);
+        let done = remote_gateway::PairDoneFrame {
+            room: accept.room.clone(),
+            device_id: accept.device_id.clone(),
+            confirm_ct: Some(confirm_ct),
+            confirm_n: Some(confirm_n),
+            origin_connection_id: "conn-pairing-test".to_owned(),
+        };
+        let mut registry = remote_gateway::RegistryState::default();
+
+        let first = process_pair_done_with_registry(
+            &slot,
+            &mut registry,
+            &conn,
+            &key_store,
+            &token_book,
+            done.clone(),
+            PAIR_TEST_NOW + 1,
+            PAIR_TEST_NOW_MS + 1_000,
+        )
+        .unwrap();
+        assert!(matches!(
+            first,
+            remote_gateway::PairDoneAction::Accepted {
+                newly_paired_device_id: Some(_)
+            }
+        ));
+        let row = db::list_remote_devices(&conn).unwrap().remove(0);
+        let generation = row
+            .generation
+            .expect("done must persist a registry generation");
+        let revision_after_first_done =
+            db::current_registry_revision(&conn, PAIR_TEST_ROOM).unwrap();
+        assert_eq!(
+            row.refresh_until,
+            Some((PAIR_TEST_NOW_MS + 1_000 + 2_592_000_000) as i64)
+        );
+        let subject = format!("device:{}", accept.device_id);
+        assert_eq!(
+            registry.consume_token_ack(&subject, generation, "rejected"),
+            remote_gateway::TokenAckAction::Rejected
+        );
+        assert!(matches!(
+            process_pair_done_with_registry(
+                &slot,
+                &mut registry,
+                &conn,
+                &key_store,
+                &token_book,
+                done.clone(),
+                PAIR_TEST_NOW + 2,
+                PAIR_TEST_NOW_MS + 2_000,
+            )
+            .unwrap(),
+            remote_gateway::PairDoneAction::Accepted {
+                newly_paired_device_id: None
+            }
+        ));
+        let rows_after_replay = db::list_remote_devices(&conn).unwrap();
+        assert_eq!(rows_after_replay.len(), 1);
+        assert_eq!(rows_after_replay[0].generation, Some(generation));
+        assert_eq!(
+            db::current_registry_revision(&conn, PAIR_TEST_ROOM).unwrap(),
+            revision_after_first_done,
+            "done replay must not claim a new registry generation"
+        );
+
+        assert!(matches!(
+            registry.consume_token_ack(&subject, generation, "ok"),
+            remote_gateway::TokenAckAction::PairReady(_)
+        ));
+        let mut replay_done = done;
+        replay_done.origin_connection_id = "conn-pairing-reconnected".to_owned();
+        let replay = process_pair_done_with_registry(
+            &slot,
+            &mut registry,
+            &conn,
+            &key_store,
+            &token_book,
+            replay_done,
+            PAIR_TEST_NOW + 3,
+            PAIR_TEST_NOW_MS + 3_000,
+        )
+        .unwrap();
+        let remote_gateway::PairDoneAction::Ready(ready) = replay else {
+            panic!("done replay after token.ack must reproduce pair.ready")
+        };
+        assert_eq!(ready.room, accept.room);
+        assert_eq!(ready.device_id, accept.device_id);
+        assert!(!ready.ct.is_empty());
+        assert!(!ready.n.is_empty());
+    }
+
+    /// S1i1 §9.6 refresh 编排测试的公共起点：跑一遍真实配对（hello → done → token.ack=ok）
+    /// 拿到一个"刚配对完成"的设备——DB 行、TokenBook、钥匙串里的 K_pair 全部就绪，跟真实桌面
+    /// 进程配对成功后的状态一致，refresh 测试不必再手工缝合半成品状态。
+    struct RefreshTestFixture {
+        conn: Connection,
+        key_store: FakeKeyStore,
+        token_book: Mutex<remote_pairing::TokenBook>,
+        device_id: String,
+        room_id: String,
+        generation: i64,
+        refresh_token: String,
+        access_token: String,
+    }
+
+    fn pair_device_for_refresh_test() -> RefreshTestFixture {
+        let conn = pairing_test_db();
+        let key_store = FakeKeyStore::default();
+        let token_book = Mutex::new(remote_pairing::TokenBook::new());
+        let slot = fresh_pairing_slot();
+        let hello = {
+            let guard = slot.lock().unwrap();
+            let PairingSlot::Waiting(session) = &*guard else {
+                unreachable!()
+            };
+            pairing_gateway_hello(session, session.pairing_token.as_bytes())
+        };
+        let accept = process_pair_hello(&slot, &key_store, hello, PAIR_TEST_NOW)
+            .unwrap()
+            .expect("valid hello should produce pair.accept");
+        let (access_token, refresh_token) = decrypt_pair_accept_tokens(&slot, &accept);
+        let k_room = remote_pairing::store::resolve_k_room(&key_store, PAIR_TEST_ROOM).unwrap();
+        let (confirm_ct, confirm_n) =
+            remote_pairing::seal_pair_done_confirm(&k_room, &accept.room, &accept.device_id);
+        let mut throwaway_registry = remote_gateway::RegistryState::default();
+        process_pair_done_with_registry(
+            &slot,
+            &mut throwaway_registry,
+            &conn,
+            &key_store,
+            &token_book,
+            remote_gateway::PairDoneFrame {
+                room: accept.room.clone(),
+                device_id: accept.device_id.clone(),
+                confirm_ct: Some(confirm_ct),
+                confirm_n: Some(confirm_n),
+                origin_connection_id: "conn-pairing-test".to_owned(),
+            },
+            PAIR_TEST_NOW + 1,
+            PAIR_TEST_NOW_MS + 1_000,
+        )
+        .unwrap();
+        let row = db::list_remote_devices(&conn).unwrap().remove(0);
+        let generation = row.generation.expect("done must persist a generation");
+
+        RefreshTestFixture {
+            conn,
+            key_store,
+            token_book,
+            device_id: accept.device_id,
+            room_id: accept.room,
+            generation,
+            refresh_token,
+            access_token,
+        }
+    }
+
+    fn seal_refresh_request(
+        k_pair: &[u8; 32],
+        room_id: &str,
+        device_id: &str,
+        request_id: &str,
+        refresh_token: &str,
+    ) -> (String, String) {
+        let meta = remote_pairing::token_refresh_meta(room_id, device_id, request_id);
+        let plaintext = serde_json::json!({ "refresh_token": refresh_token }).to_string();
+        seal(k_pair, &meta, plaintext.as_bytes())
+    }
+
+    fn open_refresh_ok_tokens(
+        k_pair: &[u8; 32],
+        room_id: &str,
+        device_id: &str,
+        request_id: &str,
+        ct: &str,
+        n: &str,
+    ) -> (String, String) {
+        let meta = remote_pairing::token_refresh_ok_meta(room_id, device_id, request_id);
+        let plaintext =
+            open(k_pair, &meta, ct, n).expect("refresh.ok body must decrypt under K_pair");
+        let tokens: serde_json::Value =
+            serde_json::from_slice(&plaintext).expect("refresh.ok body must be JSON");
+        (
+            tokens["capability_token"].as_str().unwrap().to_owned(),
+            tokens["refresh_token"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    /// 打一次完整轮换：forward → 断言 `Pending` → 用新 generation 消费 `token.ack("ok")` →
+    /// 断言吐出 `RefreshOk` → 解出新令牌明文。返回 `(新 generation, 新 access, 新 refresh)`。
+    fn perform_one_refresh_rotation(
+        fixture: &RefreshTestFixture,
+        registry: &mut remote_gateway::RegistryState,
+        request_id: &str,
+        refresh_token: &str,
+        now_ms: u64,
+    ) -> (i64, String, String) {
+        let k_pair = remote_pairing::store::load_k_pair(&fixture.key_store, &fixture.device_id)
+            .unwrap()
+            .unwrap();
+        let (ct, n) = seal_refresh_request(
+            &k_pair,
+            &fixture.room_id,
+            &fixture.device_id,
+            request_id,
+            refresh_token,
+        );
+        let frame = remote_gateway::RefreshForwardFrame {
+            request_id: request_id.to_owned(),
+            subject: format!("device:{}", fixture.device_id),
+            request_generation: 0,
+            ct,
+            n,
+        };
+        let mut token_book = fixture.token_book.lock().unwrap();
+        let outcome = process_token_refresh_with_registry(
+            registry,
+            &fixture.conn,
+            &fixture.key_store,
+            &mut token_book,
+            &frame,
+            now_ms,
+        );
+        drop(token_book);
+        assert!(
+            matches!(outcome, remote_gateway::RefreshOutcome::Pending),
+            "命中当前 refresh hash 必须先挂 outbox、等 ack 才回执"
+        );
+
+        let row = db::get_remote_device(&fixture.conn, &fixture.device_id)
+            .unwrap()
+            .unwrap();
+        let new_generation = row.generation.unwrap();
+        let subject = format!("device:{}", fixture.device_id);
+        let action = registry.consume_token_ack(&subject, new_generation, "ok");
+        let remote_gateway::TokenAckAction::RefreshOk(refresh_ok) = action else {
+            panic!("expected RefreshOk after ack, got {action:?}");
+        };
+        assert_eq!(refresh_ok.request_id, request_id);
+        assert_eq!(refresh_ok.subject, subject);
+        assert_eq!(refresh_ok.generation, new_generation);
+        let (new_access, new_refresh) = open_refresh_ok_tokens(
+            &k_pair,
+            &fixture.room_id,
+            &fixture.device_id,
+            request_id,
+            &refresh_ok.ct,
+            &refresh_ok.n,
+        );
+        (new_generation, new_access, new_refresh)
+    }
+
+    #[test]
+    fn remote_refresh_rotates_current_hash_and_new_tokens_supersede_old_ones() {
+        let fixture = pair_device_for_refresh_test();
+        let mut registry = remote_gateway::RegistryState::default();
+        let old_access = fixture.access_token.clone();
+        let old_generation = fixture.generation;
+
+        let (new_generation, new_access, new_refresh) = perform_one_refresh_rotation(
+            &fixture,
+            &mut registry,
+            "req-rotate-1",
+            &fixture.refresh_token,
+            PAIR_TEST_NOW_MS + 2_000,
+        );
+
+        assert!(new_generation > old_generation, "领代必须严格前移");
+        assert_ne!(new_access, old_access);
+        assert_ne!(new_refresh, fixture.refresh_token);
+        let token_book = fixture.token_book.lock().unwrap();
+        assert_eq!(
+            token_book.verify_access(&fixture.device_id, &new_access, PAIR_TEST_NOW_MS + 2_000),
+            Ok(())
+        );
+        assert_eq!(
+            token_book.verify_access(&fixture.device_id, &old_access, PAIR_TEST_NOW_MS + 2_000),
+            Err(remote_pairing::PairingError::TokenMismatch),
+            "轮换后旧 access token 必须立刻失效"
+        );
+        let row = db::get_remote_device(&fixture.conn, &fixture.device_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.generation, Some(new_generation));
+        assert!(row.refresh_until.unwrap() > row.access_expires_at);
+    }
+
+    #[test]
+    fn remote_refresh_replay_with_same_request_id_reuses_stored_response_without_mutating_state() {
+        let fixture = pair_device_for_refresh_test();
+        let mut registry = remote_gateway::RegistryState::default();
+        let (new_generation, new_access, new_refresh) = perform_one_refresh_rotation(
+            &fixture,
+            &mut registry,
+            "req-replay-1",
+            &fixture.refresh_token,
+            PAIR_TEST_NOW_MS + 2_000,
+        );
+        let row_before = db::get_remote_device(&fixture.conn, &fixture.device_id).unwrap();
+        let journal_before = db::load_refresh_journal(&fixture.conn, &fixture.device_id).unwrap();
+
+        let k_pair = remote_pairing::store::load_k_pair(&fixture.key_store, &fixture.device_id)
+            .unwrap()
+            .unwrap();
+        let (ct, n) = seal_refresh_request(
+            &k_pair,
+            &fixture.room_id,
+            &fixture.device_id,
+            "req-replay-1",
+            &fixture.refresh_token,
+        );
+        let frame = remote_gateway::RefreshForwardFrame {
+            request_id: "req-replay-1".to_owned(),
+            subject: format!("device:{}", fixture.device_id),
+            request_generation: 0,
+            ct,
+            n,
+        };
+        let mut token_book = fixture.token_book.lock().unwrap();
+        let outcome = process_token_refresh_with_registry(
+            &mut registry,
+            &fixture.conn,
+            &fixture.key_store,
+            &mut token_book,
+            &frame,
+            PAIR_TEST_NOW_MS + 3_000,
+        );
+        drop(token_book);
+        let remote_gateway::RefreshOutcome::Reply(value) = outcome else {
+            panic!("prev 命中 + 相同 request_id 必须立即回执，不再等 ack");
+        };
+        assert_eq!(value["t"], "token.refresh.ok");
+        assert_eq!(value["request_id"], "req-replay-1");
+        assert_eq!(value["generation"].as_i64().unwrap(), new_generation);
+        let (replayed_access, replayed_refresh) = open_refresh_ok_tokens(
+            &k_pair,
+            &fixture.room_id,
+            &fixture.device_id,
+            "req-replay-1",
+            value["ct"].as_str().unwrap(),
+            value["n"].as_str().unwrap(),
+        );
+        assert_eq!(replayed_access, new_access, "重放必须原样吐出同一份回执");
+        assert_eq!(replayed_refresh, new_refresh);
+
+        // S1i1 R4 返工：只比对解密后的明文抓不住「重放时用新 nonce 重新 seal」这种变异——两次
+        // seal 明文可以一致但密文体不同。逐字节比对 ct/n 与 journal 里存的值，才是真正验证了
+        // 「原样吐出同一份回执」而不是「重新生成了一份等价的回执」。
+        let journal_before_ref = journal_before.as_ref().expect("轮换后 journal 必须已落库");
+        assert_eq!(
+            value["ct"].as_str().unwrap(),
+            journal_before_ref.response_ct,
+            "重放回执的密文体必须与 journal 存的逐字节相同"
+        );
+        assert_eq!(
+            value["n"].as_str().unwrap(),
+            journal_before_ref.response_n,
+            "重放回执的 nonce 必须与 journal 存的逐字节相同"
+        );
+
+        assert_eq!(
+            db::get_remote_device(&fixture.conn, &fixture.device_id).unwrap(),
+            row_before,
+            "重放不得写库"
+        );
+        assert_eq!(
+            db::load_refresh_journal(&fixture.conn, &fixture.device_id).unwrap(),
+            journal_before,
+            "重放不得覆盖 journal"
+        );
+    }
+
+    #[test]
+    fn remote_refresh_replay_after_rebase_uses_current_generation_not_frozen_journal_generation() {
+        // S1i1 R1 返工：轮换与重放之间若发生一次 rebase（设备重新领号），重放回执必须用「本次
+        // 请求刚读到的设备行当前代号」，不能用 journal 里冻结的轮换时刻旧代号——否则回执带着
+        // 陈旧代号出门，被 relay 侧 §9.6 第 246 行的投递谓词丢弃。
+        let fixture = pair_device_for_refresh_test();
+        let mut registry = remote_gateway::RegistryState::default();
+        let (new_generation, _new_access, _new_refresh) = perform_one_refresh_rotation(
+            &fixture,
+            &mut registry,
+            "req-rebase-replay-1",
+            &fixture.refresh_token,
+            PAIR_TEST_NOW_MS + 2_000,
+        );
+        let journal_before = db::load_refresh_journal(&fixture.conn, &fixture.device_id)
+            .unwrap()
+            .expect("轮换后 journal 必须已落库");
+        assert_eq!(
+            journal_before.generation, new_generation,
+            "前提：journal 冻结的就是轮换那一刻的代号"
+        );
+
+        // 模拟 rebase：设备在 ack/重放之间重新领号（S1h §9.3 每次 rebase 都给每台设备领一个
+        // 新代号）——只需要 DB 侧的重新编号，不涉及 outbox（那是 R1 point 1 的另一半，已有独立
+        // 单测覆盖 `rebase_outbox_entries`）。
+        rebase_remote_registry(
+            &fixture.conn,
+            &fixture.room_id,
+            0,
+            PAIR_TEST_NOW_MS + 2_500,
+            false,
+            &[],
+        )
+        .unwrap();
+        let rebased_generation = db::get_remote_device(&fixture.conn, &fixture.device_id)
+            .unwrap()
+            .unwrap()
+            .generation
+            .unwrap();
+        assert!(
+            rebased_generation > new_generation,
+            "前提：rebase 必须严格前移代号，测试才有意义"
+        );
+
+        // 旧 refresh 用同一个 request_id 重放——命中 §2c 幂等重放分支。
+        let k_pair = remote_pairing::store::load_k_pair(&fixture.key_store, &fixture.device_id)
+            .unwrap()
+            .unwrap();
+        let (ct, n) = seal_refresh_request(
+            &k_pair,
+            &fixture.room_id,
+            &fixture.device_id,
+            "req-rebase-replay-1",
+            &fixture.refresh_token,
+        );
+        let frame = remote_gateway::RefreshForwardFrame {
+            request_id: "req-rebase-replay-1".to_owned(),
+            subject: format!("device:{}", fixture.device_id),
+            request_generation: 0,
+            ct,
+            n,
+        };
+        let mut token_book = fixture.token_book.lock().unwrap();
+        let outcome = process_token_refresh_with_registry(
+            &mut registry,
+            &fixture.conn,
+            &fixture.key_store,
+            &mut token_book,
+            &frame,
+            PAIR_TEST_NOW_MS + 3_000,
+        );
+        drop(token_book);
+        let remote_gateway::RefreshOutcome::Reply(value) = outcome else {
+            panic!("prev 命中 + 相同 request_id 必须立即回执，不再等 ack");
+        };
+        assert_eq!(value["t"], "token.refresh.ok");
+        assert_eq!(
+            value["generation"].as_i64().unwrap(),
+            rebased_generation,
+            "重放回执的 generation 必须是 rebase 后 DB 的当前代号"
+        );
+        assert_ne!(
+            value["generation"].as_i64().unwrap(),
+            journal_before.generation,
+            "回归防护：确认这条断言真的在验证「不是轮换时刻冻结的旧值」"
+        );
+        // ct/n 逐字节不变——重放不能因为代号变了就重新 seal（AAD 五元组不含 generation）。
+        assert_eq!(value["ct"].as_str().unwrap(), journal_before.response_ct);
+        assert_eq!(value["n"].as_str().unwrap(), journal_before.response_n);
+    }
+
+    #[test]
+    fn remote_refresh_rotation_commit_failure_does_not_burn_invalid_streak() {
+        // S1i1 返工二 F2：轮换事务本身失败（DB 报错）是桌面自己的故障，不该烧手机的连续无效
+        // 计数。这里用 `remote_registry_rebase_failure_rolls_back_counter_and_all_device_generations`
+        // 同款手法（`CREATE TRIGGER ... RAISE(ABORT, ...)`）真注入一次「事务已开始、写到一半
+        // SQL 失败」：`refresh_device_tokens`（remote_pairing.rs）在同一个事务里依次领号
+        // （`next_registry_generation_in_transaction`）、写 token 哈希（`update_remote_device_tokens`）、
+        // 写代号/refresh_until（`set_remote_device_registry_in_transaction`），最后才落 journal
+        // （`store_refresh_journal`，`UPDATE remote_devices SET journal_request_id = ...`）——
+        // 触发器钉在这条最后写入上，前面几步都已在事务里真正执行过，只有 commit 前最后一条
+        // 语句失败，`tx.commit()` 永远不会跑到，整个事务连同前面的写入一起回滚。跟旧版
+        // （`now_ms = u64::MAX-10`）不同：旧版在 `refresh_prev_alias_expires_at_ms` 的
+        // `i64::try_from` 上就出错（remote_pairing.rs `prepare_refresh`/该函数早于
+        // `conn.unchecked_transaction()` 开事务那一行），根本没轮到事务失败，两者只是共用同一个
+        // `Err → count_invalid=false` 出口，名不副实——这里改成真的在事务中途失败，测试名才算
+        // 名实相符。
+        let fixture = pair_device_for_refresh_test();
+        let mut registry = remote_gateway::RegistryState::default();
+        let k_pair = remote_pairing::store::load_k_pair(&fixture.key_store, &fixture.device_id)
+            .unwrap()
+            .unwrap();
+        let subject = format!("device:{}", fixture.device_id);
+
+        // S1i1 返工三 G3：事务前的快照——`remote_devices` 行的 token_hash/refresh_hash/
+        // generation/refresh_until 与 `remote_registry_counter.next_generation`，事务失败后
+        // 逐项跟这份快照比对，证明整个事务（不只是 journal 那一笔）真的原样回滚了。
+        let device_before = db::get_remote_device(&fixture.conn, &fixture.device_id)
+            .unwrap()
+            .expect("fixture 必须已落库设备行");
+        let counter_before =
+            db::current_registry_revision(&fixture.conn, &fixture.room_id).unwrap();
+
+        fixture
+            .conn
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_refresh_journal_commit \
+                 BEFORE UPDATE OF journal_request_id ON remote_devices \
+                 WHEN NEW.device_id = '{}' \
+                 BEGIN SELECT RAISE(ABORT, 'injected refresh commit failure'); END;",
+                fixture.device_id
+            ))
+            .unwrap();
+
+        let (ct, n) = seal_refresh_request(
+            &k_pair,
+            &fixture.room_id,
+            &fixture.device_id,
+            "req-overflow",
+            &fixture.refresh_token,
+        );
+        let frame = remote_gateway::RefreshForwardFrame {
+            request_id: "req-overflow".to_owned(),
+            subject: subject.clone(),
+            request_generation: 0,
+            ct,
+            n,
+        };
+        let mut token_book = fixture.token_book.lock().unwrap();
+        let outcome = process_token_refresh_with_registry(
+            &mut registry,
+            &fixture.conn,
+            &fixture.key_store,
+            &mut token_book,
+            &frame,
+            PAIR_TEST_NOW_MS + 3_500,
+        );
+        drop(token_book);
+        let remote_gateway::RefreshOutcome::Reply(value) = outcome else {
+            panic!("轮换事务失败必须立即回 fail")
+        };
+        assert_eq!(value["t"], "token.refresh.fail");
+        assert_eq!(value["reason"], "invalid");
+        assert!(
+            value.get("close").is_none(),
+            "桌面自身的轮换事务失败不该带 close"
+        );
+        // 事务确认真的整体回滚了：不只是 journal 没有落地，事务里更早执行的几步（领号/
+        // token 哈希/registry 代号与 refresh_until）也必须原样退回快照前的值——否则触发器
+        // 只挡住了最后一条语句，前面几步的写入却悄悄留在了库里，是比「journal 缺一笔」更
+        // 隐蔽的半提交 bug（S1i1 返工三 G3：原先只断言 journal == None，证明不了领号/
+        // access 哈希/refresh 哈希/registry 代号也回滚了）。
+        assert_eq!(
+            db::load_refresh_journal(&fixture.conn, &fixture.device_id).unwrap(),
+            None,
+            "前提：注入的事务失败必须连同前面几步写入一起整体回滚，不能留下半条 journal"
+        );
+        let device_after = db::get_remote_device(&fixture.conn, &fixture.device_id)
+            .unwrap()
+            .expect("设备行本身不会被这次失败的轮换删除");
+        assert_eq!(
+            device_after.token_hash, device_before.token_hash,
+            "事务必须整体回滚：token_hash 不能停在轮换写到一半的新值"
+        );
+        assert_eq!(
+            device_after.refresh_hash, device_before.refresh_hash,
+            "事务必须整体回滚：refresh_hash 不能停在轮换写到一半的新值"
+        );
+        assert_eq!(
+            device_after.generation, device_before.generation,
+            "事务必须整体回滚：registry 代号不能停在轮换写到一半的新值"
+        );
+        assert_eq!(
+            device_after.refresh_until, device_before.refresh_until,
+            "事务必须整体回滚：refresh_until 不能停在轮换写到一半的新值"
+        );
+        let counter_after = db::current_registry_revision(&fixture.conn, &fixture.room_id).unwrap();
+        assert_eq!(
+            counter_after, counter_before,
+            "事务必须整体回滚：领号已经在同一事务内前移的 next_generation 也必须退回原值，\
+             不能只回滚 journal 那一笔"
+        );
+        fixture
+            .conn
+            .execute_batch("DROP TRIGGER fail_refresh_journal_commit;")
+            .unwrap();
+
+        // 紧接着最多 3 次真无效才该触发 close（阈值 3）——如果上面那次事务失败悄悄烧了一次
+        // 计数，第 2 次真无效就会提前触发 close。逐次断言前两次都不带 close，只有第 3 次才带，
+        // 才是真正能分辨「事务失败有没有计数」的写法（只看最后有没有到 3 分辨不出来——不管
+        // 计不计数，多打几次总会到 3）。
+        let mut send_bogus = |request_id: &str, now_ms: u64| -> serde_json::Value {
+            let (ct, n) = seal_refresh_request(
+                &k_pair,
+                &fixture.room_id,
+                &fixture.device_id,
+                request_id,
+                &"f".repeat(64),
+            );
+            let frame = remote_gateway::RefreshForwardFrame {
+                request_id: request_id.to_owned(),
+                subject: subject.clone(),
+                request_generation: 0,
+                ct,
+                n,
+            };
+            let mut token_book = fixture.token_book.lock().unwrap();
+            let outcome = process_token_refresh_with_registry(
+                &mut registry,
+                &fixture.conn,
+                &fixture.key_store,
+                &mut token_book,
+                &frame,
+                now_ms,
+            );
+            let remote_gateway::RefreshOutcome::Reply(value) = outcome else {
+                panic!("无效 token 必须立即回 fail")
+            };
+            value
+        };
+        let first_real = send_bogus("req-real-1", PAIR_TEST_NOW_MS + 4_000);
+        assert!(
+            first_real.get("close").is_none(),
+            "事务失败没计数的话，这应该只是第 1 次真无效"
+        );
+        let second_real = send_bogus("req-real-2", PAIR_TEST_NOW_MS + 5_000);
+        assert!(
+            second_real.get("close").is_none(),
+            "事务失败没计数的话，这应该只是第 2 次真无效，还不该 close"
+        );
+        let third_real = send_bogus("req-real-3", PAIR_TEST_NOW_MS + 6_000);
+        assert_eq!(third_real["close"], true, "第 3 次真无效才该触发 close");
+    }
+
+    #[test]
+    fn remote_refresh_unknown_subject_does_not_grow_refresh_quota_map() {
+        // S1i1 R5-3 返工：`refresh_quota` map 的 key 是 relay 盖章转发的 frame.subject，未经
+        // 桌面自己的 DB 确认——失控/恶意 relay 换着花样报不同的假 subject，此前会让这张内存 map
+        // 无限增长（DoS）。只对「DB 里真实存在的设备 subject」记账，查不到的一律不建条目。
+        let fixture = pair_device_for_refresh_test();
+        let mut registry = remote_gateway::RegistryState::default();
+        assert_eq!(registry.refresh_quota_entry_count_for_test(), 0);
+
+        for i in 0..5_u64 {
+            let bogus_subject = format!("device:bogus-{i}");
+            let frame = remote_gateway::RefreshForwardFrame {
+                request_id: format!("req-bogus-{i}"),
+                subject: bogus_subject,
+                request_generation: 0,
+                ct: "whatever-ct".to_owned(),
+                n: "whatever-n".to_owned(),
+            };
+            let mut token_book = fixture.token_book.lock().unwrap();
+            let outcome = process_token_refresh_with_registry(
+                &mut registry,
+                &fixture.conn,
+                &fixture.key_store,
+                &mut token_book,
+                &frame,
+                PAIR_TEST_NOW_MS + 2_000 + i,
+            );
+            drop(token_book);
+            assert!(
+                matches!(outcome, remote_gateway::RefreshOutcome::Reply(_)),
+                "未知设备必须立即回 fail"
+            );
+        }
+
+        assert_eq!(
+            registry.refresh_quota_entry_count_for_test(),
+            0,
+            "relay 报回的未知/伪造 subject 不该在配额 map 里落地"
+        );
+
+        // 真实设备该记的账不受影响——照常能记上一次成功轮换。
+        perform_one_refresh_rotation(
+            &fixture,
+            &mut registry,
+            "req-real-after-bogus",
+            &fixture.refresh_token,
+            PAIR_TEST_NOW_MS + 3_000,
+        );
+        assert_eq!(
+            registry.refresh_quota_entry_count_for_test(),
+            1,
+            "真实设备的成功轮换仍然要正常记账"
+        );
+    }
+
+    #[test]
+    fn remote_refresh_in_flight_with_different_request_id_fails_without_close_or_journal_mutation()
+    {
+        let fixture = pair_device_for_refresh_test();
+        let mut registry = remote_gateway::RegistryState::default();
+        perform_one_refresh_rotation(
+            &fixture,
+            &mut registry,
+            "req-inflight-1",
+            &fixture.refresh_token,
+            PAIR_TEST_NOW_MS + 2_000,
+        );
+        let journal_before = db::load_refresh_journal(&fixture.conn, &fixture.device_id).unwrap();
+
+        let k_pair = remote_pairing::store::load_k_pair(&fixture.key_store, &fixture.device_id)
+            .unwrap()
+            .unwrap();
+        // 仍然拿"旧"（现在已经是 prev）的 refresh_token，但换一个不同的 request_id——这是
+        // §9.6 第 251 行说的"同 subject 单飞行中的违反行为"，不是幂等重试。
+        let (ct, n) = seal_refresh_request(
+            &k_pair,
+            &fixture.room_id,
+            &fixture.device_id,
+            "req-inflight-2",
+            &fixture.refresh_token,
+        );
+        let frame = remote_gateway::RefreshForwardFrame {
+            request_id: "req-inflight-2".to_owned(),
+            subject: format!("device:{}", fixture.device_id),
+            request_generation: 0,
+            ct,
+            n,
+        };
+        let mut token_book = fixture.token_book.lock().unwrap();
+        let outcome = process_token_refresh_with_registry(
+            &mut registry,
+            &fixture.conn,
+            &fixture.key_store,
+            &mut token_book,
+            &frame,
+            PAIR_TEST_NOW_MS + 3_000,
+        );
+        drop(token_book);
+        let remote_gateway::RefreshOutcome::Reply(value) = outcome else {
+            panic!("in_flight 必须立即回 fail，不进 outbox")
+        };
+        assert_eq!(value["t"], "token.refresh.fail");
+        assert_eq!(value["request_id"], "req-inflight-2");
+        assert_eq!(value["reason"], "in_flight");
+        assert!(
+            value.get("close").is_none(),
+            "in_flight 是良性单飞行冲突，不带 close"
+        );
+        assert_eq!(
+            db::load_refresh_journal(&fixture.conn, &fixture.device_id).unwrap(),
+            journal_before,
+            "in_flight 绝不能覆盖 journal（否则第一笔的重放保证失效）"
+        );
+    }
+
+    #[test]
+    fn remote_refresh_unknown_token_fails_and_third_consecutive_invalid_closes() {
+        let fixture = pair_device_for_refresh_test();
+        let mut registry = remote_gateway::RegistryState::default();
+        let k_pair = remote_pairing::store::load_k_pair(&fixture.key_store, &fixture.device_id)
+            .unwrap()
+            .unwrap();
+        let subject = format!("device:{}", fixture.device_id);
+
+        let mut send_bogus = |request_id: &str, now_ms: u64| -> serde_json::Value {
+            // 一个跟当前/prev 都不沾边的合法 hex64——AEAD 能正常开封，只是哈希对不上任何已知值。
+            let (ct, n) = seal_refresh_request(
+                &k_pair,
+                &fixture.room_id,
+                &fixture.device_id,
+                request_id,
+                &"f".repeat(64),
+            );
+            let frame = remote_gateway::RefreshForwardFrame {
+                request_id: request_id.to_owned(),
+                subject: subject.clone(),
+                request_generation: 0,
+                ct,
+                n,
+            };
+            let mut token_book = fixture.token_book.lock().unwrap();
+            let outcome = process_token_refresh_with_registry(
+                &mut registry,
+                &fixture.conn,
+                &fixture.key_store,
+                &mut token_book,
+                &frame,
+                now_ms,
+            );
+            let remote_gateway::RefreshOutcome::Reply(value) = outcome else {
+                panic!("无效 token 必须立即回 fail")
+            };
+            assert_eq!(value["t"], "token.refresh.fail");
+            value
+        };
+
+        let first = send_bogus("req-bad-1", PAIR_TEST_NOW_MS + 2_000);
+        assert_eq!(
+            first["reason"], "invalid",
+            "第 1 次无效 reason 仍是 invalid"
+        );
+        assert!(first.get("close").is_none(), "第 1 次无效不该带 close");
+        let second = send_bogus("req-bad-2", PAIR_TEST_NOW_MS + 3_000);
+        assert_eq!(
+            second["reason"], "invalid",
+            "第 2 次无效 reason 仍是 invalid"
+        );
+        assert!(second.get("close").is_none(), "第 2 次无效不该带 close");
+        let third = send_bogus("req-bad-3", PAIR_TEST_NOW_MS + 4_000);
+        assert_eq!(
+            third["close"], true,
+            "连续第 3 次无效必须带 close:true（§9.6 第 252 行）"
+        );
+        assert_eq!(
+            third["reason"], "invalid_repeated",
+            "S1i1 R5-1：带 close 的第 3 次无效 reason 必须是 invalid_repeated，\
+             与 fixtures/wire-v1.json 的 token_refresh_fail_valid 样张同词"
+        );
+    }
+
+    #[test]
+    fn remote_refresh_rate_limited_after_six_rotations_does_not_close_or_burn_invalid_streak() {
+        let fixture = pair_device_for_refresh_test();
+        let mut registry = remote_gateway::RegistryState::default();
+        let mut refresh_token = fixture.refresh_token.clone();
+        let mut now_ms = PAIR_TEST_NOW_MS + 1_000;
+
+        for round in 0..6 {
+            let (_, _, new_refresh) = perform_one_refresh_rotation(
+                &fixture,
+                &mut registry,
+                &format!("req-quota-{round}"),
+                &refresh_token,
+                now_ms,
+            );
+            refresh_token = new_refresh;
+            now_ms += 1_000;
+        }
+
+        // 第 7 次：用的是刚轮换出来、货真价实有效的 refresh token，唯一的问题是配额已经用满。
+        let k_pair = remote_pairing::store::load_k_pair(&fixture.key_store, &fixture.device_id)
+            .unwrap()
+            .unwrap();
+        let (ct, n) = seal_refresh_request(
+            &k_pair,
+            &fixture.room_id,
+            &fixture.device_id,
+            "req-quota-7th",
+            &refresh_token,
+        );
+        let subject = format!("device:{}", fixture.device_id);
+        let frame = remote_gateway::RefreshForwardFrame {
+            request_id: "req-quota-7th".to_owned(),
+            subject: subject.clone(),
+            request_generation: 0,
+            ct,
+            n,
+        };
+        let mut token_book = fixture.token_book.lock().unwrap();
+        let outcome = process_token_refresh_with_registry(
+            &mut registry,
+            &fixture.conn,
+            &fixture.key_store,
+            &mut token_book,
+            &frame,
+            now_ms,
+        );
+        drop(token_book);
+        let remote_gateway::RefreshOutcome::Reply(value) = outcome else {
+            panic!("配额超限必须立即回 fail，不得再轮换")
+        };
+        assert_eq!(value["t"], "token.refresh.fail");
+        assert_eq!(value["reason"], "rate_limited");
+        assert!(
+            value.get("close").is_none(),
+            "配额超限不是「无效请求」，不该带 close"
+        );
+
+        // 配额超限不该污染连续无效计数——紧接着两次真无效仍然不该到 3 次上限触发 close。
+        let mut send_bogus = |request_id: &str, now_ms: u64| -> serde_json::Value {
+            let (ct, n) = seal_refresh_request(
+                &k_pair,
+                &fixture.room_id,
+                &fixture.device_id,
+                request_id,
+                &"e".repeat(64),
+            );
+            let frame = remote_gateway::RefreshForwardFrame {
+                request_id: request_id.to_owned(),
+                subject: subject.clone(),
+                request_generation: 0,
+                ct,
+                n,
+            };
+            let mut token_book = fixture.token_book.lock().unwrap();
+            let outcome = process_token_refresh_with_registry(
+                &mut registry,
+                &fixture.conn,
+                &fixture.key_store,
+                &mut token_book,
+                &frame,
+                now_ms,
+            );
+            let remote_gateway::RefreshOutcome::Reply(value) = outcome else {
+                panic!("无效 token 必须立即回 fail")
+            };
+            value
+        };
+        let after_rate_limit_1 = send_bogus("req-quota-bad-1", now_ms + 1_000);
+        assert!(after_rate_limit_1.get("close").is_none());
+        let after_rate_limit_2 = send_bogus("req-quota-bad-2", now_ms + 2_000);
+        assert!(
+            after_rate_limit_2.get("close").is_none(),
+            "配额超限不计入连续无效计数——这里应该还只是第 2 次真无效"
+        );
+    }
+
+    #[test]
+    fn remote_done_replay_for_different_device_is_rejected_without_persistence() {
+        let conn = pairing_test_db();
+        let key_store = FakeKeyStore::default();
+        let token_book = Mutex::new(remote_pairing::TokenBook::new());
+        let slot = Mutex::new(PairingSlot::Done {
+            room_id: PAIR_TEST_ROOM.to_owned(),
+            device_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            completed_at_secs: PAIR_TEST_NOW,
+        });
+        let mut registry = remote_gateway::RegistryState::default();
+
+        let action = process_pair_done_with_registry(
+            &slot,
+            &mut registry,
+            &conn,
+            &key_store,
+            &token_book,
+            remote_gateway::PairDoneFrame {
+                room: PAIR_TEST_ROOM.to_owned(),
+                device_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+                ..Default::default()
+            },
+            PAIR_TEST_NOW + 1,
+            PAIR_TEST_NOW_MS + 1_000,
+        )
+        .unwrap();
+
+        assert!(matches!(action, remote_gateway::PairDoneAction::Rejected));
+        assert!(db::list_remote_devices(&conn).unwrap().is_empty());
+        assert!(matches!(*slot.lock().unwrap(), PairingSlot::Done { .. }));
+    }
+
+    #[test]
+    fn remote_done_replay_after_retention_expiry_is_rejected_and_returns_idle() {
+        let conn = pairing_test_db();
+        let key_store = FakeKeyStore::default();
+        let token_book = Mutex::new(remote_pairing::TokenBook::new());
+        let device_id = "11111111-1111-4111-8111-111111111111";
+        let slot = Mutex::new(PairingSlot::Done {
+            room_id: PAIR_TEST_ROOM.to_owned(),
+            device_id: device_id.to_owned(),
+            completed_at_secs: PAIR_TEST_NOW,
+        });
+        let mut registry = remote_gateway::RegistryState::default();
+
+        let action = process_pair_done_with_registry(
+            &slot,
+            &mut registry,
+            &conn,
+            &key_store,
+            &token_book,
+            remote_gateway::PairDoneFrame {
+                room: PAIR_TEST_ROOM.to_owned(),
+                device_id: device_id.to_owned(),
+                ..Default::default()
+            },
+            PAIR_TEST_NOW + remote_pairing::PAIRING_LIFETIME_SECS + 1,
+            PAIR_TEST_NOW_MS + (remote_pairing::PAIRING_LIFETIME_SECS + 1) * 1_000,
+        )
+        .unwrap();
+
+        assert!(matches!(action, remote_gateway::PairDoneAction::Rejected));
+        assert!(db::list_remote_devices(&conn).unwrap().is_empty());
+        assert!(matches!(*slot.lock().unwrap(), PairingSlot::Idle));
+    }
+
+    #[test]
+    fn pair_done_without_confirm_is_rejected_and_slot_stays_sent_accept() {
+        let conn = pairing_test_db();
+        let key_store = FakeKeyStore::default();
+        let token_book = Mutex::new(remote_pairing::TokenBook::new());
+        let slot = fresh_pairing_slot();
+        let hello = {
+            let guard = slot.lock().unwrap();
+            let PairingSlot::Waiting(session) = &*guard else {
+                unreachable!()
+            };
+            pairing_gateway_hello(session, session.pairing_token.as_bytes())
+        };
+        let accept = process_pair_hello(&slot, &key_store, hello, PAIR_TEST_NOW)
+            .unwrap()
+            .expect("valid hello should produce pair.accept");
+        let (capability_token, _) = decrypt_pair_accept_tokens(&slot, &accept);
+
+        let completed = process_pair_done(
+            &slot,
+            &conn,
+            &key_store,
+            &token_book,
+            remote_gateway::PairDoneFrame {
+                room: accept.room.clone(),
+                device_id: accept.device_id.clone(),
+                ..Default::default()
+            },
+            PAIR_TEST_NOW + 1,
+            PAIR_TEST_NOW_MS + 1_000,
+        )
+        .unwrap();
+
+        assert!(completed.is_none());
+        assert!(db::list_remote_devices(&conn).unwrap().is_empty());
+        assert_eq!(
+            token_book.lock().unwrap().verify_access(
+                &accept.device_id,
+                &capability_token,
+                PAIR_TEST_NOW_MS + 1_000,
+            ),
+            Err(remote_pairing::PairingError::NotFound)
+        );
+        assert!(matches!(
+            *slot.lock().unwrap(),
+            PairingSlot::SentAccept { .. }
+        ));
+    }
+
+    #[test]
+    fn pair_done_with_forged_confirm_from_wrong_key_is_rejected_and_slot_stays_sent_accept() {
+        let conn = pairing_test_db();
+        let key_store = FakeKeyStore::default();
+        let token_book = Mutex::new(remote_pairing::TokenBook::new());
+        let slot = fresh_pairing_slot();
+        let hello = {
+            let guard = slot.lock().unwrap();
+            let PairingSlot::Waiting(session) = &*guard else {
+                unreachable!()
+            };
+            pairing_gateway_hello(session, session.pairing_token.as_bytes())
+        };
+        let accept = process_pair_hello(&slot, &key_store, hello, PAIR_TEST_NOW)
+            .unwrap()
+            .expect("valid hello should produce pair.accept");
+        let (capability_token, _) = decrypt_pair_accept_tokens(&slot, &accept);
+        let (confirm_ct, confirm_n) =
+            remote_pairing::seal_pair_done_confirm(&[9_u8; 32], &accept.room, &accept.device_id);
+
+        let completed = process_pair_done(
+            &slot,
+            &conn,
+            &key_store,
+            &token_book,
+            remote_gateway::PairDoneFrame {
+                room: accept.room.clone(),
+                device_id: accept.device_id.clone(),
+                confirm_ct: Some(confirm_ct),
+                confirm_n: Some(confirm_n),
+                origin_connection_id: "conn-pairing-test".to_owned(),
+            },
+            PAIR_TEST_NOW + 1,
+            PAIR_TEST_NOW_MS + 1_000,
+        )
+        .unwrap();
+
+        assert!(completed.is_none());
+        assert!(db::list_remote_devices(&conn).unwrap().is_empty());
+        assert_eq!(
+            token_book.lock().unwrap().verify_access(
+                &accept.device_id,
+                &capability_token,
+                PAIR_TEST_NOW_MS + 1_000,
+            ),
+            Err(remote_pairing::PairingError::NotFound)
+        );
+        assert!(matches!(
+            *slot.lock().unwrap(),
+            PairingSlot::SentAccept { .. }
+        ));
+    }
+
+    #[test]
+    fn pairing_accept_without_done_expires_without_ghost_device() {
+        let conn = pairing_test_db();
+        let key_store = FakeKeyStore::default();
+        let slot = fresh_pairing_slot();
+        let hello = {
+            let guard = slot.lock().unwrap();
+            let PairingSlot::Waiting(session) = &*guard else {
+                unreachable!()
+            };
+            pairing_gateway_hello(session, session.pairing_token.as_bytes())
+        };
+        process_pair_hello(&slot, &key_store, hello, PAIR_TEST_NOW)
+            .unwrap()
+            .expect("valid hello should produce pair.accept");
+
+        let status = {
+            let mut guard = slot.lock().unwrap();
+            compute_pairing_status(&mut guard, PAIR_TEST_NOW + PAIR_ACCEPT_LIFETIME_SECS)
+        };
+
+        assert_eq!(status, RemotePairingStatus::Idle);
+        assert!(matches!(*slot.lock().unwrap(), PairingSlot::Idle));
+        assert!(db::list_remote_devices(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancel_or_rebegin_discards_pending_outcome_and_new_token_can_pair() {
+        let conn = pairing_test_db();
+        let key_store = FakeKeyStore::default();
+        let slot = fresh_pairing_slot();
+        let (first_token, first_hello) = {
+            let guard = slot.lock().unwrap();
+            let PairingSlot::Waiting(session) = &*guard else {
+                unreachable!()
+            };
+            (
+                session.pairing_token.clone(),
+                pairing_gateway_hello(session, session.pairing_token.as_bytes()),
+            )
+        };
+        process_pair_hello(&slot, &key_store, first_hello, PAIR_TEST_NOW)
+            .unwrap()
+            .expect("first hello should reach SentAccept");
+
+        *slot.lock().unwrap() = PairingSlot::Idle;
+        assert!(db::list_remote_devices(&conn).unwrap().is_empty());
+
+        let (new_session, _) = remote_pairing::PairingSession::begin(
+            "wss://relay.example.test",
+            PAIR_TEST_ROOM,
+            PAIR_TEST_NOW + 1,
+        );
+        assert_ne!(new_session.pairing_token, first_token);
+        let second_hello =
+            pairing_gateway_hello(&new_session, new_session.pairing_token.as_bytes());
+        *slot.lock().unwrap() = PairingSlot::Waiting(new_session);
+
+        assert!(
+            process_pair_hello(&slot, &key_store, second_hello, PAIR_TEST_NOW + 1)
+                .unwrap()
+                .is_some()
+        );
+        assert!(matches!(
+            *slot.lock().unwrap(),
+            PairingSlot::SentAccept { .. }
+        ));
+        assert!(db::list_remote_devices(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn compute_pairing_status_reports_and_expires_sent_accept() {
+        let key_store = FakeKeyStore::default();
+        let slot = fresh_pairing_slot();
+        let hello = {
+            let guard = slot.lock().unwrap();
+            let PairingSlot::Waiting(session) = &*guard else {
+                unreachable!()
+            };
+            pairing_gateway_hello(session, session.pairing_token.as_bytes())
+        };
+        process_pair_hello(&slot, &key_store, hello, PAIR_TEST_NOW)
+            .unwrap()
+            .unwrap();
+        let mut guard = slot.lock().unwrap();
+
+        assert_eq!(
+            compute_pairing_status(&mut guard, PAIR_TEST_NOW + 1),
+            RemotePairingStatus::WaitingForDone {
+                expires_at: PAIR_TEST_NOW + PAIR_ACCEPT_LIFETIME_SECS,
+            }
+        );
+    }
+
+    #[test]
+    fn remote_control_settings_default_to_disabled_with_empty_relay_url() {
+        let conn = cli_path_test_db();
+
+        let settings = remote_control_get_settings_in_conn(&conn).unwrap();
+
+        assert!(!settings.enabled);
+        assert_eq!(settings.relay_url, "");
+        assert_eq!(settings.active_repo_id, None);
+    }
+
+    /// M2-4d：`remote_control_get_settings_in_conn` 必须把 `remote_set_active_project_in_conn`
+    /// 写入的同一个 app_setting key 读出来喂给设置页 UI；未写时返回 `None`。
+    #[test]
+    fn remote_control_get_settings_in_conn_reflects_active_repo_id() {
+        let conn = remote_active_project_test_db();
+
+        let before = remote_control_get_settings_in_conn(&conn).unwrap();
+        assert_eq!(before.active_repo_id, None);
+
+        remote_set_active_project_in_conn(&conn, Some("repo-1")).unwrap();
+        let after = remote_control_get_settings_in_conn(&conn).unwrap();
+        assert_eq!(after.active_repo_id, Some("repo-1".to_owned()));
+
+        remote_set_active_project_in_conn(&conn, None).unwrap();
+        let cleared = remote_control_get_settings_in_conn(&conn).unwrap();
+        assert_eq!(cleared.active_repo_id, None);
+    }
+
+    /// M24DF 项 4：直接往 DB 塞一个纯空白值（绕开 `remote_set_active_project_in_conn` 的
+    /// trim+filter 写入路径，模拟陈旧数据/手工改库）——读侧必须自己也 trim+filter，不能把
+    /// 空白值读成"已设置"。
+    #[test]
+    fn remote_control_get_settings_in_conn_treats_whitespace_active_repo_id_as_unset() {
+        let conn = cli_path_test_db();
+        db::set_app_setting(&conn, REMOTE_ACTIVE_REPO_ID_SETTING, "   ").unwrap();
+
+        let settings = remote_control_get_settings_in_conn(&conn).unwrap();
+
+        assert_eq!(settings.active_repo_id, None);
+    }
+
+    #[test]
+    fn remote_control_settings_roundtrip() {
+        let conn = cli_path_test_db();
+
+        remote_control_set_settings_in_conn(&conn, true, "wss://relay.example.com").unwrap();
+        let settings = remote_control_get_settings_in_conn(&conn).unwrap();
+
+        assert!(settings.enabled);
+        assert_eq!(settings.relay_url, "wss://relay.example.com");
+    }
+
+    /// 内置公共中继单：写路径本就放行空串（`trimmed.is_empty()` 分支跳过校验、直接落库）——
+    /// 空 = 用官方公共中继（缺省），不是非法输入，写入必须成功且读回仍是空串（`relay_url`
+    /// 字段语义不变，存的是原始值；实际生效地址走 `default_relay_url`/`effective_relay_url`
+    /// 兜底，不在这里改写）。
+    #[test]
+    fn remote_control_settings_accept_empty_relay_url() {
+        let conn = cli_path_test_db();
+
+        remote_control_set_settings_in_conn(&conn, true, "").unwrap();
+        let settings = remote_control_get_settings_in_conn(&conn).unwrap();
+
+        assert!(settings.enabled);
+        assert_eq!(settings.relay_url, "");
+        assert_eq!(
+            settings.default_relay_url,
+            remote_gateway::DEFAULT_PUBLIC_RELAY_URL
+        );
+    }
+
+    /// 纯空白（非空串）同样必须放行——跟写侧其余字段 trim 后判空的纪律一致。
+    #[test]
+    fn remote_control_settings_accept_whitespace_only_relay_url() {
+        let conn = cli_path_test_db();
+
+        remote_control_set_settings_in_conn(&conn, true, "   ").unwrap();
+        let settings = remote_control_get_settings_in_conn(&conn).unwrap();
+
+        assert!(settings.enabled);
+        assert_eq!(settings.relay_url, "");
+    }
+
+    /// `default_relay_url` 恒为 `DEFAULT_PUBLIC_RELAY_URL` 常量值，不随 `relay_url` 是否已自定
+    /// 义而变化——它是"留空时会生效的值"这一固定事实，不是另一份可写状态。
+    #[test]
+    fn remote_control_settings_default_relay_url_is_constant_regardless_of_custom_relay() {
+        let conn = cli_path_test_db();
+
+        remote_control_set_settings_in_conn(&conn, true, "wss://relay.example.com").unwrap();
+        let settings = remote_control_get_settings_in_conn(&conn).unwrap();
+
+        assert_eq!(
+            settings.default_relay_url,
+            remote_gateway::DEFAULT_PUBLIC_RELAY_URL
+        );
+        assert_eq!(settings.relay_url, "wss://relay.example.com");
+    }
+
+    #[test]
+    fn remote_control_settings_reject_invalid_relay_url() {
+        let conn = cli_path_test_db();
+
+        let error = remote_control_set_settings_in_conn(&conn, true, "https://relay.example.com")
+            .unwrap_err();
+
+        assert!(error.starts_with("AL_ERR:remoteControl.invalidRelayUrl:"));
+    }
+
+    /// M24DF 项 3：写侧收紧——`starts_with("wss://")` 单独一条挡不住 userinfo/路径/query/hash/
+    /// 空 host 这几类形态，逐条钉住必拒；`wss://host` 与 `wss://host/`（唯一允许的尾随斜杠）
+    /// 必须仍然放行。
+    #[test]
+    fn remote_control_settings_reject_relay_url_with_userinfo() {
+        let conn = cli_path_test_db();
+
+        let error =
+            remote_control_set_settings_in_conn(&conn, true, "wss://user:pass@host").unwrap_err();
+
+        assert!(error.starts_with("AL_ERR:remoteControl.invalidRelayUrl:"));
+    }
+
+    #[test]
+    fn remote_control_settings_reject_relay_url_with_path() {
+        let conn = cli_path_test_db();
+
+        let error =
+            remote_control_set_settings_in_conn(&conn, true, "wss://host/room").unwrap_err();
+
+        assert!(error.starts_with("AL_ERR:remoteControl.invalidRelayUrl:"));
+    }
+
+    #[test]
+    fn remote_control_settings_reject_relay_url_with_query() {
+        let conn = cli_path_test_db();
+
+        let error =
+            remote_control_set_settings_in_conn(&conn, true, "wss://host?x=1").unwrap_err();
+
+        assert!(error.starts_with("AL_ERR:remoteControl.invalidRelayUrl:"));
+    }
+
+    #[test]
+    fn remote_control_settings_reject_relay_url_with_hash() {
+        let conn = cli_path_test_db();
+
+        let error = remote_control_set_settings_in_conn(&conn, true, "wss://host#x").unwrap_err();
+
+        assert!(error.starts_with("AL_ERR:remoteControl.invalidRelayUrl:"));
+    }
+
+    #[test]
+    fn remote_control_settings_reject_relay_url_with_empty_host() {
+        let conn = cli_path_test_db();
+
+        let error = remote_control_set_settings_in_conn(&conn, true, "wss://").unwrap_err();
+
+        assert!(error.starts_with("AL_ERR:remoteControl.invalidRelayUrl:"));
+    }
+
+    #[test]
+    fn remote_control_settings_accept_relay_url_without_trailing_slash() {
+        let conn = cli_path_test_db();
+
+        remote_control_set_settings_in_conn(&conn, true, "wss://host").unwrap();
+
+        let settings = remote_control_get_settings_in_conn(&conn).unwrap();
+        assert_eq!(settings.relay_url, "wss://host");
+    }
+
+    #[test]
+    fn remote_control_settings_accept_relay_url_with_single_trailing_slash() {
+        let conn = cli_path_test_db();
+
+        remote_control_set_settings_in_conn(&conn, true, "wss://host/").unwrap();
+
+        let settings = remote_control_get_settings_in_conn(&conn).unwrap();
+        assert_eq!(settings.relay_url, "wss://host/");
+    }
+
+    #[test]
+    fn compute_pairing_status_reports_done() {
+        let mut slot = PairingSlot::Done {
+            room_id: PAIR_TEST_ROOM.to_owned(),
+            device_id: "dev-1".to_string(),
+            completed_at_secs: 1_700_000_000,
+        };
+        assert_eq!(
+            compute_pairing_status(&mut slot, 1_700_000_299),
+            RemotePairingStatus::Done {
+                device_id: "dev-1".to_string()
+            }
+        );
+        assert_eq!(
+            compute_pairing_status(&mut slot, 1_700_000_300),
+            RemotePairingStatus::Idle
+        );
+        assert!(matches!(slot, PairingSlot::Idle));
     }
 
     #[test]
@@ -15025,6 +21491,9 @@ mod tests {
             ("namespaces_repo.rs", include_str!("namespaces_repo.rs")),
             ("perf_probe.rs", include_str!("perf_probe.rs")),
             ("proc.rs", include_str!("proc.rs")),
+            ("remote_crypto.rs", include_str!("remote_crypto.rs")),
+            ("remote_gateway.rs", include_str!("remote_gateway.rs")),
+            ("remote_pairing.rs", include_str!("remote_pairing.rs")),
             ("repos_repo.rs", include_str!("repos_repo.rs")),
             ("sandbox.rs", include_str!("sandbox.rs")),
             ("test_support.rs", include_str!("test_support.rs")),
@@ -16227,6 +22696,7 @@ mod tests {
             )
             .unwrap();
         let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
         running.0.lock().unwrap().insert(
             "s-owner-wait-timeout".into(),
             RunSlot::Finalizing {
@@ -16267,10 +22737,12 @@ mod tests {
                 );
                 assert!(emit_terminal_after_releasing_run_slot(
                     &running,
+                    &team_running,
                     "s-owner-wait-timeout",
                     "run-owner-wait-timeout",
                     vec![terminal],
                     &transport,
+                    None,
                 ));
             },
         );
@@ -16455,6 +22927,7 @@ mod tests {
         });
 
         let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
         let running_t = running.clone();
         std::thread::spawn(move || {
             let mut slots = running_t.0.lock().unwrap();
@@ -16506,10 +22979,12 @@ mod tests {
                 );
                 assert!(emit_terminal_after_releasing_run_slot(
                     &running,
+                    &team_running,
                     "s-owner-wait-auth-poison",
                     "run-owner-wait-auth-poison",
                     vec![terminal],
                     &transport,
+                    None,
                 ));
             },
         );
@@ -16691,6 +23166,76 @@ mod tests {
             sort_order: 0,
             created_at: 100,
             updated_at: 100,
+        }
+    }
+
+    struct LockFreeProbeStore<'a> {
+        db: &'a Db,
+        calls: std::cell::Cell<u32>,
+        observed_lock_free: std::cell::Cell<bool>,
+    }
+
+    impl<'a> KeyStore for LockFreeProbeStore<'a> {
+        fn get(&self, _id: &str) -> Result<Option<String>, String> {
+            self.calls.set(self.calls.get() + 1);
+            self.observed_lock_free.set(self.db.0.try_lock().is_ok());
+            Ok(Some("probe-key".to_string()))
+        }
+
+        fn set(&self, _id: &str, _key: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn delete(&self, _id: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn resolve_harness_search_creds_calls_keychain_with_db_lock_released() {
+        let conn = crate::test_support::mem_db();
+        let db = Db(crate::perf_probe::TimedMutex::new(conn));
+        let mut profile = agent_profile("harness-agent", false, false);
+        profile.access = "harness".into();
+        let probe = LockFreeProbeStore {
+            db: &db,
+            calls: std::cell::Cell::new(0),
+            observed_lock_free: std::cell::Cell::new(false),
+        };
+
+        let creds = resolve_harness_search_creds(&db, &profile, &probe).unwrap();
+
+        assert_eq!(probe.calls.get(), 1);
+        assert!(
+            probe.observed_lock_free.get(),
+            "search key 钥匙串 IPC 必须在 db.0.lock() 释放之后发生"
+        );
+        assert_eq!(creds.key.as_deref(), Some("probe-key"));
+        assert_eq!(creds.backend.as_deref(), Some("brave"));
+    }
+
+    #[test]
+    fn resolve_harness_search_creds_skips_keychain_for_non_harness_profile() {
+        let conn = crate::test_support::mem_db();
+        let db = Db(crate::perf_probe::TimedMutex::new(conn));
+        for access in ["native", "borrow"] {
+            let mut profile = agent_profile("some-agent", false, false);
+            profile.access = access.into();
+            let probe = LockFreeProbeStore {
+                db: &db,
+                calls: std::cell::Cell::new(0),
+                observed_lock_free: std::cell::Cell::new(false),
+            };
+
+            let creds = resolve_harness_search_creds(&db, &profile, &probe).unwrap();
+
+            assert_eq!(
+                probe.calls.get(),
+                0,
+                "access={access} 不应触发任何钥匙串 IPC"
+            );
+            assert_eq!(creds.key, None);
+            assert_eq!(creds.backend, None);
         }
     }
 
@@ -25727,6 +32272,134 @@ mod tests {
         assert!(running.0.lock().unwrap().contains_key("s-team-active"));
     }
 
+    /// M1-T1（remote control M0 §4c）：占槽咽喉——`reserve_new_session_run` 是 solo/lead 共用的
+    /// send_message 唯一占槽成功出口，成功后必须落一条 session_runtime running 行（run_id 此刻
+    /// 还没现场生成，写 None——调用方稍后自己回填）。
+    #[test]
+    fn reserve_new_session_run_writes_session_runtime_running() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
+
+        assert!(
+            db::get_session_runtime(&conn, "s-runtime-reserve")
+                .unwrap()
+                .is_none(),
+            "reserve 之前不该有运行态行"
+        );
+
+        reserve_new_session_run(
+            &conn,
+            &running,
+            &team_running,
+            "s-runtime-reserve",
+            Locale::Zh,
+        )
+        .unwrap();
+
+        let row = db::get_session_runtime(&conn, "s-runtime-reserve")
+            .unwrap()
+            .expect("reserve 成功后必须落一条 session_runtime 行");
+        assert_eq!(row.status, "running");
+    }
+
+    /// 占槽失败（team 仍活跃）不得写 running——否则远端会看到一个从没真正跑起来的会话。
+    #[test]
+    fn reserve_new_session_run_does_not_write_session_runtime_on_rejection() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
+        let member_key = member_runner::MemberKey::new("s-runtime-rejected", "r1", "a1");
+        team_running.register(&member_key, 43);
+
+        reserve_new_session_run(
+            &conn,
+            &running,
+            &team_running,
+            "s-runtime-rejected",
+            Locale::Zh,
+        )
+        .unwrap_err();
+
+        assert!(
+            db::get_session_runtime(&conn, "s-runtime-rejected")
+                .unwrap()
+                .is_none(),
+            "被拒绝的占槽不该留下 session_runtime 行"
+        );
+    }
+
+    // M1 修复轮 P1-1（opus 深审·2026-08-11）：`compute_session_runtime` 纯函数单测——
+    // 验收要求的四条口径：solo 槽在→running；全空→idle；槽已释放但 dispatch intent 仍在
+    // →running（P1-1 窗口，最关键的一条）；team member 在→running。
+
+    #[test]
+    fn compute_session_runtime_running_when_solo_slot_present() {
+        let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
+        try_reserve(&running, "s-compute-solo").unwrap();
+
+        assert_eq!(
+            compute_session_runtime(&running, &team_running, "s-compute-solo"),
+            db::SESSION_RUNTIME_RUNNING
+        );
+    }
+
+    #[test]
+    fn compute_session_runtime_idle_when_both_empty() {
+        let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
+
+        assert_eq!(
+            compute_session_runtime(&running, &team_running, "s-compute-empty"),
+            db::SESSION_RUNTIME_IDLE
+        );
+    }
+
+    /// P1-1 窗口·最关键的一条：Running 槽已经释放（lead 收尾），但队员派单 intent 仍在途——
+    /// 必须仍判 running，不能因为 Running 槽空了就误判 idle（旧写口在此刻会错写 idle）。
+    #[test]
+    fn compute_session_runtime_running_when_slot_released_but_dispatch_intent_still_active() {
+        let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
+        let session_id = "s-compute-intent-window";
+        try_reserve(&running, session_id).unwrap();
+        let intent = team_running.begin_dispatch_intent(session_id).unwrap();
+
+        // 模拟 lead 收尾：Running 槽已摘掉，但 intent guard 还没 drop（队员仍在跑）。
+        running.0.lock().unwrap().remove(session_id);
+
+        assert_eq!(
+            compute_session_runtime(&running, &team_running, session_id),
+            db::SESSION_RUNTIME_RUNNING,
+            "槽已释放但 dispatch intent 仍在途时必须仍判 running"
+        );
+
+        drop(intent);
+        assert_eq!(
+            compute_session_runtime(&running, &team_running, session_id),
+            db::SESSION_RUNTIME_IDLE,
+            "intent 也释放后才真正转 idle"
+        );
+    }
+
+    #[test]
+    fn compute_session_runtime_running_when_team_member_registered() {
+        let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
+        let session_id = "s-compute-team-member";
+        let member_key = member_runner::MemberKey::new(session_id, "run-a", "assignment-a");
+        team_running.register(&member_key, 4242);
+
+        assert_eq!(
+            compute_session_runtime(&running, &team_running, session_id),
+            db::SESSION_RUNTIME_RUNNING,
+            "Running 槽为空但有活跃队员时必须判 running"
+        );
+    }
+
     #[test]
     fn new_run_reservation_rejects_dispatch_intent_and_recovers_after_drop() {
         let conn = Connection::open_in_memory().unwrap();
@@ -25763,11 +32436,14 @@ mod tests {
     #[test]
     fn terminated_lead_worker_rejects_before_work_and_releases_dispatch_intent() {
         let team_running = member_runner::TeamRunning::default();
+        let running = Running::default();
         let terminated = AtomicBool::new(true);
         let work_called = std::cell::Cell::new(false);
 
         let error = run_lead_worker_with_dispatch_intent(
             &team_running,
+            &running,
+            None,
             "s-terminated-lead",
             &terminated,
             || {
@@ -26135,6 +32811,407 @@ mod tests {
         );
     }
 
+    // ---- P0-2（opus delta 复核·2026-08-11）：两处「guard 在 db 临界区内 drop」重入死锁回归钉子 ----
+    //
+    // 复用上面 `strip_comments_and_strings` / `extract_fn_body` 这套源码切片基建——运行时单测
+    // 测不出「锁持有时长跨越了 guard 的 refresh 触发点」这种时序属性（单线程跑，死锁与不死锁
+    // 两版实现在现有测试下都是全绿），只能钉源码形状。
+
+    /// 跟 `assert_call_after_lock_released` 同一个精神（复用它的核心扫描算法），但不要求「标记
+    /// 之后必须再出现一次 lock_marker」那道尾检——本刀两个钉子里，`start_continuation_session`
+    /// 的 solo 闭包在挂上 `.with_refresh(` 之后再也不会重新拿 `db.0.lock()`（后续只是解构
+    /// plan、组装 parser、调 `spawn_and_stream`），硬套那道尾检会对着正确代码误报红。只保留
+    /// 核心那道：`marker` 之前出现的每一次 `lock_marker`，其所在的最内层 block 必须在 `marker`
+    /// 出现之前就已经收尾——用来钉死「guard 挂 refresh 时手上不再攥着 conn 锁」这条不变量
+    /// （P0-1 的教训：`refresh_session_runtime` 内部会重新 `db.0.lock()`，若调用它时同一线程
+    /// 还攥着另一把 `db.0` 锁就是不可重入死锁）。
+    fn assert_lock_scope_closed_before_marker(
+        fn_body: &str,
+        lock_marker: &str,
+        marker: &str,
+        label: &str,
+    ) {
+        let marker_idx = fn_body.find(marker).unwrap_or_else(|| {
+            panic!("{label}: 函数体里没找到 {marker:?}，测试的切片标记可能已经过期")
+        });
+
+        let mut lock_positions = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(rel) = fn_body[cursor..].find(lock_marker) {
+            let idx = cursor + rel;
+            if idx >= marker_idx {
+                break;
+            }
+            lock_positions.push(idx);
+            cursor = idx + lock_marker.len();
+        }
+        assert!(
+            !lock_positions.is_empty(),
+            "{label}: {marker:?} 之前没找到任何 {lock_marker:?}，测试的切片标记可能已经过期"
+        );
+
+        for &lock_idx in &lock_positions {
+            let mut depth: i32 = 0;
+            let mut release_idx: Option<usize> = None;
+            for (i, c) in fn_body[lock_idx..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        if depth == 0 {
+                            release_idx = Some(lock_idx + i);
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+            let release_idx = release_idx.unwrap_or_else(|| {
+                panic!(
+                    "{label}: 字节 {lock_idx} 处的 {lock_marker:?} 往后没扫到把它包住的 block \
+                     收尾 `}}`，切片范围不对"
+                )
+            });
+            assert!(
+                release_idx < marker_idx,
+                "{label}: 字节 {lock_idx} 处的 {lock_marker:?} 所在 block 直到字节 \
+                 {release_idx} 才收尾，但 {marker:?} 在字节 {marker_idx} 已经出现——说明 guard \
+                 挂 refresh 时手上还攥着 conn 锁，会在同一线程重入 db.0.lock() 死锁\
+                 （P0 死锁回归）"
+            );
+        }
+    }
+
+    fn assert_search_creds_resolved_after_prior_locks(
+        production: &str,
+        fn_needle: &str,
+        label: &str,
+    ) {
+        let stripped = strip_comments_and_strings(production);
+        let body = extract_fn_body(&stripped, fn_needle, label);
+        assert_lock_scope_closed_before_marker(
+            body,
+            "db.0.lock()",
+            "resolve_harness_search_creds(",
+            label,
+        );
+    }
+
+    fn assert_member_key_resolved_after_prior_locks(
+        production: &str,
+        fn_needle: &str,
+        label: &str,
+    ) {
+        let stripped = strip_comments_and_strings(production);
+        let body = extract_fn_body(&stripped, fn_needle, label);
+        assert_lock_scope_closed_before_marker(body, ".0.lock()", "resolve_member_key(", label);
+    }
+
+    fn assert_no_keychain_ipc_in_db_lock_scopes(production: &str, fn_needle: &str, label: &str) {
+        let stripped = strip_comments_and_strings(production);
+        let body = extract_fn_body(&stripped, fn_needle, label);
+        let lock_marker = ".0.lock()";
+        let mut lock_positions = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(rel) = body[cursor..].find(lock_marker) {
+            let idx = cursor + rel;
+            lock_positions.push(idx);
+            cursor = idx + lock_marker.len();
+        }
+        assert!(
+            !lock_positions.is_empty(),
+            "{label}: 函数体里没找到 {lock_marker:?}，测试的切片标记可能已经过期"
+        );
+
+        for lock_idx in lock_positions {
+            let mut depth: i32 = 0;
+            let mut release_idx: Option<usize> = None;
+            for (i, c) in body[lock_idx..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        if depth == 0 {
+                            release_idx = Some(lock_idx + i);
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+            let release_idx = release_idx.unwrap_or_else(|| {
+                panic!(
+                    "{label}: 字节 {lock_idx} 处的 {lock_marker:?} 往后没扫到把它包住的 block \
+                     收尾 `}}`，切片范围不对"
+                )
+            });
+            let lock_scope = &body[lock_idx..=release_idx];
+            assert!(
+                !lock_scope.contains("KeyringStore.get("),
+                "{label}: 字节 {lock_idx}..={release_idx} 的 DB 锁 block 内出现了 \
+                 KeyringStore.get(，钥匙串 IPC 必须移到锁外"
+            );
+            assert!(
+                !lock_scope.contains("keychain::"),
+                "{label}: 字节 {lock_idx}..={release_idx} 的 DB 锁 block 内出现了 keychain::，\
+                 钥匙串 IPC 必须移到锁外"
+            );
+        }
+    }
+
+    #[test]
+    fn send_message_resolves_search_creds_with_lock_released() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_search_creds_resolved_after_prior_locks(
+            production,
+            "\nfn send_message(",
+            "send_message",
+        );
+    }
+
+    #[test]
+    fn lead_summarize_resolves_search_creds_with_lock_released() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_search_creds_resolved_after_prior_locks(
+            production,
+            "\nasync fn lead_summarize(",
+            "lead_summarize",
+        );
+    }
+
+    #[test]
+    fn start_repo_generation_resolves_search_creds_with_lock_released() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_search_creds_resolved_after_prior_locks(
+            production,
+            "\nfn start_repo_generation(",
+            "start_repo_generation",
+        );
+    }
+
+    #[test]
+    fn generate_handoff_doc_resolves_search_creds_with_lock_released() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_search_creds_resolved_after_prior_locks(
+            production,
+            "\nasync fn generate_handoff_doc(",
+            "generate_handoff_doc",
+        );
+    }
+
+    #[test]
+    fn propose_team_plan_resolves_search_creds_with_lock_released() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_search_creds_resolved_after_prior_locks(
+            production,
+            "\nasync fn propose_team_plan(",
+            "propose_team_plan",
+        );
+    }
+
+    #[test]
+    fn lead_step_resolves_search_creds_with_lock_released() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_search_creds_resolved_after_prior_locks(
+            production,
+            "\nasync fn lead_step(",
+            "lead_step",
+        );
+    }
+
+    #[test]
+    fn start_repo_generation_resolves_member_key_with_lock_released() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_member_key_resolved_after_prior_locks(
+            production,
+            "\nfn start_repo_generation(",
+            "start_repo_generation",
+        );
+    }
+
+    #[test]
+    fn propose_team_plan_resolves_member_key_with_lock_released() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_member_key_resolved_after_prior_locks(
+            production,
+            "\nasync fn propose_team_plan(",
+            "propose_team_plan",
+        );
+    }
+
+    #[test]
+    fn lead_step_resolves_member_key_with_lock_released() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_member_key_resolved_after_prior_locks(
+            production,
+            "\nasync fn lead_step(",
+            "lead_step",
+        );
+    }
+
+    #[test]
+    fn generate_handoff_doc_resolves_member_key_with_lock_released() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_member_key_resolved_after_prior_locks(
+            production,
+            "\nasync fn generate_handoff_doc(",
+            "generate_handoff_doc",
+        );
+    }
+
+    #[test]
+    fn start_continuation_session_resolves_member_key_with_lock_released() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_member_key_resolved_after_prior_locks(
+            production,
+            "\nfn start_continuation_session(",
+            "start_continuation_session",
+        );
+    }
+
+    #[test]
+    fn start_repo_generation_keeps_keychain_ipc_out_of_db_lock_scopes() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_no_keychain_ipc_in_db_lock_scopes(
+            production,
+            "\nfn start_repo_generation(",
+            "start_repo_generation",
+        );
+    }
+
+    #[test]
+    fn propose_team_plan_keeps_keychain_ipc_out_of_db_lock_scopes() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_no_keychain_ipc_in_db_lock_scopes(
+            production,
+            "\nasync fn propose_team_plan(",
+            "propose_team_plan",
+        );
+    }
+
+    #[test]
+    fn lead_step_keeps_keychain_ipc_out_of_db_lock_scopes() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_no_keychain_ipc_in_db_lock_scopes(production, "\nasync fn lead_step(", "lead_step");
+    }
+
+    #[test]
+    fn generate_handoff_doc_keeps_keychain_ipc_out_of_db_lock_scopes() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_no_keychain_ipc_in_db_lock_scopes(
+            production,
+            "\nasync fn generate_handoff_doc(",
+            "generate_handoff_doc",
+        );
+    }
+
+    #[test]
+    fn start_continuation_session_keeps_keychain_ipc_out_of_db_lock_scopes() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_no_keychain_ipc_in_db_lock_scopes(
+            production,
+            "\nfn start_continuation_session(",
+            "start_continuation_session",
+        );
+    }
+
+    /// 顺手③（M2-4c 双路审）：`remote_gateway_session_repo_provider` 是新 provider，DB 锁 block
+    /// 内只做一次 `SELECT`，不该碰钥匙串/网络（RN4）——把它补进这份护栏清单，防止以后有人往
+    /// 这条 provider 的锁 block 里塞钥匙串调用而没有测试拦住。
+    #[test]
+    fn remote_gateway_session_repo_provider_keeps_keychain_ipc_out_of_db_lock_scopes() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_no_keychain_ipc_in_db_lock_scopes(
+            production,
+            "\nfn remote_gateway_session_repo_provider(",
+            "remote_gateway_session_repo_provider",
+        );
+    }
+
+    /// 站点 1 钉子·上半（函数定义侧）：`reserve_lead_start_after_globalstop` 自己不许再挂
+    /// `.with_refresh(`——它的 globally-stopped 分支会在函数体内部 `drop(guard)`，而调用方在
+    /// 整个函数调用期间都还持着 conn（见下面 `start_lead_session_attaches_refresh_only_after_
+    /// reservation_lock_released` 那条钉子），一旦这里重新挂上 refresh，`drop(guard)` 就会在
+    /// conn 仍锁着的同一线程上重入 `db.0.lock()`——这正是 P0-1 那类死锁的原始形状。
+    #[test]
+    fn reserve_lead_start_after_globalstop_never_attaches_refresh_itself() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let stripped = strip_comments_and_strings(production);
+        let label = "reserve_lead_start_after_globalstop";
+        let body = extract_fn_body(
+            &stripped,
+            "\nfn reserve_lead_start_after_globalstop(",
+            label,
+        );
+        assert!(
+            !body.contains(".with_refresh("),
+            "{label}: 函数体内部不该再挂 .with_refresh()——调用方在这里仍持有 conn（db.0.lock() \
+             借出的 &Connection，函数返回前不会释放），globally-stopped 分支的 drop(guard) 若带\
+             着 refresh 句柄会在同一线程上重新 db.0.lock()，与 P0-1 同款死锁（P0-2 修复：refresh \
+             改由调用方在 conn 释放之后显式补，见 start_lead_session 里的补法）"
+        );
+    }
+
+    /// 站点 1 钉子·下半（调用方侧）：`start_lead_session` 里 `reserve_lead_start_after_
+    /// globalstop` 那把 `db.0.lock()` 必须在 `.with_refresh(` 出现之前就已经收尾——覆盖「正常
+    /// 继续」分支（conn 块结束后才挂 refresh）；配合上面「函数自己不挂 refresh」那条钉子，
+    /// 才能完整覆盖「早退」分支（函数内部的 drop(guard) 此刻压根没有 refresh 句柄，天然安全）。
+    #[test]
+    fn start_lead_session_attaches_refresh_only_after_reservation_lock_released() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let stripped = strip_comments_and_strings(production);
+        let label = "start_lead_session";
+        let body = extract_fn_body(&stripped, "\nfn start_lead_session(", label);
+        assert_call_after_lock_released(
+            body,
+            "db.0.lock()",
+            ".with_refresh(",
+            "db.0.lock()",
+            label,
+        );
+    }
+
+    /// 站点 2 钉子：`start_continuation_session` 的 solo 闭包里，任何在 `.with_refresh(` 之前
+    /// 出现的 `db.0.lock()`（`ensure_session_not_continued` 的短锁块 + build_send_plan/
+    /// append_message/prepare_run_ledger 那个内层闭包自己的 conn）都必须在 `.with_refresh(`
+    /// 出现之前就已经收尾——原实现在这些依赖 conn 的调用之前就把 refresh 句柄挂上了 guard，
+    /// 三步任一 `?` 早退都会在 conn 仍持锁的同一线程上重入 `db.0.lock()` 死锁。
+    #[test]
+    fn start_continuation_solo_closure_attaches_refresh_only_after_conn_scopes_close() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let stripped = strip_comments_and_strings(production);
+        let label = "start_continuation_session solo 闭包";
+        let body = extract_fn_body(
+            &stripped,
+            "move |child_session_id, agent_id, seed| -> Result<(), String> ",
+            label,
+        );
+        // 注意：这个闭包捕获的 db 句柄变量名是 `db_for_start_solo`（不是别处那些函数用的裸
+        // `db`），实际调用文本是 `db_for_start_solo.0.lock()`——lock_marker 用 `.0.lock()` 这个
+        // 不含变量名前缀的后缀来匹配，不依赖具体捕获变量叫什么。
+        assert_lock_scope_closed_before_marker(body, ".0.lock()", ".with_refresh(", label);
+    }
+
     // ---- 2026-07-29 opus 对抗审：把审计实测出的三组假阴性固化成 helper 自身的单测 ----
 
     /// 假阴性①复现：锁块内的注释含孤立 `}`，且这次 guard **真的**活过了慢活调用（`drop(conn)` 在
@@ -26420,9 +33497,12 @@ mod tests {
         request_stop(&running, "s-lead-fast-stop", |_| {}, |_| {}).unwrap();
         let killed_pid = std::cell::Cell::new(None);
         let terminated = AtomicBool::new(false);
+        let team_running = member_runner::TeamRunning::default();
 
         let proceed = transition_lead_spawn_handoff(
             &running,
+            &team_running,
+            None,
             &terminated,
             "s-lead-fast-stop",
             4242,
@@ -26464,10 +33544,12 @@ mod tests {
     #[test]
     fn launching_stop_handoff_transitions_to_finalizing_and_continues_finalizer() {
         let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
         try_reserve(&running, "s-fast-stop").unwrap();
         request_stop(&running, "s-fast-stop", |_| {}, |_| {}).unwrap();
 
-        let action = transition_spawn_handoff(&running, "s-fast-stop", 4242).unwrap();
+        let action =
+            transition_spawn_handoff(&running, &team_running, None, "s-fast-stop", 4242).unwrap();
 
         assert_eq!(action, SpawnHandoffAction::StopAndFinalize);
         assert!(matches!(
@@ -26665,22 +33747,29 @@ mod tests {
     #[test]
     fn abort_handoff_kills_before_unlock_and_preserves_foreign_slot() {
         let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
         running.0.lock().unwrap().insert(
             "s-abort-foreign".to_string(),
             RunSlot::Mutating { op: "undo" },
         );
         let kill_count = std::cell::Cell::new(0);
 
-        let action =
-            transition_spawn_handoff_with_abort_kill(&running, "s-abort-foreign", 4242, |pid| {
+        let action = transition_spawn_handoff_with_abort_kill(
+            &running,
+            &team_running,
+            None,
+            "s-abort-foreign",
+            4242,
+            |pid| {
                 assert_eq!(pid, 4242);
                 assert!(
                     running.0.try_lock().is_err(),
                     "abort kill must happen while reservation is still mutually excluded"
                 );
                 kill_count.set(kill_count.get() + 1);
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         assert_eq!(action, SpawnHandoffAction::Abort);
         assert_eq!(kill_count.get(), 1, "abort path must kill exactly once");
@@ -26697,18 +33786,25 @@ mod tests {
     #[test]
     fn abort_handoff_without_slot_kills_before_reservation_can_resume() {
         let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
         let kill_count = std::cell::Cell::new(0);
 
-        let action =
-            transition_spawn_handoff_with_abort_kill(&running, "s-abort-missing", 4343, |pid| {
+        let action = transition_spawn_handoff_with_abort_kill(
+            &running,
+            &team_running,
+            None,
+            "s-abort-missing",
+            4343,
+            |pid| {
                 assert_eq!(pid, 4343);
                 assert!(
                     running.0.try_lock().is_err(),
                     "same-session reservation must remain excluded until kill is issued"
                 );
                 kill_count.set(kill_count.get() + 1);
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         assert_eq!(action, SpawnHandoffAction::Abort);
         assert_eq!(kill_count.get(), 1, "abort path must kill exactly once");
@@ -26721,6 +33817,7 @@ mod tests {
     #[test]
     fn spawn_abort_cleanup_disarms_guard_before_waiting() {
         let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
         let session_id = "s-abort-wait-reserve";
         try_reserve(&running, session_id).unwrap();
         let mut old_guard = ReservationGuard::new(running.clone(), session_id.to_string());
@@ -26732,8 +33829,15 @@ mod tests {
 
         // 模拟 handoff 前 slot 异常丢失，走 missing-slot Abort。
         running.0.lock().unwrap().remove(session_id);
-        let action =
-            transition_spawn_handoff_with_abort_kill(&running, session_id, 4444, |_| {}).unwrap();
+        let action = transition_spawn_handoff_with_abort_kill(
+            &running,
+            &team_running,
+            None,
+            session_id,
+            4444,
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(action, SpawnHandoffAction::Abort);
 
         let wait_order = order.clone();
@@ -26775,6 +33879,7 @@ mod tests {
 
         for (label, slot, removes_slot) in cases {
             let running = Running::default();
+            let team_running = member_runner::TeamRunning::default();
             let session_id = format!("s-register-failed-{label}");
             running.0.lock().unwrap().insert(session_id.clone(), slot);
             let mut guard = ReservationGuard::new(running.clone(), session_id.clone());
@@ -26783,6 +33888,8 @@ mod tests {
 
             abort_spawn_after_register_failure(
                 &running,
+                &team_running,
+                None,
                 &session_id,
                 4545,
                 &mut guard,
@@ -26814,6 +33921,7 @@ mod tests {
     #[test]
     fn spawn_abort_register_failure_removes_only_the_target_session() {
         let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
         let session_id = "s-register-failed-target";
         let unrelated_session_id = "s-register-failed-unrelated";
         {
@@ -26823,8 +33931,17 @@ mod tests {
         }
         let mut guard = ReservationGuard::new(running.clone(), session_id.to_string());
 
-        abort_spawn_after_register_failure(&running, session_id, 4545, &mut guard, |_| {}, || {})
-            .unwrap();
+        abort_spawn_after_register_failure(
+            &running,
+            &team_running,
+            None,
+            session_id,
+            4545,
+            &mut guard,
+            |_| {},
+            || {},
+        )
+        .unwrap();
 
         let slots = running.0.lock().unwrap();
         assert!(
@@ -26840,10 +33957,12 @@ mod tests {
     #[test]
     fn spawn_abort_register_failure_kills_then_disarms_and_waits_after_unlock() {
         let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
         let session_id = "s-register-failed";
         try_reserve(&running, session_id).unwrap();
         let mut guard = ReservationGuard::new(running.clone(), session_id.to_string());
-        let action = transition_spawn_handoff(&running, session_id, 4545).unwrap();
+        let action =
+            transition_spawn_handoff(&running, &team_running, None, session_id, 4545).unwrap();
         assert_eq!(action, SpawnHandoffAction::Stream);
 
         let order = Arc::new(Mutex::new(Vec::new()));
@@ -26855,6 +33974,8 @@ mod tests {
         let wait_order = order.clone();
         abort_spawn_after_register_failure(
             &running,
+            &team_running,
+            None,
             session_id,
             4545,
             &mut guard,
@@ -26906,12 +34027,15 @@ mod tests {
         .expect_err("test thread must poison Running");
         assert!(running.0.is_poisoned());
 
+        let team_running = member_runner::TeamRunning::default();
         let mut guard = ReservationGuard::new(running.clone(), "s-register-poison".into());
         let order = Arc::new(Mutex::new(Vec::new()));
         let kill_order = order.clone();
         let wait_order = order.clone();
         let result = abort_spawn_after_register_failure(
             &running,
+            &team_running,
+            None,
             "s-register-poison",
             4646,
             &mut guard,
@@ -28616,6 +35740,7 @@ mod tests {
             &spec,
             &profile,
             key,
+            HarnessSearchCreds::default(),
             &wt,
             Locale::En,
         )
@@ -32167,6 +39292,14 @@ mod tests {
     }
 
     #[test]
+    fn create_session_business_rejects_pipe_in_id() {
+        use crate::test_support::mem_db;
+        let c = mem_db();
+
+        create_session_business(&c, "s|pipe", "x", None, None).unwrap_err();
+    }
+
+    #[test]
     fn cleanup_legacy_local_repos_preserves_gui_projects_sessions_and_messages() {
         use crate::test_support::{mem_db, tmp_root};
 
@@ -33315,6 +40448,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let transport = event_transport::EventTransport::new_for_test(root.path().to_path_buf());
         let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
         running.0.lock().unwrap().insert(
             "s-transport-release".into(),
             RunSlot::Finalizing {
@@ -33361,10 +40495,12 @@ mod tests {
 
         assert!(emit_terminal_after_releasing_run_slot(
             &running,
+            &team_running,
             "s-transport-release",
             "run-transport-release",
             vec![terminal.clone()],
             &transport,
+            None,
         ));
 
         let payloads = payloads.lock().unwrap();
@@ -33376,6 +40512,121 @@ mod tests {
             agent_event::AgentEvent::TextDelta { .. }
         ));
         assert_eq!(events.last().unwrap().event, terminal);
+    }
+
+    /// M1-T1（remote control M0 §4c）+ M1 修复轮 P1-1（2026-08-11）：释放咽喉——槽释放后传入
+    /// 的 db 必须落一条 idle 行。P1-1 修复后写口改走 `refresh_session_runtime`
+    /// （`db::upsert_session_runtime_status`）——run_id 列不再被清空覆盖成 NULL，而是原样保留
+    /// 表中现值（重算口本身拿不到 run_id，见该函数文档）：这是行为变化，旧版本这里断言
+    /// run_id 必须清空，现在改断言 run_id 保留。
+    #[test]
+    fn emit_terminal_after_releasing_run_slot_writes_session_runtime_idle() {
+        let conn = crate::test_support::mem_db();
+        db::set_session_runtime(
+            &conn,
+            "s-runtime-release",
+            "running",
+            Some("run-runtime-release"),
+        )
+        .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let transport = event_transport::EventTransport::new_for_test(root.path().to_path_buf());
+        let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
+        running.0.lock().unwrap().insert(
+            "s-runtime-release".into(),
+            RunSlot::Finalizing {
+                stop_requested: false,
+            },
+        );
+        transport
+            .register_run(
+                "run-runtime-release",
+                "s-runtime-release",
+                None,
+                member_runner::TextGranularity::Token,
+            )
+            .unwrap();
+        transport.install_emitter_for_test(|_| {});
+        let terminal = agent_event::AgentEvent::RunCloseout {
+            run_id: "run-runtime-release".into(),
+            commit_sha: None,
+            files_changed: None,
+            insertions: None,
+            deletions: None,
+            interrupted: Some(false),
+        };
+        let db = crate::db::Db(crate::perf_probe::TimedMutex::new(conn));
+
+        assert!(emit_terminal_after_releasing_run_slot(
+            &running,
+            &team_running,
+            "s-runtime-release",
+            "run-runtime-release",
+            vec![terminal],
+            &transport,
+            Some(&db),
+        ));
+
+        let conn = db.0.lock().unwrap();
+        let row = db::get_session_runtime(&conn, "s-runtime-release")
+            .unwrap()
+            .expect("release 后仍应留一条运行态行（idle）");
+        assert_eq!(row.status, "idle");
+        assert_eq!(
+            row.run_id.as_deref(),
+            Some("run-runtime-release"),
+            "refresh 写口不覆盖 run_id——重算口本身拿不到新值，不该清空旧值"
+        );
+    }
+
+    /// 同款释放咽喉的 `runtime_db: None` 分支——测试调用点不关心运行态表时不能报错/不能
+    /// 影响既有终态事件行为（回归钉：签名加参数后旧调用点仍必须原样能过）。
+    #[test]
+    fn emit_terminal_after_releasing_run_slot_tolerates_none_runtime_db() {
+        let root = tempfile::tempdir().unwrap();
+        let transport = event_transport::EventTransport::new_for_test(root.path().to_path_buf());
+        let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
+        running.0.lock().unwrap().insert(
+            "s-runtime-release-none".into(),
+            RunSlot::Finalizing {
+                stop_requested: false,
+            },
+        );
+        transport
+            .register_run(
+                "run-runtime-release-none",
+                "s-runtime-release-none",
+                None,
+                member_runner::TextGranularity::Token,
+            )
+            .unwrap();
+        transport.install_emitter_for_test(|_| {});
+        let terminal = agent_event::AgentEvent::RunCloseout {
+            run_id: "run-runtime-release-none".into(),
+            commit_sha: None,
+            files_changed: None,
+            insertions: None,
+            deletions: None,
+            interrupted: Some(false),
+        };
+
+        assert!(emit_terminal_after_releasing_run_slot(
+            &running,
+            &team_running,
+            "s-runtime-release-none",
+            "run-runtime-release-none",
+            vec![terminal],
+            &transport,
+            None,
+        ));
+        assert!(!running
+            .0
+            .lock()
+            .unwrap()
+            .contains_key("s-runtime-release-none"));
     }
 
     #[test]
@@ -33820,6 +41071,7 @@ mod tests {
                 },
             );
             let running = Running::default();
+            let team_running = member_runner::TeamRunning::default();
             running.0.lock().unwrap().insert(
                 name.into(),
                 RunSlot::Finalizing {
@@ -33836,7 +41088,13 @@ mod tests {
             });
             let terminals = lead_terminal_events_for_barrier(name, &decision, interrupted, pending);
             assert!(emit_terminal_after_releasing_run_slot(
-                &running, name, name, terminals, &transport,
+                &running,
+                &team_running,
+                name,
+                name,
+                terminals,
+                &transport,
+                None,
             ));
 
             let payloads = payloads.lock().unwrap();
@@ -33866,6 +41124,7 @@ mod tests {
                 .register_run(failure, failure, None, member_runner::TextGranularity::Line)
                 .unwrap();
             let running = Running::default();
+            let team_running = member_runner::TeamRunning::default();
             let terminated = AtomicBool::new(false);
             running.0.lock().unwrap().insert(
                 failure.into(),
@@ -33880,11 +41139,13 @@ mod tests {
 
             emit_lead_error_and_release(
                 &running,
+                &team_running,
                 &terminated,
                 failure,
                 failure,
                 &transport,
                 format!("{failure} failed"),
+                None,
             );
 
             assert!(!running.0.lock().unwrap().contains_key(failure));
@@ -34706,8 +41967,15 @@ mod tests {
         // 守卫删掉/永远落库，这条测试立刻变红。
         let db = test_db();
         let conn = db.0.lock().unwrap();
-        persist_lead_start_message(&conn, "s-resume", "lead-1", "Lead", None)
-            .expect("None message must be a no-op, not an error");
+        persist_lead_start_message(
+            &conn,
+            "s-resume",
+            "lead-1",
+            "Lead",
+            None,
+            &display_reduce::user_send_key("run-resume-test"),
+        )
+        .expect("None message must be a no-op, not an error");
         let msgs = db::get_messages(&conn, "s-resume").unwrap();
         assert_eq!(msgs.len(), 0, "message=None 不应产生任何落库消息: {msgs:?}");
     }
@@ -34717,8 +41985,15 @@ mod tests {
         // 真实首轮/带话续写路径（message=Some）行为不变：落恰好一条 user 消息。
         let db = test_db();
         let conn = db.0.lock().unwrap();
-        persist_lead_start_message(&conn, "s-first", "lead-1", "Lead", Some("做点什么"))
-            .expect("Some message should persist");
+        persist_lead_start_message(
+            &conn,
+            "s-first",
+            "lead-1",
+            "Lead",
+            Some("做点什么"),
+            &display_reduce::user_send_key("run-first-test"),
+        )
+        .expect("Some message should persist");
         let msgs = db::get_messages(&conn, "s-first").unwrap();
         assert_eq!(msgs.len(), 1, "message=Some 应恰好落一条消息: {msgs:?}");
         assert_eq!(msgs[0].role, "user");
@@ -34726,6 +42001,54 @@ mod tests {
             db::Block::Text { text } => assert_eq!(text, "做点什么"),
             other => panic!("期望 Text·得到 {other:?}"),
         }
+        // P0-c 返工（测试硬度钉②-a）：本机路 dedup_key 字面断言——不满足于「有落库」，直接钉
+        // `user_send:{run_id}` 这把键工厂的字面输出（比对硬编码字符串，不再调用
+        // `display_reduce::user_send_key` 复算期望值——那样「键工厂改常量」类变异会同时改动
+        // 期望值和实际值，测试永远不红），防「键工厂改常量」类变异。
+        let dedup_key_1: String = conn
+            .query_row(
+                "SELECT dedup_key FROM messages WHERE id = ?1",
+                [msgs[0].id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dedup_key_1, "user_send:run-first-test",
+            "本机 send 落库行 dedup_key 必须字面等于 user_send:{{run_id}}"
+        );
+
+        // 再送一次不同 run_id：两次不同 send 必须各自派生出不同的键，否则同键会被
+        // `INSERT OR IGNORE` 悄悄吞掉第二条——这类回归比"落库行数不对"更隐蔽。
+        persist_lead_start_message(
+            &conn,
+            "s-first",
+            "lead-1",
+            "Lead",
+            Some("再做点别的"),
+            &display_reduce::user_send_key("run-second-test"),
+        )
+        .expect("second send with a different run_id should also persist");
+        let msgs = db::get_messages(&conn, "s-first").unwrap();
+        assert_eq!(
+            msgs.len(),
+            2,
+            "两次不同 run_id 的 send 应各自落一条: {msgs:?}"
+        );
+        let dedup_key_2: String = conn
+            .query_row(
+                "SELECT dedup_key FROM messages WHERE id = ?1",
+                [msgs[1].id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dedup_key_2, "user_send:run-second-test",
+            "第二次 send 的 dedup_key 必须字面等于 user_send:{{run_id}}"
+        );
+        assert_ne!(
+            dedup_key_1, dedup_key_2,
+            "两次不同 run_id 的 send 必须派生出两把不同的键"
+        );
     }
 
     /// 造一条 pending 的 DecisionCard 消息（迟到路径测试的前置：commit_late_answer 要能
@@ -34871,17 +42194,20 @@ mod tests {
     #[test]
     fn answer_question_inner_delivered_path_does_not_touch_db() {
         // Live 槽位：答案直接 send 给还活着的 handler，answer_question_inner 本身不落库
-        // （handler 自己的原路——prompt_user 收到答案后——才是落卡的地方）。
+        // 也不再由本次调用报 resolved；翻卡广播转交 prompt_user，在 CAS 落库成功后触发。
         let q = LeadQuestions::default();
         let (tx, rx) = std::sync::mpsc::channel::<LeadAnswer>();
         q.0.lock()
             .unwrap()
             .insert("d3".into(), LeadQuestionSlot::Live(tx));
         let db = test_db();
-        // T3：Delivered 路径没有落库、没有新消息可 emit——必须是 Ok(None)。
-        assert_eq!(
-            answer_question_inner(&q, &db, "s-unused", "d3", "继续".into(), Locale::Zh),
-            Ok(None)
+        // Delivered 路径没有落库消息，也无法同步确认 handler 随后的 CAS 是否成功。
+        let result = answer_question_inner(&q, &db, "s-unused", "d3", "继续".into(), Locale::Zh)
+            .expect("delivered path should succeed");
+        assert_eq!(result.appended, None);
+        assert!(
+            !result.resolved,
+            "Delivered 不落库，不能在 answer_question_inner 提前报告 resolved"
         );
         match rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap() {
             LeadAnswer::Choice(s) => assert_eq!(s, "继续"),
@@ -34890,6 +42216,36 @@ mod tests {
         assert!(
             q.0.lock().unwrap().get("d3").is_none(),
             "answer 后必须移除 decision_id·不泄漏"
+        );
+    }
+
+    #[test]
+    fn answer_question_inner_delivered_send_failure_does_not_report_resolved() {
+        let q = LeadQuestions::default();
+        let (tx, rx) = std::sync::mpsc::channel::<LeadAnswer>();
+        drop(rx);
+        q.0.lock()
+            .unwrap()
+            .insert("d-send-failed".into(), LeadQuestionSlot::Live(tx));
+
+        let result = answer_question_inner(
+            &q,
+            &test_db(),
+            "s-unused",
+            "d-send-failed",
+            "继续".into(),
+            Locale::Zh,
+        )
+        .expect("send 失败仍应维持 Delivered 的 best-effort 返回，不 panic/不报 Err");
+
+        assert_eq!(result.appended, None);
+        assert!(
+            !result.resolved,
+            "tx.send 失败绝不能被后续代码误报成 resolved"
+        );
+        assert!(
+            q.0.lock().unwrap().get("d-send-failed").is_none(),
+            "send 失败后槽位也已消费，不应泄漏"
         );
     }
 
@@ -34906,9 +42262,9 @@ mod tests {
             .unwrap()
             .insert("d-late".into(), LeadQuestionSlot::TimedOut);
 
-        let appended =
-            answer_question_inner(&q, &db, "s-late", "d-late", "继续".into(), Locale::Zh)
-                .expect("late path should succeed");
+        let result = answer_question_inner(&q, &db, "s-late", "d-late", "继续".into(), Locale::Zh)
+            .expect("late path should succeed");
+        assert!(result.resolved);
 
         let conn = db.0.lock().unwrap();
         let msgs = db::get_messages(&conn, "s-late").unwrap();
@@ -34917,9 +42273,9 @@ mod tests {
         // T3：返回值必须是刚落库那条完整消息（供外层 emit "lead-message-appended"），
         // 不是 None（emit 就无从谈起）。
         assert_eq!(
-            appended.as_ref().map(|m| m.id),
+            result.appended.as_ref().map(|m| m.id),
             Some(msgs[1].id),
-            "应返回刚插入的迟到回答消息本身: {appended:?}"
+            "应返回刚插入的迟到回答消息本身: {result:?}"
         );
         match &msgs[0].content[0] {
             db::Block::DecisionCard {
@@ -34960,6 +42316,20 @@ mod tests {
             }
             other => panic!("expected Text, got {other:?}"),
         }
+        // P0-c 返工（测试硬度钉②-c）：迟到答案落库行 dedup_key 字面断言——硬编码
+        // `late_answer:{decision_id}`，不复算 `display_reduce::late_answer_key`，防「键工厂
+        // 改常量」类变异。
+        let dedup_key: String = conn
+            .query_row(
+                "SELECT dedup_key FROM messages WHERE id = ?1",
+                [appended.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dedup_key, "late_answer:d-late-zh",
+            "迟到答案落库行 dedup_key 必须字面等于 late_answer:{{decision_id}}"
+        );
     }
 
     #[test]
@@ -34999,10 +42369,10 @@ mod tests {
         q.0.lock()
             .unwrap()
             .insert("d-dbl".into(), LeadQuestionSlot::TimedOut);
-        assert!(
-            answer_question_inner(&q, &db, "s-dbl", "d-dbl", "继续".into(), Locale::Zh)
-                .is_ok_and(|m| m.is_some())
-        );
+        let first = answer_question_inner(&q, &db, "s-dbl", "d-dbl", "继续".into(), Locale::Zh)
+            .expect("first answer should succeed");
+        assert!(first.appended.is_some());
+        assert!(first.resolved);
 
         // 第二次：map 已经没有槽位（第一次已 remove）→ Missing 分支查 DB → 卡已 chosen → 报错。
         let err = answer_question_inner(&q, &db, "s-dbl", "d-dbl", "算了".into(), Locale::Zh)
@@ -35028,15 +42398,63 @@ mod tests {
         }
         let q = LeadQuestions::default(); // 空 map，模拟重启
 
-        let appended =
+        let result =
             answer_question_inner(&q, &db, "s-restart", "d-restart", "继续".into(), Locale::Zh)
                 .expect("missing-slot fallback should succeed");
+        assert!(result.resolved);
 
         let conn = db.0.lock().unwrap();
         let msgs = db::get_messages(&conn, "s-restart").unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[1].role, "user");
-        assert_eq!(appended.map(|m| m.id), Some(msgs[1].id));
+        assert_eq!(result.appended.map(|m| m.id), Some(msgs[1].id));
+    }
+
+    #[test]
+    fn answer_question_inner_late_path_cas_loss_is_not_resolved() {
+        // 模拟另一条路径已抢先把卡翻成 chosen，但本次调用仍拿到 TimedOut 槽位：Late 分支
+        // 的 pending→chosen CAS 必须失败，既不追加消息，也不能把本次答案广播成赢家。
+        let db = test_db();
+        {
+            let conn = db.0.lock().unwrap();
+            seed_pending_decision_card(&conn, "s-cas-loss", "d-cas-loss", "已经决定了吗？");
+            let changed = db::update_decision_card_status(
+                &conn,
+                "s-cas-loss",
+                "d-cas-loss",
+                "pending",
+                "chosen",
+                Some("先到答案"),
+            )
+            .unwrap();
+            assert!(changed, "test setup should choose the pending card");
+        }
+        let q = LeadQuestions::default();
+        q.0.lock()
+            .unwrap()
+            .insert("d-cas-loss".into(), LeadQuestionSlot::TimedOut);
+
+        let result = answer_question_inner(
+            &q,
+            &db,
+            "s-cas-loss",
+            "d-cas-loss",
+            "后到答案".into(),
+            Locale::Zh,
+        )
+        .expect("CAS loss is an idempotent success");
+        assert_eq!(result.appended, None);
+        assert!(!result.resolved);
+
+        let conn = db.0.lock().unwrap();
+        let msgs = db::get_messages(&conn, "s-cas-loss").unwrap();
+        assert_eq!(msgs.len(), 1, "CAS loser must not append a user message");
+        match &msgs[0].content[0] {
+            db::Block::DecisionCard { chosen_option, .. } => {
+                assert_eq!(chosen_option.as_deref(), Some("先到答案"));
+            }
+            other => panic!("期望 DecisionCard·得到 {other:?}"),
+        }
     }
 
     #[test]
@@ -35065,6 +42483,2051 @@ mod tests {
         let conn = db.0.lock().unwrap();
         let msgs = db::get_messages(&conn, "s-chosen").unwrap();
         assert_eq!(msgs.len(), 1, "不应新增任何消息: {msgs:?}");
+    }
+
+    #[test]
+    fn resume_after_answer_candidate_team_session_opens_gate() {
+        // 正向：team 会话（session_agent_configs 有 lead_agent_id）⇒ 续跑门开，取出
+        // lead_agent_id + member_agent_ids。
+        let config = db::SessionAgentConfig {
+            session_id: "s-team".to_string(),
+            lead_agent_id: Some("claude".to_string()),
+            member_agent_ids: vec!["codex".to_string()],
+        };
+        let candidate = resume_after_answer_candidate(&config);
+        assert_eq!(
+            candidate,
+            Some(("claude".to_string(), vec!["codex".to_string()]))
+        );
+    }
+
+    #[test]
+    fn resume_after_answer_candidate_solo_session_closes_gate() {
+        // 反向：solo 会话（无 session_agent_configs 行 / lead_agent_id 为 NULL）⇒ 不续——
+        // 迟到答案已由 commit_late_answer 落成真实 user 消息，留给下一轮普通 run 自然消费。
+        // 变异自证：把 `config.lead_agent_id.clone()?` 换成永远 Some(...) 就会让这条测试变红。
+        let config = db::SessionAgentConfig {
+            session_id: "s-solo".to_string(),
+            lead_agent_id: None,
+            member_agent_ids: vec![],
+        };
+        assert_eq!(resume_after_answer_candidate(&config), None);
+    }
+
+    #[test]
+    fn answer_lead_question_resumes_only_inside_appended_some_branch_after_emit() {
+        // 反向 + 时序：appended=None（Delivered / CAS 没赢的双击）绝不触发续跑；appended=Some
+        // 时续跑触发点必须在 emit 之后（先让前端看到答案消息、再看到 run 启动事件）。
+        // 变异自证：把 try_resume_after_answer( 调用挪到 if let 外面/emit 之前，这条测试会变红。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn answer_lead_question(")
+            .nth(1)
+            .unwrap()
+            .split("\nfn try_resume_after_answer(")
+            .next()
+            .unwrap();
+
+        assert_eq!(
+            body.matches("try_resume_after_answer(").count(),
+            1,
+            "answer_lead_question 里续跑调用必须恰好出现一次"
+        );
+
+        let before_branch = body
+            .split("if let Some(message) = appended {")
+            .next()
+            .unwrap();
+        assert!(
+            !before_branch.contains("try_resume_after_answer("),
+            "appended=Some 分支之外不该出现续跑调用"
+        );
+
+        let some_branch = body
+            .split("if let Some(message) = appended {")
+            .nth(1)
+            .expect("必须找到 appended=Some 分支");
+        let emit_idx = some_branch
+            .find("app.emit(")
+            .expect("Some 分支内应有 emit 调用");
+        let resume_idx = some_branch
+            .find("try_resume_after_answer(")
+            .expect("Some 分支内应有续跑触发调用");
+        assert!(
+            resume_idx > emit_idx,
+            "续跑触发必须在 emit 之后：先让前端看到答案消息、再看到 run 启动事件"
+        );
+
+        let resume_idx_in_body = body
+            .find("try_resume_after_answer(")
+            .expect("函数体内应有唯一续跑触发调用");
+        let else_idx = body
+            .find("} else {\n        AnswerLeadQuestionOutcome::quietly_not_resumed()")
+            .expect("必须找到 appended=None 的稳定 else 分支起点");
+        assert!(
+            resume_idx_in_body < else_idx,
+            "唯一续跑调用必须位于 appended=Some 分支内、else 分支起点之前"
+        );
+    }
+
+    #[test]
+    fn try_resume_after_answer_releases_db_lock_before_starting_lead_session() {
+        // M1-T1 死锁血案同款红线：std::sync::Mutex 不可重入，绝不能带着 db 锁进入
+        // start_lead_session（它自己也会 db.0.lock()，同线程二次加锁直接死锁）。
+        // 用源码缩进断言判门读锁的内层 block 在 start_lead_session( 调用之前就已经收口
+        // （同仓先例：lead_step_spawn_closure_releases_db_lock_before_spawning_child）。
+        // 变异自证：把 `let candidate = { ... };` 的花括号去掉、让 conn 活到
+        // start_lead_session 调用处，这条测试会变红。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn try_resume_after_answer(")
+            .nth(1)
+            .unwrap()
+            .split("\nfn resume_after_answer_candidate(")
+            .next()
+            .unwrap();
+
+        let lock_idx = body
+            .find("db_state.0.lock()")
+            .expect("函数体里应有 db_state.0.lock()");
+        let start_idx = body
+            .find("start_lead_session(")
+            .expect("函数体里应有 start_lead_session( 调用");
+        assert!(
+            start_idx > lock_idx,
+            "切片范围不对：lock 应在 start_lead_session 之前"
+        );
+
+        fn leading_spaces_of_line_at(text: &str, byte_idx: usize) -> usize {
+            let line_start = text[..byte_idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            text[line_start..].chars().take_while(|c| *c == ' ').count()
+        }
+        let lock_indent = leading_spaces_of_line_at(body, lock_idx);
+        let start_indent = leading_spaces_of_line_at(body, start_idx);
+        assert!(
+            lock_indent > start_indent,
+            "db_state.0.lock() 所在行缩进（{lock_indent} 格）应严格深于 \
+             start_lead_session( 所在行缩进（{start_indent} 格）——lock 应该在专门收 conn 的\
+             内层 block 里，判门完这个内层 block 就结束、锁随之释放，start_lead_session 在\
+             外层、更浅的缩进上执行"
+        );
+    }
+
+    #[test]
+    fn try_resume_after_answer_returns_outcome_and_classifies_resume_errors() {
+        // busy（占槽被抢=会话已在跑）静默收敛；非 busy 才保留错误原文并打非致命日志。
+        // 两者都作为 outcome 返回，不把 start_lead_session 的 Err 冒泡成 command 失败。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let after_fn = production
+            .split("fn try_resume_after_answer(")
+            .nth(1)
+            .unwrap();
+        let header_end = after_fn.find('{').expect("函数体应有花括号");
+        let header = &after_fn[..header_end];
+        assert!(
+            header.trim_end().ends_with("-> AnswerLeadQuestionOutcome"),
+            "签名必须返回可携带三元信息的 outcome: {header:?}"
+        );
+
+        let body = after_fn
+            .split("\nfn resume_after_answer_candidate(")
+            .next()
+            .unwrap();
+        assert!(body.contains("finish_resume_after_answer(session_id, lead_agent_id, result)"));
+        assert!(
+            body.contains("if !autofeed_busy_error(&e)"),
+            "busy/非 busy 分流必须复用 autofeed_busy_error"
+        );
+        assert!(
+            body.contains("eprintln!(\"resume after late answer failed (non-fatal): {e}\")"),
+            "非 busy 失败必须保留非致命日志"
+        );
+
+        let busy = finish_resume_after_answer(
+            "s-finish-resume-busy",
+            "claude".to_string(),
+            Err("SESSION_ALREADY_RUNNING: s-team".to_string()),
+        );
+        assert_eq!(busy, AnswerLeadQuestionOutcome::quietly_not_resumed());
+        assert_eq!(busy.resume_error, None, "busy 错误必须静默");
+
+        let non_busy_error = "provider unavailable".to_string();
+        let failed = finish_resume_after_answer(
+            "s-finish-resume-nonbusy",
+            "claude".to_string(),
+            Err(non_busy_error.clone()),
+        );
+        assert!(!failed.resumed);
+        assert_eq!(failed.lead_agent_id, None);
+        assert_eq!(failed.resume_error, Some(non_busy_error));
+
+        let resumed =
+            finish_resume_after_answer("s-finish-resume-ok", "saved-lead".to_string(), Ok(()));
+        assert!(resumed.resumed);
+        assert_eq!(resumed.lead_agent_id.as_deref(), Some("saved-lead"));
+        assert_eq!(resumed.resume_error, None);
+    }
+
+    #[test]
+    fn finish_resume_after_answer_registers_pending_only_on_busy() {
+        let busy_sid = "s-pending-answer-resume-busy";
+        let nonbusy_sid = "s-pending-answer-resume-nonbusy";
+        let ok_sid = "s-pending-answer-resume-ok";
+
+        let busy = finish_resume_after_answer(
+            busy_sid,
+            "lead-x".to_string(),
+            Err("SESSION_ALREADY_RUNNING: s".to_string()),
+        );
+        assert_eq!(busy, AnswerLeadQuestionOutcome::quietly_not_resumed());
+        assert!(
+            take_pending_answer_resume(busy_sid),
+            "busy 失败必须登记进 PENDING_ANSWER_RESUME"
+        );
+        assert!(
+            !take_pending_answer_resume(busy_sid),
+            "take 是一次性摘除，第二次应已清空"
+        );
+
+        let non_busy = finish_resume_after_answer(
+            nonbusy_sid,
+            "lead-x".to_string(),
+            Err("provider unavailable".to_string()),
+        );
+        assert!(!non_busy.resumed);
+        assert!(
+            !take_pending_answer_resume(nonbusy_sid),
+            "非 busy 失败不该登记"
+        );
+
+        let ok = finish_resume_after_answer(ok_sid, "lead-x".to_string(), Ok(()));
+        assert!(ok.resumed);
+        assert!(!take_pending_answer_resume(ok_sid), "成功续跑不该登记");
+    }
+
+    #[test]
+    fn try_resume_after_answer_busy_recheck_is_immediate_and_bounded_to_once() {
+        // F6 正例 + 反向源码形状：finish 先完成 busy 登记，随后才立即 take 并 continue；布尔闸
+        // 在 continue 前关闭，所以第二轮再 busy 只能由 finish 重新挂账并返回，绝不会第三轮。
+        // 变异自证：删掉整个二次探测分支，或把初始闸改成 false，这条测试都会变红。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn try_resume_after_answer(")
+            .nth(1)
+            .unwrap()
+            .split("\n/// T-4b（remote control M0 §3/§4b）挂账①收口")
+            .next()
+            .unwrap();
+
+        assert_eq!(body.matches("start_lead_session(").count(), 1);
+        assert_eq!(body.matches("finish_resume_after_answer(").count(), 1);
+        assert_eq!(body.matches("take_pending_answer_resume(").count(), 1);
+        assert_eq!(body.matches("continue;").count(), 1);
+        assert!(body.contains("let mut recheck_after_busy = true;"));
+        assert!(body.contains("if was_busy && recheck_after_busy {"));
+
+        let finish_idx = body
+            .find("let outcome = finish_resume_after_answer(")
+            .expect("busy 分类必须先经 finish 完成登记");
+        let close_gate_idx = body
+            .find("recheck_after_busy = false;")
+            .expect("二次探测前必须永久关闭本次调用的重试闸");
+        let take_idx = body
+            .find("if take_pending_answer_resume(session_id) {")
+            .expect("登记后必须立即做一次 take 探测");
+        let continue_idx = body.find("continue;").expect("take 命中必须重跑完整流程");
+        let return_idx = body
+            .rfind("return outcome;")
+            .expect("不重试或第二轮结束后必须返回");
+        assert!(
+            finish_idx < close_gate_idx
+                && close_gate_idx < take_idx
+                && take_idx < continue_idx
+                && continue_idx < return_idx,
+            "必须是 finish 登记 → 关闸 → take → 至多一次 continue → return"
+        );
+    }
+
+    #[test]
+    fn pending_answer_recheck_stops_when_competing_drain_already_took_registration() {
+        // 模拟 F6 窗口的另一种交错：finish 登记后，并发的释放 drain 抢先摘走；紧随其后的
+        // 二次探测应看到 false，不再重复启动。这里只测 check-and-remove 的可观察内核语义，
+        // 与上一条源码形状测试共同钉住它在真实调用链里的位置。
+        let session_id = "s-pending-answer-recheck-competing-drain";
+        let outcome = finish_resume_after_answer(
+            session_id,
+            "lead-x".to_string(),
+            Err("SESSION_ALREADY_RUNNING: s".to_string()),
+        );
+        assert_eq!(outcome, AnswerLeadQuestionOutcome::quietly_not_resumed());
+        assert!(
+            take_pending_answer_resume(session_id),
+            "模拟并发释放 drain 应先摘到登记"
+        );
+        assert!(
+            !take_pending_answer_resume(session_id),
+            "当前调用的立即二次探测应看到登记已被消费，不再重复续跑"
+        );
+    }
+
+    #[test]
+    fn start_lead_session_success_clears_pending_before_spawn_outside_locks() {
+        // G3 启发式源码断言：清理必须在 reserve 成功、guard disarm 之后且在 spawn 之前，并保持
+        // 函数顶层作用域，不得挪进锁块或 spawn 闭包；更绕的同级跨锁控制流仍需人工 review。
+        // 变异自证：若把清理挪回 spawn 之后模拟旧 ABA 窗口，这条测试会变红。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn start_lead_session(")
+            .nth(1)
+            .unwrap()
+            .split("\n#[cfg(unix)]\nfn background_process_stop_notice(")
+            .next()
+            .unwrap();
+
+        let spawn_idx = body
+            .find("std::thread::spawn(move || {")
+            .expect("start_lead_session 应发出 lead runner 线程");
+        let cleanup_idx = body
+            .find("let _ = take_pending_answer_resume(&session_id);")
+            .expect("成功启动路径必须清除旧 pending 续跑账");
+        let disarm_idx = body
+            .find("guard.disarm();")
+            .expect("reserve 成功后必须 disarm reservation guard");
+        let ok_idx = body
+            .rfind("\n    Ok(())")
+            .expect("函数应以 Ok(()) 成功返回");
+        assert_eq!(
+            body.matches("take_pending_answer_resume(&session_id)")
+                .count(),
+            1,
+            "成功路径 pending 清理应恰好一次"
+        );
+        assert!(disarm_idx < cleanup_idx && cleanup_idx < spawn_idx);
+
+        let line_indent = |idx: usize| {
+            let line_start = body[..idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            body[line_start..].chars().take_while(|c| *c == ' ').count()
+        };
+        assert_eq!(
+            line_indent(cleanup_idx),
+            line_indent(ok_idx + 1),
+            "pending 清理必须与函数最外层 Ok(()) 同级，不能藏在锁块或 spawn 闭包里"
+        );
+    }
+
+    #[test]
+    fn draining_guard_excludes_same_session_until_drop() {
+        let session_id = "s-draining-guard-mutual-exclusion";
+        let first = try_begin_draining(session_id).expect("第一次应取得排空资格");
+        assert!(
+            try_begin_draining(session_id).is_none(),
+            "首个 guard 存活时，同 session 第二次进入必须被拒绝"
+        );
+        drop(first);
+        let third = try_begin_draining(session_id).expect("guard drop 后应可再次排空");
+        drop(third);
+    }
+
+    #[test]
+    fn draining_guard_removes_session_during_panic_unwind() {
+        let session_id = "s-draining-guard-panic-cleanup";
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = try_begin_draining(session_id).expect("应取得排空资格");
+            panic!("intentional panic to verify DrainingGuard::drop");
+        }));
+        assert!(panicked.is_err());
+        let after_unwind =
+            try_begin_draining(session_id).expect("panic unwind 时 guard 应已摘除 session");
+        drop(after_unwind);
+    }
+
+    #[test]
+    fn draining_guard_generation_prevents_aba_drop_from_removing_new_registration() {
+        let session_id = "s-draining-guard-generation-aba";
+
+        // 1. A 取得第一代排空资格；guard 暂不 drop，模拟它仍在返回栈上。
+        let a_guard = try_begin_draining(session_id).expect("A 应取得第一代排空资格");
+        // 2. A 的最后一轮确认无脏位并摘除登记，但旧 guard 尚未走到作用域末尾。
+        assert!(!drain_round_dirty_and_continue(session_id));
+        // 3. B 趁正常收尾窗口取得空位，登记新一代排空资格。
+        let b_guard = try_begin_draining(session_id).expect("B 应在窗口内取得新一代排空资格");
+        // 4. A 的旧 guard 此刻才 drop；generation 不匹配时必须是 no-op。
+        drop(a_guard);
+        // 5. C 不得因 A 误删 B 的登记而并发取得排空资格。
+        let c_attempt = try_begin_draining(session_id);
+        assert!(c_attempt.is_none(), "A 的旧 guard 不得误删 B 的新一代登记");
+        // 6. C 的失败尝试已合并为脏位，B 收尾时必须原地重放一轮。
+        assert!(drain_round_dirty_and_continue(session_id));
+        // 7. B 重放后没有更多脏位，应正常摘除登记并结束。
+        assert!(!drain_round_dirty_and_continue(session_id));
+        // 8. B 的 guard 随后 drop；自己的登记已摘除，因此应为 no-op。
+        drop(b_guard);
+        // 9. map 已干净，后续触发可重新登记；显式 drop，避免污染其它测试。
+        let final_guard =
+            try_begin_draining(session_id).expect("B 正常收尾后应允许重新取得排空资格");
+        drop(final_guard);
+    }
+
+    #[test]
+    fn drain_with_dirty_replay_replays_notification_merged_during_first_round() {
+        let session_id = "s-draining-dirty-replay";
+        let _guard = try_begin_draining(session_id).expect("外层应先取得排空资格");
+        let mut rounds = 0;
+
+        drain_with_dirty_replay(session_id, || {
+            rounds += 1;
+            if rounds == 1 {
+                assert!(
+                    try_begin_draining(session_id).is_none(),
+                    "进行中的第二次释放通知仍不得绕过互斥"
+                );
+            }
+        });
+
+        assert_eq!(rounds, 2, "合并的脏位应触发恰好一次原地重放");
+        let after_replay = try_begin_draining(session_id)
+            .expect("重放完成后正常路径应已摘除登记，不依赖外层 guard drop");
+        drop(after_replay);
+    }
+
+    #[test]
+    fn drain_with_dirty_replay_stops_after_clean_round() {
+        let session_id = "s-draining-clean-round";
+        let _guard = try_begin_draining(session_id).expect("外层应先取得排空资格");
+        let mut rounds = 0;
+
+        drain_with_dirty_replay(session_id, || rounds += 1);
+
+        assert_eq!(rounds, 1, "无脏位时不应额外重放");
+    }
+
+    #[test]
+    fn remote_input_drain_storm_claims_before_spawning_and_replays_dirty_round() {
+        // handler 必须在 ws 读线程先 claim；回退成旧式无条件 spawn 时，本测试应先在结构护栏变红。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let handler = production
+            .split("fn remote_gateway_input_send_handler(")
+            .nth(1)
+            .unwrap()
+            .split("\nfn remote_gateway_control_stop_handler(")
+            .next()
+            .unwrap();
+        let claim_idx = handler
+            .find("let Some(guard) = try_begin_draining(&session)")
+            .expect("remote input drain 必须在线程创建前 claim");
+        let spawn_idx = handler
+            .find("spawn_remote_input_drain(")
+            .expect("claim 成功后必须创建排空线程");
+        let owned_idx = handler
+            .find("drain_owned(app, session, guard)")
+            .expect("排空线程必须直接消费已取得的 guard，不能二次 claim");
+        assert!(
+            claim_idx < spawn_idx && spawn_idx < owned_idx,
+            "remote input drain 必须先 claim，再 spawn 并把 guard 移交给 drain_owned"
+        );
+
+        let session_id = "s-remote-input-drain-spawn-storm";
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let actual_spawns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rounds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let guard = try_begin_draining(session_id).expect("第一次触发必须取得排空资格");
+        let drain_session = session_id.to_string();
+        let drain_spawns = actual_spawns.clone();
+        let drain_rounds = rounds.clone();
+        spawn_remote_input_drain(move || {
+            let _guard = guard;
+            drain_spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            started_tx.send(()).unwrap();
+            let mut first_round = true;
+            drain_with_dirty_replay(&drain_session, || {
+                drain_rounds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if first_round {
+                    first_round = false;
+                    gate_rx
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .expect("test must release the first drain round");
+                }
+            });
+            done_tx.send(()).unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("first remote input drain must start");
+
+        let mut spawn_decisions = 1;
+        for _ in 1..8 {
+            let Some(extra_guard) = try_begin_draining(session_id) else {
+                continue;
+            };
+            spawn_decisions += 1;
+            let extra_spawns = actual_spawns.clone();
+            spawn_remote_input_drain(move || {
+                let _guard = extra_guard;
+                extra_spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+
+        assert_eq!(spawn_decisions, 1, "8 次快速触发必须只作出 1 次 spawn 决策");
+        assert_eq!(
+            actual_spawns.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "同 session 风暴期间必须只实际启动 1 个排空线程"
+        );
+
+        gate_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("dirty replay must finish within the timeout");
+        assert_eq!(
+            rounds.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "被合并的 7 次触发必须通过脏位让现有线程原地重放一轮"
+        );
+    }
+
+    #[test]
+    fn startup_remote_inbox_rescan_acquires_draining_guard_before_drain() {
+        // 启动重扫必须先取同 session 排空互斥，避免与正常 run-release 路径并发消费 FIFO。
+        // 变异自证：去掉 try_begin_draining 包裹、恢复直接 drain_remote_inbox，这条测试会变红。
+        // 启发式源码断言：只挡启动循环内缺少 guard 或两个调用文本整体调换的粗糙回归；不验证
+        // guard 的运行时生命周期，也挡不住把调用藏进其他函数或更绕控制流的改法，仍需人工 review。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let loop_body = production
+            .split("for session_id in pending_remote_sessions {")
+            .nth(1)
+            .unwrap()
+            .split("\n                }\n            });")
+            .next()
+            .unwrap();
+        let begin_idx = loop_body
+            .find("try_begin_draining(")
+            .expect("启动重扫必须先取得同 session 排空互斥");
+        let drain_idx = loop_body
+            .find("drain_remote_inbox(")
+            .expect("启动重扫必须调用 drain_remote_inbox");
+        assert!(
+            begin_idx < drain_idx,
+            "启动重扫必须先 try_begin_draining，再 drain_remote_inbox"
+        );
+    }
+
+    #[test]
+    fn drain_after_run_release_runs_autofeed_before_pending_answer_before_inbox() {
+        // 排空序固定：a) autofeed → b) 迟到答案挂账续跑 → c) remote_inbox。
+        // 变异自证：把 inbox 段挪到 autofeed 之前，这条测试会变红（验证方式见 T-4b 交付报告）。
+        // 启发式源码断言：只挡把某一段整体挪到另一段前面的粗糙回归；不验证调用是否藏在
+        // if/else 分支里，也不证明运行时真的按此顺序执行，更绕的控制流改法仍需人工 review。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn drain_owned(")
+            .nth(1)
+            .unwrap()
+            .split("\n/// 纯循环内核")
+            .next()
+            .unwrap();
+        let autofeed_idx = body
+            .find("try_autofeed_lead(")
+            .expect("必须调用 try_autofeed_lead");
+        let pending_idx = body
+            .find("take_pending_answer_resume(")
+            .expect("必须调用 take_pending_answer_resume");
+        let inbox_idx = body
+            .find("drain_remote_inbox(")
+            .expect("必须调用 drain_remote_inbox");
+        assert!(
+            autofeed_idx < pending_idx,
+            "autofeed 必须先于迟到答案挂账段"
+        );
+        assert!(
+            pending_idx < inbox_idx,
+            "迟到答案挂账段必须先于 remote_inbox 排空段"
+        );
+    }
+
+    #[test]
+    fn drain_after_run_release_pending_answer_stage_takes_before_resuming() {
+        // 摘除必须先于重试调用——否则"又撞 busy"时会被 finish_resume_after_answer 的登记分支
+        // 立刻覆盖成"没摘除过"，而不是"摘除后又登记回去"的正确语义。
+        // 启发式源码断言：只挡把两个调用文本整体调换的粗糙回归；不验证调用是否藏在 if/else
+        // 分支里，也不证明运行时真的按此顺序执行，更绕的控制流改法仍需人工 review。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn drain_owned(")
+            .nth(1)
+            .unwrap()
+            .split("\n/// 纯循环内核")
+            .next()
+            .unwrap();
+        let take_idx = body
+            .find("take_pending_answer_resume(")
+            .expect("必须调用 take_pending_answer_resume");
+        let resume_idx = body
+            .find("try_resume_after_answer(")
+            .expect("必须调用 try_resume_after_answer");
+        assert!(
+            take_idx < resume_idx,
+            "必须先摘除再重试——重新登记交给 finish_resume_after_answer 的既有 busy 分支"
+        );
+    }
+
+    #[test]
+    fn drain_remote_inbox_next_pending_releases_db_lock_before_deliver_closure() {
+        // 三轮真实死锁事故原址护栏：next_pending 必须用独立闭包短锁取一条即释放，绝不能把 conn
+        // 提到闭包外、跨进 deliver（它会再走加 db 锁的投递路径）。本启发式断言能挡闭包整体被拆、
+        // conn 被直接上提及闭包边界被抹掉的回归；挡不住有人在闭包外另 lock 一次藏进别的变量等
+        // 更绕写法，那仍需人工 review。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn drain_remote_inbox(")
+            .nth(1)
+            .unwrap()
+            .split("\n/// 纯循环内核")
+            .next()
+            .unwrap();
+
+        let next_closure_idx = body
+            .find("drain_remote_inbox_loop(\n        || {")
+            .expect("next_pending 必须是 drain_remote_inbox_loop 的独立闭包");
+        let lock_idx = body
+            .find("db_state.0.lock()")
+            .expect("next_pending 闭包内必须拿 db 锁");
+        let fetch_idx = body
+            .find("db::next_pending_remote_input(&conn, session_id)")
+            .expect("next_pending 必须用局部 conn 取一条记录");
+        // P0-c 返工（rustfmt 副作用）：`deliver_remote_inbox_entry` 调用行原来单行超长，跑
+        // `rustfmt --edition 2021`（本轮测试硬度钉③）后被拆成 `|kind, payload, command_id| {`
+        // 起头的多行闭包体——下面两处字面匹配串跟着改成新的多行形状，护栏意图（next_pending
+        // 闭包必须先收口释放锁，deliver 闭包才开始）不变。
+        let closure_end_idx = body
+            .find(
+                "\n        },\n        |kind, payload, command_id| {\n            deliver_remote_inbox_entry",
+            )
+            .expect("next_pending 闭包必须在 deliver 闭包开始前独立收口");
+        let deliver_idx = body
+            .find("|kind, payload, command_id| {\n            deliver_remote_inbox_entry")
+            .expect("必须找到 deliver 闭包");
+        assert!(
+            next_closure_idx < lock_idx
+                && lock_idx < fetch_idx
+                && fetch_idx < closure_end_idx
+                && closure_end_idx < deliver_idx,
+            "必须是 next_pending 闭包内 lock/fetch → 闭包收口释放 conn → deliver 闭包"
+        );
+        assert_eq!(
+            body[..deliver_idx].matches("db_state.0.lock()").count(),
+            1,
+            "deliver 之前只应有 next_pending 闭包内部这一处 db lock"
+        );
+    }
+
+    #[test]
+    fn spawn_and_stream_solo_run_release_triggers_drain_after_run_release() {
+        // 启发式源码断言：只挡「spawn_and_stream 里 emit 之后完全没有 drain」这类回归；挡不住
+        // 把 drain 藏进某个被误认为安全、实际在锁内执行的子闭包等绕法，那仍需人工 review。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn spawn_and_stream(")
+            .nth(1)
+            .unwrap()
+            .split("\n#[tauri::command]")
+            .next()
+            .unwrap();
+        let emit_idx = body
+            .find("emit_terminal_after_releasing_run_slot(")
+            .expect("spawn_and_stream 必须释放 run 槽并 emit terminal");
+        let drain_idx = body
+            .find("drain_after_run_release(")
+            .expect("solo run 槽释放后必须触发统一排空");
+        assert!(
+            emit_idx < drain_idx,
+            "solo drain 必须出现在 emit_terminal_after_releasing_run_slot 之后"
+        );
+    }
+
+    #[test]
+    fn spawn_remote_input_drain_returns_without_waiting_and_names_thread() {
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let (name_tx, name_rx) = std::sync::mpsc::channel();
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel::<()>();
+
+        std::thread::spawn(move || {
+            spawn_remote_input_drain(move || {
+                gate_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("test must release the drain gate");
+                name_tx
+                    .send(std::thread::current().name().map(String::from))
+                    .unwrap();
+            });
+            returned_tx.send(()).unwrap();
+        });
+
+        let returned_without_waiting = returned_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok();
+        let _ = gate_tx.send(());
+        let thread_name = name_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("remote input drain must run within the timeout");
+
+        assert!(
+            returned_without_waiting,
+            "spawn_remote_input_drain must return without waiting for the drain"
+        );
+        assert_eq!(thread_name, Some("remote-input-drain".to_string()));
+    }
+
+    #[test]
+    fn spawn_remote_answer_processing_returns_without_waiting_and_names_thread() {
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let (name_tx, name_rx) = std::sync::mpsc::channel();
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel::<()>();
+
+        std::thread::spawn(move || {
+            spawn_remote_answer_processing(move || {
+                gate_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("test must release the answer gate");
+                name_tx
+                    .send(std::thread::current().name().map(String::from))
+                    .unwrap();
+            });
+            returned_tx.send(()).unwrap();
+        });
+
+        let returned_without_waiting = returned_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok();
+        let _ = gate_tx.send(());
+        let thread_name = name_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("remote answer must run within the timeout");
+
+        assert!(
+            returned_without_waiting,
+            "spawn_remote_answer_processing must return without waiting for answer handling"
+        );
+        assert_eq!(thread_name, Some("remote-answer".to_string()));
+    }
+
+    fn pending_answer_entry(command_id: &str, payload: &str) -> db::RemoteInboxEntry {
+        db::RemoteInboxEntry {
+            id: 1,
+            session_id: "s-answer-recovery".to_string(),
+            command_id: command_id.to_string(),
+            kind: "input.answer".to_string(),
+            payload: payload.to_string(),
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn parse_remote_answer_payload_accepts_decision_id_and_option() {
+        assert_eq!(
+            parse_remote_answer_payload(r#"{"decision_id":"d-1","option":"yes"}"#),
+            Ok(("d-1".to_string(), "yes".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_remote_answer_payload_rejects_missing_required_field() {
+        assert_eq!(
+            parse_remote_answer_payload(r#"{"decision_id":"d-1"}"#),
+            Err("REMOTE_INBOX_PAYLOAD_MALFORMED".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_remote_answer_payload_rejects_non_string_required_fields() {
+        for payload in [
+            r#"{"decision_id":1,"option":"yes"}"#,
+            r#"{"decision_id":"d-1","option":false}"#,
+        ] {
+            assert_eq!(
+                parse_remote_answer_payload(payload),
+                Err("REMOTE_INBOX_PAYLOAD_MALFORMED".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn recover_pending_remote_answers_spawns_valid_answer_without_marking_failed() {
+        let entries = vec![pending_answer_entry(
+            "cmd-answer-ok",
+            r#"{"decision_id":"d-ok","option":"approve"}"#,
+        )];
+        let mut spawned = Vec::new();
+        let mut failures = Vec::new();
+
+        recover_pending_remote_answers_loop(
+            entries,
+            |entry, decision_id, option| {
+                spawned.push((entry.command_id.clone(), decision_id, option));
+                true
+            },
+            |command_id, error| failures.push((command_id.to_string(), error.to_string())),
+        );
+
+        assert_eq!(
+            spawned,
+            vec![(
+                "cmd-answer-ok".to_string(),
+                "d-ok".to_string(),
+                "approve".to_string()
+            )]
+        );
+        assert!(failures.is_empty(), "spawn 成功不得写失败终态");
+    }
+
+    #[test]
+    fn recover_pending_remote_answers_marks_failed_when_spawn_returns_false() {
+        let entries = vec![pending_answer_entry(
+            "cmd-answer-spawn-failed",
+            r#"{"decision_id":"d-fail","option":"reject"}"#,
+        )];
+        let mut spawn_calls = 0;
+        let mut failures = Vec::new();
+
+        recover_pending_remote_answers_loop(
+            entries,
+            |_entry, decision_id, option| {
+                spawn_calls += 1;
+                assert_eq!(decision_id, "d-fail");
+                assert_eq!(option, "reject");
+                false
+            },
+            |command_id, error| failures.push((command_id.to_string(), error.to_string())),
+        );
+
+        assert_eq!(spawn_calls, 1);
+        assert_eq!(
+            failures,
+            vec![(
+                "cmd-answer-spawn-failed".to_string(),
+                REMOTE_ANSWER_SPAWN_FAILED.to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn recover_pending_remote_answers_marks_malformed_without_spawning() {
+        let entries = vec![pending_answer_entry(
+            "cmd-answer-malformed",
+            r#"{"decision_id":"d-missing-option"}"#,
+        )];
+        let mut spawn_calls = 0;
+        let mut failures = Vec::new();
+
+        recover_pending_remote_answers_loop(
+            entries,
+            |_entry, _decision_id, _option| {
+                spawn_calls += 1;
+                true
+            },
+            |command_id, error| failures.push((command_id.to_string(), error.to_string())),
+        );
+
+        assert_eq!(spawn_calls, 0, "畸形 payload 不得进入答案处理线程");
+        assert_eq!(
+            failures,
+            vec![(
+                "cmd-answer-malformed".to_string(),
+                "REMOTE_INBOX_PAYLOAD_MALFORMED".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn pending_remote_answer_restart_recovery_reaches_terminal_state() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        db::enqueue_remote_input(
+            &conn,
+            "s-answer-restart",
+            "cmd-answer-restart",
+            "input.answer",
+            r#"{"decision_id":"d-restart","option":"continue"}"#,
+        )
+        .unwrap();
+        let entries = db::pending_remote_answers(&conn, "s-answer-restart").unwrap();
+        assert_eq!(entries.len(), 1, "重启前应有一条 pending answer");
+
+        recover_pending_remote_answers_loop(
+            entries,
+            |entry, decision_id, option| {
+                assert_eq!(decision_id, "d-restart");
+                assert_eq!(option, "continue");
+                db::mark_remote_input_delivered_by_command_id(&conn, &entry.command_id).unwrap();
+                true
+            },
+            |_command_id, _error| panic!("成功恢复不得 mark_failed"),
+        );
+
+        assert!(
+            db::pending_remote_answers(&conn, "s-answer-restart")
+                .unwrap()
+                .is_empty(),
+            "启动恢复处理完后不能继续永久 pending"
+        );
+        assert_eq!(
+            db::remote_inbox_terminal_state_by_command_id(&conn, "cmd-answer-restart").unwrap(),
+            Some(db::RemoteInboxTerminalState::Delivered)
+        );
+    }
+
+    #[test]
+    fn pending_remote_answer_and_input_send_queries_are_bidirectionally_isolated() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        for session_id in ["s-answer-only", "s-send-only", "s-mixed"] {
+            conn.execute(
+                "INSERT INTO sessions (id, title, created_at, namespace_id) VALUES (?1, ?1, 0, NULL)",
+                [session_id],
+            )
+            .unwrap();
+        }
+        db::enqueue_remote_input(
+            &conn,
+            "s-answer-only",
+            "cmd-answer-only",
+            "input.answer",
+            r#"{"decision_id":"d-1","option":"yes"}"#,
+        )
+        .unwrap();
+        db::enqueue_remote_input(
+            &conn,
+            "s-send-only",
+            "cmd-send-only-e2e",
+            "input.send",
+            r#"{"text":"send"}"#,
+        )
+        .unwrap();
+        db::enqueue_remote_input(
+            &conn,
+            "s-mixed",
+            "cmd-mixed-send",
+            "input.send",
+            r#"{"text":"mixed"}"#,
+        )
+        .unwrap();
+        db::enqueue_remote_input(
+            &conn,
+            "s-mixed",
+            "cmd-mixed-answer",
+            "input.answer",
+            r#"{"decision_id":"d-2","option":"no"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            db::sessions_with_pending_remote_answer(&conn).unwrap(),
+            vec!["s-answer-only".to_string(), "s-mixed".to_string()]
+        );
+        assert_eq!(
+            db::pending_remote_answers(&conn, "s-mixed")
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.command_id)
+                .collect::<Vec<_>>(),
+            vec!["cmd-mixed-answer".to_string()],
+            "answer 查询不得混入同 session 的 input.send"
+        );
+        assert_eq!(
+            db::next_pending_remote_input(&conn, "s-mixed")
+                .unwrap()
+                .map(|entry| entry.command_id),
+            Some("cmd-mixed-send".to_string()),
+            "send FIFO 不得混入同 session 的 input.answer"
+        );
+        assert_eq!(
+            db::next_pending_remote_input(&conn, "s-answer-only").unwrap(),
+            None,
+            "只有 answer 的会话不能被 send FIFO 取出"
+        );
+    }
+
+    #[test]
+    fn startup_pending_remote_answer_rescan_calls_recovery_without_fifo_guard() {
+        // 结构护栏：启动后台线程必须并列消费 answer 会话，并保持在线 answer 同款的独立线程语义。
+        // 变异自证：删掉 pending_remote_answer_sessions 循环，这条测试会变红。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let loop_body = production
+            .split("for session_id in pending_remote_answer_sessions {")
+            .nth(1)
+            .expect("setup 启动线程必须逐会话恢复 pending input.answer")
+            .split("\n                }")
+            .next()
+            .unwrap();
+        assert!(
+            loop_body.contains("startup_recover_pending_remote_answers(&drain_app, &session_id)"),
+            "answer 启动重扫必须调用独立恢复薄壳"
+        );
+        assert!(
+            !loop_body.contains("try_begin_draining("),
+            "answer 独立处理路径不得套 input.send FIFO 排空互斥"
+        );
+    }
+
+    #[test]
+    fn remote_gateway_input_answer_handler_spawns_before_processing() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let handler = production
+            .split("fn remote_gateway_input_answer_handler(")
+            .nth(1)
+            .unwrap()
+            .split("\nfn remote_gateway_control_stop_handler(")
+            .next()
+            .unwrap();
+        let spawn_idx = handler
+            .find("spawn_remote_answer_processing(")
+            .expect("input.answer 新行必须启动独立答案线程");
+        let process_idx = handler
+            .find("process_remote_answer(")
+            .expect("独立答案线程必须调用 process_remote_answer");
+
+        assert_eq!(
+            handler.matches("process_remote_answer(").count(),
+            1,
+            "handler 只能在独立线程闭包中调用一次 process_remote_answer"
+        );
+        assert!(
+            spawn_idx < process_idx && handler[spawn_idx..process_idx].contains("move ||"),
+            "process_remote_answer 必须位于 spawn_remote_answer_processing 的 move 闭包内"
+        );
+        assert!(
+            handler.contains("if !spawn_remote_answer_processing(")
+                && handler.contains("mark_remote_answer_spawn_failed("),
+            "独立答案线程 spawn 失败必须同步写 failed 终态"
+        );
+    }
+
+    #[test]
+    fn remote_answer_terminal_error_marks_failed_without_marking_delivered() {
+        let mut delivered = false;
+        let mut failure = None;
+
+        remote_answer_terminal(
+            || Err("NO_PENDING_QUESTION".to_string()),
+            || delivered = true,
+            |error| failure = Some(error.to_owned()),
+        );
+
+        assert!(!delivered);
+        assert_eq!(failure.as_deref(), Some("NO_PENDING_QUESTION"));
+    }
+
+    #[test]
+    fn remote_answer_terminal_success_marks_delivered_without_marking_failed() {
+        let mut delivered = false;
+        let mut failure = None;
+
+        remote_answer_terminal(
+            || Ok(AnswerLeadQuestionOutcome::quietly_not_resumed()),
+            || delivered = true,
+            |error| failure = Some(error.to_owned()),
+        );
+
+        assert!(delivered);
+        assert_eq!(failure, None);
+    }
+
+    #[test]
+    fn lead_step_drains_before_propagating_join_error() {
+        // 启发式源码断言：只挡「lead_step 在 JoinError 冒出后才 drain」这类回归；挡不住
+        // 把 drain 藏进被误认为安全、实际仍会被跳过的分支等更绕写法，那仍需人工 review。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("async fn lead_step(")
+            .nth(1)
+            .unwrap()
+            .split("\n#[tauri::command]")
+            .next()
+            .unwrap();
+        let drain_idx = body
+            .find("std::thread::spawn(move || {\n        drain_after_run_release(")
+            .expect("lead_step 必须在线程中触发 run 槽释放后的排空");
+        let propagate_idx = body
+            .find("join_result.map_err(|e| e.to_string())?")
+            .expect("lead_step 必须在排空后再冒出 spawn_blocking 的 JoinError");
+        assert!(
+            drain_idx < propagate_idx,
+            "lead_step 必须先触发 drain，再冒出 spawn_blocking 的 JoinError"
+        );
+    }
+
+    #[test]
+    fn deliver_remote_inbox_entry_has_team_and_solo_routes_and_releases_gate_lock() {
+        // M1-T1 死锁红线：team 判门锁必须收在内层 block，不能跨进会再次 db.0.lock() 的
+        // start_lead_session；同时固定复用既有纯判门，且两条投递路由各只出现一次。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn deliver_remote_inbox_entry(")
+            .nth(1)
+            .unwrap()
+            .split("\nconst RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT")
+            .next()
+            .unwrap();
+
+        assert_eq!(
+            body.matches("resume_after_answer_candidate(").count(),
+            1,
+            "team 判门必须恰好复用一次 resume_after_answer_candidate"
+        );
+        assert_eq!(
+            body.matches("start_lead_session(").count(),
+            1,
+            "team 路由必须恰好调用一次 start_lead_session"
+        );
+        assert_eq!(
+            body.matches("send_message(").count(),
+            1,
+            "solo 路由必须恰好调用一次 send_message"
+        );
+
+        let lock_idx = body
+            .find("db_state.0.lock()")
+            .expect("函数体里应有 db_state.0.lock()");
+        let start_idx = body
+            .find("start_lead_session(")
+            .expect("函数体里应有 start_lead_session( 调用");
+        assert!(
+            start_idx > lock_idx,
+            "切片范围不对：team 判门 lock 应在 start_lead_session 之前"
+        );
+
+        fn leading_spaces_of_line_at(text: &str, byte_idx: usize) -> usize {
+            let line_start = text[..byte_idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            text[line_start..].chars().take_while(|c| *c == ' ').count()
+        }
+        let lock_indent = leading_spaces_of_line_at(body, lock_idx);
+        let start_indent = leading_spaces_of_line_at(body, start_idx);
+        assert!(
+            lock_indent > start_indent,
+            "db_state.0.lock() 所在行缩进（{lock_indent} 格）应严格深于 \
+             start_lead_session( 所在行缩进（{start_indent} 格）——判门锁必须在专门的内层 \
+             block 结束时释放，跨调用在外层执行"
+        );
+    }
+
+    #[test]
+    fn deliver_remote_inbox_entry_routes_team_and_solo_exclusively() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn deliver_remote_inbox_entry(")
+            .nth(1)
+            .unwrap()
+            .split("\nconst RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT")
+            .next()
+            .unwrap();
+        let after_if = body
+            .split("if let Some((lead_agent_id, member_agent_ids)) = team_candidate {")
+            .nth(1)
+            .expect("必须找到 team_candidate 的 Some 分支");
+        let (team_branch, solo_tail) = after_if
+            .split_once("\n    }\n    let agent_id = {")
+            .expect("必须找到 team 分支收口及其后的 solo 路由");
+
+        assert!(
+            team_branch.contains("start_lead_session("),
+            "team 分支必须走 start_lead_session"
+        );
+        assert!(
+            !team_branch.contains("send_message("),
+            "team 分支不得落回 send_message"
+        );
+        assert!(
+            solo_tail.contains("send_message("),
+            "team 分支之后的 solo 尾段必须走 send_message"
+        );
+        assert!(
+            !solo_tail.contains("start_lead_session("),
+            "solo 尾段不得走 start_lead_session"
+        );
+    }
+
+    #[test]
+    fn deliver_remote_inbox_entry_team_route_matches_composer_message_arguments() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn deliver_remote_inbox_entry(")
+            .nth(1)
+            .unwrap()
+            .split("\nconst RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT")
+            .next()
+            .unwrap();
+        let after_if = body
+            .split("if let Some((lead_agent_id, member_agent_ids)) = team_candidate {")
+            .nth(1)
+            .expect("必须找到 team_candidate 的 Some 分支");
+        let team_branch = after_if
+            .split("\n    }\n    let agent_id = {")
+            .next()
+            .unwrap();
+
+        assert!(
+            team_branch.contains("Some(text)"),
+            "team message 必须是 Some(text)"
+        );
+        assert!(
+            team_branch.contains("member_agent_ids,"),
+            "team 成员池必须传 saved member_agent_ids"
+        );
+        assert!(
+            team_branch.contains(
+                "member_agent_ids,\n            None,\n            Some(display_reduce::remote_input_key(command_id)),\n        );"
+            ),
+            "member_agent_ids 后的 reasoning_tier 必须传 None，再后必须把 command_id 派生的\
+             user_dedup_key 传给 start_lead_session（P0-c command_id 穿线）"
+        );
+    }
+
+    #[test]
+    fn deliver_remote_inbox_entry_solo_route_threads_command_id_dedup_key() {
+        // P0-c 返工（测试硬度钉①）：`deliver_remote_inbox_entry` 第一行就要
+        // `app.state::<Db>()`——真调用它需要一整套 Tauri `AppHandle`/`Db`/`Running`/
+        // `member_runner::TeamRunning` 装配，本仓没有 `tauri::test` mock 装配（加这套装配
+        // 属于新基建，超出本轮 clean 单任务范围），没法在单测里整函数直接调用验证运行时
+        // 行为。装配边界：下面
+        // `remote_inbox_redelivery_before_mark_delivered_dedupes_via_command_id_key` 因此
+        // 只能走到 `parse_remote_input` + `db::append_message_dedup_and_publish` 这层——它
+        // 验证的是「同 command_id 键两轮重投确实去重」，但验证不了「`deliver_remote_inbox_
+        // entry` 内部真的把 command_id 穿到了 send_message 调用参数上」（因为测试的 deliver
+        // 闭包是手写的，根本没有执行这行源码）。这里改用本文件既有的源码字面匹配套路（见上方
+        // `deliver_remote_inbox_entry_team_route_matches_composer_message_arguments` 对 team
+        // 分支的同款验证）补上 solo 分支的镜像覆盖：solo 分支若把
+        // `Some(display_reduce::remote_input_key(command_id))` 误改成 `None`（command_id
+        // 穿线断裂），这里立刻断言失败——两个测试合起来才是「重投测试」对穿线断裂的完整
+        // 覆盖。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn deliver_remote_inbox_entry(")
+            .nth(1)
+            .unwrap()
+            .split("\nconst RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT")
+            .next()
+            .unwrap();
+        let after_if = body
+            .split("if let Some((lead_agent_id, member_agent_ids)) = team_candidate {")
+            .nth(1)
+            .expect("必须找到 team_candidate 的 Some 分支");
+        let solo_tail = after_if
+            .split_once("\n    }\n    let agent_id = {")
+            .expect("必须找到 team 分支收口及其后的 solo 路由")
+            .1;
+
+        assert!(
+            solo_tail.contains("send_message("),
+            "solo 分支必须调用 send_message"
+        );
+        assert!(
+            solo_tail.contains(
+                "text,\n        None,\n        None,\n        Some(display_reduce::remote_input_key(command_id)),\n    )"
+            ),
+            "solo 路由 send_message 的最后一个参数必须是 command_id 派生的 \
+             Some(display_reduce::remote_input_key(command_id))（P0-c command_id 穿线）——\
+             solo_tail={solo_tail:?}"
+        );
+    }
+
+    struct RemoteInputSendTestHarness {
+        conn: std::cell::RefCell<Connection>,
+        busy: std::cell::Cell<bool>,
+        delivery_calls: std::cell::Cell<usize>,
+        delivered_texts: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl RemoteInputSendTestHarness {
+        fn new(busy: bool) -> Self {
+            Self {
+                conn: std::cell::RefCell::new(crate::test_support::mem_db()),
+                busy: std::cell::Cell::new(busy),
+                delivery_calls: std::cell::Cell::new(0),
+                delivered_texts: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn send(
+            &self,
+            session_id: &str,
+            command_id: &str,
+            text: &str,
+        ) -> Option<remote_gateway::AckOutcome> {
+            let payload = serde_json::json!({"text": text}).to_string();
+            remote_input_send_ack(
+                || {
+                    db::enqueue_remote_input(
+                        &self.conn.borrow(),
+                        session_id,
+                        command_id,
+                        "input.send",
+                        &payload,
+                    )
+                    .map_err(|e| e.to_string())
+                },
+                || {
+                    drain_remote_inbox_loop(
+                        || {
+                            db::next_pending_remote_input(&self.conn.borrow(), session_id)
+                                .unwrap()
+                                .map(|entry| {
+                                    (entry.id, entry.command_id, entry.kind, entry.payload)
+                                })
+                        },
+                        |kind, payload, _command_id| {
+                            if self.busy.get() {
+                                return Err(format!("SESSION_ALREADY_RUNNING: {session_id}"));
+                            }
+                            let text = parse_remote_input(kind, payload)?;
+                            self.delivery_calls.set(self.delivery_calls.get() + 1);
+                            self.delivered_texts.borrow_mut().push(text);
+                            Ok(())
+                        },
+                        |id, _command_id| {
+                            db::mark_remote_input_delivered(&self.conn.borrow(), id).is_ok()
+                        },
+                        |id, _command_id, error| {
+                            db::record_remote_input_failure(&self.conn.borrow(), id, error).ok()
+                        },
+                        |id, _command_id, error| {
+                            db::mark_remote_input_failed(&self.conn.borrow(), id, error).is_ok()
+                        },
+                    );
+                },
+                || {
+                    db::remote_inbox_terminal_state_by_command_id(&self.conn.borrow(), command_id)
+                        .map_err(|e| e.to_string())
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn remote_input_send_enqueue_error_returns_no_ack_without_drain() {
+        let drain_calls = std::sync::atomic::AtomicU64::new(0);
+
+        let outcome = remote_input_send_ack(
+            || Err("boom".to_string()),
+            || {
+                drain_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            || panic!("enqueue 失败后不得查询终态"),
+        );
+
+        assert_eq!(outcome, None);
+        assert_eq!(drain_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn remote_input_send_same_frame_queues_after_enqueue_recovers() {
+        let conn = crate::test_support::mem_db();
+        let session_id = "s-enqueue-recovery";
+        let command_id = "cmd-enqueue-recovery";
+        let payload = serde_json::json!({"text": "retry"}).to_string();
+
+        let first = remote_input_send_ack(
+            || Err("boom".to_string()),
+            || panic!("enqueue 失败后不得排空"),
+            || panic!("enqueue 失败后不得查询终态"),
+        );
+        assert_eq!(first, None);
+        let count_after_failure: i64 = conn
+            .query_row("SELECT COUNT(*) FROM remote_inbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count_after_failure, 0);
+
+        let second = remote_input_send_ack(
+            || {
+                db::enqueue_remote_input(&conn, session_id, command_id, "input.send", &payload)
+                    .map_err(|e| e.to_string())
+            },
+            || {},
+            || panic!("新插入行不应查询终态"),
+        );
+        assert_eq!(second, Some(remote_gateway::AckOutcome::Queued));
+        let inserted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM remote_inbox WHERE command_id = ?1",
+                [command_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inserted, 1);
+    }
+
+    #[test]
+    fn remote_input_send_idle_drains_once_returns_queued_and_marks_delivered() {
+        let harness = RemoteInputSendTestHarness::new(false);
+
+        // 生产 drain 是异步线程；此处用同步闭包测试纯决策逻辑。新行仍回 queued，
+        // delivered_at 已落库只是同步 drain 的副作用，不代表 ack 承诺投递完成。
+        assert_eq!(
+            harness.send("s-input-idle", "cmd-input-idle", "idle"),
+            Some(remote_gateway::AckOutcome::Queued)
+        );
+        assert_eq!(harness.delivery_calls.get(), 1);
+        let delivered_at: Option<i64> = harness
+            .conn
+            .borrow()
+            .query_row(
+                "SELECT delivered_at FROM remote_inbox WHERE command_id = 'cmd-input-idle'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(delivered_at.is_some());
+    }
+
+    #[test]
+    fn remote_input_send_ack_loss_retry_first_queued_then_ok_without_redelivery() {
+        let harness = RemoteInputSendTestHarness::new(false);
+
+        assert_eq!(
+            harness.send("s-input-retry", "cmd-input-retry", "once"),
+            Some(remote_gateway::AckOutcome::Queued)
+        );
+        assert_eq!(
+            harness.send("s-input-retry", "cmd-input-retry", "duplicate"),
+            Some(remote_gateway::AckOutcome::Ok)
+        );
+        assert_eq!(harness.delivery_calls.get(), 1);
+        assert_eq!(harness.delivered_texts.borrow().as_slice(), ["once"]);
+    }
+
+    #[test]
+    fn remote_input_send_busy_retry_stays_queued_with_one_ledger_row() {
+        let harness = RemoteInputSendTestHarness::new(true);
+
+        assert_eq!(
+            harness.send("s-input-busy", "cmd-input-busy", "busy"),
+            Some(remote_gateway::AckOutcome::Queued)
+        );
+        assert_eq!(
+            harness.send("s-input-busy", "cmd-input-busy", "duplicate"),
+            Some(remote_gateway::AckOutcome::Queued)
+        );
+        assert_eq!(harness.delivery_calls.get(), 0);
+        let count: i64 = harness
+            .conn
+            .borrow()
+            .query_row(
+                "SELECT COUNT(*) FROM remote_inbox WHERE command_id = 'cmd-input-busy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn remote_input_send_new_idle_command_drains_older_pending_entry_first() {
+        let harness = RemoteInputSendTestHarness::new(true);
+        assert!(db::enqueue_remote_input(
+            &harness.conn.borrow(),
+            "s-input-fifo",
+            "cmd-input-old",
+            "input.send",
+            &serde_json::json!({"text": "old"}).to_string(),
+        )
+        .unwrap());
+        harness.busy.set(false);
+
+        assert_eq!(
+            harness.send("s-input-fifo", "cmd-input-new", "new"),
+            Some(remote_gateway::AckOutcome::Queued)
+        );
+        assert_eq!(
+            harness.delivered_texts.borrow().as_slice(),
+            ["old", "new"],
+            "即时排空必须复用 FIFO，后到的新行不得越过历史 pending 行"
+        );
+    }
+
+    #[test]
+    fn remote_input_send_failed_duplicate_returns_failed_without_delivery() {
+        let harness = RemoteInputSendTestHarness::new(false);
+        assert!(db::enqueue_remote_input(
+            &harness.conn.borrow(),
+            "s-input-failed",
+            "cmd-input-failed",
+            "input.send",
+            "{}",
+        )
+        .unwrap());
+        let entry = db::next_pending_remote_input(&harness.conn.borrow(), "s-input-failed")
+            .unwrap()
+            .unwrap();
+        db::mark_remote_input_failed(&harness.conn.borrow(), entry.id, "TEST_FAILED").unwrap();
+
+        assert_eq!(
+            harness.send("s-input-failed", "cmd-input-failed", "duplicate"),
+            Some(remote_gateway::AckOutcome::Failed)
+        );
+        assert_eq!(harness.delivery_calls.get(), 0);
+    }
+
+    #[test]
+    fn drain_remote_inbox_loop_stops_without_marking_delivered_on_busy() {
+        use std::collections::VecDeque;
+        let mut pending: VecDeque<(i64, String, String, String)> = VecDeque::from([
+            (
+                1,
+                "cmd-a".to_string(),
+                "input.send".to_string(),
+                "{\"text\":\"a\"}".to_string(),
+            ),
+            (
+                2,
+                "cmd-b".to_string(),
+                "input.send".to_string(),
+                "{\"text\":\"b\"}".to_string(),
+            ),
+        ]);
+        let mut delivered_ids: Vec<i64> = Vec::new();
+        let mut delivery_calls = 0;
+        drain_remote_inbox_loop(
+            || pending.pop_front(),
+            |_kind, _payload, _command_id| {
+                delivery_calls += 1;
+                Err("SESSION_ALREADY_RUNNING: s-x".to_string())
+            },
+            |id, _command_id| {
+                delivered_ids.push(id);
+                true
+            },
+            |_id, _command_id, _error| panic!("busy 不得记录失败次数"),
+            |_id, _command_id, _error| panic!("busy 不得标失败终态"),
+        );
+        assert_eq!(delivery_calls, 1, "撞忙应在第一条投递后立即停");
+        assert!(delivered_ids.is_empty(), "撞忙即停：零条 mark_delivered");
+        assert_eq!(pending.len(), 1, "第二条应原样留在队列里，等下次释放");
+    }
+
+    #[test]
+    fn drain_remote_inbox_loop_drains_fifo_and_skips_non_busy_failures_without_blocking() {
+        use std::collections::VecDeque;
+        let mut pending: VecDeque<(i64, String, String, String)> = VecDeque::from([
+            (
+                1,
+                "cmd-a".to_string(),
+                "input.send".to_string(),
+                "{\"text\":\"a\"}".to_string(),
+            ),
+            (
+                2,
+                "cmd-bogus".to_string(),
+                "control.bogus".to_string(),
+                "{}".to_string(),
+            ),
+            (
+                3,
+                "cmd-c".to_string(),
+                "input.send".to_string(),
+                "{\"text\":\"c\"}".to_string(),
+            ),
+        ]);
+        let mut delivered_ids: Vec<i64> = Vec::new();
+        let mut failed_ids: Vec<i64> = Vec::new();
+        let mut seen_kinds: Vec<String> = Vec::new();
+        drain_remote_inbox_loop(
+            || pending.pop_front(),
+            |kind, _payload, _command_id| {
+                seen_kinds.push(kind.to_string());
+                if kind == "input.send" {
+                    Ok(())
+                } else {
+                    Err(format!("UNKNOWN_REMOTE_INBOX_KIND:{kind}"))
+                }
+            },
+            |id, _command_id| {
+                delivered_ids.push(id);
+                true
+            },
+            |_id, _command_id, _error| panic!("parse 失败不得累计投递 attempts"),
+            |id, _command_id, _error| {
+                failed_ids.push(id);
+                true
+            },
+        );
+        assert_eq!(
+            delivered_ids,
+            vec![1, 3],
+            "只有真正投递成功的条目才能 mark_delivered"
+        );
+        assert_eq!(failed_ids, vec![2], "未知 kind 必须标 failed 终态");
+        assert_eq!(
+            seen_kinds,
+            vec!["input.send", "control.bogus", "input.send"]
+        );
+    }
+
+    #[test]
+    fn drain_remote_inbox_loop_retries_delivery_failure_then_marks_third_failure_terminal() {
+        use std::cell::Cell;
+
+        let attempts = Cell::new(0_i64);
+        let terminal = Cell::new(false);
+        let delivery_calls = Cell::new(0);
+        let marked_failed = Cell::new(0);
+        let following_delivered = Cell::new(false);
+
+        for expected_attempts in 1..=3 {
+            drain_remote_inbox_loop(
+                || {
+                    if !terminal.get() {
+                        Some((
+                            1,
+                            "cmd-retry".to_string(),
+                            "input.send".to_string(),
+                            "{\"text\":\"retry\"}".to_string(),
+                        ))
+                    } else if !following_delivered.get() {
+                        Some((
+                            2,
+                            "cmd-after".to_string(),
+                            "input.send".to_string(),
+                            "{\"text\":\"after\"}".to_string(),
+                        ))
+                    } else {
+                        None
+                    }
+                },
+                |_kind, payload, _command_id| {
+                    delivery_calls.set(delivery_calls.get() + 1);
+                    if payload.contains("retry") {
+                        Err("AGENT_NOT_FOUND".to_string())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |id, command_id| {
+                    assert_eq!((id, command_id), (2, "cmd-after"));
+                    following_delivered.set(true);
+                    true
+                },
+                |_id, _command_id, error| {
+                    assert_eq!(error, "AGENT_NOT_FOUND");
+                    attempts.set(attempts.get() + 1);
+                    Some(attempts.get())
+                },
+                |_id, _command_id, error| {
+                    assert_eq!(error, "AGENT_NOT_FOUND");
+                    marked_failed.set(marked_failed.get() + 1);
+                    terminal.set(true);
+                    true
+                },
+            );
+            assert_eq!(attempts.get(), expected_attempts);
+            assert_eq!(
+                terminal.get(),
+                expected_attempts >= 3,
+                "前两次保留 pending，第三次标失败终态"
+            );
+            assert_eq!(
+                following_delivered.get(),
+                expected_attempts >= 3,
+                "前两次不得越过失败条目；第三次终态化后应继续后续 FIFO 条目"
+            );
+        }
+
+        assert_eq!(delivery_calls.get(), 4, "第三轮还应投递终态条目之后的一条");
+        assert_eq!(marked_failed.get(), 1, "仅第三次失败标终态");
+    }
+
+    #[test]
+    fn drain_remote_inbox_loop_stops_when_record_failure_write_fails() {
+        let mut next_calls = 0;
+        let mut delivery_calls = 0;
+        drain_remote_inbox_loop(
+            || {
+                next_calls += 1;
+                Some((
+                    next_calls,
+                    format!("cmd-{next_calls}"),
+                    "input.send".to_string(),
+                    "{\"text\":\"x\"}".to_string(),
+                ))
+            },
+            |_kind, _payload, _command_id| {
+                delivery_calls += 1;
+                Err("AGENT_NOT_FOUND".to_string())
+            },
+            |_id, _command_id| panic!("投递失败不得 mark_delivered"),
+            |_id, _command_id, _error| None,
+            |_id, _command_id, _error| panic!("计数写失败不得继续标终态"),
+        );
+        assert_eq!(delivery_calls, 1, "计数写失败安全阀应立即停");
+        assert_eq!(next_calls, 1, "计数写失败后不得再取下一条");
+    }
+
+    #[test]
+    fn drain_remote_inbox_loop_stops_after_mark_delivered_failure() {
+        use std::collections::VecDeque;
+        let mut pending: VecDeque<(i64, String, String, String)> = VecDeque::from([
+            (
+                1,
+                "cmd-a".to_string(),
+                "input.send".to_string(),
+                "{\"text\":\"a\"}".to_string(),
+            ),
+            (
+                2,
+                "cmd-b".to_string(),
+                "input.send".to_string(),
+                "{\"text\":\"b\"}".to_string(),
+            ),
+        ]);
+        let mut delivery_calls = 0;
+        drain_remote_inbox_loop(
+            || pending.pop_front(),
+            |_kind, _payload, _command_id| {
+                delivery_calls += 1;
+                Ok(())
+            },
+            |_id, _command_id| false,
+            |_id, _command_id, _error| panic!("成功分支不得 record_failure"),
+            |_id, _command_id, _error| panic!("成功分支不得 mark_failed"),
+        );
+        assert_eq!(delivery_calls, 1, "mark 失败后不得继续投递第二条");
+    }
+
+    #[test]
+    fn drain_remote_inbox_loop_stops_before_redelivering_same_id() {
+        let mut next_pending_calls = 0;
+        let mut delivery_calls = 0;
+        drain_remote_inbox_loop(
+            || {
+                next_pending_calls += 1;
+                Some((
+                    1,
+                    "cmd-x".to_string(),
+                    "input.send".to_string(),
+                    "{\"text\":\"x\"}".to_string(),
+                ))
+            },
+            |_kind, _payload, _command_id| {
+                delivery_calls += 1;
+                Ok(())
+            },
+            |_id, _command_id| true,
+            |_id, _command_id, _error| panic!("成功分支不得 record_failure"),
+            |_id, _command_id, _error| panic!("成功分支不得 mark_failed"),
+        );
+        assert!(
+            next_pending_calls <= 2,
+            "同 id 第二次出现时必须停止查询循环"
+        );
+        assert_eq!(delivery_calls, 1, "同一条不得被二次投递");
+    }
+
+    #[test]
+    fn remote_inbox_emit_loads_new_solo_user_message_even_when_delivery_fails() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let delivery_body = production
+            .split("fn deliver_remote_inbox_entry(")
+            .nth(1)
+            .unwrap()
+            .split("\nconst RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT")
+            .next()
+            .unwrap();
+        let emit_call =
+            "emit_remote_inbox_message_if_new(app, session_id, &dedup_key, existed_before);";
+        assert_eq!(
+            delivery_body.matches(emit_call).count(),
+            2,
+            "team/solo 两条投递路由都必须尝试回显"
+        );
+        assert!(
+            delivery_body.contains(&format!("{emit_call}\n        return result;")),
+            "team 路由必须在无条件尝试回显后原样返回投递结果"
+        );
+        assert!(
+            delivery_body.contains(&format!("{emit_call}\n    result\n}}")),
+            "solo 路由必须在无条件尝试回显后原样返回投递结果"
+        );
+
+        let conn = crate::test_support::mem_db();
+        let session_id = "s-remote-emit-solo";
+        let dedup_key = "remote_input:cmd-remote-emit-solo";
+
+        let existed_before = db::get_message_by_session_and_dedup_key(&conn, session_id, dedup_key)
+            .unwrap()
+            .is_some();
+        assert!(!existed_before);
+        assert!(db::append_message_dedup_and_publish(
+            &conn,
+            session_id,
+            "user",
+            &[Block::Text {
+                text: "手机发来的消息".to_string(),
+            }],
+            None,
+            Some("solo-agent"),
+            Some("Solo Agent"),
+            dedup_key,
+        )
+        .unwrap());
+
+        // user 消息已在 append 阶段落库，但后续 run ledger/spawn 失败：回显判据仍应只看
+        // existed_before + 查回结果，不与投递整体的 Err 绑定。
+        let delivery_result: Result<(), String> = Err("spawn failed".to_string());
+        assert!(delivery_result.is_err());
+        let message = remote_inbox_message_to_emit(&conn, session_id, dedup_key, existed_before)
+            .unwrap()
+            .expect("投递失败时，本次新落库的 remote user 消息仍必须可供外层 emit");
+        assert_eq!(message.role, "user");
+        assert_eq!(message.agent_id.as_deref(), Some("solo-agent"));
+        assert_eq!(message.agent_name_snapshot.as_deref(), Some("Solo Agent"));
+        assert_eq!(
+            message.content,
+            vec![Block::Text {
+                text: "手机发来的消息".to_string(),
+            }]
+        );
+        let stored_dedup_key: String = conn
+            .query_row(
+                "SELECT dedup_key FROM messages WHERE id = ?1",
+                [message.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_dedup_key, dedup_key);
+    }
+
+    #[test]
+    fn remote_inbox_emit_duplicate_delivery_returns_none() {
+        let conn = crate::test_support::mem_db();
+        let session_id = "s-remote-emit-duplicate";
+        let dedup_key = "remote_input:cmd-remote-emit-duplicate";
+
+        assert!(db::append_message_dedup_and_publish(
+            &conn,
+            session_id,
+            "user",
+            &[Block::Text {
+                text: "只显示一次".to_string(),
+            }],
+            None,
+            None,
+            None,
+            dedup_key,
+        )
+        .unwrap());
+        let existed_before = db::get_message_by_session_and_dedup_key(&conn, session_id, dedup_key)
+            .unwrap()
+            .is_some();
+        assert!(existed_before);
+        assert!(!db::append_message_dedup_and_publish(
+            &conn,
+            session_id,
+            "user",
+            &[Block::Text {
+                text: "只显示一次".to_string(),
+            }],
+            None,
+            None,
+            None,
+            dedup_key,
+        )
+        .unwrap());
+
+        assert_eq!(
+            remote_inbox_message_to_emit(&conn, session_id, dedup_key, existed_before,).unwrap(),
+            None,
+            "同 command_id 重投命中既有行时不得产生第二次 emit 语义"
+        );
+        assert_eq!(db::get_messages(&conn, session_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remote_inbox_redelivery_before_mark_delivered_dedupes_via_command_id_key() {
+        // P0-c 步骤 9：at-least-once 窗口——这是 `remote_input_key(command_id)` 存在的理由。
+        // 第一轮：deliver 真落库成功，但 mark_delivered 模拟落库失败（崩溃/断连场景）——
+        // `drain_remote_inbox_loop` 的既有安全阀让循环立即停，remote_inbox 那一行仍是 pending。
+        // 第二轮：模拟进程重启/重连后再次排空——next_pending 找到同一条仍 pending 的行（同
+        // command_id），deliver 被真实地再调用一次；这次是同一把 `remote_input_key(command_id)`
+        // 键，INSERT OR IGNORE 挡下第二次落库，也不重复发 msg.completed 里程碑（publish 只发生
+        // 在真插入那次）。这是 command_id 穿线（而非退回 None 键、每次现场生成 run_id）的直接
+        // 证据：若穿线断开，两轮会各自派生不同 dedup_key，messages 表会落 2 行、publish 2 次。
+        //
+        // 装配边界（P0-c 返工·测试硬度钉①）：下面的 deliver 闭包没有调用生产
+        // `deliver_remote_inbox_entry`——那个函数第一行就要 `app.state::<Db>()`，真调用它需要
+        // 整套 Tauri `AppHandle`/`Db`/`Running`/`member_runner::TeamRunning` 装配，本仓无
+        // `tauri::test` mock 装配、加这套装配属新基建、超出本轮 clean 单任务范围。这里因此只能
+        // 手写调用它「内部能到的最深生产层」——`parse_remote_input` +
+        // `db::append_message_dedup_and_publish`——去验证「同 command_id 键两轮重投确实
+        // 去重」这条 DB 层行为；但这样绕过了 `deliver_remote_inbox_entry` 本身「把 command_id
+        // 传给 send_message 最后一参」那行源码，验证不了它被改掉（比如 solo 路误传 None）的
+        // 回归。这个穿线断裂的缺口由同 mod 内的
+        // `deliver_remote_inbox_entry_solo_route_threads_command_id_dedup_key`（源码字面匹配）
+        // 补上——两个测试合起来才是「重投测试」对 command_id 穿线的完整覆盖。
+        let conn = crate::test_support::mem_db();
+        let session_id = "s-redeliver";
+        let command_id = "cmd-redeliver";
+        let payload = serde_json::json!({"text": "重投测试"}).to_string();
+        assert!(
+            db::enqueue_remote_input(&conn, session_id, command_id, "input.send", &payload)
+                .unwrap()
+        );
+
+        crate::remote_gateway::test_take_publish_log();
+        let mut deliver_calls = 0;
+
+        // 第一轮：deliver 成功，但 mark_delivered 模拟落库失败——安全阀停，行仍 pending。
+        drain_remote_inbox_loop(
+            || {
+                db::next_pending_remote_input(&conn, session_id)
+                    .unwrap()
+                    .map(|e| (e.id, e.command_id, e.kind, e.payload))
+            },
+            |kind, payload, command_id| {
+                deliver_calls += 1;
+                let text = parse_remote_input(kind, payload)?;
+                db::append_message_dedup_and_publish(
+                    &conn,
+                    session_id,
+                    "user",
+                    &[Block::Text { text }],
+                    None,
+                    None,
+                    None,
+                    &display_reduce::remote_input_key(command_id),
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(())
+            },
+            |_id, _command_id| false, // 模拟 mark_delivered 落库失败
+            |_id, _command_id, _error| panic!("成功分支不得 record_failure"),
+            |_id, _command_id, _error| panic!("成功分支不得 mark_failed"),
+        );
+
+        // 第二轮：同一条仍 pending 的行被再次取到、再次投递（真实 at-least-once 重投）；这次
+        // mark_delivered 真正成功，收尾这条。
+        drain_remote_inbox_loop(
+            || {
+                db::next_pending_remote_input(&conn, session_id)
+                    .unwrap()
+                    .map(|e| (e.id, e.command_id, e.kind, e.payload))
+            },
+            |kind, payload, command_id| {
+                deliver_calls += 1;
+                let text = parse_remote_input(kind, payload)?;
+                db::append_message_dedup_and_publish(
+                    &conn,
+                    session_id,
+                    "user",
+                    &[Block::Text { text }],
+                    None,
+                    None,
+                    None,
+                    &display_reduce::remote_input_key(command_id),
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(())
+            },
+            |id, _command_id| db::mark_remote_input_delivered(&conn, id).is_ok(),
+            |_id, _command_id, _error| panic!("成功分支不得 record_failure"),
+            |_id, _command_id, _error| panic!("成功分支不得 mark_failed"),
+        );
+
+        assert_eq!(
+            deliver_calls, 2,
+            "两轮各投递一次（真实 at-least-once 重投）"
+        );
+        let messages = db::get_messages(&conn, session_id).unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "同 command_id 重投不得产生第二条落库消息: {messages:?}"
+        );
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["msg.completed"],
+            "同 command_id 重投不得重复发布 msg.completed 里程碑"
+        );
+        // P0-c 返工（测试硬度钉②-b）：remote 路 dedup_key 字面断言——硬编码
+        // `remote_input:{command_id}`，不复算 `display_reduce::remote_input_key`，防「键工厂
+        // 改常量」类变异。
+        let dedup_key: String = conn
+            .query_row(
+                "SELECT dedup_key FROM messages WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dedup_key, "remote_input:cmd-redeliver",
+            "重投落库行 dedup_key 必须字面等于 remote_input:{{command_id}}"
+        );
+    }
+
+    #[test]
+    fn parse_remote_input_accepts_valid_input_send() {
+        assert_eq!(
+            parse_remote_input("input.send", r#"{"text":"hello"}"#),
+            Ok("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_remote_input_rejects_malformed_payload() {
+        assert_eq!(
+            parse_remote_input("input.send", "{malformed"),
+            Err("REMOTE_INBOX_PAYLOAD_MALFORMED".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_remote_input_rejects_unknown_kind() {
+        let error = parse_remote_input("control.bogus", "{}").unwrap_err();
+        assert!(
+            error.starts_with("UNKNOWN_REMOTE_INBOX_KIND:"),
+            "未知 kind 必须保留稳定分类前缀"
+        );
+        assert_eq!(error, "UNKNOWN_REMOTE_INBOX_KIND:control.bogus");
+    }
+
+    #[test]
+    fn parse_remote_input_rejects_input_answer_defensively() {
+        assert_eq!(
+            parse_remote_input("input.answer", r#"{"text":"answer"}"#),
+            Err("REMOTE_INBOX_KIND_NOT_SUPPORTED_YET".to_string())
+        );
+    }
+
+    #[test]
+    fn answer_lead_question_outcome_serializes_stable_snake_case_fields() {
+        let json = serde_json::to_string(&AnswerLeadQuestionOutcome {
+            resumed: true,
+            lead_agent_id: Some("claude".into()),
+            resume_error: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"resumed":true,"lead_agent_id":"claude","resume_error":null}"#
+        );
     }
 
     #[test]

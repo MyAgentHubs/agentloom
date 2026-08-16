@@ -10,6 +10,14 @@ describe("AgentAvatar", () => {
     expect(el?.querySelector("svg")).toBeInTheDocument();
   });
 
+  it("assistant → agent-avatar--assistant + svg（U2：手机端 LiveMessageRow 固定传 kind=\"assistant\"，不该落到裸字母兜底）", () => {
+    const { container } = render(<AgentAvatar kind="assistant" />);
+    const el = container.querySelector(".agent-avatar--assistant");
+    expect(el).toBeInTheDocument();
+    expect(el?.querySelector("svg")).toBeInTheDocument();
+    expect(screen.queryByText("A")).toBeNull();
+  });
+
   it("user → agent-avatar--user + svg", () => {
     const { container } = render(<AgentAvatar kind="user" />);
     expect(

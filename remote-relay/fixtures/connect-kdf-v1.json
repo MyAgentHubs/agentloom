@@ -1,0 +1,26 @@
+[
+  {
+    "name": "connect_kdf_zero_ascii_hex",
+    "pairing_token_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "expect": {
+      "connect_token_hex": "db83d955c0cec8338d09bc4e49a3d422e42f617d0ca16d87729d60db4b09578a",
+      "token_hash_hex": "78e8abb05da7f8b7d7b22f6c2feb256225e0aa68b0f20afc463a6261dd978934"
+    }
+  },
+  {
+    "name": "connect_kdf_ff_ascii_hex",
+    "pairing_token_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expect": {
+      "connect_token_hex": "89a64c596415674ef62accd5cc5d979239e874ed9fd3e04eff52d37e64097178",
+      "token_hash_hex": "c6c82ad9e42146efabcfd112c05f86f4d6fdc0cbf48e210738615302df454850"
+    }
+  },
+  {
+    "name": "connect_kdf_random_ascii_hex",
+    "pairing_token_hex": "7b4d2f8a019ce653b67a40d5e28f913cc8a7610bde35f49214c7ab8069ef523d",
+    "expect": {
+      "connect_token_hex": "358f0f8272888c93fcba00434dd7e04fd9830d6d256f1efa8a237dab7e19c513",
+      "token_hash_hex": "e20a8b4fbd2d9ee50b5827a676708d96fb687f61fc8ff7a4422d0c4273901f31"
+    }
+  }
+]

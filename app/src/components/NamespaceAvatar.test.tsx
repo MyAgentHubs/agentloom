@@ -15,7 +15,7 @@ describe("NamespaceAvatar", () => {
   });
   it("github_org → 首字母色块 + GitHub 角标", () => {
     const { container, getByText } = render(
-      <NamespaceAvatar namespace={gh("org-1", "impanda-cookie")} />,
+      <NamespaceAvatar namespace={gh("org-1", "impact-octocat")} />,
     );
     expect(container.querySelector(".ns-av__sq")).not.toBeNull();
     expect(getByText("I")).not.toBeNull();
@@ -23,7 +23,7 @@ describe("NamespaceAvatar", () => {
   });
   it("不同 org 保留各自身份首字母（不被 provider 抹平）", () => {
     const { getByText: g1 } = render(
-      <NamespaceAvatar namespace={gh("org-1", "impanda-cookie")} />,
+      <NamespaceAvatar namespace={gh("org-1", "impact-octocat")} />,
     );
     const { getByText: g2 } = render(
       <NamespaceAvatar namespace={gh("org-2", "MyAgentHubs")} />,

@@ -913,13 +913,14 @@ pub fn run_lead_step(
     crate::db::set_lead_event_cursor(&tx, session_id, event_cursor).map_err(|e| e.to_string())?;
 
     // T-C3b b1 减法：只有 lead 真出 AskUser，才同事务 append 一条含 decision_card 块的 assistant 消息。
+    let mut msg_completed_milestone = None;
     let decision_card = if matches!(&action, LeadAction::AskUser { .. }) {
         let now = crate::db::now_secs();
         let source_run_id = crate::new_run_id();
         let decision_id = crate::new_run_id();
         let block = build_decision_card_block(&decision_id, &source_run_id, &action, now);
         if let Some(b) = &block {
-            crate::db::append_message_dedup(
+            msg_completed_milestone = crate::db::append_message_dedup(
                 &tx,
                 session_id,
                 "assistant",
@@ -937,6 +938,9 @@ pub fn run_lead_step(
     };
 
     tx.commit().map_err(|e| e.to_string())?;
+    if let Some(milestone) = msg_completed_milestone {
+        milestone.publish();
+    }
     Ok((action, decision_card))
 }
 
@@ -1778,6 +1782,7 @@ mod tests {
     #[test]
     fn run_lead_step_ask_user_appends_ask_decision_card() {
         let db = test_db();
+        crate::remote_gateway::test_take_publish_log();
         let (action, card) = run_lead_step(
             &db,
             "s-ask",
@@ -1791,6 +1796,11 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["msg.completed"],
+            "AskUser 决策卡应在事务提交成功后发布一次"
+        );
         assert!(matches!(action, LeadAction::AskUser { .. }));
         let block = card.expect("ask_user 应回传 decision_card 块");
         let decision_id = match &block {

@@ -1,0 +1,538 @@
+{
+  "version": "data-plane-v1",
+  "note": "data-plane 里程碑帧契约样张：session.index / msg.completed / card.created / card.resolved / run.status / tool.completed 六类共 11 张。每张的 frame 是解密后的里程碑明文负载，含顶层 `t` 类型字段（不是裸 builder 输出）；桌面与 relay 两端以此为共享真相源对拍 wire 形状。",
+  "coverage": [
+    {
+      "category": "session.index",
+      "sample_count": 5,
+      "consumer_tests": [
+        "data_plane_v1_session_index_variants_match_fixture_and_drive_builders"
+      ],
+      "gap": null
+    },
+    {
+      "category": "msg.completed",
+      "sample_count": 1,
+      "consumer_tests": [
+        "data_plane_v1_msg_completed_matches_fixture_and_drives_builder"
+      ],
+      "gap": "P0-c（本刀）已补：msg.completed 现覆盖 assistant 与 user 两种角色的落库咽喉（send_message / start_lead_session / commit_late_answer / 续会话种子四源统一走 dedup 落库 + command_id 穿线补发）；build_msg_completed_payload(message_id, role, blocks) 本就 role 无关，样张沿用既有 assistant 样张即可覆盖两路——不再需要专属 user 样张。显示当前 agent（MA1，本刀）已补：build_msg_completed_payload 加 optional agent 参数，Some 时插入样张的 \"agent\" 键（本样张即覆盖 Some 分支）；None（无 agent 归属）分支不单出样张，由 Rust 侧单元测试 builds_msg_completed_payload_agent_field_optional 覆盖『agent 键整个省略、不是 null』。已知子 gap：重连补发路径（publish_milestone_replay_batch_on_connect，消费 db::MilestoneReplayRow）暂不带 agent——MilestoneReplayRow 尚未携带 agent_name_snapshot，另立单跟进，不在本刀 scope。剩余 gap：本机旁路 IPC `append_message`（前端三处非 reply 动作）仍走非 dedup 版落库，无 dedup_key/里程碑，留后续刀。"
+    },
+    {
+      "category": "event 其余里程碑：card.created / card.resolved / run.status / tool.completed",
+      "sample_count": 5,
+      "consumer_tests": [
+        "data_plane_v1_card_and_run_status_milestones_match_fixture_and_drive_builders",
+        "data_plane_v1_tool_completed_matches_fixture_and_drives_extract_tool_milestones"
+      ],
+      "gap": null
+    },
+    {
+      "category": "live 四变体：text_delta / thinking_delta / tool_output_delta / usage_delta",
+      "sample_count": 5,
+      "consumer_tests": [
+        "data_plane_v1_live_deltas_match_fixture_and_drive_classify"
+      ],
+      "gap": null
+    },
+    {
+      "category": "control.snapshot 请求",
+      "sample_count": 4,
+      "consumer_tests": [
+        "data_plane_v1_control_snapshot_request_cases_match_fixture_and_drive_handle_command_envelope"
+      ],
+      "gap": null
+    },
+    {
+      "category": "snapshot 应答（v1.8.12 水印/尺寸预算契约·P0-b 返工重钉）",
+      "sample_count": 3,
+      "consumer_tests": [
+        "data_plane_v1_snapshot_response_matches_fixture_and_drives_partial_snapshot_pipeline"
+      ],
+      "gap": null
+    },
+    {
+      "category": "presence",
+      "sample_count": 1,
+      "consumer_tests": [
+        "relay presence 明文帧经 webSocketMessage 原样广播给其它在线连接"
+      ],
+      "gap": null
+    },
+    {
+      "category": "input.ack",
+      "sample_count": 2,
+      "consumer_tests": [
+        "relay input.ack 合法确认经 webSocketMessage 删除 pending_input 行并广播回执",
+        "relay input.ack 缺 command_id 经 webSocketMessage 不删除 pending_input 行且不崩溃"
+      ],
+      "gap": "『未知 status』反样张未出：实勘 room-do.js handlePlainFrame 的 input.ack 分支对 outcome 字段零校验——只要 `typeof payload.command_id === \"string\"` 就无条件 removePendingInput，outcome 取值不影响是否删行。按字面造『未知 status → 不删行』反样张会与生产行为不符（现状是仍会删），故遵铁律 4 不出；今天唯一真实存在的拒绝差异是『command_id 缺失/非字符串』。"
+    },
+    {
+      "category": "input.expired",
+      "sample_count": 1,
+      "consumer_tests": [
+        "relay 过期 pending_input 行经 webSocketMessage 触发清扫并广播 input.expired"
+      ],
+      "gap": null
+    },
+    {
+      "category": "replay.head",
+      "sample_count": 1,
+      "consumer_tests": [
+        "relay desktopHello 在 registry_ready 激活后下发的首帧 replay.head 与 store 现状一致"
+      ],
+      "gap": null
+    }
+  ],
+  "cases": [
+    {
+      "name": "session_index_full",
+      "desc": "session.index 全量快照——build_session_index_snapshot_payload(sessions)；sessions 逐字段抄自 db::SessionIndexSnapshotRow 的真实 Serialize 输出（id/title/repo_id/archived/status/run_id/updated_at）。",
+      "frame": {
+        "t": "session.index",
+        "full": true,
+        "sessions": [
+          {
+            "id": "sess-1",
+            "title": "Fix login bug",
+            "repo_id": "repo-a",
+            "archived": false,
+            "status": "running",
+            "run_id": "run-42",
+            "updated_at": 1765430400123,
+            "last_msg_preview": "Latest assistant reply",
+            "last_activity_at": 1765430450
+          },
+          {
+            "id": "sess-2",
+            "title": "Update docs",
+            "repo_id": "repo-a",
+            "archived": false,
+            "status": null,
+            "run_id": null,
+            "updated_at": 1765430300000,
+            "last_msg_preview": null,
+            "last_activity_at": null
+          }
+        ]
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_session_index_variants_match_fixture_and_drive_builders"
+      ]
+    },
+    {
+      "name": "session_index_created",
+      "desc": "session.index 增量·created——build_session_index_created_payload(id, title, repo_id, namespace_id)。",
+      "frame": {
+        "t": "session.index",
+        "op": "created",
+        "full": false,
+        "session": {
+          "id": "sess-3",
+          "title": "New session",
+          "repo_id": "repo-a",
+          "namespace_id": "ns-1",
+          "archived": false
+        }
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_session_index_variants_match_fixture_and_drive_builders"
+      ]
+    },
+    {
+      "name": "session_index_renamed",
+      "desc": "session.index 增量·renamed——build_session_index_renamed_payload(id, title)。",
+      "frame": {
+        "t": "session.index",
+        "op": "renamed",
+        "full": false,
+        "id": "sess-1",
+        "title": "Renamed title"
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_session_index_variants_match_fixture_and_drive_builders"
+      ]
+    },
+    {
+      "name": "session_index_archived",
+      "desc": "session.index 增量·archived——build_session_index_archived_payload(ids, true)。",
+      "frame": {
+        "t": "session.index",
+        "op": "archived",
+        "full": false,
+        "ids": [
+          "sess-1",
+          "sess-2"
+        ]
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_session_index_variants_match_fixture_and_drive_builders"
+      ]
+    },
+    {
+      "name": "session_index_deleted",
+      "desc": "session.index 增量·deleted——build_session_index_deleted_payload(id)。",
+      "frame": {
+        "t": "session.index",
+        "op": "deleted",
+        "full": false,
+        "id": "sess-9"
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_session_index_variants_match_fixture_and_drive_builders"
+      ]
+    },
+    {
+      "name": "msg_completed",
+      "desc": "msg.completed——build_msg_completed_payload(message_id, role, blocks, agent)；blocks 逐字段抄自 db::Block 的真实 Serialize 输出（Text + Tool 两类块，tag=\"type\"/snake_case）。显示当前 agent（MA1）：agent = 落库时的 agent_name_snapshot，Some 时插入本样张的 \"agent\" 键；user 消息 / 无 agent 归属时该键整个省略（不是 null）——另有消费测试单独覆盖 None 分支，未各出一张样张。",
+      "frame": {
+        "t": "msg.completed",
+        "message_id": 101,
+        "role": "assistant",
+        "agent": "Claude",
+        "blocks": [
+          {
+            "type": "text",
+            "text": "Fixed the login bug and added a regression test."
+          },
+          {
+            "type": "tool",
+            "id": "tool-1",
+            "tool": "shell",
+            "summary": "cargo test",
+            "card": "command",
+            "status": "ok",
+            "exit_code": 0,
+            "output": "test result: ok. 42 passed"
+          }
+        ]
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_msg_completed_matches_fixture_and_drives_builder"
+      ]
+    },
+    {
+      "name": "card_created",
+      "desc": "card.created——build_card_created_payload(block)；block 是真实 db::Block::DecisionCard 的 Serialize 输出。",
+      "frame": {
+        "t": "card.created",
+        "block": {
+          "type": "decision_card",
+          "decision_id": "d-1",
+          "kind": "ask",
+          "question": "Deploy the hotfix to production now?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "recommended": "yes",
+          "rationale": "Regression test passes; fix is isolated.",
+          "payload": null,
+          "source_run_id": "run-7",
+          "status": "pending",
+          "chosen_option": null,
+          "created_at": 1765430400123
+        }
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_card_and_run_status_milestones_match_fixture_and_drive_builders"
+      ]
+    },
+    {
+      "name": "card_resolved",
+      "desc": "card.resolved——build_card_resolved_payload(decision_id, status, chosen_option)。",
+      "frame": {
+        "t": "card.resolved",
+        "decision_id": "d-1",
+        "status": "resolved",
+        "chosen_option": "yes"
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_card_and_run_status_milestones_match_fixture_and_drive_builders"
+      ]
+    },
+    {
+      "name": "run_status_running",
+      "desc": "run.status·running 带 run_id——build_run_status_payload(session_id, \"running\", Some(run_id))。",
+      "frame": {
+        "t": "run.status",
+        "session_id": "sess-1",
+        "status": "running",
+        "run_id": "run-7"
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_card_and_run_status_milestones_match_fixture_and_drive_builders"
+      ]
+    },
+    {
+      "name": "run_status_idle",
+      "desc": "run.status·idle 无 run_id——build_run_status_payload(session_id, \"idle\", None)。",
+      "frame": {
+        "t": "run.status",
+        "session_id": "sess-1",
+        "status": "idle",
+        "run_id": null
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_card_and_run_status_milestones_match_fixture_and_drive_builders"
+      ]
+    },
+    {
+      "name": "tool_completed",
+      "desc": "tool.completed——由 extract_tool_milestones 在真实 sink 入队路径（enqueue_batch_payload_for_upstream）产出，不是手写 builder。",
+      "frame": {
+        "t": "tool.completed",
+        "id": "tool-1",
+        "tool": "shell",
+        "status": "ok",
+        "exit_code": 0,
+        "output": "build succeeded"
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_tool_completed_matches_fixture_and_drives_extract_tool_milestones"
+      ]
+    },
+    {
+      "name": "live_text_delta",
+      "desc": "live·text_delta——classify(AgentEvent::TextDelta, seq)。",
+      "frame": {
+        "t": "text_delta",
+        "seq": 5,
+        "text": "Hello, "
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_live_deltas_match_fixture_and_drive_classify"
+      ]
+    },
+    {
+      "name": "live_thinking_delta",
+      "desc": "live·thinking_delta——classify(AgentEvent::ThinkingDelta, seq)。",
+      "frame": {
+        "t": "thinking_delta",
+        "seq": 6,
+        "text": "Let me check the tests..."
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_live_deltas_match_fixture_and_drive_classify"
+      ]
+    },
+    {
+      "name": "live_tool_output_delta",
+      "desc": "live·tool_output_delta——classify(AgentEvent::ToolOutputDelta, seq)。",
+      "frame": {
+        "t": "tool_output_delta",
+        "seq": 7,
+        "id": "tool-1",
+        "text": "Running cargo test\n"
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_live_deltas_match_fixture_and_drive_classify"
+      ]
+    },
+    {
+      "name": "live_usage_delta",
+      "desc": "live·usage_delta——classify(AgentEvent::UsageDelta, seq)。",
+      "frame": {
+        "t": "usage_delta",
+        "seq": 8,
+        "input_tokens": 120,
+        "output_tokens": 45
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_live_deltas_match_fixture_and_drive_classify"
+      ]
+    },
+    {
+      "name": "live_text_delta_truncated",
+      "desc": "live·text_delta 超长被截断——源事件文本 2065 字节（OUTPUT_TRUNCATE_BYTES=2048 + 17），classify 内部 truncate_utf8 截到恰好 2048 字节。frame.text 长度必须等于 2048。",
+      "frame": {
+        "t": "text_delta",
+        "seq": 9,
+        "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_live_deltas_match_fixture_and_drive_classify"
+      ]
+    },
+    {
+      "name": "control_snapshot_request_accepted_todo_stub",
+      "desc": "control.snapshot 请求·结构合法——解密通过、到达 (\"control\", Some(\"control.snapshot\")) 匹配臂；P0-b 已接线：session 归属闸放行后，原子读取 partial_snapshots 归约态并发布 snapshot 里程碑，回 ok ack，不计 bad_frames。（case 名沿用旧名，未接线年代的历史命名，避免无谓改名扩大 diff。）",
+      "frame": {
+        "t": "control.snapshot",
+        "session": "s-6"
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_control_snapshot_request_cases_match_fixture_and_drive_handle_command_envelope"
+      ]
+    },
+    {
+      "name": "control_snapshot_request_unknown_t_rejected",
+      "desc": "control.snapshot 请求·未知 t——kind=control 但 t 不是任何已知类型，落 handle_command_envelope 的 `_ => failed()` 分支，计 bad_frames。",
+      "frame": {
+        "t": "control.bogus",
+        "session": "s-6"
+      },
+      "valid": false,
+      "consumers": [
+        "data_plane_v1_control_snapshot_request_cases_match_fixture_and_drive_handle_command_envelope"
+      ]
+    },
+    {
+      "name": "control_snapshot_request_missing_session_rejected",
+      "desc": "control.snapshot 请求·payload 缺 session 字段——P0-b 接线后 handle_command_envelope 在读归属闸前先校验业务字段，缺失直接 failed，计 bad_frames（与 input.send/control.stop/input.answer 同款字段校验顺序）。",
+      "frame": {
+        "t": "control.snapshot"
+      },
+      "valid": false,
+      "consumers": [
+        "data_plane_v1_control_snapshot_request_cases_match_fixture_and_drive_handle_command_envelope"
+      ]
+    },
+    {
+      "name": "control_snapshot_request_session_wrong_type_rejected",
+      "desc": "control.snapshot 请求·payload session 非字符串——同上，failed，计 bad_frames。",
+      "frame": {
+        "t": "control.snapshot",
+        "session": 7
+      },
+      "valid": false,
+      "consumers": [
+        "data_plane_v1_control_snapshot_request_cases_match_fixture_and_drive_handle_command_envelope"
+      ]
+    },
+    {
+      "name": "snapshot_response_running_with_partial",
+      "desc": "snapshot 应答·进行中且已纳入 live 帧——run_id/through_run_seq 非 null 且 partial_msg 非 null。P0-b 已接线：真路径 = maintain_partial_snapshots 喂一条 TextDelta（seq=12）后原子截取归约态，经 build_snapshot_payload 构造。",
+      "frame": {
+        "t": "snapshot",
+        "session": "s-1",
+        "run_id": "run-7",
+        "through_run_seq": 12,
+        "partial_msg": {
+          "role": "assistant",
+          "blocks": [
+            {
+              "type": "text",
+              "text": "Working on the fix, running tests now..."
+            }
+          ]
+        }
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_snapshot_response_matches_fixture_and_drives_partial_snapshot_pipeline"
+      ]
+    },
+    {
+      "name": "snapshot_response_running_no_partial",
+      "desc": "snapshot 应答·进行中但已纳入的事件不产可显示内容——v1.8.12 订正：through_run_seq=0 这个取值废除（生产序号器先自增后返回，首条事件即 seq=1；首事件到达前桌面没有归约条目，落 idle 分支）。此态 = 已纳入事件但暂无可显示归约内容（如仅 usage 类事件），partial_msg 为 null 但 run_id/through_run_seq 非 null 且 ≥1。P0-b 返工已接线：真路径 = 喂一条不产 block 的事件（UsageDelta，seq=1），reducer 不出块，through_run_seq=Some(1)。",
+      "frame": {
+        "t": "snapshot",
+        "session": "s-1",
+        "run_id": "run-8",
+        "through_run_seq": 1,
+        "partial_msg": null
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_snapshot_response_matches_fixture_and_drives_partial_snapshot_pipeline"
+      ]
+    },
+    {
+      "name": "snapshot_response_idle_all_null",
+      "desc": "snapshot 应答·idle——三字段全 null（无进行中 run，客户端视作『无 live 缺口需补』）。P0-b 已接线：真路径 = partial_snapshots 无该 session 条目（从未 feed，或已被 Completed/RunCloseout 清掉）。",
+      "frame": {
+        "t": "snapshot",
+        "session": "s-1",
+        "run_id": null,
+        "through_run_seq": null,
+        "partial_msg": null
+      },
+      "valid": true,
+      "consumers": [
+        "data_plane_v1_snapshot_response_matches_fixture_and_drives_partial_snapshot_pipeline"
+      ]
+    },
+    {
+      "name": "presence_broadcast",
+      "desc": "presence——明文帧（M0 §1 明文帧例外），relay 收到后经 broadcastRaw 原样转发给房间内其它连接（不加 ts，转发内容与收到内容逐字节一致）。",
+      "frame": {
+        "t": "presence",
+        "role": "remote",
+        "event": "online"
+      },
+      "valid": true,
+      "consumers": [
+        "relay presence 明文帧经 webSocketMessage 原样广播给其它在线连接"
+      ]
+    },
+    {
+      "name": "input_ack_valid_deletes_pending",
+      "desc": "input.ack·合法（桌面发·command_id 命中 pending_input 行）——relay 删除该行并把回执广播给远端。",
+      "frame": {
+        "t": "input.ack",
+        "command_id": "cmd-dp1-ack",
+        "outcome": "ok"
+      },
+      "valid": true,
+      "consumers": [
+        "relay input.ack 合法确认经 webSocketMessage 删除 pending_input 行并广播回执"
+      ]
+    },
+    {
+      "name": "input_ack_missing_command_id_no_delete",
+      "desc": "input.ack·缺 command_id——relay 当前只按 `typeof payload.command_id === \"string\"` 决定删不删行；缺字段时跳过删除，仍会 broadcastToRemotes 原样转发，不崩溃、不抛异常。",
+      "frame": {
+        "t": "input.ack",
+        "outcome": "ok"
+      },
+      "valid": false,
+      "consumers": [
+        "relay input.ack 缺 command_id 经 webSocketMessage 不删除 pending_input 行且不崩溃"
+      ]
+    },
+    {
+      "name": "input_expired_broadcast",
+      "desc": "input.expired——relay 在 handleInput 入队前清扫过期 pending_input 行（G8 R4 purgeExpiredPendingInput），逐条广播 {t, command_id} 给房间内远端。",
+      "frame": {
+        "t": "input.expired",
+        "command_id": "cmd-dp1-expired"
+      },
+      "valid": true,
+      "consumers": [
+        "relay 过期 pending_input 行经 webSocketMessage 触发清扫并广播 input.expired"
+      ]
+    },
+    {
+      "name": "replay_head_on_connect",
+      "desc": "replay.head——桌面连接（registry_ready 激活后）relay 首帧下发 {t, epoch, headSeq}，与 store 现状（bumpEpoch 一次 + 落库两条里程碑）一致。",
+      "frame": {
+        "t": "replay.head",
+        "epoch": 1,
+        "headSeq": 2
+      },
+      "valid": true,
+      "consumers": [
+        "relay desktopHello 在 registry_ready 激活后下发的首帧 replay.head 与 store 现状一致"
+      ]
+    }
+  ]
+}

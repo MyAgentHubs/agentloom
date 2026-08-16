@@ -43,8 +43,15 @@ In scope:
   the project directory it was scoped to.
 - Credential exposure: API keys or tokens leaking out of the OS keychain into
   logs, the database, configuration files, crash dumps, or network requests.
-- Unexpected outbound network traffic to anything other than a model provider
-  the user explicitly configured.
+- Unexpected outbound network traffic to anything other than a destination the
+  user configured or enabled: their model providers, their chosen web-search
+  backend, and — when Remote Control is enabled — the relay server (the
+  official one by default, or a self-hosted one).
+- Remote Control boundary violations: the relay or a network observer
+  recovering session plaintext (they should only ever see ciphertext plus
+  connection metadata), a pairing token accepted outside its single-use
+  five-minute window, device tokens failing to rotate or revoke as designed,
+  or a paired phone gaining capabilities beyond the scope it paired with.
 - Remote code execution triggered by untrusted content — for example, a
   malicious repository, file, or model response causing execution the user did
   not authorise.
@@ -64,12 +71,18 @@ Out of scope:
   demonstrated impact.
 - Denial of service against your own machine.
 - Social-engineering scenarios that require the user to deliberately paste a
-  malicious instruction and approve the result.
+  malicious instruction and approve the result — including showing a Remote
+  Control pairing QR code to someone else while it is still valid.
+- Availability of the official public relay. It is shared infrastructure;
+  outages and rate limiting degrade Remote Control but are not
+  vulnerabilities. The connection metadata the relay sees by design — room
+  and session identifiers, timing, sizes — is documented and out of scope.
 
 ## A note on the threat model
 
 AgentLoom runs AI agents that execute commands and modify files on your
 machine, by design. The security boundary we defend is: *the workspace you
-authorised*, *the credentials you stored*, and *the network destinations you
-chose*. Reports are most useful when they show one of those three being crossed
-without the user's involvement.
+authorised*, *the credentials you stored*, *the network destinations you
+chose*, and — when Remote Control is enabled — *the end-to-end encryption
+between your desktop and your phone*. Reports are most useful when they show
+one of those being crossed without the user's involvement.

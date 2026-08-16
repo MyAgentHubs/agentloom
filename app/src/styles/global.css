@@ -1696,6 +1696,13 @@ body {
   background: var(--bg-sunken);
   color: var(--ink-3);
 }
+/* F2（remote-web 整盘审）：`AgentAvatar` 的 assistant glyph（`kind="assistant"` →
+ * `.agent-avatar--assistant`）没有对应背景规则——白色 glyph 贴透明底看不见。桌面目前不传字面量
+ * "assistant"（见 AgentAvatar.tsx 注释），补这条是防未来桌面传 assistant 的兜底，同 --unknown 口径。 */
+.agent-avatar--assistant {
+  background: var(--bg-sunken);
+  color: var(--ink-3);
+}
 .composer__agent .agent-avatar,
 .dd__item .agent-avatar {
   width: 15px;

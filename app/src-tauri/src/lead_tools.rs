@@ -730,6 +730,13 @@ fn prompt_user(
                 "agent_name_snapshot": agent_name,
             }),
         );
+        if let Ok(block_value) = serde_json::to_value(b) {
+            crate::remote_gateway::publish_card_created_milestone(
+                session_id,
+                &decision_id,
+                block_value,
+            );
+        }
     }
 
     let questions = app.state::<crate::LeadQuestions>();
@@ -742,18 +749,35 @@ fn prompt_user(
         wait,
     )? {
         crate::WaitOutcome::Answered(opt) => {
-            {
+            let changed = {
                 let db_state = app.state::<crate::db::Db>();
-                if let Ok(conn) = db_state.0.lock() {
-                    let _ = crate::db::update_decision_card_status(
-                        &conn,
-                        session_id,
-                        &decision_id,
-                        "pending",
-                        "chosen",
-                        Some(&opt),
-                    );
+                let cas_changed = match db_state.0.lock() {
+                    Ok(conn) => matches!(
+                        crate::db::update_decision_card_status(
+                            &conn,
+                            session_id,
+                            &decision_id,
+                            "pending",
+                            "chosen",
+                            Some(&opt),
+                        ),
+                        Ok(true)
+                    ),
+                    Err(_) => false,
                 };
+                cas_changed
+            };
+            if changed {
+                use tauri::Emitter;
+                let _ = app.emit(
+                    "decision-card-resolved",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "decision_id": decision_id,
+                        "status": "chosen",
+                        "chosen_option": opt,
+                    }),
+                );
             }
             Ok(PromptOutcome::Answered(opt))
         }
@@ -1005,6 +1029,91 @@ pub fn propose_verifier(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_user_emits_decision_card_resolved_only_inside_changed_branch() {
+        // AppHandle 无法在普通 #[test] 中构造；结构性钉死薄壳契约：CAS 调用在前，且 resolved
+        // emit 必须实际嵌套在 `if changed` 花括号内。把 emit 挪到该分支前/后都会使本测试变红。
+        let source = include_str!("lead_tools.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let prompt_user = production
+            .split("fn prompt_user(")
+            .nth(1)
+            .expect("必须找到 prompt_user")
+            .split("\nfn unbounded_prompt_never_pending(")
+            .next()
+            .unwrap();
+        let answered = prompt_user
+            .split("crate::WaitOutcome::Answered(opt) => {")
+            .nth(1)
+            .expect("必须找到 Answered 分支")
+            .split("crate::WaitOutcome::TimedOut =>")
+            .next()
+            .unwrap();
+
+        assert_eq!(
+            answered.matches("\"decision-card-resolved\"").count(),
+            1,
+            "Answered 分支应且仅应有一次翻卡 emit"
+        );
+        let update_idx = answered
+            .find("crate::db::update_decision_card_status(")
+            .expect("Answered 分支必须执行决策卡 CAS");
+        let if_idx = answered
+            .find("if changed {")
+            .expect("Answered 分支必须以 changed 门控 emit");
+        assert!(update_idx < if_idx, "必须先取得 CAS 结果，再判断是否 emit");
+        let changed_source = answered
+            .split("let changed = {")
+            .nth(1)
+            .expect("必须捕获 CAS 是否成功")
+            .split("if changed {")
+            .next()
+            .unwrap();
+        assert!(
+            changed_source.contains("matches!(") && changed_source.contains("Ok(true)"),
+            "只有 CAS 返回 Ok(true) 才能把 changed 置为 true"
+        );
+        assert!(
+            changed_source.contains("Err(_) => false"),
+            "DB 锁失败必须折叠为 changed=false，不得 emit"
+        );
+
+        let open_idx = if_idx
+            + answered[if_idx..]
+                .find('{')
+                .expect("if changed 必须有分支体");
+        let mut depth = 0usize;
+        let mut close_idx = None;
+        for (offset, ch) in answered[open_idx..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_idx = Some(open_idx + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close_idx = close_idx.expect("if changed 花括号必须闭合");
+        let emit_idx = answered
+            .find("\"decision-card-resolved\"")
+            .expect("必须存在翻卡 emit");
+        assert!(
+            emit_idx > open_idx && emit_idx < close_idx,
+            "decision-card-resolved emit 必须嵌套在 CAS changed=true 分支内"
+        );
+        let answer_return_idx = answered
+            .find("Ok(PromptOutcome::Answered(opt))")
+            .expect("无论是否 emit 都必须返回 Answered");
+        assert!(
+            close_idx < answer_return_idx,
+            "门控 emit 完成后仍应维持原有 Answered 返回"
+        );
+    }
 
     fn pool_member(agent_id: &str) -> PoolMember {
         PoolMember {

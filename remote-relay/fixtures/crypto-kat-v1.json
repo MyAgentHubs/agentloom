@@ -1,0 +1,17 @@
+{
+  "name": "crypto-kat-v1",
+  "description": "X25519 RFC 7748 §5.2 DH 测试向量 + 该 DH 输出接续做 K_pair 派生的 HKDF-SHA256 KAT。桌面 Rust 实现与 Web 客户端实现共享的加密 KAT 真相源，取代此前两端各自维护、曾漂移风险的内联常量复制。",
+  "source": "x25519_dh 三个字段是 RFC 7748 §5.2 官方 published X25519 DH 测试向量；k_pair_hkdf.expected_k_pair_hex 另用 Node.js crypto.hkdfSync 与独立 Python HMAC-SHA256 手写实现交叉核验（核验脚本原记于 remote_crypto.rs 内联注释，含 pairing_code=\"123456\" 与 HKDF info=\"agentloom-rc-v1\"）。",
+  "x25519_dh": {
+    "name": "rfc7748_5_2_dh",
+    "my_secret_hex": "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+    "their_public_hex": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+    "expected_shared_hex": "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
+  },
+  "k_pair_hkdf": {
+    "name": "k_pair_hkdf_sha256",
+    "shared_secret_hex": "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742",
+    "pairing_code": "123456",
+    "expected_k_pair_hex": "31e35121421873b1a2005cb204410e8cd872adfd401fea1bbfef3f19b77c84f9"
+  }
+}

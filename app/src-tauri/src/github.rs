@@ -86,7 +86,7 @@ fn gh_command_error(error: CommandOutputError) -> String {
     }
 }
 
-fn gh_command() -> Result<Command, String> {
+pub(crate) fn gh_command() -> Result<Command, String> {
     let path =
         crate::detect::which_or_fallback("gh", &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"])
             .ok_or_else(|| "GH_MISSING".to_string())?;
@@ -315,13 +315,14 @@ pub fn clone_repo_https(token: &str, owner: &str, name: &str, dest: &str) -> Res
         std::fs::create_dir_all(parent).map_err(|e| format!("MKDIR_FAILED:{e}"))?;
     }
     let url = format!("https://github.com/{owner}/{name}.git");
-    let out = crate::proc::command("gh")
+    let mut command = gh_command()?;
+    let out = command
         .args(["repo", "clone", &url, dest])
         .env("GH_TOKEN", token)
         .env("GH_PROMPT_DISABLED", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
-        .map_err(|_| "GH_MISSING".to_string())?;
+        .map_err(|e| format!("GH_COMMAND_FAILED:{e}"))?;
     if !out.status.success() {
         let raw = String::from_utf8_lossy(&out.stderr);
         let redacted = raw.replace(token, "***");
@@ -532,6 +533,19 @@ mod tests {
             owner: owner.into(),
             repo: repo.into(),
         })
+    }
+
+    #[test]
+    fn gh_command_no_bare_spawn_literal_regression() {
+        let sources = [include_str!("github.rs"), include_str!("git_ops.rs")];
+        let forbidden = ["proc::command(", "\"gh\"", ")"].concat();
+
+        for source in sources {
+            assert!(
+                !source.contains(&forbidden),
+                "GitHub CLI commands must be resolved through github::gh_command"
+            );
+        }
     }
 
     #[test]

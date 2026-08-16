@@ -27,6 +27,7 @@
     "@tauri-apps/plugin-opener": "^2",
     "anser": "^2.3.5",
     "mermaid": "^11.16.1",
+    "qrcode": "^1.5.4",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0",

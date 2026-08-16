@@ -85,7 +85,8 @@ function assistantAvatarKind(message: ChatMessage): string {
 
 function messageId(message: ChatMessage): string | null {
   const id = (message as { id?: unknown }).id;
-  return typeof id === "string" && id.length > 0 ? id : null;
+  if (typeof id === "string") return id.length > 0 ? id : null;
+  return typeof id === "number" && Number.isFinite(id) ? String(id) : null;
 }
 
 function messageHasLeadTurnBlock(message: ChatMessage): boolean {
@@ -129,7 +130,7 @@ function hashString(value: string): string {
   return (hash >>> 0).toString(36);
 }
 
-function stableMessageKeys(messages: ChatMessage[]): string[] {
+export function stableMessageKeys(messages: ChatMessage[]): string[] {
   const occurrences = new Map<string, number>();
   return messages.map((message) => {
     const id = messageId(message);

@@ -94,6 +94,20 @@ describe("ToolStepsFold", () => {
     expect(details?.querySelector(".toolfold__chevron")).toBe(chevron);
   });
 
+  it("chevron svg 内联 width/height/fill，不依赖外部样式表也能正确显示（手机端零 CSS 场景）", () => {
+    const { container } = renderZh([
+      tool({ id: "a", summary: "ls" }),
+      tool({ id: "b", summary: "cat a" }),
+    ]);
+    const chevron = container.querySelector(".toolfold__chevron");
+    expect(chevron).not.toBeNull();
+    expect(chevron?.getAttribute("width")).toBe("11");
+    expect(chevron?.getAttribute("height")).toBe("11");
+    expect(chevron?.getAttribute("fill")).toBe("none");
+    expect(chevron?.getAttribute("stroke")).toBe("currentColor");
+    expect(chevron?.getAttribute("stroke-width")).toBe("2");
+  });
+
   it("重渲染（相同 key）不丢展开态", () => {
     const blocksV1 = [
       tool({ id: "a", summary: "ls" }),

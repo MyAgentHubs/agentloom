@@ -129,7 +129,20 @@ struct TeamRegistry {
 /// Drop 在成功、错误和 unwind 路径都对称清理；进程 abort 时内存注册表随进程重建。
 pub struct DispatchIntentGuard {
     registry: Arc<Mutex<TeamRegistry>>,
+    team_running: TeamRunning,
     session_id: String,
+    // M1 修复轮 P1-2（opus 深审·2026-08-11）：`None` = 测试/内部二次登记默认态（Drop 只做原有
+    // 的计数清理、不碰 db，零测试改动）；生产调用点（`run_lead_worker_with_dispatch_intent`）
+    // 用 `with_refresh` 挂上后，Drop（intent 计数真正清零/递减）时重算 session_runtime——
+    // 这是「team 从忙转闲」的真正时点之一（详见 P1-1 窗口注释）。
+    refresh: Option<(crate::Running, tauri::AppHandle)>,
+}
+
+impl DispatchIntentGuard {
+    pub fn with_refresh(mut self, running: crate::Running, app: tauri::AppHandle) -> Self {
+        self.refresh = Some((running, app));
+        self
+    }
 }
 
 impl Drop for DispatchIntentGuard {
@@ -147,6 +160,19 @@ impl Drop for DispatchIntentGuard {
             *count = count.saturating_sub(1);
             if *count == 0 {
                 registry.dispatch_intents.remove(&self.session_id);
+            }
+        }
+        drop(registry);
+        // `registry`（TeamRegistry 的锁）已在上面 drop——refresh_session_runtime 内部会重新
+        // 获取 team_running 自己的锁（同一把），此处若还攥着就是 P0-1 那类同线程重入死锁。
+        if let Some((running, app)) = &self.refresh {
+            if let Some(db) = app.try_state::<crate::db::Db>() {
+                crate::refresh_session_runtime(
+                    db.inner(),
+                    running,
+                    &self.team_running,
+                    &self.session_id,
+                );
             }
         }
     }
@@ -196,7 +222,9 @@ impl TeamRunning {
         drop(registry);
         Ok(DispatchIntentGuard {
             registry: self.0.clone(),
+            team_running: self.clone(),
             session_id: session_id.to_string(),
+            refresh: None,
         })
     }
 
@@ -672,11 +700,11 @@ pub(crate) fn validate_members_against_saved_session_config(
 /// git 子进程，两者都可能是秒级操作，N 个 member 顺序做会把全局锁占到秒级到十秒级，期间全 app
 /// 所有其它会话的 DB 操作都会被阻塞。改成三段：
 /// ①（锁内·快）批量读出所有 member 需要的 DB 数据：校验 + acceptance + 每个 member 的 agent profile；
-/// ②（锁外·慢）钥匙串 IPC + 非 in-place 会话逐 member 建 git worktree——都不需要 conn；
-/// ③（锁内）用已解析好的 profile/key/wt 拼最终 Command（`build_member_command_with`：
-///    `make_backend` 对 native/borrow 只做内存计算，harness 分支目前仍会做一次搜索后端钥匙串 IPC
-///    ——见 `build_member_command_with` doc 的 F3① 更正——外加 `checkpoint_hook::install` 一次
-///    快速 DB 读写）。
+/// ②（外层锁外·慢）agent key + harness 搜索 key 的钥匙串 IPC，以及非 in-place 会话逐 member 建
+///    git worktree；其中搜索凭据解析会短暂自取一次 `db.0` 锁读取后端名（逐 member 一次·team run
+///    共享解析一次的优化仍留账）；
+/// ③（锁内）用已解析好的 profile/key/search/wt 拼最终 Command（`make_backend` 已不再接收 conn，
+///    此段不再做钥匙串 IPC；`backend.build_command` 仍会做必要的快速 DB 读写）。
 ///
 /// **口径（opus 对抗审 F4 后改判·别再说"逐位相同"）**：*正常路径*（全部 member 都能成功准备）
 /// 每一步的输入/输出与原来逐位相同。*失败路径*的错误优先级和副作用顺序确实变了，均无害：
@@ -744,10 +772,13 @@ fn prepare_team_members(
         MemberSpec,
         crate::db::AgentProfile,
         Option<String>,
+        crate::HarnessSearchCreds,
         std::path::PathBuf,
     )> = Vec::with_capacity(member_preps.len());
     for (spec, profile) in member_preps {
         let key = crate::resolve_member_key(&profile)?;
+        let search =
+            crate::resolve_harness_search_creds(db, &profile, &crate::keychain::KeyringStore)?;
         let wt = match &inplace_wt {
             Some(p) => p.clone(),
             None => crate::worktree::ensure_member_workspace(
@@ -757,7 +788,7 @@ fn prepare_team_members(
                 true,
             )?,
         };
-        member_ready.push((spec, profile, key, wt));
+        member_ready.push((spec, profile, key, search, wt));
     }
 
     // 锁内（快）：拼最终 Command——批量再取一次锁，不逐 member 反复取（省锁竞争次数，
@@ -782,9 +813,9 @@ fn prepare_team_members(
     let mut prepared: Vec<PreparedMember> = Vec::with_capacity(member_ready.len());
     {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        for (spec, profile, key, wt) in member_ready {
+        for (spec, profile, key, search, wt) in member_ready {
             let (command, parser, parse_fn, granularity) = crate::build_member_command_with(
-                &conn, session_id, run_id, &spec, &profile, key, &wt, locale,
+                &conn, session_id, run_id, &spec, &profile, key, search, &wt, locale,
             )?;
             prepared.push((spec, command, parser, parse_fn, wt, granularity));
         }
@@ -821,10 +852,29 @@ pub fn start_team_run(
     // `release_team_run_slot`（在 `run_member_finished` 判定"最后一个"的地方调用，可能是本函数
     // 下面的同步全失败分支，也可能是 `spawn_member` 后台 reader 线程）。
     crate::reserve_team_run_slot(running.inner(), &session_id)?;
-    let mut slot_guard = crate::TeamRunSlotGuard::new(running.inner().clone(), session_id.clone());
+    // M1 修复轮 P1-2：guard 挂上 refresh 句柄——起跑准备期（写 team_run_pending / goal 事件 /
+    // EventTransport 注册……）任何提前 `?` 失败都会让 Drop 摘槽，此时必须同步重算 session_runtime
+    // （此前这段窗口完全不写这张表，是个覆盖面缺口）。
+    let mut slot_guard = crate::TeamRunSlotGuard::new(running.inner().clone(), session_id.clone())
+        .with_refresh(team_running.inner().clone(), app.clone());
     // A 子片（spec §3.1 run_id 贯通）：前端传 propose 的 run_id 则复用·不传则自生（M1b 兼容）。
     let run_id = run_id.unwrap_or_else(crate::new_run_id);
     let criteria = criteria.unwrap_or_default();
+    // M1-T1（remote control M0 §4c）：team 注册咽喉——`reserve_team_run_slot` 已在上面成功
+    // 占到槽（否则本函数已 `?` 提前返回），此处 run_id 已现场确定，一并写入。这是「reserve」
+    // 类写口（run_id 现场已知，直接 set_session_runtime；不是「release/摘槽」类，不走
+    // refresh_session_runtime——见该函数与 set_session_runtime 文档分工）。失败非致命但不再
+    // 全吞（P3-1），仿 set_goal_title 的写法。
+    if let Ok(conn) = db.0.lock() {
+        if let Err(e) = crate::db::set_session_runtime(
+            &conn,
+            &session_id,
+            crate::db::SESSION_RUNTIME_RUNNING,
+            Some(&run_id),
+        ) {
+            eprintln!("session_runtime running write failed (non-fatal): {e}");
+        }
+    }
 
     let assignments_json = serde_json::to_string(
         &members
@@ -908,8 +958,20 @@ pub fn start_team_run(
             if team_running.run_member_finished(&run_id) {
                 crate::release_team_run_slot(running.inner(), &session_id);
                 if let Ok(conn) = db.0.lock() {
-                    let _ = finalize_team_run(&conn, &session_id, &run_id);
+                    if let Err(e) = finalize_team_run(&conn, &session_id, &run_id) {
+                        eprintln!("finalize_team_run failed (non-fatal): {e}");
+                    }
                 }
+                // M1 修复轮 P1-1：team 清空咽喉——同步全部队员 spawn 失败分支（对齐下方
+                // spawn_member 异步 reader 线程那条路径）。不再硬编码 idle 字面量，改走重算
+                // 写口（`db.0.lock()` 已在上面的 `if let` 块结束时释放，这里另起短锁，避免
+                // 一路带着 db 锁走进 refresh_session_runtime 内部的二次加锁——P0-1 教训）。
+                crate::refresh_session_runtime(
+                    db.inner(),
+                    running.inner(),
+                    team_running.inner(),
+                    &session_id,
+                );
             }
         }
     }
@@ -1386,7 +1448,7 @@ pub(crate) fn persist_member_result_message(
     result: &MemberResult,
 ) -> rusqlite::Result<bool> {
     let report = render_member_result_report(agent_name, result);
-    let inserted = crate::db::append_message_dedup(
+    let inserted = crate::db::append_message_dedup_and_publish(
         conn,
         session_id,
         "assistant",
@@ -1424,7 +1486,7 @@ fn persist_member_failure_message(
         None,
         &[],
     );
-    let inserted = crate::db::append_message_dedup(
+    let inserted = crate::db::append_message_dedup_and_publish(
         conn,
         session_id,
         "assistant",
@@ -1462,7 +1524,7 @@ fn persist_member_setup_failure_message(
         None,
         &[],
     );
-    let inserted = crate::db::append_message_dedup(
+    let inserted = crate::db::append_message_dedup_and_publish(
         conn,
         session_id,
         "assistant",
@@ -2969,6 +3031,7 @@ fn prepare_single_worker(
     };
 
     let key = crate::resolve_member_key(&profile)?;
+    let search = crate::resolve_harness_search_creds(db, &profile, &crate::keychain::KeyringStore)?;
     let wt = match &inplace_wt {
         Some(p) => p.clone(),
         None => {
@@ -2981,7 +3044,7 @@ fn prepare_single_worker(
     let (command, parser, parse_fn, granularity) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         crate::build_member_command_with(
-            &conn, session_id, run_id, &spec, &profile, key, &wt, locale,
+            &conn, session_id, run_id, &spec, &profile, key, search, &wt, locale,
         )?
     };
     Ok((
@@ -3319,8 +3382,15 @@ pub fn spawn_member(
             crate::release_team_run_slot(&running, &session_id);
             if let Some(db) = app.try_state::<crate::db::Db>() {
                 if let Ok(conn) = db.0.lock() {
-                    let _ = finalize_team_run(&conn, &session_id, &run_id);
+                    if let Err(e) = finalize_team_run(&conn, &session_id, &run_id) {
+                        eprintln!("finalize_team_run failed (non-fatal): {e}");
+                    }
                 }
+                // M1 修复轮 P1-1（remote control M0 §4c）：team 清空咽喉——正常完成/失败/被停
+                // 三种终态都汇聚到这条 run_done 分支。不再硬编码 idle 字面量，改走重算写口；
+                // `db.0.lock()` 已在上面的 `if let` 块结束时释放，另起短锁避免带锁二次加锁
+                // （P0-1 教训）。
+                crate::refresh_session_runtime(db.inner(), &running, &tr, &session_id);
             }
         }
     });
@@ -3334,6 +3404,142 @@ mod tests {
         AgentEvent, CardKind, ChangedFile, GoalCriterion, ResultAnchor, StatusTransition,
         ToolStatus,
     };
+
+    fn strip_comments_and_strings(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '/' && chars.peek() == Some(&'/') {
+                while let Some(&nc) = chars.peek() {
+                    if nc == '\n' {
+                        break;
+                    }
+                    chars.next();
+                }
+                out.push_str("/*stripped-comment*/");
+            } else if c == '"' {
+                while let Some(nc) = chars.next() {
+                    if nc == '\\' {
+                        chars.next();
+                        continue;
+                    }
+                    if nc == '"' {
+                        break;
+                    }
+                }
+                out.push_str("\"stripped-string\"");
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    fn extract_fn_body<'a>(stripped_source: &'a str, fn_needle: &str, label: &str) -> &'a str {
+        let after_sig = stripped_source.split(fn_needle).nth(1).unwrap_or_else(|| {
+            panic!("{label}: 源码里没找到 {fn_needle:?}，测试的切片标记可能已经过期")
+        });
+        let open_rel = after_sig
+            .find('{')
+            .unwrap_or_else(|| panic!("{label}: {fn_needle:?} 后面没找到函数体开头的 `{{`"));
+        let from_open = &after_sig[open_rel..];
+        let mut depth: i32 = 0;
+        for (i, c) in from_open.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &from_open[..=i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{label}: {fn_needle:?} 的函数体没扫到匹配的收尾 `}}`，测试的切片标记可能已经过期");
+    }
+
+    fn assert_lock_scope_closed_before_marker(
+        fn_body: &str,
+        lock_marker: &str,
+        marker: &str,
+        label: &str,
+    ) {
+        let marker_idx = fn_body.find(marker).unwrap_or_else(|| {
+            panic!("{label}: 函数体里没找到 {marker:?}，测试的切片标记可能已经过期")
+        });
+        let mut lock_positions = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(rel) = fn_body[cursor..].find(lock_marker) {
+            let idx = cursor + rel;
+            if idx >= marker_idx {
+                break;
+            }
+            lock_positions.push(idx);
+            cursor = idx + lock_marker.len();
+        }
+        assert!(
+            !lock_positions.is_empty(),
+            "{label}: {marker:?} 之前没找到任何 {lock_marker:?}，测试的切片标记可能已经过期"
+        );
+
+        for &lock_idx in &lock_positions {
+            let mut depth: i32 = 0;
+            let mut release_idx: Option<usize> = None;
+            for (i, c) in fn_body[lock_idx..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        if depth == 0 {
+                            release_idx = Some(lock_idx + i);
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+            let release_idx = release_idx.unwrap_or_else(|| {
+                panic!(
+                    "{label}: 字节 {lock_idx} 处的 {lock_marker:?} 往后没扫到把它包住的 block 收尾"
+                )
+            });
+            assert!(
+                release_idx < marker_idx,
+                "{label}: {lock_marker:?} 所在 block 到字节 {release_idx} 才收尾，晚于 {marker:?}@{marker_idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_team_members_resolves_search_creds_with_lock_released() {
+        let source = include_str!("member_runner.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let stripped = strip_comments_and_strings(production);
+        let label = "prepare_team_members";
+        let body = extract_fn_body(&stripped, "\nfn prepare_team_members(", label);
+        assert_lock_scope_closed_before_marker(
+            body,
+            "db.0.lock()",
+            "crate::resolve_harness_search_creds(",
+            label,
+        );
+    }
+
+    #[test]
+    fn prepare_single_worker_resolves_search_creds_with_lock_released() {
+        let source = include_str!("member_runner.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let stripped = strip_comments_and_strings(production);
+        let label = "prepare_single_worker";
+        let body = extract_fn_body(&stripped, "\nfn prepare_single_worker(", label);
+        assert_lock_scope_closed_before_marker(
+            body,
+            "db.0.lock()",
+            "crate::resolve_harness_search_creds(",
+            label,
+        );
+    }
 
     #[test]
     fn member_failure_messages_keep_zh_and_render_en() {
@@ -3829,6 +4035,69 @@ fi"#,
         );
     }
 
+    /// M1-T1（remote control M0 §4c）+ M1 修复轮 P1-1（2026-08-11）：team 注册/清空咽喉——
+    /// `start_team_run` 起跑占槽成功后必须紧跟着写 session_runtime running；两条清空路径
+    /// （`start_team_run` 同步全失败分支 / `spawn_member` 异步 run_done 分支）都必须紧跟
+    /// `release_team_run_slot` 重算 session_runtime（P1-1 修复后不再硬编码 idle 字面量，
+    /// 改走 `crate::refresh_session_runtime` 统一重算写口）。同上两条 G1 钉子一样，
+    /// `start_team_run`/`spawn_member` 是 `#[tauri::command]`/需要真实 AppHandle 的函数，
+    /// 仓库没有 mock Tauri app 测试设施，只能源码切片钉住「调了 + 调用顺序对」。
+    #[test]
+    fn m1t1_team_run_source_writes_session_runtime_at_reserve_and_release() {
+        let source = include_str!("member_runner.rs");
+
+        let start_body = source
+            .split("pub fn start_team_run(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n}\n").next())
+            .expect("start_team_run source slice");
+
+        let reserve_pos = start_body
+            .find("crate::reserve_team_run_slot(running.inner(), &session_id)?")
+            .expect("reserve_team_run_slot 调用位置");
+        let running_write_pos = start_body
+            .find("crate::db::set_session_runtime(")
+            .expect("start_team_run 必须在占槽后写 session_runtime running");
+        assert!(
+            reserve_pos < running_write_pos,
+            "session_runtime running 写入必须在 reserve_team_run_slot 占槽成功之后：\
+             reserve@{reserve_pos} write@{running_write_pos}"
+        );
+        assert!(
+            start_body.contains("crate::db::SESSION_RUNTIME_RUNNING"),
+            "reserve 类写口必须用 SESSION_RUNTIME_RUNNING 常量，不再裸写 \"running\" 字面量"
+        );
+
+        let sync_release_pos = start_body
+            .find("crate::release_team_run_slot(running.inner(), &session_id)")
+            .expect("同步全失败分支 release_team_run_slot 调用位置");
+        let sync_refresh_pos = start_body.find("crate::refresh_session_runtime(").expect(
+            "start_team_run 同步全失败分支必须经 refresh_session_runtime 重算 session_runtime",
+        );
+        assert!(
+            sync_release_pos < sync_refresh_pos,
+            "session_runtime 重算必须在同步失败分支释放槽之后：\
+             release@{sync_release_pos} refresh@{sync_refresh_pos}"
+        );
+
+        let spawn_body = source
+            .split("pub fn spawn_member(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n}\n").next())
+            .expect("spawn_member source slice");
+        let async_release_pos = spawn_body
+            .find("crate::release_team_run_slot(&running, &session_id)")
+            .expect("spawn_member run_done 分支 release_team_run_slot 调用位置");
+        let async_refresh_pos = spawn_body.find("crate::refresh_session_runtime(").expect(
+            "spawn_member run_done 分支必须经 refresh_session_runtime 重算 session_runtime",
+        );
+        assert!(
+            async_release_pos < async_refresh_pos,
+            "session_runtime 重算必须在 spawn_member run_done 释放槽之后：\
+             release@{async_release_pos} refresh@{async_refresh_pos}"
+        );
+    }
+
     /// P1 不变量钉子（opus 对抗审·实证反例=老 Team spawn_member 路径漏改·2026-07-25 回炉）：
     /// 「任何 Failed 终态事件必带非空 failure_reason」——生产代码里只要出现
     /// `member_terminal_event(..., StatusTransition::Failed, None, None)` 这个字面 shape，
@@ -4173,7 +4442,7 @@ fi"#,
         // 用 H1 之前原代码就在用的写法 `crate::db::get_agent(&conn, &spec.agent_id)` 在 phase③
         // 把重查加回去——同样的 split-brain，旧断言看不出来，因为它只数 `get_member_agent_profile(`
         // 出现几次，压根没看 `get_agent(`）：不再对整个函数体数「查了几次」，改成直接切出 phase③
-        // 那个 for 循环（`for (spec, profile, key, wt) in member_ready {` 到函数末尾）——这一段
+        // 那个 for 循环（`for (spec, profile, key, search, wt) in member_ready {` 到函数末尾）——这一段
         // 拿到的 `profile` 只能来自循环变量（phase②传下来的、源头是 phase① 的那一份），这段代码里
         // 不应该出现任何形式的「再查一次 profile」，不管用的是 `get_agent(` 还是
         // `get_member_agent_profile(`。
@@ -4187,11 +4456,11 @@ fi"#,
             .next()
             .unwrap();
         let phase3_loop = function_body
-            .split("for (spec, profile, key, wt) in member_ready {")
+            .split("for (spec, profile, key, search, wt) in member_ready {")
             .nth(1)
             .unwrap_or_else(|| {
                 panic!(
-                    "没切到 phase③ 循环——测试的切片标记（for (spec, profile, key, wt) in member_ready {{）\
+                    "没切到 phase③ 循环——测试的切片标记（for (spec, profile, key, search, wt) in member_ready {{）\
                      可能已经过期，需要同步更新"
                 )
             });

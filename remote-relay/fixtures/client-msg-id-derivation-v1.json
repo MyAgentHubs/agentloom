@@ -1,0 +1,9 @@
+{
+  "namespace": "fe4e51ad-468c-4c11-85c2-f15f0c22f030",
+  "vectors": [
+    { "name": "msg.completed|s-1|dk-1", "expect": "73996db9-9424-5e73-acb6-965bf87bfb80" },
+    { "name": "card.created|decision-1", "expect": "d158145f-8ee9-58aa-a45e-77c5f364a596" },
+    { "name": "card.resolved|decision-1|resolved", "expect": "6ac580b3-1b88-5198-b7f5-27808dc027e3" },
+    { "name": "tool.completed|run-1|tool-1", "expect": "d0c166ac-91e7-53b3-a992-73d8f4246a0e" }
+  ]
+}

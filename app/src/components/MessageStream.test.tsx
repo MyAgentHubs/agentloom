@@ -1,7 +1,7 @@
 import { render, screen, fireEvent } from "@testing-library/react";
 import { act, useState } from "react";
 import { afterEach, beforeEach, describe, it, expect, vi, test } from "vitest";
-import { MessageStream } from "./MessageStream";
+import { MessageStream, stableMessageKeys } from "./MessageStream";
 import type { ChatMessage, LeadSummaryBlock, MemberUnit } from "../types/agent";
 
 const messageContentMountProbe = vi.hoisted(() => vi.fn());
@@ -826,6 +826,33 @@ describe("MessageStream", () => {
     expect(messageContentMountProbe).toHaveBeenCalledTimes(1);
     expect(screen.getByText("流式完成").tagName).toBe("STRONG");
     expect(screen.getByText("最终内容")).toBeInTheDocument();
+  });
+
+  it("数字 id 生成 message:id key，内容变化时 key 保持稳定", () => {
+    const message = (text: string): ChatMessage & { id: number } => ({
+      id: 42,
+      role: "assistant",
+      engine: "claude",
+      content: [{ type: "text", text }],
+    });
+
+    expect(stableMessageKeys([message("流")])).toEqual(["message:id:42"]);
+    expect(stableMessageKeys([message("流式完成")])).toEqual(["message:id:42"]);
+  });
+
+  it("无 id 消息仍使用内容指纹 fallback key", () => {
+    const message = (text: string): ChatMessage => ({
+      role: "assistant",
+      engine: "claude",
+      content: [{ type: "text", text }],
+    });
+
+    const before = stableMessageKeys([message("流")])[0];
+    const after = stableMessageKeys([message("流式完成")])[0];
+
+    expect(before).toMatch(/^message:assistant:[^:]+:0$/);
+    expect(after).toMatch(/^message:assistant:[^:]+:0$/);
+    expect(after).not.toBe(before);
   });
 
   it("同会话头部插入消息时，既有无 id 消息保持 DOM 身份", () => {

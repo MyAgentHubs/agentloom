@@ -1,6 +1,6 @@
 use crate::perf_probe::TimedMutex;
-use rusqlite::Connection;
 use rusqlite::OptionalExtension;
+use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
 
 pub struct Db(pub TimedMutex<Connection>);
@@ -961,6 +961,9 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             created_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+        CREATE INDEX IF NOT EXISTS idx_messages_history
+            ON messages(session_id, id DESC)
+            WHERE role IN ('user','assistant');
         CREATE TABLE IF NOT EXISTS attachments (
             id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL,
@@ -1743,6 +1746,1025 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         [],
     )?;
 
+    // M1-T1（remote control M0 §4c）：会话运行态独立表——不加列到 sessions（实勘裁决：
+    // 加列不如独立表），不做数据迁移（新表天然从空开始）。四咽喉（solo 占槽/释放 · team
+    // 注册/清空）与启动 reconcile 共用同一份 helper（下方 set_session_runtime）。
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS session_runtime (
+            session_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL CHECK (status IN ('running', 'idle')),
+            run_id TEXT,
+            updated_at INTEGER NOT NULL
+        )",
+        [],
+    )?;
+
+    // T-4b（remote control M0 §3/§4b）：忙时入队本地表——桌面收到 input.send 撞
+    // SESSION_ALREADY_RUNNING 时不回错，落一条 pending 到这里；会话释放槽位后由
+    // `drain_after_run_release`（lib.rs）自动续投。`command_id` UNIQUE 是幂等去重键
+    // （relay 侧超时重发 / 桌面重连补发都可能重复投同一条）。不声明到 sessions 的 FK
+    // （与 session_runtime 同款先例：这张表只是运行期镜像，允许会话已删但行还没来得及清）。
+    // delivered/failed 行同时也是 `command_id` 去重账本；将来若做 GC/清理，必须配独立的
+    // 去重保留窗口，不得裸删这些终态行，否则 relay 重发会被当成新消息再次投递。
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS remote_inbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            command_id TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            delivered_at INTEGER,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            failed_at INTEGER,
+            last_error TEXT
+        )",
+        [],
+    )?;
+    // rc-4b 早期旧库的 remote_inbox 缺少以下三列；幂等补齐，避免 failed_at 查询触发
+    // no such column 后被调用方 `.ok()` 静默 fail-open。
+    let remote_inbox_cols = {
+        let mut stmt = conn.prepare("PRAGMA table_info(remote_inbox)")?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        columns
+    };
+    for (column, declaration) in [
+        ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("failed_at", "INTEGER"),
+        ("last_error", "TEXT"),
+    ] {
+        if !remote_inbox_cols.iter().any(|existing| existing == column) {
+            conn.execute(
+                &format!("ALTER TABLE remote_inbox ADD COLUMN {column} {declaration}"),
+                [],
+            )?;
+        }
+    }
+    conn.execute("DROP INDEX IF EXISTS idx_remote_inbox_pending", [])?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_remote_inbox_pending \
+         ON remote_inbox(session_id, id) \
+         WHERE delivered_at IS NULL AND failed_at IS NULL",
+        [],
+    )?;
+
+    // T5e2（remote control M0 §5）：配对完成后落地的设备清单表——K_room/设备 K_pair 这类
+    // 真密钥留钥匙串（remote_pairing.rs::store，W1 ADR：钥匙串只放真密钥），这里只落「设备
+    // 清单 + 令牌哈希」。token_hash/refresh_hash 是 remote_pairing::TokenBook 同款 sha256
+    // hex 字符串，绝不落明文令牌；revoked_at 为 NULL 表示仍有效。
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS remote_devices (
+            device_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL DEFAULT '',
+            token_hash TEXT NOT NULL,
+            refresh_hash TEXT NOT NULL,
+            access_expires_at INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            revoked_at INTEGER
+        )",
+        [],
+    )?;
+
+    // S1c（remote control M0 §9.2/§9.6）：remote_devices 令牌面列族。
+    // 这里的到期时间一律是 unix 毫秒；S1c2 会在补齐列族后把旧 access_expires_at 秒值
+    // 幂等回填成毫秒，避免应用启动后出现秒/毫秒混合消费窗口。
+    let remote_device_cols = {
+        let mut stmt = conn.prepare("PRAGMA table_info(remote_devices)")?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        columns
+    };
+    for (column, declaration) in [
+        ("room_id", "TEXT"),
+        ("generation", "INTEGER"),
+        ("refresh_until", "INTEGER"),
+        ("journal_request_id", "TEXT"),
+        ("journal_generation", "INTEGER"),
+        ("journal_prev_generation", "INTEGER"),
+        ("journal_prev_access_hash", "TEXT"),
+        ("journal_prev_refresh_hash", "TEXT"),
+        ("journal_response_ct", "TEXT"),
+        ("journal_response_n", "TEXT"),
+        ("journal_prev_expires_at", "INTEGER"),
+        ("journal_response_expires", "INTEGER"),
+    ] {
+        if !remote_device_cols.iter().any(|existing| existing == column) {
+            conn.execute(
+                &format!("ALTER TABLE remote_devices ADD COLUMN {column} {declaration}"),
+                [],
+            )?;
+        }
+    }
+    conn.execute(
+        "UPDATE remote_devices \
+            SET access_expires_at = access_expires_at * 1000 \
+          WHERE access_expires_at > 0 AND access_expires_at < ?1",
+        [ACCESS_EXPIRES_MILLIS_THRESHOLD],
+    )?;
+    // S1f2 P1-1：旧版本只有一个全局房间，因而 NULL 行可安全、幂等地回填到当前配置房间。
+    // 没有配置过 remote_room_id 时子查询无行，保持 NULL 并在所有房间快照中 fail-closed。
+    conn.execute(
+        "UPDATE remote_devices \
+            SET room_id = (SELECT value FROM app_settings WHERE key = 'remote_room_id') \
+          WHERE room_id IS NULL \
+            AND EXISTS (SELECT 1 FROM app_settings WHERE key = 'remote_room_id')",
+        [],
+    )?;
+
+    // §9.2 generation/revision 的桌面权威领号源；每房间 next_generation 只增不减。
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS remote_registry_counter (
+            room_id TEXT PRIMARY KEY,
+            next_generation INTEGER NOT NULL CHECK (next_generation > 0)
+        )",
+        [],
+    )?;
+
+    // M2-4a（remote control M2-4 §0.5 决策 1：单活跃房间模型第一刀）：per-project room
+    // 映射——「新世界」schema，不是数据搬家。旧全局房间（app_settings 里的
+    // `remote_room_id` 单值 key，见 lib.rs `resolve_remote_room_id`）不迁移、不删除，
+    // 继续原样只读存在，直到 M2-4b 把网关消费源切过来为止；这张表与旧全局 key 平行
+    // 并存，两者互不回填。room_id 形状与旧全局房间同源（128-bit CSPRNG → 32 位小写
+    // hex，见 `remote_pairing::generate_room_id`）。
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS project_remote_rooms (
+            project_id TEXT PRIMARY KEY,
+            room_id TEXT NOT NULL UNIQUE,
+            created_at_ms INTEGER NOT NULL
+        )",
+        [],
+    )?;
+
+    Ok(())
+}
+
+/// M2-4a：per-project room 只查表，查无返回 `None`。**不回落全局 `remote_room_id`**——
+/// 回落是 M2-4b 的迁移期语义，本单不做，调用方今天也没人读这个函数（纯新增、零调用点
+/// 改动）。
+pub fn remote_room_for_project(
+    conn: &Connection,
+    project_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT room_id FROM project_remote_rooms WHERE project_id = ?1",
+        [project_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// M2-4a：已有房间直接返回；没有则生成一个新的（复用 `remote_pairing::generate_room_id`，
+/// 不自造第二个生成器）落库再返回。
+///
+/// 并发安全方案：**`INSERT OR IGNORE` + 插入后重新 `SELECT`**（不用「先查后插」，那样
+/// 两次并发调用之间存在窗口，会各自生成一个不同 room_id 都尝试插入同一 project_id）。
+/// `project_id` 是主键，`INSERT OR IGNORE` 在主键冲突时静默不写、不报错；无论这次调用
+/// 是赢家（自己插入成功）还是输家（另一次并发调用先落库、这次的 candidate 被默默丢
+/// 弃），随后重新 `SELECT` 拿到的都是「表里真正落地的那一行」，因此并发调用最终收敛到
+/// 同一个 room_id。这个保证不依赖调用方持有的是不是同一把锁——SQLite 对
+/// PRIMARY KEY/UNIQUE 冲突的检测在引擎层是原子的，跨连接（甚至跨进程）都成立，覆盖
+/// 本 app 里偶尔为单条查询另开一条连接（如 lib.rs 的 `cli_path_override_for_spawn`）
+/// 这种不经过全局 `Db(Mutex<Connection>)` 的路径。
+///
+/// **回读为空的两种成因，只有一种是「正常」**：`INSERT OR IGNORE` 静默不写有两个可能
+/// 触发源——① `project_id` 主键冲突（另一次并发调用抢先给同一 project 落库了房间，这
+/// 是期望路径，回读一定能查到赢家那一行，走不到「回读为空」这一步）；② `room_id`
+/// UNIQUE 冲突（这次生成的 candidate 撞上了**别的** project 已有的 room_id——128-bit
+/// CSPRNG 碰撞概率可忽略但不是零，必须处理，否则会静默产出「分配其实失败、调用方以为
+/// 成功」的幽灵）。回读为空只可能是②，换一个新 candidate 重试即可修复，本函数有界重试
+/// 3 次；3 次都撞列说明系统性异常（例如唯一约束本身被破坏），此时不能再静默重试，必须
+/// 报错——**返回值特意不用 `rusqlite::Error::QueryReturnedNoRows` 当耗尽重试的哨兵**：
+/// 本文件另有多处把这个变体当「查无此行 = None」的既有文化、经 `.optional()` 吞成
+/// `Ok(None)`；如果这里也复用它，重试耗尽的真失败会被这套文化悄悄吃成「看起来正常的
+/// None」。改用 `Result<String, String>` 纯文本错误，类型上就没有 `.optional()` 方法
+/// 可调，杜绝被误吞。**调用方同理：不要给本函数的返回值套 `.optional()`。**
+///
+/// M2-4b/d 接手人前瞻约束（本单不实现，写在这里防止接手时漏想）：
+/// 1.（M2-4b 已实现·精化为真实不变量，不再是"若后续接上"的前瞻）：**房行本身可以先于
+///    凭据落库**——本表没有其它消费方会因为"房行存在但凭据还没建"而误用它。真正的不变量
+///    是**配置发布门**：`remote_gateway::current_config`（remote_gateway.rs）只有在
+///    「房行 ensure 成功 **且** 该房凭据 ensure 成功」两步都完成后，才会把这间房包进
+///    `GatewayConfig` 返回给调用方；凭据 ensure 失败时严禁返回配置（`current_config` 据此
+///    分支：resolver 报错就落到"暂无可用配置"，不会拿一个查无凭据的房间去连接/claim）。
+///    崩溃若恰好夹在"房行落库成功"与"凭据 ensure 成功"之间，不会有任何调用方观察到这个
+///    中间态（因为还没人拿到配置）；下次启动重新解析 active project 时，本函数幂等返回
+///    同一个 room_id、凭据 ensure 幂等重建——自愈，不留 stranded 状态。落地见 lib.rs
+///    `remote_gateway_active_room_resolver` + `ensure_desktop_credential_for_room_cached`。
+/// 2. 若把插入/回读包进显式事务：必须用 `TransactionBehavior::Immediate`，不能用默认
+///    的 Deferred——deferred 事务在锁升级时撞库不保证走 `busy_timeout` 的 busy handler；
+///    另外事务回滚会让本函数已经返回的 `String` 变成「幽灵房」（返回值看着成功，实际
+///    那一行已被回滚抹掉），把本函数嵌进更大事务的调用方要自己保证不回滚，或者把它放
+///    在事务边界之外。
+/// 3. 删除项目时必须连带清本表对应行 + 吊销该 room 名下的 `remote_devices` 与钥匙串
+///    凭据——本表故意不设 `REFERENCES repos(id)` 外键（详见 `init_schema` 里的建表
+///    注释），`DELETE FROM repos`（如 lib.rs `delete_repo_forever_inner`）不会级联清掉这
+///    里；不清的话本表孤儿行只是垃圾，但 `remote_devices` 残留会造成「以为已撤销、其实
+///    设备仍能连上已删项目房间」的假象。**M2-4b 已做的只是最小半**——删除项目时同步清
+///    `app_settings` 里的 `remote_active_repo_id`（若它恰好指向被删项目，见 lib.rs
+///    `delete_repo_forever_inner` R5 注释）；本表行 / `remote_devices` / 钥匙串凭据的全量
+///    清理仍是 M2-4d 的活，没做。
+/// 4. `project_id` 存的就是 `repos.id` 的值——这是全库唯一叫 `project_id`（而不是别处
+///    通用的 `repo_id`）的列，M2-4c 做归属校验时别误当成一套独立于 `repos.id` 的第二
+///    id 体系。
+pub fn ensure_remote_room_for_project(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<String, String> {
+    if let Some(existing) =
+        remote_room_for_project(conn, project_id).map_err(|error| error.to_string())?
+    {
+        return Ok(existing);
+    }
+    const MAX_ATTEMPTS: u8 = 3;
+    for _ in 0..MAX_ATTEMPTS {
+        let candidate = crate::remote_pairing::generate_room_id();
+        conn.execute(
+            "INSERT OR IGNORE INTO project_remote_rooms (project_id, room_id, created_at_ms) \
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![project_id, candidate, now_ms()],
+        )
+        .map_err(|error| error.to_string())?;
+        if let Some(existing) =
+            remote_room_for_project(conn, project_id).map_err(|error| error.to_string())?
+        {
+            return Ok(existing);
+        }
+        // 回读仍为空：candidate 撞了别的 project 的 room_id UNIQUE 列，换一个新 candidate 重试。
+    }
+    Err(format!(
+        "ensure_remote_room_for_project: room_id 分配在 {MAX_ATTEMPTS} 次尝试后仍未落库\
+         （project_id={project_id}）——大概率是 room_id UNIQUE 约束持续撞列，需要人工核查"
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteInboxEntry {
+    pub id: i64,
+    pub session_id: String,
+    pub command_id: String,
+    pub kind: String,
+    pub payload: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteInboxTerminalState {
+    Pending,
+    Delivered,
+    Failed,
+}
+
+/// T-4b：忙时入队——`command_id` 撞 UNIQUE 视为同一条指令的重复投递（relay 重发/桌面重连补发），
+/// 幂等丢弃。返回 `Ok(true)` = 真插了一条新的待投递；`Ok(false)` = 命中重复、未写。
+/// 语义与风格同 `append_message_dedup`（INSERT OR IGNORE + conn.changes()）。
+pub fn enqueue_remote_input(
+    conn: &Connection,
+    session_id: &str,
+    command_id: &str,
+    kind: &str,
+    payload: &str,
+) -> rusqlite::Result<bool> {
+    conn.execute(
+        "INSERT OR IGNORE INTO remote_inbox \
+         (session_id, command_id, kind, payload, created_at, delivered_at) \
+         VALUES (?1, ?2, ?3, ?4, strftime('%s','now'), NULL)",
+        (session_id, command_id, kind, payload),
+    )?;
+    Ok(conn.changes() > 0)
+}
+
+/// 按 `command_id` 重读 remote_inbox 台账终态，供网关在 enqueue/即时排空后稳定映射 ack。
+/// failed 优先于 delivered 是防御性处理；正常写路径不会让两列同时非 NULL。
+pub fn remote_inbox_terminal_state_by_command_id(
+    conn: &Connection,
+    command_id: &str,
+) -> rusqlite::Result<Option<RemoteInboxTerminalState>> {
+    conn.query_row(
+        "SELECT delivered_at IS NOT NULL, failed_at IS NOT NULL \
+           FROM remote_inbox WHERE command_id = ?1",
+        [command_id],
+        |row| {
+            let delivered = row.get::<_, bool>(0)?;
+            let failed = row.get::<_, bool>(1)?;
+            Ok(if failed {
+                RemoteInboxTerminalState::Failed
+            } else if delivered {
+                RemoteInboxTerminalState::Delivered
+            } else {
+                RemoteInboxTerminalState::Pending
+            })
+        },
+    )
+    .optional()
+}
+
+/// 持久记录一条已通过新鲜度检查的 control 指令，`command_id` 撞 UNIQUE 即视为重放。
+/// 新行插入时便设置 `delivered_at`，天生就是终态；`next_pending_remote_input` 与
+/// `sessions_with_pending_remote_input` 都只读取 `delivered_at IS NULL AND failed_at IS NULL`
+/// 的行，因此 remote_inbox 排空管线绝不可能把这条 control 账本记录误当 input 投递。
+pub fn record_control_command_seen(
+    conn: &Connection,
+    session_id: &str,
+    command_id: &str,
+    payload: &str,
+) -> rusqlite::Result<bool> {
+    conn.execute(
+        "INSERT OR IGNORE INTO remote_inbox \
+         (session_id, command_id, kind, payload, created_at, delivered_at) \
+         VALUES (?1, ?2, 'control', ?3, strftime('%s','now'), strftime('%s','now'))",
+        (session_id, command_id, payload),
+    )?;
+    Ok(conn.changes() > 0)
+}
+
+/// FIFO 取下一条待投递的 `input.send`（尚未 delivered/failed，按 `id` 升序=插入序）。
+/// 排空循环逐条调用：取到一条、投递并按结果标记后再取下一条；取到 `None` 说明排空完毕。
+pub fn next_pending_remote_input(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<RemoteInboxEntry>> {
+    conn.query_row(
+        "SELECT id, session_id, command_id, kind, payload, created_at \
+           FROM remote_inbox \
+          WHERE session_id = ?1 AND kind = 'input.send' \
+            AND delivered_at IS NULL AND failed_at IS NULL \
+          ORDER BY id ASC LIMIT 1",
+        [session_id],
+        |r| {
+            Ok(RemoteInboxEntry {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                command_id: r.get(2)?,
+                kind: r.get(3)?,
+                payload: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        },
+    )
+    .optional()
+}
+
+pub fn mark_remote_input_delivered(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE remote_inbox SET delivered_at = strftime('%s','now') WHERE id = ?1",
+        [id],
+    )?;
+    Ok(())
+}
+
+/// `input.answer` 由独立答案线程处理，线程只携带 receipt 的 `command_id`，据此回写成功终态。
+pub fn mark_remote_input_delivered_by_command_id(
+    conn: &Connection,
+    command_id: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE remote_inbox SET delivered_at = strftime('%s','now') WHERE command_id = ?1",
+        [command_id],
+    )?;
+    Ok(())
+}
+
+/// 记录一次可重试的真实投递失败，并返回更新后的尝试次数。
+pub fn record_remote_input_failure(
+    conn: &Connection,
+    id: i64,
+    error: &str,
+) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "UPDATE remote_inbox \
+            SET attempts = attempts + 1, last_error = ?2 \
+          WHERE id = ?1 \
+          RETURNING attempts",
+        (id, error),
+        |row| row.get(0),
+    )
+}
+
+/// 将不可重试或已耗尽重试次数的消息标为失败终态，不再参与 pending 查询。
+pub fn mark_remote_input_failed(conn: &Connection, id: i64, error: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE remote_inbox \
+            SET failed_at = strftime('%s','now'), last_error = ?2 \
+          WHERE id = ?1",
+        (id, error),
+    )?;
+    Ok(())
+}
+
+/// `input.answer` 由独立答案线程处理，线程只携带 receipt 的 `command_id`，据此回写失败终态。
+pub fn mark_remote_input_failed_by_command_id(
+    conn: &Connection,
+    command_id: &str,
+    error: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE remote_inbox SET failed_at = strftime('%s','now'), last_error = ?2 WHERE command_id = ?1",
+        (command_id, error),
+    )?;
+    Ok(())
+}
+
+/// 重启重扫用：全表尚有未投递 pending 的会话去重列表（进程刚起时 Running/TeamRunning 全员
+/// idle，逐会话触发一次 drain 天然安全——撞忙即停，等真正的运行态释放咽喉再补）。
+pub fn sessions_with_pending_remote_input(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT remote_inbox.session_id \
+           FROM remote_inbox \
+           JOIN sessions ON sessions.id = remote_inbox.session_id \
+          WHERE remote_inbox.delivered_at IS NULL \
+            AND remote_inbox.failed_at IS NULL \
+            AND sessions.deleted_at IS NULL \
+          ORDER BY remote_inbox.session_id",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    rows.collect()
+}
+
+/// `input.answer` 启动恢复用：只报告仍有待处理答案、且尚未软删的会话。答案走独立线程
+/// 直达处理，不进入 `input.send` FIFO，因此必须单独重扫，不能依赖既有排空循环顺带消费。
+pub fn sessions_with_pending_remote_answer(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT remote_inbox.session_id \
+           FROM remote_inbox \
+           JOIN sessions ON sessions.id = remote_inbox.session_id \
+          WHERE remote_inbox.kind = 'input.answer' \
+            AND remote_inbox.delivered_at IS NULL \
+            AND remote_inbox.failed_at IS NULL \
+            AND sessions.deleted_at IS NULL \
+          ORDER BY remote_inbox.session_id",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    rows.collect()
+}
+
+/// `input.answer` 启动恢复用：一次取出该会话全部 pending 答案，按台账插入序返回。
+/// 答案彼此不要求 FIFO 串行，调用方会逐条启动独立处理线程；send 行与其他会话绝不混入。
+pub fn pending_remote_answers(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Vec<RemoteInboxEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, command_id, kind, payload, created_at \
+           FROM remote_inbox \
+          WHERE session_id = ?1 AND kind = 'input.answer' \
+            AND delivered_at IS NULL AND failed_at IS NULL \
+          ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map([session_id], |r| {
+        Ok(RemoteInboxEntry {
+            id: r.get(0)?,
+            session_id: r.get(1)?,
+            command_id: r.get(2)?,
+            kind: r.get(3)?,
+            payload: r.get(4)?,
+            created_at: r.get(5)?,
+        })
+    })?;
+    rows.collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteDeviceRow {
+    pub device_id: String,
+    pub name: String,
+    pub token_hash: String,
+    pub refresh_hash: String,
+    /// S1c2 §9.2：unix 毫秒。
+    pub access_expires_at: i64,
+    /// unix 秒（历史 UI/审计列，S1 令牌过期列不复用此口径）。
+    pub created_at: i64,
+    /// unix 秒（历史 UI/审计列）。
+    pub revoked_at: Option<i64>,
+    pub room_id: Option<String>,
+    pub generation: Option<i64>,
+    /// S1c §9.2：unix 毫秒。
+    pub refresh_until: Option<i64>,
+    pub journal_request_id: Option<String>,
+    pub journal_generation: Option<i64>,
+    pub journal_prev_generation: Option<i64>,
+    pub journal_prev_access_hash: Option<String>,
+    pub journal_prev_refresh_hash: Option<String>,
+    pub journal_response_ct: Option<String>,
+    pub journal_response_n: Option<String>,
+    /// S1c §9.6：unix 毫秒。
+    pub journal_prev_expires_at: Option<i64>,
+    /// S1c §9.6：unix 毫秒。
+    pub journal_response_expires: Option<i64>,
+}
+
+/// S1c §9.6：单个 remote_devices subject 当前的 refresh 回执 journal。
+/// 两个 expires 字段均为 unix 毫秒；整组列为 NULL 表示没有飞行中的 journal。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRefreshJournal {
+    pub request_id: String,
+    pub generation: i64,
+    pub prev_generation: i64,
+    pub prev_access_hash: String,
+    pub prev_refresh_hash: String,
+    pub response_ct: String,
+    pub response_n: String,
+    pub prev_expires_at: i64,
+    pub response_expires: i64,
+}
+
+/// T5e2：配对完成后落一条设备清单行——`token_hash`/`refresh_hash` 是调用方
+/// （remote_pairing::store）已算好的 sha256 hex 字符串，这里只管落库，不做哈希。
+const ACCESS_EXPIRES_MILLIS_THRESHOLD: i64 = 100_000_000_000;
+
+fn normalize_access_expires_at_millis(access_expires_at_ms: i64) -> rusqlite::Result<i64> {
+    if access_expires_at_ms <= 0 {
+        return Err(rusqlite::Error::IntegralValueOutOfRange(
+            0,
+            access_expires_at_ms,
+        ));
+    }
+    if access_expires_at_ms < ACCESS_EXPIRES_MILLIS_THRESHOLD {
+        Ok(access_expires_at_ms * 1000)
+    } else {
+        Ok(access_expires_at_ms)
+    }
+}
+
+pub fn insert_remote_device(
+    conn: &Connection,
+    device_id: &str,
+    room_id: Option<&str>,
+    name: &str,
+    token_hash: &str,
+    refresh_hash: &str,
+    access_expires_at_ms: i64,
+    created_at_secs: i64,
+) -> rusqlite::Result<()> {
+    // 上游全面原生毫秒后此守卫仍保留为写边界兜底，防止旧调用方重新写入秒值。
+    let access_expires_at_ms = normalize_access_expires_at_millis(access_expires_at_ms)?;
+    conn.execute(
+        "INSERT INTO remote_devices \
+         (device_id, room_id, name, token_hash, refresh_hash, access_expires_at, created_at, revoked_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+        (
+            device_id,
+            room_id,
+            name,
+            token_hash,
+            refresh_hash,
+            access_expires_at_ms,
+            created_at_secs,
+        ),
+    )?;
+    Ok(())
+}
+
+/// 全量设备清单（含已吊销），按 created_at 升序——UI 列表与 TokenBook 重建共用同一张源表，
+/// 「是否吊销」由调用方按需过滤 `revoked_at`。
+pub fn list_remote_devices(conn: &Connection) -> rusqlite::Result<Vec<RemoteDeviceRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT device_id, name, token_hash, refresh_hash, access_expires_at, created_at, revoked_at, \
+                room_id, generation, refresh_until, journal_request_id, journal_generation, \
+                journal_prev_generation, journal_prev_access_hash, journal_prev_refresh_hash, \
+                journal_response_ct, journal_response_n, journal_prev_expires_at, \
+                journal_response_expires \
+           FROM remote_devices ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(RemoteDeviceRow {
+            device_id: r.get(0)?,
+            name: r.get(1)?,
+            token_hash: r.get(2)?,
+            refresh_hash: r.get(3)?,
+            access_expires_at: r.get(4)?,
+            created_at: r.get(5)?,
+            revoked_at: r.get(6)?,
+            room_id: r.get(7)?,
+            generation: r.get(8)?,
+            refresh_until: r.get(9)?,
+            journal_request_id: r.get(10)?,
+            journal_generation: r.get(11)?,
+            journal_prev_generation: r.get(12)?,
+            journal_prev_access_hash: r.get(13)?,
+            journal_prev_refresh_hash: r.get(14)?,
+            journal_response_ct: r.get(15)?,
+            journal_response_n: r.get(16)?,
+            journal_prev_expires_at: r.get(17)?,
+            journal_response_expires: r.get(18)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// S1i1 §9.6：按 device_id 取单行——refresh 轮换需要 room_id/generation/journal 一次性到手，
+/// 不必像 `has_active_remote_device_in_room` 那样扫全量列表。列集合与 `list_remote_devices`
+/// 保持一致，只是多了一个 `WHERE device_id = ?1`。
+pub fn get_remote_device(
+    conn: &Connection,
+    device_id: &str,
+) -> rusqlite::Result<Option<RemoteDeviceRow>> {
+    conn.query_row(
+        "SELECT device_id, name, token_hash, refresh_hash, access_expires_at, created_at, revoked_at, \
+                room_id, generation, refresh_until, journal_request_id, journal_generation, \
+                journal_prev_generation, journal_prev_access_hash, journal_prev_refresh_hash, \
+                journal_response_ct, journal_response_n, journal_prev_expires_at, \
+                journal_response_expires \
+           FROM remote_devices WHERE device_id = ?1",
+        [device_id],
+        |r| {
+            Ok(RemoteDeviceRow {
+                device_id: r.get(0)?,
+                name: r.get(1)?,
+                token_hash: r.get(2)?,
+                refresh_hash: r.get(3)?,
+                access_expires_at: r.get(4)?,
+                created_at: r.get(5)?,
+                revoked_at: r.get(6)?,
+                room_id: r.get(7)?,
+                generation: r.get(8)?,
+                refresh_until: r.get(9)?,
+                journal_request_id: r.get(10)?,
+                journal_generation: r.get(11)?,
+                journal_prev_generation: r.get(12)?,
+                journal_prev_access_hash: r.get(13)?,
+                journal_prev_refresh_hash: r.get(14)?,
+                journal_response_ct: r.get(15)?,
+                journal_response_n: r.get(16)?,
+                journal_prev_expires_at: r.get(17)?,
+                journal_response_expires: r.get(18)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// S1c §9.2：把设备绑定到 room + generation，并写入毫秒口径 refresh_until。
+pub fn set_remote_device_registry(
+    conn: &Connection,
+    device_id: &str,
+    room_id: &str,
+    generation: i64,
+    refresh_until_ms: i64,
+) -> rusqlite::Result<bool> {
+    require_millis_timestamp(refresh_until_ms)?;
+    let changed = conn.execute(
+        "UPDATE remote_devices \
+            SET room_id = ?2, generation = ?3, refresh_until = ?4 \
+          WHERE device_id = ?1",
+        (device_id, room_id, generation, refresh_until_ms),
+    )?;
+    Ok(changed > 0)
+}
+
+fn require_millis_timestamp(value: i64) -> rusqlite::Result<i64> {
+    if value < ACCESS_EXPIRES_MILLIS_THRESHOLD {
+        return Err(rusqlite::Error::IntegralValueOutOfRange(0, value));
+    }
+    Ok(value)
+}
+
+/// `rebase_remote_registry` 专用：调用方已开启事务，领号与设备写回必须留在同一事务内。
+pub(crate) fn set_remote_device_registry_in_transaction(
+    tx: &Transaction<'_>,
+    device_id: &str,
+    room_id: &str,
+    generation: i64,
+    refresh_until_ms: i64,
+) -> rusqlite::Result<bool> {
+    require_millis_timestamp(refresh_until_ms)?;
+    let changed = tx.execute(
+        "UPDATE remote_devices \
+            SET room_id = ?2, generation = ?3, refresh_until = ?4 \
+          WHERE device_id = ?1",
+        (device_id, room_id, generation, refresh_until_ms),
+    )?;
+    Ok(changed > 0)
+}
+
+/// S1c §9.6：原子替换一个 subject 的完整 refresh journal 列族。
+pub fn store_refresh_journal(
+    conn: &Connection,
+    device_id: &str,
+    journal: &RemoteRefreshJournal,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE remote_devices SET \
+            journal_request_id = ?2, journal_generation = ?3, journal_prev_generation = ?4, \
+            journal_prev_access_hash = ?5, journal_prev_refresh_hash = ?6, \
+            journal_response_ct = ?7, journal_response_n = ?8, \
+            journal_prev_expires_at = ?9, journal_response_expires = ?10 \
+          WHERE device_id = ?1",
+        rusqlite::params![
+            device_id,
+            journal.request_id,
+            journal.generation,
+            journal.prev_generation,
+            journal.prev_access_hash,
+            journal.prev_refresh_hash,
+            journal.response_ct,
+            journal.response_n,
+            journal.prev_expires_at,
+            journal.response_expires,
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+/// S1c §9.6：读取当前 journal；request_id 为 NULL 即无飞行中 journal。
+pub fn load_refresh_journal(
+    conn: &Connection,
+    device_id: &str,
+) -> rusqlite::Result<Option<RemoteRefreshJournal>> {
+    conn.query_row(
+        "SELECT journal_request_id, journal_generation, journal_prev_generation, \
+                journal_prev_access_hash, journal_prev_refresh_hash, journal_response_ct, \
+                journal_response_n, journal_prev_expires_at, journal_response_expires \
+           FROM remote_devices \
+          WHERE device_id = ?1 AND journal_request_id IS NOT NULL",
+        [device_id],
+        |row| {
+            Ok(RemoteRefreshJournal {
+                request_id: row.get(0)?,
+                generation: row.get(1)?,
+                prev_generation: row.get(2)?,
+                prev_access_hash: row.get(3)?,
+                prev_refresh_hash: row.get(4)?,
+                response_ct: row.get(5)?,
+                response_n: row.get(6)?,
+                prev_expires_at: row.get(7)?,
+                response_expires: row.get(8)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// S1c §9.6：原子清空一个 subject 的完整 refresh journal 列族。
+pub fn clear_refresh_journal(conn: &Connection, device_id: &str) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE remote_devices SET \
+            journal_request_id = NULL, journal_generation = NULL, journal_prev_generation = NULL, \
+            journal_prev_access_hash = NULL, journal_prev_refresh_hash = NULL, \
+            journal_response_ct = NULL, journal_response_n = NULL, \
+            journal_prev_expires_at = NULL, journal_response_expires = NULL \
+          WHERE device_id = ?1",
+        [device_id],
+    )?;
+    Ok(changed > 0)
+}
+
+/// S1c §9.2：在单事务内领取 room 的当前 generation，并把 next_generation 前移一位。
+pub fn next_registry_generation(conn: &Connection, room_id: &str) -> rusqlite::Result<i64> {
+    let tx = conn.unchecked_transaction()?;
+    let generation = next_registry_generation_in_transaction(&tx, room_id)?;
+    tx.commit()?;
+    Ok(generation)
+}
+
+/// 调用方已开启事务，不得在此再嵌套事务。原为 `rebase_remote_registry` 专用；S1h R1 返工起
+/// 也被 `absorb_registry_high_water_and_reissue_revokes`（sync.ack 后给 outbox 里仍待送达的
+/// revoke 项重新领号）复用。
+pub(crate) fn next_registry_generation_in_transaction(
+    tx: &Transaction<'_>,
+    room_id: &str,
+) -> rusqlite::Result<i64> {
+    let generation: i64 = tx
+        .query_row(
+            "SELECT next_generation FROM remote_registry_counter WHERE room_id = ?1",
+            [room_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(1);
+    let following_generation = generation
+        .checked_add(1)
+        .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, generation))?;
+    tx.execute(
+        "INSERT INTO remote_registry_counter (room_id, next_generation) VALUES (?1, ?2) \
+         ON CONFLICT(room_id) DO UPDATE SET next_generation = excluded.next_generation",
+        (room_id, following_generation),
+    )?;
+    Ok(generation)
+}
+
+/// S1f2 §9.4：快照 revision 使用当前 next_generation（始终严格高于本房已领出的代号）。
+pub fn current_registry_revision(conn: &Connection, room_id: &str) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT next_generation FROM remote_registry_counter WHERE room_id = ?1",
+        [room_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map(|value| value.unwrap_or(1))
+}
+
+/// S1c §9.4 rebase：把下一领号值抬到 max(现值, floor + 1)，重复/较小 floor 不回退。
+pub fn bump_registry_counter_to(
+    conn: &Connection,
+    room_id: &str,
+    floor: i64,
+) -> rusqlite::Result<()> {
+    let next_generation = floor
+        .checked_add(1)
+        .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, floor))?
+        .max(1);
+    conn.execute(
+        "INSERT INTO remote_registry_counter (room_id, next_generation) VALUES (?1, ?2) \
+         ON CONFLICT(room_id) DO UPDATE SET \
+            next_generation = max(remote_registry_counter.next_generation, excluded.next_generation)",
+        (room_id, next_generation),
+    )?;
+    Ok(())
+}
+
+/// 调用方已开启事务，高水位吸收与重新领号原子提交。原为 `rebase_remote_registry` 专用；
+/// S1h R1 返工起也被 `absorb_registry_high_water_and_reissue_revokes`（每次 sync.ack 后无
+/// 条件吸收 relay_high_water）复用。
+pub(crate) fn bump_registry_counter_to_in_transaction(
+    tx: &Transaction<'_>,
+    room_id: &str,
+    floor: i64,
+) -> rusqlite::Result<()> {
+    let next_generation = floor
+        .checked_add(1)
+        .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, floor))?
+        .max(1);
+    tx.execute(
+        "INSERT INTO remote_registry_counter (room_id, next_generation) VALUES (?1, ?2) \
+         ON CONFLICT(room_id) DO UPDATE SET \
+            next_generation = max(remote_registry_counter.next_generation, excluded.next_generation)",
+        (room_id, next_generation),
+    )?;
+    Ok(())
+}
+
+/// 吊销一个设备——幂等：已吊销的行不会被覆盖 `revoked_at`（保留首次吊销时间）。返回
+/// `Ok(true)` = 本次真的把它从「有效」翻成「已吊销」；`Ok(false)` = 设备不存在或已吊销过。
+pub fn revoke_remote_device(
+    conn: &Connection,
+    device_id: &str,
+    now_secs: i64,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE remote_devices SET revoked_at = ?2 WHERE device_id = ?1 AND revoked_at IS NULL",
+        (device_id, now_secs),
+    )?;
+    Ok(changed > 0)
+}
+
+/// refresh 轮换后回写新令牌哈希 + 新的 access 过期时间（T5e1 `TokenBook::refresh` 同款
+/// 语义的落库半边）。只更新未吊销设备——已吊销设备的 refresh 理应先被 `TokenBook::refresh`
+/// 挡在 Revoked 分支，这里的 WHERE 只是防御性兜底，不覆盖已吊销行。
+pub fn update_remote_device_tokens(
+    conn: &Connection,
+    device_id: &str,
+    token_hash: &str,
+    refresh_hash: &str,
+    access_expires_at_ms: i64,
+) -> rusqlite::Result<bool> {
+    // 上游全面原生毫秒后此守卫仍保留为写边界兜底，防止旧调用方重新写入秒值。
+    let access_expires_at_ms = normalize_access_expires_at_millis(access_expires_at_ms)?;
+    let changed = conn.execute(
+        "UPDATE remote_devices \
+            SET token_hash = ?2, refresh_hash = ?3, access_expires_at = ?4 \
+          WHERE device_id = ?1 AND revoked_at IS NULL",
+        (device_id, token_hash, refresh_hash, access_expires_at_ms),
+    )?;
+    Ok(changed > 0)
+}
+
+/// P3-1（2026-08-11 M1 修复轮）：`session_runtime.status` 只有这两个取值（CHECK 约束同款字面量），
+/// 抽成 const 供全 crate 写口引用，别再各自散落裸字符串。
+pub const SESSION_RUNTIME_RUNNING: &str = "running";
+pub const SESSION_RUNTIME_IDLE: &str = "idle";
+
+/// M1-T1：`set_session_runtime` 是「reserve」类咽喉专用——占槽/run_id 现场已知时显式写一条完整行
+/// （solo `reserve_new_session_run` 占槽 + 事后 run_id 回填、team `start_team_run` 注册）。
+/// 2026-08-11 M1 修复轮（opus P1-1/P1-2）：**release/摘槽类**写口不再调这个函数——那类场景
+/// 「当前是否真的 idle」不能只看本次调用方手头的局部信息（例如 lead 释放了 Running 槽，但
+/// 队员 dispatch intent 可能还在途），必须统一走 `crate::refresh_session_runtime` 重算真相后
+/// 调下面的 `upsert_session_runtime_status`。调用方一律 `let _ =`/`eprintln!` 静默失败（不挡
+/// 主流程·M0 §4c「不加 IPC、不动前端」原则的延伸——这张表只是 best-effort 镜像，真出错不该
+/// 拖垮送消息/派单本身）。
+pub fn set_session_runtime(
+    conn: &Connection,
+    session_id: &str,
+    status: &str,
+    run_id: Option<&str>,
+) -> rusqlite::Result<bool> {
+    let current = conn
+        .query_row(
+            "SELECT status, run_id FROM session_runtime WHERE session_id = ?1",
+            [session_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let changed = match &current {
+        Some((current_status, current_run_id)) => {
+            current_status.as_str() != status || current_run_id.as_deref() != run_id
+        }
+        None => true,
+    };
+
+    conn.execute(
+        "INSERT INTO session_runtime (session_id, status, run_id, updated_at) \
+         VALUES (?1, ?2, ?3, strftime('%s','now')) \
+         ON CONFLICT(session_id) DO UPDATE SET \
+            status = excluded.status, \
+            run_id = excluded.run_id, \
+            updated_at = excluded.updated_at",
+        (session_id, status, run_id),
+    )?;
+    if changed {
+        crate::remote_gateway::publish_run_status_milestone(session_id, status, run_id);
+    }
+    Ok(changed)
+}
+
+/// M1 修复轮 P1-1：`crate::refresh_session_runtime`（lib.rs）唯一使用的重算写口——只重算
+/// `status` 列，`run_id` 列保持表中现值不动（新行才落 NULL，语义与 `set_session_runtime` 的
+/// idle 转场惯例一致）。这是刻意的：重算口本身拿不到 run_id（调用点大多是"摘槽/释放"场景，
+/// run_id 早在 reserve 时已经由 `set_session_runtime` 写过），没有新值就不该覆盖成 NULL——
+/// 否则一条已经在跑的 run 会因为另一条无关摘槽路径的 refresh 调用被误清 run_id。
+pub fn upsert_session_runtime_status(
+    conn: &Connection,
+    session_id: &str,
+    status: &str,
+) -> rusqlite::Result<bool> {
+    let current = conn
+        .query_row(
+            "SELECT status, run_id FROM session_runtime WHERE session_id = ?1",
+            [session_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let changed = match &current {
+        Some((current_status, _)) => current_status.as_str() != status,
+        None => true,
+    };
+
+    conn.execute(
+        "INSERT INTO session_runtime (session_id, status, run_id, updated_at) \
+         VALUES (?1, ?2, NULL, strftime('%s','now')) \
+         ON CONFLICT(session_id) DO UPDATE SET \
+            status = excluded.status, \
+            updated_at = excluded.updated_at",
+        (session_id, status),
+    )?;
+    if changed {
+        let run_id = current
+            .as_ref()
+            .and_then(|(_, current_run_id)| current_run_id.as_deref());
+        crate::remote_gateway::publish_run_status_milestone(session_id, status, run_id);
+    }
+    Ok(changed)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRuntime {
+    pub session_id: String,
+    pub status: String,
+    pub run_id: Option<String>,
+    pub updated_at: i64,
+}
+
+/// 单会话运行态查询（M1 暂无生产调用点；测试直用 + 留给将来 `session.index` 单会话读路径）。
+#[allow(dead_code)]
+pub fn get_session_runtime(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<SessionRuntime>> {
+    conn.query_row(
+        "SELECT session_id, status, run_id, updated_at FROM session_runtime WHERE session_id = ?1",
+        [session_id],
+        |r| {
+            Ok(SessionRuntime {
+                session_id: r.get(0)?,
+                status: r.get(1)?,
+                run_id: r.get(2)?,
+                updated_at: r.get(3)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// 全表 running 会话（M1 暂无生产调用点；留给将来 remote_gateway `session.index` 汇总流）。
+#[allow(dead_code)]
+pub fn list_running_sessions(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT session_id FROM session_runtime WHERE status = 'running'")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    rows.collect()
+}
+
+/// 启动期 reconcile：进程重启时把上一轮崩溃/强杀遗留的 `running` 脏行全洗成 `idle`
+/// （M0 §4c 原文「崩溃脏行自愈」）。不做数据迁移，只是状态归位——`run_id` 一并清空，
+/// 语义与四咽喉里「释放槽 → idle 写 None」一致。
+pub fn reconcile_session_runtime_on_startup(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE session_runtime SET status = 'idle', run_id = NULL, updated_at = strftime('%s','now') \
+         WHERE status != 'idle'",
+        [],
+    )?;
     Ok(())
 }
 
@@ -2352,6 +3374,19 @@ pub fn migrate_null_repo_id_to_local_default(conn: &Connection) -> rusqlite::Res
     Ok(n)
 }
 
+/// 一次性回填存量 user/assistant 消息的 dedup_key，让历史消息进入连接回放批。
+///
+/// `messages.id` 是全表主键，因此 `backfill:<id>` 在全表范围内唯一；仓内生成端也不使用
+/// `backfill:` 前缀，所以不可能与 `(session_id, dedup_key)` 部分唯一索引中的键冲突。仅更新
+/// NULL 行，重复执行为 no-op。
+pub fn migrate_backfill_dedup_keys(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE messages SET dedup_key = 'backfill:' || id \
+         WHERE dedup_key IS NULL AND role IN ('user', 'assistant')",
+        [],
+    )
+}
+
 /// 将仍保留原始种子名的 local-default 改名为“我的项目”。
 /// 同时限定 id 和旧名，避免覆盖用户已经修改过的名称。幂等：改过即 no-op。
 pub fn migrate_local_default_name(conn: &Connection) -> rusqlite::Result<usize> {
@@ -2529,6 +3564,7 @@ pub fn create_session(
         "INSERT INTO sessions (id, title, repo_id, namespace_id, created_at) VALUES (?1, ?2, ?3, ?4, strftime('%s','now'))",
         (id, title, repo_id, namespace_id),
     )?;
+    crate::remote_gateway::publish_session_index_created(id, title, repo_id, namespace_id);
     Ok(())
 }
 
@@ -2669,7 +3705,10 @@ pub fn continuation_chain_ids(
 }
 
 pub fn rename_session(conn: &Connection, id: &str, title: &str) -> rusqlite::Result<()> {
-    conn.execute("UPDATE sessions SET title = ?2 WHERE id = ?1", (id, title))?;
+    let changed = conn.execute("UPDATE sessions SET title = ?2 WHERE id = ?1", (id, title))?;
+    if changed > 0 {
+        crate::remote_gateway::publish_session_index_renamed(id, title);
+    }
     Ok(())
 }
 
@@ -2692,11 +3731,35 @@ pub fn append_message(
 
 /// 刀 R P0-2：防重复写入口——同 (session_id, dedup_key) 已存在则整条跳过（INSERT OR IGNORE
 /// 语义，部分唯一索引 `idx_messages_dedup` 兜底），否则插入。其余列语义与 `append_message`
-/// 完全一致。返回 Ok(true) = 真插了一行；Ok(false) = 命中重复、未写。
+/// 完全一致。返回 Ok(Some(milestone)) = 真插了一行；Ok(None) = 命中重复、未写。
 /// 注意（opus 审 P0-2 Low）：OR IGNORE 会吞掉**任何**约束违例（含 json_valid CHECK / NOT NULL），
 /// 不止唯一冲突——本函数只预期挡 `idx_messages_dedup` 唯一冲突；content 由
 /// `serde_json::to_string(&[Block])` 生成恒为合法 JSON、各 NOT NULL 列恒有值，其余违例实践不可达。
-/// 若将来 Ok(false) 出现在「键确未重复」的场景，先查是不是别的约束被吞了。
+/// 若将来 Ok(None) 出现在「键确未重复」的场景，先查是不是别的约束被吞了。
+pub struct MsgCompletedMilestone {
+    session_id: String,
+    dedup_key: String,
+    message_id: i64,
+    role: String,
+    blocks_value: serde_json::Value,
+    agent_name_snapshot: Option<String>,
+}
+
+impl MsgCompletedMilestone {
+    /// 调用方必须在对应写入已经真正落盘之后才能调用：显式事务中的插入必须等
+    /// `commit()` 成功；autocommit 连接中的插入执行成功后即可调用。
+    pub fn publish(self) {
+        crate::remote_gateway::publish_msg_completed_milestone(
+            &self.session_id,
+            &self.dedup_key,
+            self.message_id,
+            &self.role,
+            self.blocks_value,
+            self.agent_name_snapshot.as_deref(),
+        );
+    }
+}
+
 pub fn append_message_dedup(
     conn: &Connection,
     session_id: &str,
@@ -2706,7 +3769,7 @@ pub fn append_message_dedup(
     agent_id: Option<&str>,
     agent_name_snapshot: Option<&str>,
     dedup_key: &str,
-) -> rusqlite::Result<bool> {
+) -> rusqlite::Result<Option<MsgCompletedMilestone>> {
     let json = serde_json::to_string(content).expect("content 序列化失败");
     conn.execute(
         "INSERT OR IGNORE INTO messages (session_id, role, content, engine, agent_id, agent_name_snapshot, dedup_key, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%s','now'))",
@@ -2720,7 +3783,48 @@ pub fn append_message_dedup(
             dedup_key,
         ),
     )?;
-    Ok(conn.changes() > 0)
+    if conn.changes() > 0 {
+        let message_id = conn.last_insert_rowid();
+        let blocks_value = serde_json::to_value(content).unwrap_or(serde_json::Value::Null);
+        Ok(Some(MsgCompletedMilestone {
+            session_id: session_id.to_string(),
+            dedup_key: dedup_key.to_string(),
+            message_id,
+            role: role.to_string(),
+            blocks_value,
+            agent_name_snapshot: agent_name_snapshot.map(str::to_string),
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// 仅供 autocommit 连接调用：插入执行成功即已落盘，因此可以立即发布里程碑。
+pub fn append_message_dedup_and_publish(
+    conn: &Connection,
+    session_id: &str,
+    role: &str,
+    content: &[Block],
+    engine: Option<&str>,
+    agent_id: Option<&str>,
+    agent_name_snapshot: Option<&str>,
+    dedup_key: &str,
+) -> rusqlite::Result<bool> {
+    let milestone = append_message_dedup(
+        conn,
+        session_id,
+        role,
+        content,
+        engine,
+        agent_id,
+        agent_name_snapshot,
+        dedup_key,
+    )?;
+    let inserted = milestone.is_some();
+    if let Some(milestone) = milestone {
+        milestone.publish();
+    }
+    Ok(inserted)
 }
 
 /// 把已落库 lead 消息中的 running DispatchCard 原地收敛到 worker 终态。
@@ -2998,6 +4102,12 @@ pub fn delete_session(conn: &Connection, id: &str) -> rusqlite::Result<()> {
         "DELETE FROM session_agent_configs WHERE session_id = ?1",
         [id],
     )?;
+    // P2-2（M1 修复轮 opus 深审）：session_runtime 是 M1-T1 新增的独立运行态镜像表，同样按
+    // session_id 键——漏了这行会在 purge 后留一条永久孤儿行（远端 session.index 汇总流会看到
+    // 一个已经不存在的 session 却仍标着 running/idle）。
+    tx.execute("DELETE FROM session_runtime WHERE session_id = ?1", [id])?;
+    // T-4b：remote_inbox 同样按 session_id 键、同样不声明 FK——漏级联=永久孤儿行同款风险。
+    tx.execute("DELETE FROM remote_inbox WHERE session_id = ?1", [id])?;
     tx.execute(
         "UPDATE sessions
             SET parent_session_id = NULL
@@ -3009,8 +4119,11 @@ pub fn delete_session(conn: &Connection, id: &str) -> rusqlite::Result<()> {
         [id],
     )?;
     // Step 4: finally delete the session itself
-    tx.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+    let session_row_deleted = tx.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
     tx.commit()?;
+    if session_row_deleted > 0 {
+        crate::remote_gateway::publish_session_index_deleted(id);
+    }
     Ok(())
 }
 
@@ -3040,6 +4153,20 @@ pub fn get_message_by_id(conn: &Connection, id: i64) -> rusqlite::Result<Option<
     conn.query_row(
         "SELECT id, role, content, engine, agent_id, agent_name_snapshot, created_at FROM messages WHERE id = ?1",
         [id],
+        map_message_row,
+    )
+    .optional()
+}
+
+pub fn get_message_by_session_and_dedup_key(
+    conn: &Connection,
+    session_id: &str,
+    dedup_key: &str,
+) -> rusqlite::Result<Option<Message>> {
+    conn.query_row(
+        "SELECT id, role, content, engine, agent_id, agent_name_snapshot, created_at \
+         FROM messages WHERE session_id = ?1 AND dedup_key = ?2",
+        (session_id, dedup_key),
         map_message_row,
     )
     .optional()
@@ -3227,6 +4354,14 @@ pub fn update_decision_card_status(
                 )?;
             }
             tx.commit()?;
+            if changed {
+                crate::remote_gateway::publish_card_resolved_milestone(
+                    session_id,
+                    decision_id,
+                    next_status,
+                    chosen_option,
+                );
+            }
             return Ok(changed);
         }
     }
@@ -4739,21 +5874,51 @@ pub fn set_session_archived(conn: &Connection, id: &str, archived: bool) -> rusq
 /// 移除项目时连带软归档该 repo「当前未归档」的会话（archived=1 + archived_at=now·秒级）。
 /// 非破坏·不删行·不碰 deleted_at·不动其他 repo。返回受影响行数。
 pub fn archive_sessions_for_repo(conn: &Connection, repo_id: &str) -> rusqlite::Result<usize> {
-    conn.execute(
+    let ids: Vec<String> = {
+        let mut stmt =
+            conn.prepare("SELECT id FROM sessions WHERE repo_id = ?1 AND archived = 0")?;
+        let ids = stmt
+            .query_map([repo_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        ids
+    };
+    let changed = conn.execute(
         "UPDATE sessions SET archived = 1, archived_at = strftime('%s','now') \
          WHERE repo_id = ?1 AND archived = 0",
         [repo_id],
-    )
+    )?;
+    if !ids.is_empty() {
+        // 已知边界：本函数不拥有调用方 lib.rs archive_repo_inner 外层那个事务——那层事务把
+        // repos_repo::archive_repo 和本函数包在一起一并 commit。这里的 publish 在本函数返回时
+        // 立刻触发，早于外层 tx.commit()；若外层事务后续失败回滚，这条已入队的 session.index
+        // 里程碑不会被撤回。影响面很小，且下次重连的全量快照会自然纠正，不阻塞本单收口。
+        crate::remote_gateway::publish_session_index_archived(&ids, true);
+    }
+    Ok(changed)
 }
 
 /// 恢复项目时解归档该 repo 全部已归档会话（archived=0 + archived_at=NULL）。
 /// 已知取舍：会一并解归档用户手动归档过的（接受·KISS）。返回受影响行数。
 pub fn unarchive_sessions_for_repo(conn: &Connection, repo_id: &str) -> rusqlite::Result<usize> {
-    conn.execute(
+    let ids: Vec<String> = {
+        let mut stmt =
+            conn.prepare("SELECT id FROM sessions WHERE repo_id = ?1 AND archived = 1")?;
+        let ids = stmt
+            .query_map([repo_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        ids
+    };
+    let changed = conn.execute(
         "UPDATE sessions SET archived = 0, archived_at = NULL \
          WHERE repo_id = ?1 AND archived = 1",
         [repo_id],
-    )
+    )?;
+    if !ids.is_empty() {
+        // 已知边界：本函数不拥有调用方 lib.rs restore_repo_inner 外层那个事务——publish 早于
+        // 外层 tx.commit()；若外层后续失败回滚，已入队事件不会撤回，重连全量快照会纠正。
+        crate::remote_gateway::publish_session_index_archived(&ids, false);
+    }
+    Ok(changed)
 }
 
 pub fn set_sessions_archived(
@@ -4762,16 +5927,174 @@ pub fn set_sessions_archived(
     archived: bool,
 ) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
+    let mut changed_ids: Vec<String> = Vec::new();
     for id in ids {
-        tx.execute(
+        let changed = tx.execute(
             "UPDATE sessions SET archived = ?2, \
              archived_at = CASE WHEN ?2 THEN strftime('%s','now') ELSE NULL END \
              WHERE id = ?1",
             (id.as_str(), archived),
         )?;
+        if changed > 0 {
+            changed_ids.push(id.clone());
+        }
     }
     tx.commit()?;
+    if !changed_ids.is_empty() {
+        crate::remote_gateway::publish_session_index_archived(&changed_ids, archived);
+    }
     Ok(())
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct SessionIndexSnapshotRow {
+    pub id: String,
+    pub title: String,
+    pub repo_id: Option<String>,
+    pub archived: bool,
+    pub status: Option<String>,
+    pub run_id: Option<String>,
+    pub updated_at: i64,
+    pub last_msg_preview: Option<String>,
+    pub last_activity_at: Option<i64>,
+}
+
+const SESSION_INDEX_PREVIEW_CHARS: usize = 80;
+
+fn session_index_message_preview(content_json: &str) -> Option<String> {
+    let content = serde_json::from_str::<serde_json::Value>(content_json).ok()?;
+    let blocks = content.as_array()?;
+    let text = blocks.iter().find_map(|block| {
+        (block.get("type")?.as_str()? == "text")
+            .then(|| block.get("text")?.as_str())
+            .flatten()
+    })?;
+    Some(text.chars().take(SESSION_INDEX_PREVIEW_CHARS).collect())
+}
+
+/// M0 §6 连接后全量快照 provider 用（remote_gateway `session_index_snapshot_provider`）。
+/// 全部未软删会话 LEFT JOIN session_runtime 汇总运行态；session_runtime 无对应行时
+/// status/run_id 落 None（该会话从未跑过/表还没来得及写），updated_at 兜底用 sessions.created_at。
+pub fn list_session_index_snapshot_rows(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<SessionIndexSnapshotRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.title, s.repo_id, s.archived, sr.status, sr.run_id, \
+                COALESCE(sr.updated_at, s.created_at) AS updated_at, \
+                latest_message.content, latest_message.created_at \
+         FROM sessions s \
+         LEFT JOIN session_runtime sr ON sr.session_id = s.id \
+         LEFT JOIN messages latest_message ON latest_message.id = ( \
+             SELECT m.id FROM messages m \
+             WHERE m.session_id = s.id AND m.role IN ('user', 'assistant') \
+             ORDER BY m.id DESC LIMIT 1 \
+         ) \
+         WHERE s.deleted_at IS NULL \
+         ORDER BY s.pinned DESC, s.created_at DESC, s.id DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let latest_content: Option<String> = r.get(7)?;
+        Ok(SessionIndexSnapshotRow {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            repo_id: r.get(2)?,
+            archived: r.get(3)?,
+            status: r.get(4)?,
+            run_id: r.get(5)?,
+            updated_at: r.get(6)?,
+            last_msg_preview: latest_content
+                .as_deref()
+                .and_then(session_index_message_preview),
+            last_activity_at: r.get(8)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// M0 v1.7.5 §4d：连接后重发批 provider 用——最近 N 条"role IN (assistant, user) 且 dedup_key
+/// 非空"的消息（跨全部会话·排除软删会话·同 list_session_index_snapshot_rows 口径
+/// s.deleted_at IS NULL·不过滤 archived）。按 id DESC 取最近 limit 条，再反转成升序（旧→新）
+/// 返回，供调用方按序重建 msg.completed 并逐条重发。content 反序列化失败的行（理论不可达：
+/// content 恒为 serde_json::to_string(&[Block]) 产物）防御性跳过，不让整批查询失败。
+/// P0-c：纳入 user 行（assistant-only 是刀 R 遗留窄口径——user 消息今天已能落 dedup_key，
+/// 该纳入补发）；`RECENT_MILESTONE_REPLAY_LIMIT` 常量本身不变，200 条预算现在被
+/// assistant/user 两种角色共摊，不专属 assistant。
+#[derive(Clone, Debug, PartialEq)]
+pub struct MilestoneReplayRow {
+    pub session_id: String,
+    pub message_id: i64,
+    pub role: String,
+    pub content_json: serde_json::Value,
+    pub dedup_key: String,
+}
+
+/// `control.history` 的短锁 DB 读取结果。这里只搬运 SQLite 原始列；`content` 的 JSON 解析
+/// 必须由 provider 在释放全局 Db mutex 后完成，避免大消息反序列化扩大锁面。
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionHistoryRow {
+    pub message_id: i64,
+    pub role: String,
+    pub content: String,
+}
+
+pub fn list_session_history_rows(
+    conn: &Connection,
+    session_id: &str,
+    before_message_id: Option<i64>,
+    max_rows: i64,
+) -> rusqlite::Result<Vec<SessionHistoryRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.role, m.content FROM messages m \
+         JOIN sessions s ON s.id = m.session_id \
+         WHERE m.session_id = ?1 AND m.role IN ('user','assistant') \
+           AND (?2 IS NULL OR m.id < ?2) AND s.deleted_at IS NULL \
+         ORDER BY m.id DESC LIMIT ?3",
+    )?;
+    let rows = stmt.query_map((session_id, before_message_id, max_rows), |r| {
+        Ok(SessionHistoryRow {
+            message_id: r.get(0)?,
+            role: r.get(1)?,
+            content: r.get(2)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// 对齐 relay 保留窗（7 天 / 1 万条，M0 §6）——重发集有界常量。
+pub const RECENT_MILESTONE_REPLAY_LIMIT: i64 = 200;
+
+pub fn list_recent_milestone_replay_rows(
+    conn: &Connection,
+    limit: i64,
+) -> rusqlite::Result<Vec<MilestoneReplayRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.session_id, m.role, m.content, m.dedup_key \
+         FROM messages m \
+         JOIN sessions s ON s.id = m.session_id \
+         WHERE m.role IN ('assistant', 'user') AND m.dedup_key IS NOT NULL AND s.deleted_at IS NULL \
+         ORDER BY m.id DESC \
+         LIMIT ?1",
+    )?;
+    let raw_rows: Vec<(i64, String, String, String, String)> = stmt
+        .query_map([limit], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut rows: Vec<MilestoneReplayRow> = raw_rows
+        .into_iter()
+        .filter_map(|(message_id, session_id, role, content_text, dedup_key)| {
+            let content_json = serde_json::from_str(&content_text).ok()?;
+            Some(MilestoneReplayRow {
+                session_id,
+                message_id,
+                role,
+                content_json,
+                dedup_key,
+            })
+        })
+        .collect();
+    rows.reverse();
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -7082,6 +8405,585 @@ mod tests {
     }
 
     #[test]
+    fn create_session_publishes_index_only_after_success() {
+        let c = mem();
+        crate::remote_gateway::test_take_publish_log();
+
+        create_session(&c, "index-create", "Title", "local-default", "local").unwrap();
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["session.index.created"]
+        );
+
+        assert!(create_session(&c, "index-create", "Duplicate", "local-default", "local").is_err());
+        assert!(crate::remote_gateway::test_take_publish_log().is_empty());
+    }
+
+    #[test]
+    fn rename_session_publishes_index_only_for_existing_row() {
+        let c = mem();
+        create_session(&c, "index-rename", "Before", "local-default", "local").unwrap();
+        crate::remote_gateway::test_take_publish_log();
+
+        rename_session(&c, "index-rename", "After").unwrap();
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["session.index.renamed"]
+        );
+
+        rename_session(&c, "missing-index-rename", "No row").unwrap();
+        assert!(crate::remote_gateway::test_take_publish_log().is_empty());
+    }
+
+    #[test]
+    fn delete_session_publishes_index_only_for_existing_row() {
+        let c = mem();
+        create_session(&c, "index-delete", "Title", "local-default", "local").unwrap();
+        crate::remote_gateway::test_take_publish_log();
+
+        delete_session(&c, "index-delete").unwrap();
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["session.index.deleted"]
+        );
+
+        delete_session(&c, "index-delete").unwrap();
+        assert!(crate::remote_gateway::test_take_publish_log().is_empty());
+    }
+
+    #[test]
+    fn set_sessions_archived_publishes_one_filtered_batch() {
+        let c = mem();
+        create_session(&c, "index-archive-1", "One", "local-default", "local").unwrap();
+        create_session(&c, "index-archive-2", "Two", "local-default", "local").unwrap();
+        crate::remote_gateway::test_take_publish_log();
+        crate::remote_gateway::test_take_session_index_archived_payload_log();
+
+        let ids = vec![
+            "index-archive-1".to_owned(),
+            "missing-index-archive".to_owned(),
+            "index-archive-2".to_owned(),
+        ];
+        set_sessions_archived(&c, &ids, true).unwrap();
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["session.index.archived"]
+        );
+        assert_eq!(
+            crate::remote_gateway::test_take_session_index_archived_payload_log(),
+            vec![serde_json::json!({
+                "op": "archived",
+                "full": false,
+                "ids": ["index-archive-1", "index-archive-2"],
+            })]
+        );
+
+        set_sessions_archived(&c, &ids, false).unwrap();
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["session.index.unarchived"]
+        );
+        assert_eq!(
+            crate::remote_gateway::test_take_session_index_archived_payload_log(),
+            vec![serde_json::json!({
+                "op": "unarchived",
+                "full": false,
+                "ids": ["index-archive-1", "index-archive-2"],
+            })]
+        );
+
+        set_sessions_archived(&c, &["still-missing".to_owned()], true).unwrap();
+        assert!(crate::remote_gateway::test_take_publish_log().is_empty());
+        assert!(crate::remote_gateway::test_take_session_index_archived_payload_log().is_empty());
+    }
+
+    #[test]
+    fn repo_archive_helpers_publish_one_batch_of_matching_ids() {
+        let c = mem();
+        create_session(&c, "repo-index-1", "One", "local-default", "local").unwrap();
+        create_session(&c, "repo-index-2", "Two", "local-default", "local").unwrap();
+        create_session(&c, "repo-index-3", "Three", "local-default", "local").unwrap();
+        c.execute(
+            "UPDATE sessions SET archived = 1, archived_at = 1 WHERE id = 'repo-index-2'",
+            [],
+        )
+        .unwrap();
+        crate::remote_gateway::test_take_publish_log();
+        crate::remote_gateway::test_take_session_index_archived_payload_log();
+
+        assert_eq!(archive_sessions_for_repo(&c, "local-default").unwrap(), 2);
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["session.index.archived"]
+        );
+        let payloads = crate::remote_gateway::test_take_session_index_archived_payload_log();
+        assert_eq!(payloads.len(), 1);
+        let mut archived_ids: Vec<&str> = payloads[0]["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap())
+            .collect();
+        archived_ids.sort_unstable();
+        assert_eq!(archived_ids, vec!["repo-index-1", "repo-index-3"]);
+
+        c.execute(
+            "UPDATE sessions SET archived = 0, archived_at = NULL WHERE id = 'repo-index-3'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(unarchive_sessions_for_repo(&c, "local-default").unwrap(), 2);
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["session.index.unarchived"]
+        );
+        let payloads = crate::remote_gateway::test_take_session_index_archived_payload_log();
+        assert_eq!(payloads.len(), 1);
+        let mut unarchived_ids: Vec<&str> = payloads[0]["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap())
+            .collect();
+        unarchived_ids.sort_unstable();
+        assert_eq!(unarchived_ids, vec!["repo-index-1", "repo-index-2"]);
+
+        assert_eq!(archive_sessions_for_repo(&c, "missing-repo").unwrap(), 0);
+        assert_eq!(unarchive_sessions_for_repo(&c, "missing-repo").unwrap(), 0);
+        assert!(crate::remote_gateway::test_take_publish_log().is_empty());
+        assert!(crate::remote_gateway::test_take_session_index_archived_payload_log().is_empty());
+    }
+
+    #[test]
+    fn list_session_index_snapshot_rows_joins_runtime_and_excludes_soft_deleted() {
+        let c = mem();
+        create_session(&c, "snapshot-running", "Running", "local-default", "local").unwrap();
+        create_session(
+            &c,
+            "snapshot-never-ran",
+            "Never ran",
+            "local-default",
+            "local",
+        )
+        .unwrap();
+        create_session(&c, "snapshot-deleted", "Deleted", "local-default", "local").unwrap();
+        c.execute(
+            "UPDATE sessions SET created_at = CASE id \
+                WHEN 'snapshot-running' THEN 101 \
+                WHEN 'snapshot-never-ran' THEN 202 \
+                ELSE 303 END",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE sessions SET archived = 1, archived_at = 1 WHERE id = 'snapshot-never-ran'",
+            [],
+        )
+        .unwrap();
+        set_session_runtime(&c, "snapshot-running", "running", Some("run-1")).unwrap();
+        set_session_deleted(&c, "snapshot-deleted").unwrap();
+
+        let rows = list_session_index_snapshot_rows(&c).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.id != "snapshot-deleted"));
+
+        let running = rows
+            .iter()
+            .find(|row| row.id == "snapshot-running")
+            .unwrap();
+        assert_eq!(running.title, "Running");
+        assert_eq!(running.repo_id.as_deref(), Some("local-default"));
+        assert!(!running.archived);
+        assert_eq!(running.status.as_deref(), Some("running"));
+        assert_eq!(running.run_id.as_deref(), Some("run-1"));
+        assert!(running.updated_at >= 101);
+
+        let never_ran = rows
+            .iter()
+            .find(|row| row.id == "snapshot-never-ran")
+            .unwrap();
+        assert_eq!(never_ran.title, "Never ran");
+        assert_eq!(never_ran.repo_id.as_deref(), Some("local-default"));
+        assert!(never_ran.archived);
+        assert_eq!(never_ran.status, None);
+        assert_eq!(never_ran.run_id, None);
+        assert_eq!(never_ran.updated_at, 202);
+    }
+
+    #[test]
+    fn session_index_snapshot_rows_use_latest_user_or_assistant_text_and_activity() {
+        let c = mem();
+        create_session(&c, "snapshot-preview", "Preview", "local-default", "local").unwrap();
+        c.execute(
+            "INSERT INTO messages (session_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "snapshot-preview",
+                "assistant",
+                serde_json::json!([{ "type": "text", "text": "older" }]).to_string(),
+                100,
+            ],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO messages (session_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "snapshot-preview",
+                "user",
+                serde_json::json!([
+                    { "type": "thinking", "text": "skip me" },
+                    { "type": "text", "text": "latest relevant text" },
+                ])
+                .to_string(),
+                200,
+            ],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO messages (session_id, role, content, created_at) VALUES (?1, 'system', ?2, ?3)",
+            rusqlite::params![
+                "snapshot-preview",
+                serde_json::json!([{ "type": "text", "text": "newer system text" }]).to_string(),
+                300,
+            ],
+        )
+        .unwrap();
+
+        let rows = list_session_index_snapshot_rows(&c).unwrap();
+        let preview = rows
+            .iter()
+            .find(|row| row.id == "snapshot-preview")
+            .unwrap();
+        assert_eq!(
+            preview.last_msg_preview.as_deref(),
+            Some("latest relevant text")
+        );
+        assert_eq!(preview.last_activity_at, Some(200));
+    }
+
+    #[test]
+    fn session_index_preview_truncates_at_unicode_char_boundary_and_is_none_without_messages() {
+        let c = mem();
+        create_session(&c, "snapshot-unicode", "Unicode", "local-default", "local").unwrap();
+        create_session(&c, "snapshot-empty", "Empty", "local-default", "local").unwrap();
+        let long_text = format!("{}尾", "你".repeat(80));
+        c.execute(
+            "INSERT INTO messages (session_id, role, content, created_at) VALUES (?1, 'assistant', ?2, 400)",
+            rusqlite::params![
+                "snapshot-unicode",
+                serde_json::json!([{ "type": "text", "text": long_text }]).to_string(),
+            ],
+        )
+        .unwrap();
+
+        let rows = list_session_index_snapshot_rows(&c).unwrap();
+        let unicode = rows
+            .iter()
+            .find(|row| row.id == "snapshot-unicode")
+            .unwrap();
+        let preview = unicode.last_msg_preview.as_deref().unwrap();
+        assert_eq!(preview.chars().count(), 80);
+        assert_eq!(preview, "你".repeat(80));
+        assert_eq!(unicode.last_activity_at, Some(400));
+
+        let empty = rows.iter().find(|row| row.id == "snapshot-empty").unwrap();
+        assert_eq!(empty.last_msg_preview, None);
+        assert_eq!(empty.last_activity_at, None);
+    }
+
+    #[test]
+    fn recent_milestone_replay_includes_dedup_user_rows_filters_null_dedup_and_soft_deleted_session(
+    ) {
+        // 两向语料（P0-c 语义反转：user 行不再一律被滤）——
+        // 正例：assistant/user 各一条带 dedup_key 都应纳入补发批；
+        // 反例：assistant/user 各一条 dedup_key 为 NULL（走 `append_message`，非 dedup 版）
+        // 仍应被滤，role 放宽不等于 dedup_key 校验被放松；deleted 会话即便带 dedup_key 也应被滤。
+        let c = crate::test_support::mem_db();
+        create_session(&c, "replay-live", "Live", "local-default", "local").unwrap();
+        create_session(&c, "replay-deleted", "Deleted", "local-default", "local").unwrap();
+        let blocks = [Block::Text {
+            text: "milestone".into(),
+        }];
+
+        // 正例①：assistant + dedup_key 非空 —— 纳入。
+        append_message_dedup(
+            &c,
+            "replay-live",
+            "assistant",
+            &blocks,
+            None,
+            None,
+            None,
+            "keep",
+        )
+        .unwrap();
+        // 正例②：user + dedup_key 非空 —— 纳入（语义反转的核心断言）。
+        append_message_dedup(
+            &c,
+            "replay-live",
+            "user",
+            &blocks,
+            None,
+            None,
+            None,
+            "user-with-dedup",
+        )
+        .unwrap();
+        // 反例①：assistant + dedup_key NULL —— 仍被滤。
+        append_message(&c, "replay-live", "assistant", &blocks, None, None, None).unwrap();
+        // 反例②：user + dedup_key NULL —— 仍被滤（role 放宽≠dedup_key 校验放松）。
+        append_message(&c, "replay-live", "user", &blocks, None, None, None).unwrap();
+        // 反例③：assistant + dedup_key 非空但会话已软删 —— 仍被滤。
+        append_message_dedup(
+            &c,
+            "replay-deleted",
+            "assistant",
+            &blocks,
+            None,
+            None,
+            None,
+            "deleted-session",
+        )
+        .unwrap();
+        set_session_deleted(&c, "replay-deleted").unwrap();
+
+        let rows = list_recent_milestone_replay_rows(&c, 20).unwrap();
+        assert_eq!(rows.len(), 2, "两条正例都应纳入: {rows:?}");
+        assert_eq!(rows[0].session_id, "replay-live");
+        assert_eq!(rows[0].role, "assistant");
+        assert_eq!(rows[0].dedup_key, "keep");
+        assert_eq!(rows[0].content_json, serde_json::json!(blocks));
+        assert_eq!(rows[1].session_id, "replay-live");
+        assert_eq!(rows[1].role, "user", "user 行带 dedup_key 应被纳入补发批");
+        assert_eq!(rows[1].dedup_key, "user-with-dedup");
+        assert_eq!(rows[1].content_json, serde_json::json!(blocks));
+    }
+
+    #[test]
+    fn recent_milestone_replay_limit_returns_newest_rows_oldest_first() {
+        let c = crate::test_support::mem_db();
+        create_session(&c, "replay-limit", "Limit", "local-default", "local").unwrap();
+        for index in 0..5 {
+            append_message_dedup(
+                &c,
+                "replay-limit",
+                "assistant",
+                &[Block::Text {
+                    text: format!("message-{index}"),
+                }],
+                None,
+                None,
+                None,
+                &format!("dedup-{index}"),
+            )
+            .unwrap();
+        }
+
+        let rows = list_recent_milestone_replay_rows(&c, 2).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].dedup_key, "dedup-3");
+        assert_eq!(rows[1].dedup_key, "dedup-4");
+        assert!(rows[0].message_id < rows[1].message_id);
+    }
+
+    #[test]
+    fn history_db_before_null_returns_latest_rows_and_cursor_is_exclusive() {
+        let c = mem();
+        create_session(&c, "history-page", "History", "local-default", "local").unwrap();
+        let mut ids = Vec::new();
+        for index in 0..5 {
+            append_message(
+                &c,
+                "history-page",
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &[Block::Text {
+                    text: format!("message-{index}"),
+                }],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            ids.push(c.last_insert_rowid());
+        }
+
+        let latest = list_session_history_rows(&c, "history-page", None, 2).unwrap();
+        assert_eq!(
+            latest.iter().map(|row| row.message_id).collect::<Vec<_>>(),
+            vec![ids[4], ids[3]]
+        );
+        let earlier = list_session_history_rows(&c, "history-page", Some(ids[3]), 10).unwrap();
+        assert_eq!(
+            earlier.iter().map(|row| row.message_id).collect::<Vec<_>>(),
+            vec![ids[2], ids[1], ids[0]],
+            "before_message_id 必须是严格小于边界"
+        );
+    }
+
+    #[test]
+    fn history_db_filters_non_conversation_roles_and_preserves_content_json() {
+        let c = mem();
+        create_session(&c, "history-role", "History", "local-default", "local").unwrap();
+        for role in ["user", "system", "assistant", "tool"] {
+            append_message(
+                &c,
+                "history-role",
+                role,
+                &[Block::Text {
+                    text: format!("{role}-text"),
+                }],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let rows = list_session_history_rows(&c, "history-role", None, 10).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.role.as_str()).collect::<Vec<_>>(),
+            vec!["assistant", "user"]
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rows[0].content).unwrap(),
+            serde_json::json!([{"type": "text", "text": "assistant-text"}])
+        );
+    }
+
+    #[test]
+    fn history_db_soft_deleted_session_returns_empty_page() {
+        let c = mem();
+        create_session(
+            &c,
+            "history-soft-deleted",
+            "History",
+            "local-default",
+            "local",
+        )
+        .unwrap();
+        append_message(
+            &c,
+            "history-soft-deleted",
+            "assistant",
+            &[Block::Text {
+                text: "must stay hidden".into(),
+            }],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        set_session_deleted(&c, "history-soft-deleted").unwrap();
+
+        let rows = list_session_history_rows(&c, "history-soft-deleted", None, 10).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn history_init_schema_creates_role_filtered_pagination_index() {
+        let c = mem();
+        let sql: String = c
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_history'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains("ON messages(session_id, id DESC)"));
+        assert!(normalized.contains("WHERE role IN ('user','assistant')"));
+    }
+
+    #[test]
+    fn migrate_backfill_dedup_updates_only_null_user_and_assistant_rows_idempotently() {
+        let c = crate::test_support::mem_db();
+        create_session(&c, "backfill", "Backfill", "local-default", "local").unwrap();
+        let blocks = [Block::Text {
+            text: "history".into(),
+        }];
+
+        append_message(&c, "backfill", "user", &blocks, None, None, None).unwrap();
+        let user_id = c.last_insert_rowid();
+        append_message(&c, "backfill", "assistant", &blocks, None, None, None).unwrap();
+        let assistant_id = c.last_insert_rowid();
+        append_message(&c, "backfill", "system", &blocks, None, None, None).unwrap();
+        let system_id = c.last_insert_rowid();
+        append_message_dedup(
+            &c,
+            "backfill",
+            "assistant",
+            &blocks,
+            None,
+            None,
+            None,
+            "existing-key",
+        )
+        .unwrap();
+        let existing_id = c.last_insert_rowid();
+
+        assert_eq!(migrate_backfill_dedup_keys(&c).unwrap(), 2);
+        let keys: Vec<(i64, Option<String>)> = c
+            .prepare("SELECT id, dedup_key FROM messages ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            keys,
+            vec![
+                (user_id, Some(format!("backfill:{user_id}"))),
+                (assistant_id, Some(format!("backfill:{assistant_id}"))),
+                (system_id, None),
+                (existing_id, Some("existing-key".into())),
+            ]
+        );
+        assert_eq!(migrate_backfill_dedup_keys(&c).unwrap(), 0);
+    }
+
+    #[test]
+    fn migrate_backfill_dedup_makes_legacy_rows_visible_to_recent_milestone_replay() {
+        let c = crate::test_support::mem_db();
+        create_session(
+            &c,
+            "backfill-replay",
+            "Backfill replay",
+            "local-default",
+            "local",
+        )
+        .unwrap();
+        let blocks = [Block::Text {
+            text: "legacy".into(),
+        }];
+        append_message(&c, "backfill-replay", "user", &blocks, None, None, None).unwrap();
+        let user_id = c.last_insert_rowid();
+        append_message(
+            &c,
+            "backfill-replay",
+            "assistant",
+            &blocks,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let assistant_id = c.last_insert_rowid();
+
+        assert!(list_recent_milestone_replay_rows(&c, 20)
+            .unwrap()
+            .is_empty());
+        assert_eq!(migrate_backfill_dedup_keys(&c).unwrap(), 2);
+
+        let rows = list_recent_milestone_replay_rows(&c, 20).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].message_id, user_id);
+        assert_eq!(rows[0].role, "user");
+        assert_eq!(rows[0].dedup_key, format!("backfill:{user_id}"));
+        assert_eq!(rows[1].message_id, assistant_id);
+        assert_eq!(rows[1].role, "assistant");
+        assert_eq!(rows[1].dedup_key, format!("backfill:{assistant_id}"));
+    }
+
+    #[test]
     fn soft_delete_sets_tombstone_and_restore_clears_it() {
         let c = mem();
         c.execute(
@@ -7135,8 +9037,10 @@ mod tests {
     #[test]
     fn purge_session_cascades_all_session_scoped_rows() {
         // 🔴 I3 不变量锁(最高风险·漏表=永久孤儿行·codex+opus 双审 I2):delete_session 必须级联清掉
-        //    该 session 的全部 14 张 session-scoped 表 + 3 张 artifact-scoped 表。每张各插一行·
+        //    该 session 的全部 16 张 session-scoped 表 + 3 张 artifact-scoped 表。每张各插一行·
         //    purge 后逐张断言归零——未来误删任一 DELETE 行→此测试立刻 FAIL(防回归命根)。
+        //    （2026-08-11 M1 修复轮 P2-2：session_runtime 补第 15 张——M1-T1 新增独立运行态镜像表，
+        //    同样按 session_id 键，此前漏了级联删。T-4b 再补 remote_inbox 第 16 张。）
         let c = mem();
         c.execute(
             "INSERT INTO sessions (id,title,repo_id,namespace_id,created_at) VALUES ('s-p','t','local-default','local',1)",
@@ -7167,6 +9071,17 @@ mod tests {
         c.execute("INSERT INTO artifacts (id,session_id,run_id,member_assignment_id,branch,base_sha,created_at) VALUES ('art-p','s-p','r1','a1','branch1','sha1',1)", []).unwrap();
         c.execute(
             "INSERT INTO session_agent_configs (session_id) VALUES ('s-p')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO session_runtime (session_id,status,run_id,updated_at) VALUES ('s-p','running','r1',1)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO remote_inbox (session_id,command_id,kind,payload,created_at) \
+             VALUES ('s-p','cmd-p','input.send','{}',1)",
             [],
         )
         .unwrap();
@@ -7242,6 +9157,14 @@ mod tests {
             (
                 "session_agent_configs",
                 "SELECT COUNT(*) FROM session_agent_configs WHERE session_id='s-p'",
+            ),
+            (
+                "session_runtime",
+                "SELECT COUNT(*) FROM session_runtime WHERE session_id='s-p'",
+            ),
+            (
+                "remote_inbox",
+                "SELECT COUNT(*) FROM remote_inbox WHERE session_id='s-p'",
             ),
             (
                 "verifications",
@@ -8670,6 +10593,52 @@ mod tests {
         assert!(
             !update_decision_card_status(&c, "s1", "nope", "pending", "submitting", None).unwrap()
         );
+    }
+
+    #[test]
+    fn update_decision_card_status_publishes_only_for_cas_winner() {
+        let c = mem();
+        create_session(&c, "s1", "x", "local-default", "local").unwrap();
+        let blocks = vec![Block::DecisionCard {
+            decision_id: "dc-publish-1".into(),
+            kind: "ask".into(),
+            question: "?".into(),
+            options: vec!["A".into(), "B".into()],
+            recommended: None,
+            rationale: None,
+            payload: serde_json::Value::Null,
+            source_run_id: "r-1".into(),
+            status: "pending".into(),
+            chosen_option: None,
+            created_at: 1,
+        }];
+        append_message(&c, "s1", "assistant", &blocks, None, None, None).unwrap();
+
+        crate::remote_gateway::test_take_publish_log();
+        assert!(update_decision_card_status(
+            &c,
+            "s1",
+            "dc-publish-1",
+            "pending",
+            "resolved",
+            Some("A"),
+        )
+        .unwrap());
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["card.resolved"]
+        );
+
+        assert!(!update_decision_card_status(
+            &c,
+            "s1",
+            "dc-publish-1",
+            "pending",
+            "resolved",
+            Some("B"),
+        )
+        .unwrap());
+        assert!(crate::remote_gateway::test_take_publish_log().is_empty());
     }
 
     #[test]
@@ -10776,7 +12745,7 @@ mod agents {
             "run_flush:r1",
         )
         .unwrap();
-        assert!(ok1, "第一次写应成功");
+        assert!(ok1.is_some(), "第一次写应成功并返回 Some(milestone)");
         let ok2 = append_message_dedup(
             &c,
             "s1",
@@ -10790,7 +12759,7 @@ mod agents {
             "run_flush:r1",
         )
         .unwrap();
-        assert!(!ok2, "同键第二次写应被挡、返回 false");
+        assert!(ok2.is_none(), "同键第二次写应被挡、返回 None");
         let count: i64 = c
             .query_row(
                 "SELECT count(*) FROM messages WHERE session_id = 's1' AND dedup_key = 'run_flush:r1'",
@@ -10799,6 +12768,81 @@ mod agents {
             )
             .unwrap();
         assert_eq!(count, 1, "同键只应落 1 行");
+    }
+
+    #[test]
+    fn append_message_dedup_and_publish_publishes_only_for_new_key() {
+        let c = crate::test_support::mem_db();
+        create_session(&c, "s1", "x", "local-default", "local").unwrap();
+
+        crate::remote_gateway::test_take_publish_log();
+        assert!(append_message_dedup_and_publish(
+            &c,
+            "s1",
+            "assistant",
+            &[Block::Text {
+                text: "first".into(),
+            }],
+            Some("claude"),
+            None,
+            None,
+            "run_flush:publish-r1",
+        )
+        .unwrap());
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["msg.completed"]
+        );
+
+        assert!(!append_message_dedup_and_publish(
+            &c,
+            "s1",
+            "assistant",
+            &[Block::Text {
+                text: "duplicate".into(),
+            }],
+            Some("claude"),
+            None,
+            None,
+            "run_flush:publish-r1",
+        )
+        .unwrap());
+        assert!(crate::remote_gateway::test_take_publish_log().is_empty());
+    }
+
+    #[test]
+    fn append_message_dedup_defers_publish_until_caller_commits() {
+        let c = crate::test_support::mem_db();
+        create_session(&c, "s1", "x", "local-default", "local").unwrap();
+
+        crate::remote_gateway::test_take_publish_log();
+        let tx = c.unchecked_transaction().unwrap();
+        let milestone = append_message_dedup(
+            &tx,
+            "s1",
+            "assistant",
+            &[Block::Text {
+                text: "in-tx".into(),
+            }],
+            Some("claude"),
+            None,
+            None,
+            "run_flush:tx-defer",
+        )
+        .unwrap();
+        assert!(milestone.is_some(), "真插入应返回 Some(milestone)");
+        assert!(
+            crate::remote_gateway::test_take_publish_log().is_empty(),
+            "append_message_dedup 不应在事务提交前发布 msg.completed"
+        );
+
+        tx.commit().unwrap();
+        milestone.unwrap().publish();
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["msg.completed"],
+            "commit 成功之后调用 publish() 才应该真正发布"
+        );
     }
 
     #[test]
@@ -11058,5 +13102,1624 @@ mod agents {
             .query_row("SELECT COUNT(*) FROM daily_report", [], |row| row.get(0))
             .unwrap();
         assert_eq!((intro_count, daily_count), (1, 1));
+    }
+
+    // M1-T1（remote control M0 §4c）：session_runtime 表 helper 单测。
+
+    #[test]
+    fn set_session_runtime_same_values_do_not_publish() {
+        let conn = mem();
+        crate::remote_gateway::test_take_publish_log();
+        crate::remote_gateway::test_take_run_status_payload_log();
+        assert!(set_session_runtime(&conn, "s-same", "running", Some("run-1")).unwrap());
+
+        crate::remote_gateway::test_take_publish_log();
+        crate::remote_gateway::test_take_run_status_payload_log();
+        assert!(!set_session_runtime(&conn, "s-same", "running", Some("run-1")).unwrap());
+        assert!(crate::remote_gateway::test_take_publish_log().is_empty());
+        assert!(
+            crate::remote_gateway::test_take_run_status_payload_log().is_empty(),
+            "同值重写不该发布 run.status payload"
+        );
+    }
+
+    #[test]
+    fn set_session_runtime_changed_values_publish_once() {
+        let conn = mem();
+        set_session_runtime(&conn, "s-changed", "running", Some("run-1")).unwrap();
+        crate::remote_gateway::test_take_publish_log();
+        crate::remote_gateway::test_take_run_status_payload_log();
+
+        assert!(set_session_runtime(&conn, "s-changed", "running", Some("run-2")).unwrap());
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["run.status"]
+        );
+        crate::remote_gateway::test_take_run_status_payload_log();
+    }
+
+    #[test]
+    fn set_session_runtime_new_row_publishes_once() {
+        let conn = mem();
+        crate::remote_gateway::test_take_publish_log();
+        crate::remote_gateway::test_take_run_status_payload_log();
+
+        assert!(set_session_runtime(&conn, "s-new", "running", Some("run-new")).unwrap());
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["run.status"]
+        );
+        crate::remote_gateway::test_take_run_status_payload_log();
+    }
+
+    #[test]
+    fn upsert_session_runtime_status_same_value_does_not_publish() {
+        let conn = mem();
+        set_session_runtime(&conn, "s-refresh-same", "running", Some("run-keep")).unwrap();
+        crate::remote_gateway::test_take_publish_log();
+        crate::remote_gateway::test_take_run_status_payload_log();
+
+        assert!(!upsert_session_runtime_status(&conn, "s-refresh-same", "running").unwrap());
+        assert!(crate::remote_gateway::test_take_publish_log().is_empty());
+        assert!(
+            crate::remote_gateway::test_take_run_status_payload_log().is_empty(),
+            "同 status 重写不该发布 run.status payload"
+        );
+    }
+
+    #[test]
+    fn upsert_session_runtime_status_change_publishes_existing_run_id() {
+        let conn = mem();
+        set_session_runtime(&conn, "s-refresh-changed", "running", Some("run-keep")).unwrap();
+        crate::remote_gateway::test_take_publish_log();
+        crate::remote_gateway::test_take_run_status_payload_log();
+
+        assert!(upsert_session_runtime_status(&conn, "s-refresh-changed", "idle").unwrap());
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["run.status"]
+        );
+        assert_eq!(
+            crate::remote_gateway::test_take_run_status_payload_log(),
+            vec![serde_json::json!({
+                "session_id": "s-refresh-changed",
+                "status": "idle",
+                "run_id": "run-keep",
+            })],
+            "refresh 发布必须沿用写前读到的 run_id"
+        );
+        assert_eq!(
+            get_session_runtime(&conn, "s-refresh-changed")
+                .unwrap()
+                .unwrap()
+                .run_id
+                .as_deref(),
+            Some("run-keep")
+        );
+    }
+
+    #[test]
+    fn upsert_session_runtime_status_new_row_publishes_once() {
+        let conn = mem();
+        crate::remote_gateway::test_take_publish_log();
+        crate::remote_gateway::test_take_run_status_payload_log();
+
+        assert!(upsert_session_runtime_status(&conn, "s-refresh-new-publish", "idle").unwrap());
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["run.status"]
+        );
+        assert_eq!(
+            crate::remote_gateway::test_take_run_status_payload_log(),
+            vec![serde_json::json!({
+                "session_id": "s-refresh-new-publish",
+                "status": "idle",
+                "run_id": null,
+            })]
+        );
+    }
+
+    #[test]
+    fn set_session_runtime_upserts_idempotently() {
+        let conn = mem();
+        set_session_runtime(&conn, "s1", "running", Some("run-1")).unwrap();
+        let row = get_session_runtime(&conn, "s1").unwrap().unwrap();
+        assert_eq!(row.status, "running");
+        assert_eq!(row.run_id.as_deref(), Some("run-1"));
+        let first_updated_at = row.updated_at;
+
+        // 第二次 upsert（同 session_id）必须更新同一行，不产生第二行。
+        set_session_runtime(&conn, "s1", "idle", None).unwrap();
+        let row = get_session_runtime(&conn, "s1").unwrap().unwrap();
+        assert_eq!(row.status, "idle");
+        assert_eq!(row.run_id, None);
+        assert!(row.updated_at >= first_updated_at);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_runtime", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "upsert 必须是同一行，不能插出第二行");
+    }
+
+    /// M1 修复轮 P1-1：`upsert_session_runtime_status`（refresh 写口专用）在已有行上只动
+    /// status/updated_at，run_id 必须原样保留——这是它与 `set_session_runtime` 唯一的行为差异。
+    #[test]
+    fn upsert_session_runtime_status_preserves_existing_run_id() {
+        let conn = mem();
+        set_session_runtime(&conn, "s-refresh", "running", Some("run-keep")).unwrap();
+
+        upsert_session_runtime_status(&conn, "s-refresh", "idle").unwrap();
+
+        let row = get_session_runtime(&conn, "s-refresh").unwrap().unwrap();
+        assert_eq!(row.status, "idle");
+        assert_eq!(
+            row.run_id.as_deref(),
+            Some("run-keep"),
+            "refresh 写口不该覆盖 run_id——它压根不知道新值"
+        );
+    }
+
+    /// 新行（此前从未 reserve 过）经 `upsert_session_runtime_status` 落地必须是 NULL run_id
+    /// （没有别的值可继承），且不产生第二行（幂等 upsert）。
+    #[test]
+    fn upsert_session_runtime_status_inserts_null_run_id_for_new_row() {
+        let conn = mem();
+        upsert_session_runtime_status(&conn, "s-refresh-new", "running").unwrap();
+
+        let row = get_session_runtime(&conn, "s-refresh-new")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "running");
+        assert_eq!(row.run_id, None);
+
+        upsert_session_runtime_status(&conn, "s-refresh-new", "idle").unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_runtime", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "upsert 必须是同一行，不能插出第二行");
+    }
+
+    #[test]
+    fn get_session_runtime_returns_none_for_unknown_session() {
+        let conn = mem();
+        assert_eq!(get_session_runtime(&conn, "unknown-session").unwrap(), None);
+    }
+
+    #[test]
+    fn list_running_sessions_only_returns_running_status() {
+        let conn = mem();
+        set_session_runtime(&conn, "s-running-1", "running", Some("run-a")).unwrap();
+        set_session_runtime(&conn, "s-idle-1", "idle", None).unwrap();
+        set_session_runtime(&conn, "s-running-2", "running", None).unwrap();
+
+        let mut running = list_running_sessions(&conn).unwrap();
+        running.sort();
+        assert_eq!(running, vec!["s-running-1", "s-running-2"]);
+    }
+
+    #[test]
+    fn reconcile_session_runtime_on_startup_clears_stale_running_rows() {
+        let conn = mem();
+        set_session_runtime(&conn, "s-crashed", "running", Some("run-orphan")).unwrap();
+        set_session_runtime(&conn, "s-already-idle", "idle", None).unwrap();
+        crate::remote_gateway::test_take_publish_log();
+        crate::remote_gateway::test_take_run_status_payload_log();
+
+        reconcile_session_runtime_on_startup(&conn).unwrap();
+
+        assert!(
+            crate::remote_gateway::test_take_publish_log().is_empty(),
+            "启动 reconcile 不应发布 run.status"
+        );
+        assert!(crate::remote_gateway::test_take_run_status_payload_log().is_empty());
+
+        let crashed = get_session_runtime(&conn, "s-crashed").unwrap().unwrap();
+        assert_eq!(crashed.status, "idle");
+        assert_eq!(crashed.run_id, None, "reconcile 必须一并清空 run_id");
+
+        let already_idle = get_session_runtime(&conn, "s-already-idle")
+            .unwrap()
+            .unwrap();
+        assert_eq!(already_idle.status, "idle");
+
+        assert_eq!(list_running_sessions(&conn).unwrap().len(), 0);
+    }
+
+    /// 变异自证：CREATE TABLE IF NOT EXISTS 是幂等的——同一 conn 上重复调用 init_schema
+    /// 不得清空/重建已有 session_runtime 数据（防未来有人把这张表误改成非幂等迁移）。
+    #[test]
+    fn init_schema_is_idempotent_for_session_runtime_table() {
+        let conn = mem();
+        set_session_runtime(&conn, "s-survives-reinit", "running", Some("run-x")).unwrap();
+        init_schema(&conn).unwrap();
+        let row = get_session_runtime(&conn, "s-survives-reinit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "running");
+    }
+
+    // T-4b（remote control M0 §3/§4b）：remote_inbox 表 helper 单测。
+
+    fn insert_remote_inbox_session(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO sessions (id, title, created_at, namespace_id) VALUES (?1, ?1, 0, NULL)",
+            [id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn init_schema_upgrades_legacy_remote_inbox_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE remote_inbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                command_id TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                delivered_at INTEGER
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE INDEX idx_remote_inbox_pending \
+             ON remote_inbox(session_id, id) \
+             WHERE delivered_at IS NULL",
+            [],
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let mut stmt = conn.prepare("PRAGMA table_info(remote_inbox)").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for column in ["attempts", "failed_at", "last_error"] {
+            assert!(
+                cols.iter().any(|existing| existing == column),
+                "旧库 remote_inbox 应补上 {column} 列：实际 {cols:?}"
+            );
+        }
+
+        let index_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_remote_inbox_pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            index_sql.contains("failed_at"),
+            "旧 partial index 应重建并排除 failed 行：实际 {index_sql}"
+        );
+
+        insert_remote_inbox_session(&conn, "s-inbox-legacy");
+        assert!(enqueue_remote_input(
+            &conn,
+            "s-inbox-legacy",
+            "cmd-legacy",
+            "input.send",
+            r#"{"text":"legacy"}"#,
+        )
+        .unwrap());
+        let entry = next_pending_remote_input(&conn, "s-inbox-legacy")
+            .unwrap()
+            .expect("升级后的旧库应能读取 pending 消息");
+        mark_remote_input_failed(&conn, entry.id, "LEGACY_DELIVERY_FAILED").unwrap();
+        assert_eq!(
+            next_pending_remote_input(&conn, "s-inbox-legacy").unwrap(),
+            None,
+            "标记失败后的消息应被 pending 查询排除"
+        );
+        let (attempts, failed_at, last_error): (i64, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT attempts, failed_at, last_error FROM remote_inbox WHERE id = ?1",
+                [entry.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(attempts, 0);
+        assert!(failed_at.is_some());
+        assert_eq!(last_error.as_deref(), Some("LEGACY_DELIVERY_FAILED"));
+
+        init_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn enqueue_remote_input_is_idempotent_by_command_id() {
+        let conn = mem();
+        let first = enqueue_remote_input(
+            &conn,
+            "s-inbox-1",
+            "cmd-1",
+            "input.send",
+            "{\"text\":\"a\"}",
+        )
+        .unwrap();
+        let second = enqueue_remote_input(
+            &conn,
+            "s-inbox-1",
+            "cmd-1",
+            "input.send",
+            "{\"text\":\"dup\"}",
+        )
+        .unwrap();
+        assert!(first, "首次插入必须成功");
+        assert!(!second, "同 command_id 二次插入必须被幂等吞掉");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM remote_inbox WHERE command_id = 'cmd-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "重复 command_id 不该产生第二行");
+    }
+
+    #[test]
+    fn remote_inbox_terminal_state_lookup_covers_pending_delivered_failed_and_missing() {
+        let conn = mem();
+        enqueue_remote_input(&conn, "s-inbox-state", "cmd-state", "input.send", "{}").unwrap();
+        assert_eq!(
+            remote_inbox_terminal_state_by_command_id(&conn, "cmd-state").unwrap(),
+            Some(RemoteInboxTerminalState::Pending)
+        );
+
+        let delivered = next_pending_remote_input(&conn, "s-inbox-state")
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.command_id, "cmd-state");
+        mark_remote_input_delivered(&conn, delivered.id).unwrap();
+        assert_eq!(
+            remote_inbox_terminal_state_by_command_id(&conn, "cmd-state").unwrap(),
+            Some(RemoteInboxTerminalState::Delivered)
+        );
+
+        enqueue_remote_input(&conn, "s-inbox-state", "cmd-failed", "input.send", "{}").unwrap();
+        let failed = next_pending_remote_input(&conn, "s-inbox-state")
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.command_id, "cmd-failed");
+        mark_remote_input_failed(&conn, failed.id, "TEST_FAILED").unwrap();
+
+        assert_eq!(
+            remote_inbox_terminal_state_by_command_id(&conn, "cmd-failed").unwrap(),
+            Some(RemoteInboxTerminalState::Failed)
+        );
+        assert_eq!(
+            remote_inbox_terminal_state_by_command_id(&conn, "cmd-missing").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn control_command_ledger_is_idempotent_and_terminal_from_insert() {
+        let conn = mem();
+        insert_remote_inbox_session(&conn, "s-control-ledger");
+
+        assert!(
+            record_control_command_seen(&conn, "s-control-ledger", "cmd-control-ledger-1", "{}",)
+                .unwrap(),
+            "首次 control command_id 应写入账本"
+        );
+        assert!(
+            !record_control_command_seen(&conn, "s-control-ledger", "cmd-control-ledger-1", "{}",)
+                .unwrap(),
+            "重复 control command_id 应被 UNIQUE 幂等拒绝"
+        );
+
+        let (kind, payload, delivered_at): (String, String, Option<i64>) = conn
+            .query_row(
+                "SELECT kind, payload, delivered_at FROM remote_inbox \
+                 WHERE command_id = 'cmd-control-ledger-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "control");
+        assert_eq!(payload, "{}");
+        assert!(delivered_at.is_some(), "账本行插入时必须已经是终态");
+        assert_eq!(
+            next_pending_remote_input(&conn, "s-control-ledger").unwrap(),
+            None,
+            "终态 control 账本行不得进入单会话 pending 查询"
+        );
+        assert!(
+            !sessions_with_pending_remote_input(&conn)
+                .unwrap()
+                .contains(&"s-control-ledger".to_owned()),
+            "终态 control 账本行不得进入启动重扫查询"
+        );
+    }
+
+    #[test]
+    fn next_pending_remote_input_returns_fifo_order() {
+        let conn = mem();
+        enqueue_remote_input(
+            &conn,
+            "s-inbox-2",
+            "cmd-a",
+            "input.send",
+            "{\"text\":\"a\"}",
+        )
+        .unwrap();
+        enqueue_remote_input(
+            &conn,
+            "s-inbox-2",
+            "cmd-b",
+            "input.send",
+            "{\"text\":\"b\"}",
+        )
+        .unwrap();
+
+        let first = next_pending_remote_input(&conn, "s-inbox-2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.command_id, "cmd-a", "FIFO：先插的先出");
+
+        mark_remote_input_delivered(&conn, first.id).unwrap();
+
+        let second = next_pending_remote_input(&conn, "s-inbox-2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.command_id, "cmd-b");
+    }
+
+    #[test]
+    fn next_pending_remote_input_excludes_input_answer_without_hiding_input_send() {
+        let conn = mem();
+        enqueue_remote_input(
+            &conn,
+            "s-inbox-kind-isolation",
+            "cmd-answer-pending",
+            "input.answer",
+            r#"{"decision_id":"d-1","option":"yes"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            next_pending_remote_input(&conn, "s-inbox-kind-isolation").unwrap(),
+            None,
+            "pending input.answer 只能由独立答案线程处理，绝不能进入 FIFO"
+        );
+
+        enqueue_remote_input(
+            &conn,
+            "s-inbox-kind-isolation",
+            "cmd-send-pending",
+            "input.send",
+            r#"{"text":"hello"}"#,
+        )
+        .unwrap();
+        let entry = next_pending_remote_input(&conn, "s-inbox-kind-isolation")
+            .unwrap()
+            .expect("同 session 的 input.send 仍应进入 FIFO");
+        assert_eq!(entry.command_id, "cmd-send-pending");
+        assert_eq!(entry.kind, "input.send");
+    }
+
+    #[test]
+    fn sessions_with_pending_remote_answer_reports_answer_but_not_send_only_session() {
+        let conn = mem();
+        insert_remote_inbox_session(&conn, "s-answer-pending");
+        insert_remote_inbox_session(&conn, "s-send-only");
+        enqueue_remote_input(
+            &conn,
+            "s-answer-pending",
+            "cmd-answer-pending",
+            "input.answer",
+            r#"{"decision_id":"d-1","option":"yes"}"#,
+        )
+        .unwrap();
+        enqueue_remote_input(
+            &conn,
+            "s-send-only",
+            "cmd-send-only",
+            "input.send",
+            r#"{"text":"hello"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sessions_with_pending_remote_answer(&conn).unwrap(),
+            vec!["s-answer-pending".to_string()],
+            "answer 启动重扫只报告有 pending input.answer 的会话"
+        );
+    }
+
+    #[test]
+    fn sessions_with_pending_remote_answer_excludes_delivered_and_failed_answers() {
+        let conn = mem();
+        for session_id in ["s-answer-live", "s-answer-delivered", "s-answer-failed"] {
+            insert_remote_inbox_session(&conn, session_id);
+        }
+        for (session_id, command_id) in [
+            ("s-answer-live", "cmd-answer-live"),
+            ("s-answer-delivered", "cmd-answer-delivered-terminal"),
+            ("s-answer-failed", "cmd-answer-failed-terminal"),
+        ] {
+            enqueue_remote_input(
+                &conn,
+                session_id,
+                command_id,
+                "input.answer",
+                r#"{"decision_id":"d-1","option":"yes"}"#,
+            )
+            .unwrap();
+        }
+        mark_remote_input_delivered_by_command_id(&conn, "cmd-answer-delivered-terminal").unwrap();
+        mark_remote_input_failed_by_command_id(&conn, "cmd-answer-failed-terminal", "TEST_FAILED")
+            .unwrap();
+
+        assert_eq!(
+            sessions_with_pending_remote_answer(&conn).unwrap(),
+            vec!["s-answer-live".to_string()],
+            "delivered/failed answer 已是终态，不得进入启动重扫"
+        );
+    }
+
+    #[test]
+    fn sessions_with_pending_remote_answer_excludes_soft_deleted_sessions() {
+        let conn = mem();
+        insert_remote_inbox_session(&conn, "s-answer-deleted");
+        enqueue_remote_input(
+            &conn,
+            "s-answer-deleted",
+            "cmd-answer-deleted",
+            "input.answer",
+            r#"{"decision_id":"d-1","option":"yes"}"#,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET deleted_at = 1 WHERE id = 's-answer-deleted'",
+            [],
+        )
+        .unwrap();
+
+        assert!(
+            sessions_with_pending_remote_answer(&conn)
+                .unwrap()
+                .is_empty(),
+            "软删会话即使还有 pending answer 也不得参与启动恢复"
+        );
+    }
+
+    #[test]
+    fn pending_remote_answers_returns_all_pending_answers_in_id_order_without_send() {
+        let conn = mem();
+        enqueue_remote_input(
+            &conn,
+            "s-answer-list",
+            "cmd-answer-first",
+            "input.answer",
+            r#"{"decision_id":"d-1","option":"yes"}"#,
+        )
+        .unwrap();
+        enqueue_remote_input(
+            &conn,
+            "s-answer-list",
+            "cmd-send-middle",
+            "input.send",
+            r#"{"text":"hello"}"#,
+        )
+        .unwrap();
+        enqueue_remote_input(
+            &conn,
+            "s-answer-list",
+            "cmd-answer-second",
+            "input.answer",
+            r#"{"decision_id":"d-2","option":"no"}"#,
+        )
+        .unwrap();
+
+        let entries = pending_remote_answers(&conn, "s-answer-list").unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.command_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cmd-answer-first", "cmd-answer-second"]
+        );
+        assert!(entries[0].id < entries[1].id, "答案必须按 id 升序返回");
+        assert!(entries.iter().all(|entry| entry.kind == "input.answer"));
+    }
+
+    #[test]
+    fn pending_remote_answers_does_not_return_other_session_or_terminal_rows() {
+        let conn = mem();
+        enqueue_remote_input(
+            &conn,
+            "s-answer-target",
+            "cmd-answer-target",
+            "input.answer",
+            r#"{"decision_id":"d-target","option":"yes"}"#,
+        )
+        .unwrap();
+        enqueue_remote_input(
+            &conn,
+            "s-answer-other",
+            "cmd-answer-other",
+            "input.answer",
+            r#"{"decision_id":"d-other","option":"no"}"#,
+        )
+        .unwrap();
+        enqueue_remote_input(
+            &conn,
+            "s-answer-target",
+            "cmd-answer-terminal",
+            "input.answer",
+            r#"{"decision_id":"d-terminal","option":"yes"}"#,
+        )
+        .unwrap();
+        mark_remote_input_delivered_by_command_id(&conn, "cmd-answer-terminal").unwrap();
+
+        let entries = pending_remote_answers(&conn, "s-answer-target").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command_id, "cmd-answer-target");
+        assert_eq!(entries[0].session_id, "s-answer-target");
+    }
+
+    #[test]
+    fn mark_remote_input_delivered_removes_it_from_pending_queue() {
+        let conn = mem();
+        enqueue_remote_input(
+            &conn,
+            "s-inbox-3",
+            "cmd-only",
+            "input.send",
+            "{\"text\":\"a\"}",
+        )
+        .unwrap();
+        let entry = next_pending_remote_input(&conn, "s-inbox-3")
+            .unwrap()
+            .unwrap();
+        mark_remote_input_delivered(&conn, entry.id).unwrap();
+
+        assert_eq!(
+            next_pending_remote_input(&conn, "s-inbox-3").unwrap(),
+            None,
+            "标记投递后不该再被 next_pending 取到"
+        );
+    }
+
+    #[test]
+    fn mark_remote_input_delivered_by_command_id_sets_delivered_terminal_state() {
+        let conn = mem();
+        enqueue_remote_input(
+            &conn,
+            "s-answer-delivered",
+            "cmd-answer-delivered",
+            "input.answer",
+            "{}",
+        )
+        .unwrap();
+
+        mark_remote_input_delivered_by_command_id(&conn, "cmd-answer-delivered").unwrap();
+
+        assert_eq!(
+            remote_inbox_terminal_state_by_command_id(&conn, "cmd-answer-delivered").unwrap(),
+            Some(RemoteInboxTerminalState::Delivered)
+        );
+    }
+
+    #[test]
+    fn mark_remote_input_failed_by_command_id_sets_failed_terminal_state_and_error() {
+        let conn = mem();
+        enqueue_remote_input(
+            &conn,
+            "s-answer-failed",
+            "cmd-answer-failed",
+            "input.answer",
+            "{}",
+        )
+        .unwrap();
+
+        mark_remote_input_failed_by_command_id(&conn, "cmd-answer-failed", "NO_PENDING_QUESTION")
+            .unwrap();
+
+        assert_eq!(
+            remote_inbox_terminal_state_by_command_id(&conn, "cmd-answer-failed").unwrap(),
+            Some(RemoteInboxTerminalState::Failed)
+        );
+        let last_error: Option<String> = conn
+            .query_row(
+                "SELECT last_error FROM remote_inbox WHERE command_id = 'cmd-answer-failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_error.as_deref(), Some("NO_PENDING_QUESTION"));
+    }
+
+    #[test]
+    fn sessions_with_pending_remote_input_only_reports_undelivered_sessions() {
+        let conn = mem();
+        insert_remote_inbox_session(&conn, "s-inbox-pending");
+        insert_remote_inbox_session(&conn, "s-inbox-delivered");
+        enqueue_remote_input(&conn, "s-inbox-pending", "cmd-p1", "input.send", "{}").unwrap();
+        enqueue_remote_input(&conn, "s-inbox-delivered", "cmd-d1", "input.send", "{}").unwrap();
+        let delivered = next_pending_remote_input(&conn, "s-inbox-delivered")
+            .unwrap()
+            .unwrap();
+        mark_remote_input_delivered(&conn, delivered.id).unwrap();
+
+        let sessions = sessions_with_pending_remote_input(&conn).unwrap();
+        assert!(sessions.contains(&"s-inbox-pending".to_string()));
+        assert!(
+            !sessions.contains(&"s-inbox-delivered".to_string()),
+            "已全部投递的会话不该出现在重扫列表里"
+        );
+    }
+
+    #[test]
+    fn remote_input_delivery_failure_retries_twice_then_becomes_terminal() {
+        let conn = mem();
+        insert_remote_inbox_session(&conn, "s-inbox-retry");
+        enqueue_remote_input(
+            &conn,
+            "s-inbox-retry",
+            "cmd-retry",
+            "input.send",
+            r#"{"text":"retry"}"#,
+        )
+        .unwrap();
+        let entry = next_pending_remote_input(&conn, "s-inbox-retry")
+            .unwrap()
+            .unwrap();
+
+        for expected_attempts in 1..=3 {
+            let attempts = record_remote_input_failure(&conn, entry.id, "AGENT_NOT_FOUND")
+                .expect("记录投递失败次数");
+            assert_eq!(attempts, expected_attempts);
+            if attempts < 3 {
+                assert!(
+                    next_pending_remote_input(&conn, "s-inbox-retry")
+                        .unwrap()
+                        .is_some(),
+                    "前两次失败后仍应保留 pending"
+                );
+                assert!(
+                    sessions_with_pending_remote_input(&conn)
+                        .unwrap()
+                        .contains(&"s-inbox-retry".to_string()),
+                    "前两次失败后启动重扫仍应报告该会话"
+                );
+            } else {
+                mark_remote_input_failed(&conn, entry.id, "AGENT_NOT_FOUND")
+                    .expect("第三次失败标终态");
+            }
+        }
+
+        assert_eq!(
+            next_pending_remote_input(&conn, "s-inbox-retry").unwrap(),
+            None,
+            "第三次失败终态后不得再返回"
+        );
+        assert!(
+            !sessions_with_pending_remote_input(&conn)
+                .unwrap()
+                .contains(&"s-inbox-retry".to_string()),
+            "第三次失败终态后启动重扫不得再报告该会话"
+        );
+        let (attempts, failed_at, last_error): (i64, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT attempts, failed_at, last_error FROM remote_inbox WHERE id = ?1",
+                [entry.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(attempts, 3);
+        assert!(failed_at.is_some());
+        assert_eq!(last_error.as_deref(), Some("AGENT_NOT_FOUND"));
+    }
+
+    #[test]
+    fn mark_remote_input_failed_is_terminal_without_incrementing_attempts() {
+        let conn = mem();
+        enqueue_remote_input(
+            &conn,
+            "s-inbox-parse",
+            "cmd-parse",
+            "input.send",
+            "{malformed",
+        )
+        .unwrap();
+        let entry = next_pending_remote_input(&conn, "s-inbox-parse")
+            .unwrap()
+            .unwrap();
+        mark_remote_input_failed(&conn, entry.id, "REMOTE_INBOX_PAYLOAD_MALFORMED").unwrap();
+
+        assert_eq!(
+            next_pending_remote_input(&conn, "s-inbox-parse").unwrap(),
+            None,
+            "parse 失败应直接终态"
+        );
+        let (attempts, failed_at, last_error): (i64, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT attempts, failed_at, last_error FROM remote_inbox WHERE id = ?1",
+                [entry.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(attempts, 0, "parse 失败不消耗真实投递重试次数");
+        assert!(failed_at.is_some());
+        assert_eq!(
+            last_error.as_deref(),
+            Some("REMOTE_INBOX_PAYLOAD_MALFORMED")
+        );
+    }
+
+    #[test]
+    fn sessions_with_pending_remote_input_excludes_soft_deleted_sessions() {
+        let conn = mem();
+        insert_remote_inbox_session(&conn, "s-inbox-deleted");
+        enqueue_remote_input(
+            &conn,
+            "s-inbox-deleted",
+            "cmd-deleted",
+            "input.send",
+            r#"{"text":"queued"}"#,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET deleted_at = 1 WHERE id = 's-inbox-deleted'",
+            [],
+        )
+        .unwrap();
+
+        assert!(
+            !sessions_with_pending_remote_input(&conn)
+                .unwrap()
+                .contains(&"s-inbox-deleted".to_string()),
+            "软删会话即使还有 pending 行也不得参与启动重扫"
+        );
+    }
+
+    // T5e2（remote control M0 §5）：remote_devices 表 helper 单测。
+
+    fn remote_devices_column_names(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn.prepare("PRAGMA table_info(remote_devices)").unwrap();
+        stmt.query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn remote_devices_insert_and_list_roundtrip() {
+        let conn = mem();
+        insert_remote_device(
+            &conn,
+            "dev-1",
+            Some("room-a"),
+            "iPhone",
+            "hash-a",
+            "refresh-a",
+            1_700_003_600,
+            1_700_000_000,
+        )
+        .unwrap();
+        insert_remote_device(
+            &conn,
+            "dev-2",
+            None,
+            "",
+            "hash-b",
+            "refresh-b",
+            1_700_003_601_000,
+            1_700_000_001,
+        )
+        .unwrap();
+
+        let rows = list_remote_devices(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].device_id, "dev-1");
+        assert_eq!(rows[0].name, "iPhone");
+        assert_eq!(rows[0].token_hash, "hash-a");
+        assert_eq!(rows[0].refresh_hash, "refresh-a");
+        assert_eq!(rows[0].access_expires_at, 1_700_003_600_000);
+        assert_eq!(rows[0].revoked_at, None);
+        assert_eq!(rows[0].room_id.as_deref(), Some("room-a"));
+        assert_eq!(rows[0].generation, None);
+        assert_eq!(rows[0].refresh_until, None);
+        assert_eq!(rows[1].device_id, "dev-2");
+        assert_eq!(rows[1].access_expires_at, 1_700_003_601_000);
+    }
+
+    #[test]
+    fn remote_devices_revoke_is_idempotent_and_preserves_first_revoked_at() {
+        let conn = mem();
+        insert_remote_device(
+            &conn,
+            "dev-1",
+            None,
+            "",
+            "hash-a",
+            "refresh-a",
+            1_700_003_600,
+            1_700_000_000,
+        )
+        .unwrap();
+
+        assert!(revoke_remote_device(&conn, "dev-1", 1_700_001_000).unwrap());
+        assert!(!revoke_remote_device(&conn, "dev-1", 1_700_002_000).unwrap());
+
+        let rows = list_remote_devices(&conn).unwrap();
+        assert_eq!(rows[0].revoked_at, Some(1_700_001_000));
+    }
+
+    #[test]
+    fn remote_devices_revoke_unknown_device_returns_false() {
+        let conn = mem();
+        assert!(!revoke_remote_device(&conn, "does-not-exist", 1_700_001_000).unwrap());
+    }
+
+    #[test]
+    fn remote_devices_update_tokens_rotates_hashes_and_expiry() {
+        let conn = mem();
+        insert_remote_device(
+            &conn,
+            "dev-1",
+            None,
+            "",
+            "hash-old",
+            "refresh-old",
+            1_700_003_600,
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let changed =
+            update_remote_device_tokens(&conn, "dev-1", "hash-new", "refresh-new", 1_700_007_200)
+                .unwrap();
+        assert!(changed);
+
+        let rows = list_remote_devices(&conn).unwrap();
+        assert_eq!(rows[0].token_hash, "hash-new");
+        assert_eq!(rows[0].refresh_hash, "refresh-new");
+        assert_eq!(rows[0].access_expires_at, 1_700_007_200_000);
+
+        let changed = update_remote_device_tokens(
+            &conn,
+            "dev-1",
+            "hash-newer",
+            "refresh-newer",
+            1_700_010_800_000,
+        )
+        .unwrap();
+        assert!(changed);
+        assert_eq!(
+            list_remote_devices(&conn).unwrap()[0].access_expires_at,
+            1_700_010_800_000,
+            "毫秒入参必须原样落库，不能再乘一次"
+        );
+    }
+
+    #[test]
+    fn remote_devices_reject_non_positive_access_expiry_writes() {
+        let conn = mem();
+
+        for expires_at in [-1, 0] {
+            assert!(insert_remote_device(
+                &conn,
+                &format!("dev-{expires_at}"),
+                None,
+                "",
+                "hash",
+                "refresh",
+                expires_at,
+                1_700_000_000,
+            )
+            .is_err());
+        }
+
+        insert_remote_device(
+            &conn,
+            "dev-valid",
+            None,
+            "",
+            "hash-old",
+            "refresh-old",
+            1_700_003_600_000,
+            1_700_000_000,
+        )
+        .unwrap();
+        for expires_at in [-1, 0] {
+            assert!(update_remote_device_tokens(
+                &conn,
+                "dev-valid",
+                "hash-new",
+                "refresh-new",
+                expires_at,
+            )
+            .is_err());
+        }
+        assert_eq!(
+            list_remote_devices(&conn).unwrap()[0].access_expires_at,
+            1_700_003_600_000
+        );
+    }
+
+    #[test]
+    fn remote_devices_update_tokens_does_not_resurrect_revoked_device() {
+        let conn = mem();
+        insert_remote_device(
+            &conn,
+            "dev-1",
+            None,
+            "",
+            "hash-old",
+            "refresh-old",
+            1_700_003_600,
+            1_700_000_000,
+        )
+        .unwrap();
+        revoke_remote_device(&conn, "dev-1", 1_700_001_000).unwrap();
+
+        let changed =
+            update_remote_device_tokens(&conn, "dev-1", "hash-new", "refresh-new", 1_700_007_200)
+                .unwrap();
+        assert!(!changed, "已吊销设备不应被 refresh 悄悄复活");
+
+        let rows = list_remote_devices(&conn).unwrap();
+        assert_eq!(rows[0].token_hash, "hash-old");
+    }
+
+    #[test]
+    fn remote_devices_init_schema_is_idempotent_for_new_database() {
+        let conn = mem();
+        insert_remote_device(
+            &conn,
+            "dev-survives",
+            None,
+            "",
+            "hash-a",
+            "refresh-a",
+            1_700_003_600,
+            1_700_000_000,
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+
+        let rows = list_remote_devices(&conn).unwrap();
+        assert_eq!(rows[0].access_expires_at, 1_700_003_600_000);
+
+        init_schema(&conn).unwrap();
+
+        let rows = list_remote_devices(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].device_id, "dev-survives");
+
+        let columns = remote_devices_column_names(&conn);
+        for expected in [
+            "room_id",
+            "generation",
+            "refresh_until",
+            "journal_request_id",
+            "journal_generation",
+            "journal_prev_generation",
+            "journal_prev_access_hash",
+            "journal_prev_refresh_hash",
+            "journal_response_ct",
+            "journal_response_n",
+            "journal_prev_expires_at",
+            "journal_response_expires",
+        ] {
+            assert!(columns.iter().any(|column| column == expected));
+        }
+    }
+
+    #[test]
+    fn remote_devices_without_room_config_keep_legacy_room_id_null() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE remote_devices (
+                device_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                token_hash TEXT NOT NULL,
+                refresh_hash TEXT NOT NULL,
+                access_expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                revoked_at INTEGER
+            );
+            INSERT INTO remote_devices
+                (device_id, name, token_hash, refresh_hash, access_expires_at, created_at, revoked_at)
+            VALUES
+                ('legacy-device', 'Legacy', 'legacy-access', 'legacy-refresh', 1700003600, 1700000000, 1700000100);",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        assert_eq!(
+            list_remote_devices(&conn).unwrap()[0].access_expires_at,
+            1_700_003_600_000,
+            "旧秒值必须在第一次迁移时回填成毫秒"
+        );
+
+        init_schema(&conn).unwrap();
+
+        let columns = remote_devices_column_names(&conn);
+        assert_eq!(columns.len(), 19);
+        let rows = list_remote_devices(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].device_id, "legacy-device");
+        assert_eq!(rows[0].name, "Legacy");
+        assert_eq!(rows[0].token_hash, "legacy-access");
+        assert_eq!(rows[0].refresh_hash, "legacy-refresh");
+        assert_eq!(
+            rows[0].access_expires_at, 1_700_003_600_000,
+            "迁移重跑不得把已经是毫秒的值再乘 1000"
+        );
+        assert_eq!(rows[0].created_at, 1_700_000_000);
+        assert_eq!(rows[0].revoked_at, Some(1_700_000_100));
+        assert_eq!(rows[0].room_id, None);
+        assert_eq!(rows[0].generation, None);
+        assert_eq!(rows[0].refresh_until, None);
+    }
+
+    #[test]
+    fn remote_devices_migration_backfills_current_room_without_changing_other_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO app_settings(key, value) VALUES('remote_room_id', 'room-current');
+             CREATE TABLE remote_devices (
+                device_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                token_hash TEXT NOT NULL,
+                refresh_hash TEXT NOT NULL,
+                access_expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                revoked_at INTEGER
+             );
+             INSERT INTO remote_devices
+                (device_id, name, token_hash, refresh_hash, access_expires_at, created_at, revoked_at)
+             VALUES
+                ('legacy-device', 'Legacy', 'access-hash', 'refresh-hash',
+                 1700003600000, 1700000000, 1700000100);",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap();
+
+        let row = list_remote_devices(&conn).unwrap().remove(0);
+        assert_eq!(row.device_id, "legacy-device");
+        assert_eq!(row.name, "Legacy");
+        assert_eq!(row.token_hash, "access-hash");
+        assert_eq!(row.refresh_hash, "refresh-hash");
+        assert_eq!(row.access_expires_at, 1_700_003_600_000);
+        assert_eq!(row.created_at, 1_700_000_000);
+        assert_eq!(row.revoked_at, Some(1_700_000_100));
+        assert_eq!(row.room_id.as_deref(), Some("room-current"));
+        assert_eq!(row.generation, None);
+        assert_eq!(row.refresh_until, None);
+        assert_eq!(row.journal_request_id, None);
+        assert_eq!(row.journal_generation, None);
+        assert_eq!(row.journal_prev_generation, None);
+        assert_eq!(row.journal_prev_access_hash, None);
+        assert_eq!(row.journal_prev_refresh_hash, None);
+        assert_eq!(row.journal_response_ct, None);
+        assert_eq!(row.journal_response_n, None);
+        assert_eq!(row.journal_prev_expires_at, None);
+        assert_eq!(row.journal_response_expires, None);
+    }
+
+    #[test]
+    fn remote_devices_migration_leaves_non_positive_expiry_for_fail_closed_loading() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE remote_devices (
+                device_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                token_hash TEXT NOT NULL,
+                refresh_hash TEXT NOT NULL,
+                access_expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                revoked_at INTEGER
+            );
+            INSERT INTO remote_devices
+                (device_id, token_hash, refresh_hash, access_expires_at, created_at)
+            VALUES
+                ('negative', 'hash-negative', 'refresh-negative', -1, 1700000000),
+                ('zero', 'hash-zero', 'refresh-zero', 0, 1700000000);",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let rows = list_remote_devices(&conn).unwrap();
+        assert_eq!(rows[0].access_expires_at, -1);
+        assert_eq!(rows[1].access_expires_at, 0);
+    }
+
+    #[test]
+    fn remote_devices_registry_fields_roundtrip() {
+        let conn = mem();
+        insert_remote_device(
+            &conn,
+            "dev-registry",
+            None,
+            "",
+            "hash-a",
+            "refresh-a",
+            1_700_003_600,
+            1_700_000_000,
+        )
+        .unwrap();
+
+        assert!(
+            set_remote_device_registry(&conn, "dev-registry", "room-1", 7, 1_700_000_000_000,)
+                .unwrap()
+        );
+
+        let rows = list_remote_devices(&conn).unwrap();
+        assert_eq!(rows[0].room_id.as_deref(), Some("room-1"));
+        assert_eq!(rows[0].generation, Some(7));
+        assert_eq!(rows[0].refresh_until, Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn remote_device_registry_rejects_second_scale_refresh_until() {
+        let conn = mem();
+        insert_remote_device(
+            &conn,
+            "dev-registry-seconds",
+            None,
+            "",
+            "hash-a",
+            "refresh-a",
+            1_700_003_600_000,
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let error =
+            set_remote_device_registry(&conn, "dev-registry-seconds", "room-1", 7, 1_700_000_000)
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            rusqlite::Error::IntegralValueOutOfRange(_, 1_700_000_000)
+        ));
+        let row = list_remote_devices(&conn).unwrap().remove(0);
+        assert_eq!(row.room_id, None);
+        assert_eq!(row.generation, None);
+        assert_eq!(row.refresh_until, None);
+    }
+
+    #[test]
+    fn get_remote_device_returns_none_for_unknown_id() {
+        let conn = mem();
+        assert_eq!(get_remote_device(&conn, "dev-missing").unwrap(), None);
+    }
+
+    #[test]
+    fn get_remote_device_matches_the_row_from_list_remote_devices() {
+        let conn = mem();
+        insert_remote_device(
+            &conn,
+            "dev-single",
+            None,
+            "",
+            "hash-a",
+            "refresh-a",
+            1_700_003_600_000,
+            1_700_000_000,
+        )
+        .unwrap();
+        assert!(
+            set_remote_device_registry(&conn, "dev-single", "room-1", 3, 1_700_000_000_000,)
+                .unwrap()
+        );
+
+        let single = get_remote_device(&conn, "dev-single").unwrap().unwrap();
+        let listed = list_remote_devices(&conn).unwrap().remove(0);
+        assert_eq!(single, listed);
+        assert_eq!(single.room_id.as_deref(), Some("room-1"));
+        assert_eq!(single.generation, Some(3));
+    }
+
+    #[test]
+    fn remote_devices_refresh_journal_roundtrip_and_clear() {
+        let conn = mem();
+        insert_remote_device(
+            &conn,
+            "dev-journal",
+            None,
+            "",
+            "hash-a",
+            "refresh-a",
+            1_700_003_600,
+            1_700_000_000,
+        )
+        .unwrap();
+        let journal = RemoteRefreshJournal {
+            request_id: "request-1".to_string(),
+            generation: 8,
+            prev_generation: 7,
+            prev_access_hash: "prev-access".to_string(),
+            prev_refresh_hash: "prev-refresh".to_string(),
+            response_ct: "ciphertext".to_string(),
+            response_n: "nonce".to_string(),
+            prev_expires_at: 1_700_172_800_000,
+            response_expires: 1_700_003_600_000,
+        };
+
+        assert!(store_refresh_journal(&conn, "dev-journal", &journal).unwrap());
+        assert_eq!(
+            load_refresh_journal(&conn, "dev-journal").unwrap(),
+            Some(journal)
+        );
+        assert!(clear_refresh_journal(&conn, "dev-journal").unwrap());
+        assert_eq!(load_refresh_journal(&conn, "dev-journal").unwrap(), None);
+    }
+
+    #[test]
+    fn remote_registry_counter_starts_at_one_and_is_monotonic_per_room() {
+        let conn = mem();
+        assert_eq!(next_registry_generation(&conn, "room-a").unwrap(), 1);
+        assert_eq!(next_registry_generation(&conn, "room-a").unwrap(), 2);
+        assert_eq!(next_registry_generation(&conn, "room-b").unwrap(), 1);
+        assert_eq!(next_registry_generation(&conn, "room-a").unwrap(), 3);
+    }
+
+    #[test]
+    fn remote_registry_bump_to_is_idempotent_and_never_moves_backward() {
+        let conn = mem();
+        bump_registry_counter_to(&conn, "room-a", 10).unwrap();
+        bump_registry_counter_to(&conn, "room-a", 10).unwrap();
+        bump_registry_counter_to(&conn, "room-a", 4).unwrap();
+        assert_eq!(next_registry_generation(&conn, "room-a").unwrap(), 11);
+        assert_eq!(next_registry_generation(&conn, "room-a").unwrap(), 12);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // M2-4a：project_remote_rooms schema + resolver + 分配
+    // ---------------------------------------------------------------------------------
+
+    #[test]
+    fn project_remote_room_schema_migration_is_idempotent() {
+        let conn = mem();
+        let room = ensure_remote_room_for_project(&conn, "proj-1").unwrap();
+
+        // 重跑 init_schema（模拟应用重启再次建表）不得报错，也不得动已有行。
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap();
+
+        assert_eq!(
+            remote_room_for_project(&conn, "proj-1").unwrap(),
+            Some(room)
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM project_remote_rooms", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "重跑迁移不得复制/丢失已有行");
+    }
+
+    /// R2 · 确定性替补：24 线程 barrier 测试只是「概率性」证明并发路径不产两个房——
+    /// PK/UNIQUE 这两条防线本身此前零直接覆盖（谁都可能手滑把它们从迁移 SQL 里删掉，
+    /// 而并发测试依然大概率绿，只是命中率从必红变成偶尔红）。这条测试直接读
+    /// `PRAGMA table_info`/`PRAGMA index_list` 断言约束「在」，两条任一被删都会确定性
+    /// 转红。
+    #[test]
+    fn project_remote_room_schema_enforces_project_id_pk_and_room_id_unique_not_null() {
+        let conn = mem();
+
+        // (name, notnull, pk) —— PRAGMA table_info 列序：cid,name,type,notnull,dflt_value,pk。
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(project_remote_rooms)")
+            .unwrap();
+        let cols: Vec<(String, i64, i64)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        drop(stmt);
+
+        let project_id_col = cols
+            .iter()
+            .find(|(name, _, _)| name == "project_id")
+            .expect("project_remote_rooms 必须有 project_id 列");
+        assert_eq!(
+            project_id_col.2, 1,
+            "project_id 必须是主键（pk=1）：{cols:?}"
+        );
+
+        let room_id_col = cols
+            .iter()
+            .find(|(name, _, _)| name == "room_id")
+            .expect("project_remote_rooms 必须有 room_id 列");
+        assert_eq!(room_id_col.1, 1, "room_id 必须 NOT NULL：{cols:?}");
+
+        // room_id 的 UNIQUE：TEXT NOT NULL UNIQUE 会让 SQLite 自动建一条
+        // sqlite_autoindex_* 唯一索引，覆盖单列 room_id。
+        let mut idx_stmt = conn
+            .prepare("PRAGMA index_list(project_remote_rooms)")
+            .unwrap();
+        let indexes: Vec<(String, i64)> = idx_stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        drop(idx_stmt);
+
+        let mut found_room_id_unique_index = false;
+        for (index_name, is_unique) in &indexes {
+            if *is_unique != 1 {
+                continue;
+            }
+            let mut cols_stmt = conn
+                .prepare(&format!("PRAGMA index_info('{index_name}')"))
+                .unwrap();
+            let idx_cols: Vec<String> = cols_stmt
+                .query_map([], |row| row.get::<_, String>(2))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            if idx_cols == vec!["room_id".to_string()] {
+                found_room_id_unique_index = true;
+            }
+        }
+        assert!(
+            found_room_id_unique_index,
+            "room_id 必须有单列 UNIQUE 索引：indexes={indexes:?}"
+        );
+    }
+
+    /// R2 · 裸 SQL 语义测试：不经过 `ensure_remote_room_for_project`，直接验证
+    /// `INSERT OR IGNORE` 撞主键时的行为本身——已有行原样保留、不被覆盖、不报错。这是
+    /// `ensure_remote_room_for_project` 并发方案成立的底层前提，单独钉死。
+    #[test]
+    fn project_remote_room_insert_or_ignore_does_not_overwrite_existing_row() {
+        let conn = mem();
+        conn.execute(
+            "INSERT INTO project_remote_rooms (project_id, room_id, created_at_ms) \
+             VALUES ('p1', 'r1', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO project_remote_rooms (project_id, room_id, created_at_ms) \
+             VALUES ('p1', 'r2', 2)",
+            [],
+        )
+        .unwrap();
+
+        let room: String = conn
+            .query_row(
+                "SELECT room_id FROM project_remote_rooms WHERE project_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            room, "r1",
+            "INSERT OR IGNORE 撞主键必须原样保留旧行，不覆盖"
+        );
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_remote_rooms WHERE project_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "撞主键的 INSERT OR IGNORE 不得多插一行");
+    }
+
+    #[test]
+    fn project_remote_room_resolver_returns_none_when_unassigned() {
+        let conn = mem();
+        assert_eq!(
+            remote_room_for_project(&conn, "proj-never-assigned").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn project_remote_room_assignment_is_idempotent_per_project() {
+        let conn = mem();
+        let first = ensure_remote_room_for_project(&conn, "proj-1").unwrap();
+        let second = ensure_remote_room_for_project(&conn, "proj-1").unwrap();
+        assert_eq!(first, second, "同一 project 两次分配必须拿到同一个 room_id");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_remote_rooms WHERE project_id = 'proj-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "同一 project 不得插出第二行");
+    }
+
+    #[test]
+    fn project_remote_room_assignment_differs_across_projects() {
+        let conn = mem();
+        let room_a = ensure_remote_room_for_project(&conn, "proj-a").unwrap();
+        let room_b = ensure_remote_room_for_project(&conn, "proj-b").unwrap();
+        assert_ne!(room_a, room_b, "不同 project 不得分到同一个 room_id");
+    }
+
+    #[test]
+    fn project_remote_room_id_shape_is_32_lowercase_hex() {
+        let conn = mem();
+        let room = ensure_remote_room_for_project(&conn, "proj-shape").unwrap();
+        assert_eq!(room.len(), 32, "room_id 必须是 128-bit → 32 位 hex：{room}");
+        assert!(
+            room.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "room_id 必须是小写 hex：{room}"
+        );
+    }
+
+    /// 并发安全的真实多连接实证：不用共享同一个 `Connection`（那样 app 层
+    /// `Db(Mutex<Connection>)` 早把并发串行化了，测不出 `ensure_remote_room_for_project`
+    /// 自身这层防线），而是给每个线程各开一条指向同一 sqlite 文件的独立连接，模拟
+    /// lib.rs 里偶尔另开连接（`cli_path_override_for_spawn`）那种不经过全局锁的路径。
+    #[test]
+    fn project_remote_room_assignment_is_concurrency_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("m24a-concurrency.db");
+
+        {
+            let setup = Connection::open(&db_path).unwrap();
+            init_schema(&setup).unwrap();
+        }
+
+        const THREAD_COUNT: usize = 24;
+        // Barrier 让所有线程先各自开好连接、卡在同一起跑线，`wait()` 放行后几乎同一
+        // 瞬间一起调用 `ensure_remote_room_for_project`——不这样做的话线程创建本身的
+        // 调度抖动会把「先查后插」那个窗口拉开，race 命中率会掉到不可靠。
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREAD_COUNT));
+        let handles: Vec<_> = (0..THREAD_COUNT)
+            .map(|_| {
+                let path = db_path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let conn = Connection::open(&path).unwrap();
+                    conn.busy_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    barrier.wait();
+                    ensure_remote_room_for_project(&conn, "proj-race").unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let first = results[0].clone();
+        assert!(
+            results.iter().all(|room| *room == first),
+            "并发分配必须收敛到同一个 room_id，实际观测到:{results:?}"
+        );
+
+        let verify = Connection::open(&db_path).unwrap();
+        let count: i64 = verify
+            .query_row(
+                "SELECT COUNT(*) FROM project_remote_rooms WHERE project_id = 'proj-race'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "并发分配不得在表里落两行");
     }
 }

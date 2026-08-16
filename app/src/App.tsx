@@ -78,6 +78,7 @@ import {
   assistantText,
   ensureStreamTail,
   hasRunningTool,
+  sealStreamTail,
   sweepRunning,
 } from "./lib/streamBlocks";
 import { isHiddenTool } from "./lib/streamItems";
@@ -669,6 +670,8 @@ function AppContent() {
     new Map(),
   );
   const runningSessionsRef = useRef<Map<string, RunInfo>>(new Map());
+  // 每会话清 run 态序号：跨 await 判断终态是否已抢先到达，避免随后把已收工的 run 重新画活。
+  const closeoutSeqRef = useRef<Map<string, number>>(new Map());
   const sessionEventEpochRef = useRef<Map<string, number>>(new Map());
   const stopIssuedAtRef = useRef<Map<string, number>>(new Map());
   // 左栏行状态点三态：running 由 runningSessions 派生即可（此 map 记 running + 终态 attention/done，
@@ -1400,6 +1403,12 @@ function AppContent() {
     info: RunInfo | null,
     options?: { preserveStopGate?: boolean },
   ) {
+    if (!info) {
+      closeoutSeqRef.current.set(
+        sid,
+        (closeoutSeqRef.current.get(sid) ?? 0) + 1,
+      );
+    }
     const current = runningSessionsRef.current.get(sid);
     if (!info && !options?.preserveStopGate) {
       const stopIssuedAt = stopIssuedAtRef.current.get(sid);
@@ -2876,6 +2885,18 @@ function AppContent() {
   // 每次渲染同步刷新，effect 里只经 ref 调用取当前值）。
   const resolveRuntimeTeamConfigRef = useRef(resolveRuntimeTeamConfig);
   resolveRuntimeTeamConfigRef.current = resolveRuntimeTeamConfig;
+  // 远端 session_started 没有 agent 字段：复用本机 lead 开跑的会话配置来源，
+  // 再从当前 agentProfiles 映射展示名；经 ref 避免事件监听器读到挂载时闭包。
+  function sessionRunIdentity(sid: string) {
+    const configuredAgentId = resolveRuntimeTeamConfig(sid).effectiveLeadId;
+    return {
+      engine: configuredAgentId,
+      agent_id: configuredAgentId,
+      agent_name_snapshot: agentNameSnapshotFor(configuredAgentId),
+    };
+  }
+  const sessionRunIdentityRef = useRef(sessionRunIdentity);
+  sessionRunIdentityRef.current = sessionRunIdentity;
 
   function defaultWorkerAgentId(runtime: RuntimeTeamConfig): string | null {
     if (runtime.hasSavedLead) return runtime.memberPoolIds[0] ?? null;
@@ -3148,6 +3169,14 @@ function AppContent() {
       );
 
       if (ev.kind === "session_started") {
+        if (!runningSessionsRef.current.has(sid)) {
+          const identity = sessionRunIdentityRef.current(sid);
+          setRun(sid, {
+            startedAt: Date.now(),
+            workingTokens: null,
+            ...identity,
+          });
+        }
         return;
       }
 
@@ -3541,15 +3570,21 @@ function AppContent() {
         let finalMsgs = swept;
         if (streamed === "" && (ev.final_text ?? "") !== "") {
           // 决策卡结尾时 streamed==="" 必命中·末条是被 consume 的卡 → ensureStreamTail 另起新消息·final_text 不被吞（块②a-1）。
+          // F1：同一 run 的收尾续写，不是新一轮 delta——allowSealedTail 让它续灌进
+          // 可能已被前面分支（或 onStop）封过口的尾巴，不另起孤儿气泡。
           finalMsgs = appendTextDelta(
-            ensureStreamTail(swept, leadStreamIdentity(sid)),
+            ensureStreamTail(swept, leadStreamIdentity(sid), {
+              allowSealedTail: true,
+            }),
             ev.final_text ?? "",
           );
         }
         // plan B3：非空轮（后端带 commit 字段）→ 末尾 append 持久 run_card block
         if (ev.files_changed != null && ev.run_id) {
           finalMsgs = appendRunCard(
-            ensureStreamTail(finalMsgs, leadStreamIdentity(sid)),
+            ensureStreamTail(finalMsgs, leadStreamIdentity(sid), {
+              allowSealedTail: true,
+            }),
             {
               type: "run_card",
               run_id: ev.run_id,
@@ -3561,6 +3596,9 @@ function AppContent() {
             },
           );
         }
+        // U6：这条终态分支自己的收尾内容（final_text / run_card）全部追加完之后再封口——
+        // 封早了会把它们劈进另起的新尾巴（多渲一整行头像+名字），与已流式的内容分家。
+        finalMsgs = sealStreamTail(finalMsgs);
         mutate(sid, () => finalMsgs);
 
         const run = runningSessionsRef.current.get(sid);
@@ -3620,16 +3658,27 @@ function AppContent() {
         stopIssuedAtRef.current.delete(sid);
         const filesChanged = ev.files_changed;
         if (filesChanged != null) {
+          // U6：run_card 追加完之后再封口（同 completed 分支），不劈成两条消息。
+          // U6 修复轮 2：allowSealedTail — 这是同一 run 的收尾续写，不是新一轮
+          // delta，即便末条 assistant 已被前面的终态分支封过口，也该续灌进它，
+          // 不该另起孤儿气泡（run_card 独占一条、跟错误/停止文案分家）。
           mutate(sid, (m) =>
-            appendRunCard(ensureStreamTail(m, leadStreamIdentity(sid)), {
-              type: "run_card",
-              run_id: ev.run_id,
-              commit_sha: ev.commit_sha,
-              files_changed: filesChanged,
-              insertions: ev.insertions ?? 0,
-              deletions: ev.deletions ?? 0,
-              interrupted: ev.interrupted ?? false,
-            }),
+            sealStreamTail(
+              appendRunCard(
+                ensureStreamTail(m, leadStreamIdentity(sid), {
+                  allowSealedTail: true,
+                }),
+                {
+                  type: "run_card",
+                  run_id: ev.run_id,
+                  commit_sha: ev.commit_sha,
+                  files_changed: filesChanged,
+                  insertions: ev.insertions ?? 0,
+                  deletions: ev.deletions ?? 0,
+                  interrupted: ev.interrupted ?? false,
+                },
+              ),
+            ),
           );
           if (sid === currentIdRef.current) {
             refreshReview(sid);
@@ -3638,6 +3687,17 @@ function AppContent() {
             // 不刷新的话 undo_total 会一直读到 0，把刚做完、真有得撤销的这一轮也藏起来。
             void refreshRunStates(sid);
           }
+        } else {
+          // 没有文件改动可追加时，run_closeout 仍是终态事件——同样要封口，否则本轮
+          // 遗留的活尾会一直被当成「还在流」，让下一轮的 delta 误灌进来。
+          // F9（nit·同根·本轮不改行为，先记档）：这里是无条件封口——一条带真实
+          // run_id 的 A 轮迟到 closeout，若在 B 轮已经开跑之后才到达，会把 B 轮的
+          // 活尾也封掉（B 轮随后的 text_delta 会被误判成新一轮而另起孤儿消息）。
+          // 触发条件：A 轮 completed/closeout 事件在网络/调度上显著滞后，用户在此
+          // 期间已经发起并开始流式接收 B 轮。当前判断窗口很小（closeout 通常紧跟
+          // completed 到达）且真实 run_id 闸需要契约扩展（同类风险另见上方
+          // run_id === "" 分支的注释），本轮先接受、留后续补 run_id 级别的闸门。
+          mutate(sid, (m) => sealStreamTail(m));
         }
         if (ev.interrupted === true) {
           setSessionDotStatus(sid, "attention");
@@ -3645,11 +3705,18 @@ function AppContent() {
         setRun(sid, null);
       } else if (ev.kind === "error") {
         const swept = sweepSession(sid);
-        const withErr = appendTextDelta(
-          ensureStreamTail(swept, leadStreamIdentity(sid)),
-          tRef.current("app.run.error", {
-            message: renderBackendError(ev.message, tRef.current),
-          }),
+        // U6：错误文案追加完之后再封口——同 completed 分支，不把它劈进另起的新尾巴。
+        // F1：allowSealedTail——同一 run 的收尾续写，即便末条已被前面终态分支/onStop
+        // 封过口，也该续灌进去，不该另起孤儿气泡。
+        const withErr = sealStreamTail(
+          appendTextDelta(
+            ensureStreamTail(swept, leadStreamIdentity(sid), {
+              allowSealedTail: true,
+            }),
+            tRef.current("app.run.error", {
+              message: renderBackendError(ev.message, tRef.current),
+            }),
+          ),
         );
         mutate(sid, () => withErr);
 
@@ -3657,12 +3724,18 @@ function AppContent() {
         setSessionDotStatus(sid, "attention");
       } else if (ev.kind === "needs_decision") {
         const swept = sweepSession(sid);
-        const withCard = appendScopeChangeCard(
-          ensureStreamTail(swept, leadStreamIdentity(sid)),
-          {
-            type: "scope_change",
-            changes: ev.changes,
-          },
+        // U6：scope 卡追加完之后再封口。
+        // F1：allowSealedTail——同一 run 的收尾续写，不该因末条已被封口就另起孤儿气泡。
+        const withCard = sealStreamTail(
+          appendScopeChangeCard(
+            ensureStreamTail(swept, leadStreamIdentity(sid), {
+              allowSealedTail: true,
+            }),
+            {
+              type: "scope_change",
+              changes: ev.changes,
+            },
+          ),
         );
         mutate(sid, () => withCard);
 
@@ -3687,9 +3760,17 @@ function AppContent() {
           (hasPendingMcpQuestion
             ? tRef.current("app.run.stoppedPendingQuestion")
             : "");
-        const withErr = appendTextDelta(
-          ensureStreamTail(swept, leadStreamIdentity(sid)),
-          stopText,
+        // U6：停止文案追加完之后再封口。
+        // F1：allowSealedTail——onStop 在用户点停止那一刻就先封了口（此时收尾文案
+        // 还没到），这条终态事件的停止文案是同一 run 的收尾续写，该续灌进那条已封口
+        // 的尾巴，不该另起孤儿气泡（与已流式的文本分家）。
+        const withErr = sealStreamTail(
+          appendTextDelta(
+            ensureStreamTail(swept, leadStreamIdentity(sid), {
+              allowSealedTail: true,
+            }),
+            stopText,
+          ),
         );
         mutate(sid, () => withErr);
 
@@ -3829,15 +3910,26 @@ function AppContent() {
       if (!messagesRef.current.has(sid)) return;
       const arr = messagesRef.current.get(sid) ?? [];
       const newId = String(message.id);
-      const alreadyHas = arr.some(
-        (m) => (m as ChatMessage & { id?: string }).id === newId,
-      );
+      const alreadyHas = arr.some((m) => {
+        const id = (m as ChatMessage & { id?: unknown }).id;
+        return id != null && String(id) === newId;
+      });
       if (!alreadyHas) {
         let insertAt = arr.length;
-        while (
-          insertAt > 0 &&
-          (arr[insertAt - 1] as ChatMessage & { id?: string }).id == null
-        ) {
+        while (insertAt > 0) {
+          const trailing = arr[insertAt - 1];
+          const trailingId = (trailing as ChatMessage & { id?: unknown }).id;
+          if (
+            trailing.role !== "assistant" ||
+            typeof trailingId !== "string" ||
+            /^\d+$/.test(trailingId) ||
+            // U6：只跳过真正还在流的尾巴（stream_live===true）。已经被 sealStreamTail
+            // 封口（false）或从未被追踪过（undefined，如决策卡消息）的 UUID id
+            // assistant 消息一律当已终结的锚点，不再被误判成「永远可跳过的活尾」。
+            trailing.stream_live !== true
+          ) {
+            break;
+          }
           insertAt--;
         }
         const firstLargerId = arr.findIndex((m) => {
@@ -3857,6 +3949,35 @@ function AppContent() {
           ...arr.slice(insertAt),
         ]);
       }
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<{
+      session_id: string;
+      decision_id: string;
+      status: "chosen";
+      chosen_option: string | null;
+    }>("decision-card-resolved", (e) => {
+      const {
+        session_id: sid,
+        decision_id: decisionId,
+        status,
+        chosen_option: chosenOption,
+      } = e.payload;
+      if (!messagesRef.current.has(sid)) return;
+      const current = findDecisionCard(sid, decisionId);
+      if (current?.status === status && current.chosen_option === chosenOption)
+        return;
+      setDecisionStatusInMemory(
+        sid,
+        decisionId,
+        status,
+        chosenOption ?? undefined,
+      );
     });
     return () => {
       unlisten.then((f) => f());
@@ -4810,9 +4931,12 @@ function AppContent() {
           setRun(sid, null, { preserveStopGate: true });
         }
       });
+    // U6：用户主动停也是终态——先 sweep（收束 running 卡）再 seal（封口流式尾巴），
+    // 顺序与五个终态事件分支一致。
     const swept = sweepSession(sid);
+    const sealed = sealStreamTail(swept);
     const next = new Map(messagesRef.current);
-    next.set(sid, swept);
+    next.set(sid, sealed);
     messagesRef.current = next;
     setMessagesBySession(next);
   }
@@ -4890,6 +5014,9 @@ function AppContent() {
         engine: selectedAgentId,
         agent_id: selectedAgentId,
         agent_name_snapshot: agentNameSnapshot,
+        // U6：本机乐观 assistant 也打活标——与远程流式尾巴统一走 stream_live===true
+        // 才算「活尾」的语义，插入位判据（lead-message-appended）才能一致处理本机/远程两态。
+        stream_live: true,
       },
     ]);
     const optimisticRun: RunInfo = {
@@ -5562,27 +5689,37 @@ function AppContent() {
       // 落定前不改任何状态，点击后按钮不置灰、没有任何"已收到点击"的反馈。
       setDecisionStatusInMemory(sid, decisionId, "submitting");
       try {
-        await invoke("answer_lead_question", {
+        // T3（remote control M0 §4a）：续跑权收归后端——commit_late_answer 落库成功后
+        // answer_lead_question 已经自己 try_resume_after_answer 触发续跑（覆盖远程控制
+        // 场景：手机答卡走同一条 IPC，背后没有前端替它 invoke resume_lead_session）。这里
+        // 只按后端回的 resumed 做乐观绘制，绝不再自己 invoke resume_lead_session——否则本机
+        // 路径会双触发：后端先占槽、前端随后 resume 撞 busy，给用户弹假错误。
+        const closeoutSeqBeforeAnswer = closeoutSeqRef.current.get(sid) ?? 0;
+        const result = await invoke<{
+          resumed: boolean;
+          lead_agent_id: string | null;
+          resume_error: string | null;
+        }>("answer_lead_question", {
           sessionId: sid,
           decisionId,
           answer: option,
         });
+        const runClearedWhileAnswering =
+          (closeoutSeqRef.current.get(sid) ?? 0) !== closeoutSeqBeforeAnswer;
         setDecisionStatusInMemory(sid, decisionId, "chosen", option);
+        if (result?.resume_error) {
+          showLeadError(sid, result.resume_error);
+        }
         // 答完且队长仍在跑 → 立刻另起续写消息·busy 时显示「工作中」·填队长思考空窗（块②a-1 体验 b·选完到首字之间不留空白）。
-        if (runningSessionsRef.current.has(sid)) {
-          mutateSession(sid, (m) =>
-            ensureStreamTail(m, leadStreamIdentity(sid)),
-          );
-        } else {
-          const runtime = resolveRuntimeTeamConfig(sid);
-          // G3 停摆修复（T3）只适用于有持久化 lead 配置的 team 会话：solo 的迟到答案
-          // 已由 commit_late_answer 落成真实 user 消息，留给下一轮普通 run 自然消费，不能把
-          // effectiveLeadId 对 agentId 的回退误当成 lead 身份去调用 resume_lead_session。
-          if (runtime.hasSavedLead) {
-            // resume_lead_session 不落新消息（避免答案在 transcript 里重复），直接以现有历史
-            // （已含刚落的答案）起新 run；并发安全复用它内部同一套
-            // reserve_new_session_run 互斥闸，不新造锁。
-            const leadId = runtime.effectiveLeadId;
+        if (!runClearedWhileAnswering) {
+          if (runningSessionsRef.current.has(sid)) {
+            mutateSession(sid, (m) =>
+              ensureStreamTail(m, leadStreamIdentity(sid)),
+            );
+          } else if (result?.resumed) {
+            // 后端已经决定续跑（team 会话）——只做乐观绘制，优先采用后端实际恢复的 lead identity。
+            const runtime = resolveRuntimeTeamConfig(sid);
+            const leadId = result?.lead_agent_id || runtime.effectiveLeadId;
             const identity = {
               engine: leadId,
               agent_id: leadId,
@@ -5594,14 +5731,6 @@ function AppContent() {
               ...identity,
             });
             mutateSession(sid, (m) => ensureStreamTail(m, identity));
-            invoke("resume_lead_session", {
-              sessionId: sid,
-              leadAgentId: leadId,
-              memberIds: runtime.memberPoolIds,
-            }).catch((e) => {
-              setRun(sid, null);
-              showLeadError(sid, String(e));
-            });
           }
         }
       } catch (e) {

@@ -1,4 +1,3 @@
-import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
@@ -6,12 +5,7 @@ import {
   getAttachmentDataUri,
   setAttachmentDataUri,
 } from "../lib/attachmentCache";
-
-type AttachmentContent = {
-  kind: "text" | "image" | "binary";
-  imageBase64?: string;
-  mediaType?: string;
-};
+import { useAttachmentPort } from "../lib/attachmentPortContext";
 
 type Props = {
   path: string;
@@ -21,6 +15,7 @@ type Props = {
 
 export function Lightbox({ path, sessionId, onClose }: Props) {
   const { t } = useI18n();
+  const attachmentPort = useAttachmentPort();
   const closeRef = useRef<HTMLButtonElement>(null);
   const [dataUri, setDataUri] = useState<string | null>(() =>
     getAttachmentDataUri(path, sessionId),
@@ -50,16 +45,13 @@ export function Lightbox({ path, sessionId, onClose }: Props) {
     }
 
     setFailed(false);
-    void invoke<AttachmentContent>("read_attachment", {
-      path,
-      sessionId: sessionId ?? null,
-    })
-      .then((attachment) => {
+    void attachmentPort
+      .resolveImageSrc(path, sessionId)
+      .then((src) => {
         if (cancelled) return;
-        if (attachment.imageBase64 && attachment.mediaType) {
-          const nextDataUri = `data:${attachment.mediaType};base64,${attachment.imageBase64}`;
-          setAttachmentDataUri(path, sessionId, nextDataUri);
-          setDataUri(nextDataUri);
+        if (src) {
+          setAttachmentDataUri(path, sessionId, src);
+          setDataUri(src);
         } else {
           setFailed(true);
         }
@@ -71,7 +63,7 @@ export function Lightbox({ path, sessionId, onClose }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [path, sessionId]);
+  }, [attachmentPort, path, sessionId]);
 
   return createPortal(
     <div

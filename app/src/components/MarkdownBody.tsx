@@ -1,9 +1,7 @@
-import { invoke } from "@tauri-apps/api/core";
 import React, { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import Markdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { CodeBlock } from "./CodeBlock";
 import { MermaidBlock } from "./MermaidBlock";
 import { useI18n } from "../i18n";
@@ -13,6 +11,7 @@ import {
   PreviewablePath,
 } from "./localMarkdownImage";
 import { renderBackendError } from "../lib/backendMsg";
+import { useAttachmentPort } from "../lib/attachmentPortContext";
 
 // 内联代码若形如「带已知可预览后缀的文件路径」→ 可点开预览。
 // 要求：无空白/反引号/圆括号（排掉 array.map()、foo.bar() 这类），且以已知后缀结尾。
@@ -56,6 +55,7 @@ export const MarkdownBody = React.memo(function MarkdownBody({
   sessionId,
 }: Props) {
   const { t } = useI18n();
+  const attachmentPort = useAttachmentPort();
   const [attachmentOpenError, setAttachmentOpenError] = useState<string | null>(
     null,
   );
@@ -76,19 +76,18 @@ export const MarkdownBody = React.memo(function MarkdownBody({
             onClick={(event) => {
               event.preventDefault();
               if (external) {
-                void openUrl(href).catch(() => {});
+                void attachmentPort.openUrl(href).catch(() => {});
                 return;
               }
               if (!href || !isLocalPreviewablePath(href)) return;
 
               const decodedPath = decodeFilePath(href);
               if (isHtmlPath(decodedPath)) {
-                void invoke("open_attachment_external", {
-                  sessionId: sessionId ?? null,
-                  path: decodedPath,
-                }).catch((error) => {
-                  setAttachmentOpenError(renderBackendError(error, t));
-                });
+                void attachmentPort
+                  .openExternal(decodedPath, sessionId ?? null)
+                  .catch((error) => {
+                    setAttachmentOpenError(renderBackendError(error, t));
+                  });
                 return;
               }
               onOpenPreview?.(decodedPath);
@@ -142,7 +141,7 @@ export const MarkdownBody = React.memo(function MarkdownBody({
         );
       },
     }),
-    [onOpenLightbox, onOpenPreview, sessionId, streaming, t],
+    [attachmentPort, onOpenLightbox, onOpenPreview, sessionId, streaming, t],
   );
 
   return (

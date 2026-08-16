@@ -195,8 +195,10 @@ function loadI18nMessages(): {
   zh: Record<string, unknown>;
   en: Record<string, unknown>;
 } {
-  const source = readFileSync("src/i18n.tsx", "utf-8");
-  const match = source.match(/const messages = (\{[\s\S]*?\n\} as const)/);
+  const source = readFileSync("src/i18nMessages.ts", "utf-8");
+  const match = source.match(
+    /export const messages = (\{[\s\S]*?\n\} as const)/,
+  );
   if (!match) {
     throw new Error(
       "i18n.test.tsx: 未能在 i18n.tsx 中定位 `const messages = {...} as const` 字面量，" +

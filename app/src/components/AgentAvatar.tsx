@@ -30,6 +30,16 @@ const GLYPHS: Record<string, ReactNode> = {
       <path d="M4 21c0-4 4-6 8-6s8 2 8 6z" />
     </svg>
   ),
+  // U2：手机端 `remote-web/src/ui/stream/SessionStreamScreen.tsx` 的 `LiveMessageRow` 在还不知道
+  // 具体 agent 名字时固定传 `kind="assistant"`——`resolveKind()` 查不中会落到"首字母兜底"，显示
+  // 裸字母「A」。这里补一个通用占位 glyph 让它落进正常头像路径。桌面所有调用点传的都是真实
+  // agent 名（`assistantAvatarKind(message)`/`leadName`/`member.name`/`agent.provider` 等），从不
+  // 传字面量 "assistant"，不会走到这条分支，零行为变化。
+  assistant: (
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z" />
+    </svg>
+  ),
 };
 
 const STYLES: Record<string, CSSProperties> = {

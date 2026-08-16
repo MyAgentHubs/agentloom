@@ -7,12 +7,14 @@ export type SettingsPage =
   | "archivedProjects"
   | "language"
   | "search"
+  | "remoteControl"
   | "about";
 
 type NavKey =
   | "agents"
   | "search"
   | "language"
+  | "remoteControl"
   | "defaults"
   | "repos"
   | "archivedProjects"
@@ -36,6 +38,12 @@ const ICONS: Record<NavKey, ReactNode> = {
     <>
       <circle cx="12" cy="12" r="9" />
       <path d="M3 12h18M12 3a14 14 0 010 18M12 3a14 14 0 000 18" />
+    </>
+  ),
+  remoteControl: (
+    <>
+      <rect x="5" y="2" width="10" height="20" rx="2" />
+      <path d="M9 18h2M18 8a4 4 0 010 8M20.5 5.5a7.5 7.5 0 010 13" />
     </>
   ),
   defaults: (
@@ -102,6 +110,11 @@ const NAV: {
   {
     key: "language",
     labelKey: "settings.nav.language",
+    enabled: true,
+  },
+  {
+    key: "remoteControl",
+    labelKey: "settings.nav.remoteControl",
     enabled: true,
   },
   {

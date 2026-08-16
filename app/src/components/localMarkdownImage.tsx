@@ -1,10 +1,10 @@
-import { invoke } from "@tauri-apps/api/core";
 import React, { useEffect, useState } from "react";
 import type { UrlTransform } from "react-markdown";
 import {
   getAttachmentDataUri,
   setAttachmentDataUri,
 } from "../lib/attachmentCache";
+import { useAttachmentPort } from "../lib/attachmentPortContext";
 
 export function isLocalImagePath(src: string): boolean {
   if (
@@ -48,12 +48,6 @@ function decodeLocalImagePath(path: string): string {
   }
 }
 
-type AttachmentContent = {
-  kind: "text" | "image" | "binary";
-  imageBase64?: string;
-  mediaType?: string;
-};
-
 export function PreviewablePath({
   path,
   onOpenPreview,
@@ -96,6 +90,7 @@ export function LocalMarkdownImage({
   onOpenLightbox?: (path: string) => void;
 }) {
   const decodedPath = decodeLocalImagePath(path);
+  const attachmentPort = useAttachmentPort();
   const [dataUri, setDataUri] = useState<string | null>(() =>
     getAttachmentDataUri(decodedPath, sessionId),
   );
@@ -111,16 +106,13 @@ export function LocalMarkdownImage({
     }
     setFailed(false);
 
-    void invoke<AttachmentContent>("read_attachment", {
-      path: decodedPath,
-      sessionId: sessionId ?? null,
-    })
-      .then((attachment) => {
+    void attachmentPort
+      .resolveImageSrc(decodedPath, sessionId)
+      .then((src) => {
         if (cancelled) return;
-        if (attachment.imageBase64 && attachment.mediaType) {
-          const nextDataUri = `data:${attachment.mediaType};base64,${attachment.imageBase64}`;
-          setAttachmentDataUri(decodedPath, sessionId, nextDataUri);
-          setDataUri(nextDataUri);
+        if (src) {
+          setAttachmentDataUri(decodedPath, sessionId, src);
+          setDataUri(src);
         } else {
           setFailed(true);
         }
@@ -132,7 +124,7 @@ export function LocalMarkdownImage({
     return () => {
       cancelled = true;
     };
-  }, [decodedPath, sessionId]);
+  }, [attachmentPort, decodedPath, sessionId]);
 
   if (dataUri) {
     return (

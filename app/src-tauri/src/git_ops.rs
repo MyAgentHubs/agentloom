@@ -150,7 +150,8 @@ fn run_git_in(repo: &std::path::Path, args: &[&str]) -> Result<String, String> {
 ///
 /// env 注入照 github::clone_repo_https（GH_TOKEN + GH_PROMPT_DISABLED + GIT_TERMINAL_PROMPT）。
 fn run_gh_in(repo: &std::path::Path, args: &[&str], gh_token: &str) -> Result<String, String> {
-    let out = crate::proc::command("gh")
+    let mut command = crate::github::gh_command()?;
+    let out = command
         .current_dir(repo)
         .args(args)
         .env("GH_TOKEN", gh_token)
@@ -349,7 +350,7 @@ mod tests {
             "MyAgentHubs",
             |login| match login {
                 "MyAgentHubs" => Err("NO_TOKEN:MyAgentHubs".to_string()),
-                "impanda-cookie" => Ok("tok-active".to_string()),
+                "demo-octocat" => Ok("tok-active".to_string()),
                 other => panic!("unexpected login {other}"),
             },
             || {
@@ -359,7 +360,7 @@ mod tests {
                         active: false,
                     },
                     crate::github::GhAccount {
-                        login: "impanda-cookie".to_string(),
+                        login: "demo-octocat".to_string(),
                         active: true,
                     },
                 ])
@@ -377,7 +378,7 @@ mod tests {
             |_login| Err("NO_TOKEN:whatever".to_string()),
             || {
                 Ok(vec![crate::github::GhAccount {
-                    login: "impanda-cookie".to_string(),
+                    login: "demo-octocat".to_string(),
                     active: true,
                 }])
             },
@@ -388,7 +389,7 @@ mod tests {
             "保留前缀兼容前端解析: {err}"
         );
         assert!(err.contains("MyAgentHubs"), "含属主名: {err}");
-        assert!(err.contains("impanda-cookie"), "含已登录账户列表: {err}");
+        assert!(err.contains("demo-octocat"), "含已登录账户列表: {err}");
     }
 
     #[test]

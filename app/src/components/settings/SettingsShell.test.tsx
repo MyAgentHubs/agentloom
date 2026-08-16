@@ -12,6 +12,7 @@ describe("SettingsShell", () => {
     expect(screen.getByText("Agent 池")).toBeInTheDocument();
     expect(screen.getByText("联网搜索")).toBeInTheDocument();
     expect(screen.getByText("语言与区域")).toBeInTheDocument();
+    expect(screen.getByText("远程控制")).toBeInTheDocument();
     expect(screen.getByText("仓库")).toBeInTheDocument();
     expect(screen.getByText("已归档项目")).toBeInTheDocument();
     expect(screen.getByText("关于")).toBeInTheDocument();
@@ -20,7 +21,7 @@ describe("SettingsShell", () => {
     expect(screen.queryByText("namespace 白名单")).toBeNull();
     expect(screen.queryByText("账户 & Git")).toBeNull();
     expect(screen.queryByText("成本 & 预算")).toBeNull();
-    expect(screen.getAllByRole("button")).toHaveLength(6);
+    expect(screen.getAllByRole("button")).toHaveLength(7);
     expect(screen.getByText("Agent 池").closest("button")).toHaveAttribute(
       "aria-current",
       "page",
@@ -33,7 +34,7 @@ describe("SettingsShell", () => {
       .getAllByRole("button")
       .filter((b) => b.getAttribute("aria-disabled") === "true");
     expect(disabled.length).toBe(0);
-    expect(container.querySelectorAll(".st-nav-item svg").length).toBe(6);
+    expect(container.querySelectorAll(".st-nav-item svg").length).toBe(7);
     expect(
       container.querySelector(".st-nav-item:last-child"),
     ).toHaveTextContent("关于");
@@ -60,6 +61,17 @@ describe("SettingsShell", () => {
     );
     fireEvent.click(screen.getByText("联网搜索"));
     expect(onNavigate).toHaveBeenCalledWith("search");
+  });
+
+  it("点「远程控制」nav 触发 onNavigate(remoteControl)", () => {
+    const onNavigate = vi.fn();
+    render(
+      <SettingsShell activeKey="agents" onNavigate={onNavigate}>
+        <div>content</div>
+      </SettingsShell>,
+    );
+    fireEvent.click(screen.getByText("远程控制"));
+    expect(onNavigate).toHaveBeenCalledWith("remoteControl");
   });
 
   it("activeKey=repos 时 st-content 加 .repo 变体类", () => {

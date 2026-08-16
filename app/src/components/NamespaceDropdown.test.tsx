@@ -24,7 +24,7 @@ const orgA: NamespaceMeta = {
 const orgB: NamespaceMeta = {
   id: "ns-b",
   kind: "github_org",
-  name: "impanda-cookie",
+  name: "impact-octocat",
   is_builtin: 0,
   last_active_repo_id: null,
   added_at: 50,
@@ -142,12 +142,12 @@ describe("NamespaceDropdown · v4 严格保真", () => {
         onClose={onClose}
       />,
     );
-    fireEvent.click(screen.getByText("impanda-cookie"));
+    fireEvent.click(screen.getByText("impact-octocat"));
     expect(onSelectNamespace).toHaveBeenCalledWith("ns-b");
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it("search input filter rows · 输入 'imp' 只剩 impanda-cookie", () => {
+  it("search input filter rows · 输入 'imp' 只剩 impact-octocat", () => {
     const { container } = render(<NamespaceDropdown {...base} />);
     const search = container.querySelector(
       ".dd-search input",
@@ -155,7 +155,7 @@ describe("NamespaceDropdown · v4 严格保真", () => {
     fireEvent.change(search, { target: { value: "imp" } });
     expect(screen.queryByText("myagenthubs")).not.toBeInTheDocument();
     expect(screen.queryByText("Local")).not.toBeInTheDocument();
-    expect(screen.getByText("impanda-cookie")).toBeInTheDocument();
+    expect(screen.getByText("impact-octocat")).toBeInTheDocument();
   });
 
   it("footer「连接 GitHub repo」可点 · 触发 onConnectGithub 不触发 onSelectNamespace", () => {

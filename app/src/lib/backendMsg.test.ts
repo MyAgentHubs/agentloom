@@ -27,8 +27,10 @@ const t = (
 };
 
 function loadI18nMessages(): Record<Locale, Record<string, string>> {
-  const source = readFileSync("src/i18n.tsx", "utf-8");
-  const match = source.match(/const messages = (\{[\s\S]*?\n\} as const)/);
+  const source = readFileSync("src/i18nMessages.ts", "utf-8");
+  const match = source.match(
+    /export const messages = (\{[\s\S]*?\n\} as const)/,
+  );
   if (!match) throw new Error("Could not locate the i18n message tables");
   const literalText = match[1].replace(/\s+as const$/, "");
   return new Function(`"use strict"; return (${literalText});`)() as Record<

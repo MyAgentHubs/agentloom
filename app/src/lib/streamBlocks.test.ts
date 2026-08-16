@@ -12,6 +12,7 @@ import {
   assistantText,
   ensureStreamTail,
   hasRunningTool,
+  sealStreamTail,
   sweepRunning,
 } from "./streamBlocks";
 
@@ -227,6 +228,20 @@ describe("streamBlocks", () => {
     expect((m[1].content[1] as any).status).toBe("interrupted");
   });
 
+  // U6 修复轮：sweepRunning 只收束卡片状态，不再碰 stream_live——封口挪给
+  // sealStreamTail，在终态分支追加完自己的收尾内容之后才调用（见下面的
+  // describe("sealStreamTail")），否则会把分支自己后续要追加的内容误判成
+  // 「已封口」而劈成两条消息。
+  it("sweepRunning 不改动 stream_live（封口另由 sealStreamTail 负责）", () => {
+    let m = seed();
+    m = appendTextDelta(m, "已完成的回答");
+    expect((m[1] as { stream_live?: boolean }).stream_live).toBeUndefined();
+    m = sweepRunning(m);
+    expect((m[1] as { stream_live?: boolean }).stream_live).toBeUndefined();
+    // 内容本身不受影响
+    expect(m[1].content).toEqual([{ type: "text", text: "已完成的回答" }]);
+  });
+
   it("sweepRunning 把 pending 审批卡收束为 cancelled", () => {
     let m = seed();
     m = appendApprovalRequested(m, {
@@ -305,6 +320,58 @@ describe("streamBlocks", () => {
     expect(assistantText([])).toBe("");
     expect(appendTextDelta([], "x")).toEqual([]);
     expect(hasRunningTool([], "t1")).toBe(false);
+  });
+});
+
+// U6 修复轮：sealStreamTail 是「已终结尾」标记的唯一权威落点——终态分支把自己的
+// 收尾内容（final_text / run_card / 错误文案 / scope 卡 / 停止文案…）全部追加完
+// 之后才调用，供插入位判据 / ensureStreamTail 的 needsTail 判据区分「真在流的
+// 尾巴」与「已经封口的尾巴」。
+describe("sealStreamTail", () => {
+  it("把末条 assistant 的 stream_live 封为 false，不动内容", () => {
+    let m = seed();
+    m = appendTextDelta(m, "已完成的回答");
+    m = sealStreamTail(m);
+    expect((m[1] as { stream_live?: boolean }).stream_live).toBe(false);
+    expect(m[1].content).toEqual([{ type: "text", text: "已完成的回答" }]);
+  });
+
+  it("已经是 false 时原样返回（同引用，不产生新数组）", () => {
+    const msgs: ChatMessage[] = [
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "done" }],
+        engine: "claude",
+        stream_live: false,
+      },
+    ];
+    expect(sealStreamTail(msgs)).toBe(msgs);
+  });
+
+  it("stream_live 为 true 时封为 false", () => {
+    const msgs: ChatMessage[] = [
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "done" }],
+        engine: "claude",
+        stream_live: true,
+      },
+    ];
+    const out = sealStreamTail(msgs);
+    expect((out[0] as { stream_live?: boolean }).stream_live).toBe(false);
+    // 不改原数组（引用安全）
+    expect((msgs[0] as { stream_live?: boolean }).stream_live).toBe(true);
+  });
+
+  it("无 assistant 消息时原样返回（防御）", () => {
+    const msgs: ChatMessage[] = [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+    ];
+    expect(sealStreamTail(msgs)).toBe(msgs);
+  });
+
+  it("空列表原样返回", () => {
+    expect(sealStreamTail([])).toEqual([]);
   });
 });
 
@@ -415,7 +482,8 @@ describe("appendRunCard", () => {
     };
     const next = ensureStreamTail(msgs, id);
     expect(next).toHaveLength(4);
-    expect(next[3]).toEqual({
+    expect(next[3]).toMatchObject({
+      id: expect.any(String),
       role: "assistant",
       content: [],
       engine: "claude",
@@ -426,6 +494,64 @@ describe("appendRunCard", () => {
     const after = appendTextDelta(next, "叙述2");
     expect(after[3].content).toEqual([{ type: "text", text: "叙述2" }]);
     expect(after[2].content).toHaveLength(1);
+  });
+
+  it("ensureStreamTail：末元素是 user 时另起带 id 的 assistant 尾且连续调用幂等", () => {
+    const msgs: ChatMessage[] = [
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "旧回答" }],
+        engine: "claude",
+      },
+      { role: "user", content: [{ type: "text", text: "远程提问" }] },
+    ];
+    const identity = {
+      engine: "codex",
+      agent_id: "codex",
+      agent_name_snapshot: "Codex",
+    };
+
+    const next = ensureStreamTail(msgs, identity);
+    const again = ensureStreamTail(next, identity);
+
+    expect(next).toHaveLength(3);
+    expect(next[2]).toMatchObject({
+      id: expect.any(String),
+      role: "assistant",
+      content: [],
+      ...identity,
+    });
+    expect(again).toBe(next);
+    expect(again).toHaveLength(3);
+    expect(appendTextDelta(again, "新回答")[2].content).toEqual([
+      { type: "text", text: "新回答" },
+    ]);
+    expect(msgs[0].content).toEqual([{ type: "text", text: "旧回答" }]);
+  });
+
+  it("ensureStreamTail：空列表或没有 assistant 时创建带 id 的 assistant 尾", () => {
+    const cases: ChatMessage[][] = [
+      [],
+      [{ role: "user", content: [{ type: "text", text: "远程提问" }] }],
+    ];
+
+    for (const msgs of cases) {
+      const next = ensureStreamTail(msgs, {
+        engine: "claude",
+        agent_id: null,
+        agent_name_snapshot: "Claude",
+      });
+
+      expect(next).toHaveLength(msgs.length + 1);
+      expect(next[next.length - 1]).toMatchObject({
+        id: expect.any(String),
+        role: "assistant",
+        content: [],
+        engine: "claude",
+        agent_id: null,
+        agent_name_snapshot: "Claude",
+      });
+    }
   });
 
   it("ensureStreamTail：末条是普通文本消息→原样返回（不误开新消息）", () => {
@@ -444,5 +570,51 @@ describe("appendRunCard", () => {
         agent_name_snapshot: null,
       }),
     ).toBe(msgs);
+  });
+
+  // U6：新造的尾巴要带活跃标记，供插入位判据 / needsTail 判据识别「真在流」。
+  it("ensureStreamTail：新造的尾巴带 stream_live:true", () => {
+    const msgs: ChatMessage[] = [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+    ];
+    const next = ensureStreamTail(msgs, {
+      engine: "claude",
+      agent_id: null,
+      agent_name_snapshot: null,
+    });
+    expect((next[1] as { stream_live?: boolean }).stream_live).toBe(true);
+  });
+
+  // U6 症状根修的另一半：末条 assistant 已被 sealStreamTail 封口（stream_live:false）
+  // 说明上一轮流式已终结，第 2 轮 text_delta 到达时不该续灌进它，必须另起新尾巴。
+  it("ensureStreamTail：末条 assistant 已封口(stream_live:false)→另起新尾而不是灌进旧尾", () => {
+    const msgs: ChatMessage[] = [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "第一轮回答" }],
+        engine: "claude",
+        stream_live: false,
+      },
+    ];
+    const identity = {
+      engine: "claude",
+      agent_id: "claude",
+      agent_name_snapshot: "Claude",
+    };
+    const next = ensureStreamTail(msgs, identity);
+    expect(next).toHaveLength(3);
+    expect(next[2]).toMatchObject({
+      id: expect.any(String),
+      role: "assistant",
+      content: [],
+      stream_live: true,
+    });
+    // 旧的已封口尾巴内容不被污染
+    expect(next[1].content).toEqual([{ type: "text", text: "第一轮回答" }]);
+
+    const after = appendTextDelta(next, "第二轮回答");
+    expect(after[2].content).toEqual([{ type: "text", text: "第二轮回答" }]);
+    expect(after[1].content).toEqual([{ type: "text", text: "第一轮回答" }]);
   });
 });

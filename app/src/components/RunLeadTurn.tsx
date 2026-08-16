@@ -95,7 +95,14 @@ export function RunLeadTurn({
                   onClick={() => setProcessOpen((open) => !open)}
                 >
                   <span className="pf-tri" aria-hidden="true">
-                    <svg viewBox="0 0 24 24">
+                    <svg
+                      viewBox="0 0 24 24"
+                      width="11"
+                      height="11"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.4"
+                    >
                       <path d="M9 6l6 6-6 6" />
                     </svg>
                   </span>
