@@ -7,7 +7,9 @@ import { AttachmentPortContext } from "../lib/attachmentPortContext";
 import type { AttachmentPort } from "../lib/remoteSessionPort";
 import { Lightbox } from "./Lightbox";
 
-function stubAttachmentPort(overrides: Partial<AttachmentPort> = {}): AttachmentPort {
+function stubAttachmentPort(
+  overrides: Partial<AttachmentPort> = {},
+): AttachmentPort {
   return {
     resolveImageSrc: vi.fn().mockResolvedValue(null),
     openExternal: vi.fn().mockResolvedValue(undefined),
@@ -120,10 +122,7 @@ describe("Lightbox — 注入 AttachmentPort", () => {
     );
 
     const image = await screen.findByRole("img", { name: "放大的图片" });
-    expect(image).toHaveAttribute(
-      "src",
-      "data:image/png;base64,c3R1Yg==",
-    );
+    expect(image).toHaveAttribute("src", "data:image/png;base64,c3R1Yg==");
     expect(resolveImageSrc).toHaveBeenCalledWith(
       "/tmp/stub.png",
       "session-stub",

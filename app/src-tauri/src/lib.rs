@@ -18239,7 +18239,10 @@ mod tests {
 
         let room_one = db::ensure_remote_room_for_project(&conn, "repo-1").unwrap();
         let room_two = db::ensure_remote_room_for_project(&conn, "repo-2").unwrap();
-        assert_ne!(room_one, room_two, "前置条件：两个 project 各自的房间必须不同");
+        assert_ne!(
+            room_one, room_two,
+            "前置条件：两个 project 各自的房间必须不同"
+        );
 
         db::insert_remote_device(
             &conn,
@@ -20830,8 +20833,7 @@ mod tests {
     fn remote_control_settings_reject_relay_url_with_query() {
         let conn = cli_path_test_db();
 
-        let error =
-            remote_control_set_settings_in_conn(&conn, true, "wss://host?x=1").unwrap_err();
+        let error = remote_control_set_settings_in_conn(&conn, true, "wss://host?x=1").unwrap_err();
 
         assert!(error.starts_with("AL_ERR:remoteControl.invalidRelayUrl:"));
     }

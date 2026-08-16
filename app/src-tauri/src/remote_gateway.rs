@@ -1990,7 +1990,11 @@ impl StopReason {
     }
 }
 
-fn ensure_claim(inner: &Inner, config: &GatewayConfig, credential: &DesktopCredential) -> ClaimAction {
+fn ensure_claim(
+    inner: &Inner,
+    config: &GatewayConfig,
+    credential: &DesktopCredential,
+) -> ClaimAction {
     let credential_hash = crate::remote_pairing::desktop_credential_hash(credential.expose());
     let response = match (inner.claim_client)(&config.relay_url, &config.room_id, &credential_hash)
     {
@@ -5805,7 +5809,8 @@ mod tests {
 
     /// 见 `test_session_repo_provider_allowing_default_repo` 文档——两者成对使用。
     fn with_default_active_repo(inner: Arc<Inner>) -> Arc<Inner> {
-        *lock(&inner.state.active_repo_id_for_gating) = Some(TEST_DEFAULT_ACTIVE_REPO_ID.to_owned());
+        *lock(&inner.state.active_repo_id_for_gating) =
+            Some(TEST_DEFAULT_ACTIVE_REPO_ID.to_owned());
         inner
     }
 
@@ -7126,9 +7131,7 @@ mod tests {
                 "remote_active_repo_id" => Some("proj-1".to_owned()),
                 _ => None,
             },
-            Box::new(|_project_id| {
-                Ok("0123456789abcdef0123456789abcdef".to_owned())
-            }),
+            Box::new(|_project_id| Ok("0123456789abcdef0123456789abcdef".to_owned())),
             Box::new(|_, _| {
                 Ok(RegistrySnapshot {
                     revision: 100,
@@ -7185,8 +7188,7 @@ mod tests {
         gateway_thread.join().unwrap();
 
         assert_eq!(
-            accepted_count,
-            1,
+            accepted_count, 1,
             "terminal Stop must remain in wait_for_reload instead of reconnecting"
         );
         assert!(
@@ -9239,10 +9241,8 @@ mod tests {
 
     #[test]
     fn ensure_claim_409_with_devices_stops_without_regeneration() {
-        let inner = test_inner_with_claim_handlers(
-            |_, _, _| Ok(ClaimResponse::Conflict),
-            |_| Ok(true),
-        );
+        let inner =
+            test_inner_with_claim_handlers(|_, _, _| Ok(ClaimResponse::Conflict), |_| Ok(true));
 
         assert!(matches!(
             ensure_claim(
@@ -9260,9 +9260,8 @@ mod tests {
     /// 撤除说明）。
     #[test]
     fn ensure_claim_conflict_without_devices_stops_immediately() {
-        let inner = test_inner_with_claim_handlers(|_, _, _| Ok(ClaimResponse::Conflict), |_| {
-            Ok(false)
-        });
+        let inner =
+            test_inner_with_claim_handlers(|_, _, _| Ok(ClaimResponse::Conflict), |_| Ok(false));
         let config = GatewayConfig {
             relay_url: "wss://relay.example.com".to_owned(),
             room_id: "0123456789abcdef0123456789abcdef".to_owned(),
@@ -16404,7 +16403,11 @@ mod tests {
         settings: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
         active_room_resolver: impl Fn(&str) -> Result<String, String> + Send + Sync + 'static,
     ) -> Arc<Inner> {
-        test_inner_with_token_provider_and_active_room_resolver(settings, || None, active_room_resolver)
+        test_inner_with_token_provider_and_active_room_resolver(
+            settings,
+            || None,
+            active_room_resolver,
+        )
     }
 
     /// M2-4d：`test_inner_with_active_room_resolver` 的通用版——额外暴露 `token_provider`。
@@ -17488,8 +17491,9 @@ mod tests {
     fn assert_panicking_attempt_enters_backoff(inner: &Arc<Inner>) {
         let (_upstream_tx, upstream_rx) = mpsc::sync_channel(1);
         let (_milestone_tx, milestone_rx) = mpsc::sync_channel(1);
-        let result =
-            catch_unwind(AssertUnwindSafe(|| attempt_once(inner, &upstream_rx, &milestone_rx)));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            attempt_once(inner, &upstream_rx, &milestone_rx)
+        }));
         let payload = result.expect_err("callback panic must be caught around the whole attempt");
         let mut failed_attempts = 0;
         assert_eq!(

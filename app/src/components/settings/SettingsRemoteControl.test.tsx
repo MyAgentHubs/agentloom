@@ -137,9 +137,8 @@ describe("SettingsRemoteControl", () => {
 
     render(<SettingsRemoteControl />);
 
-    const input = await screen.findByLabelText<HTMLInputElement>(
-      "Relay 服务器地址",
-    );
+    const input =
+      await screen.findByLabelText<HTMLInputElement>("Relay 服务器地址");
     await waitFor(() =>
       expect(input).toHaveAttribute(
         "placeholder",
@@ -190,9 +189,7 @@ describe("SettingsRemoteControl", () => {
 
     fireEvent.click(await screen.findByText("诊断"));
 
-    expect(
-      await screen.findByText("keepalive_pings_sent"),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("keepalive_pings_sent")).toBeInTheDocument();
     expect(screen.getByText("19")).toBeInTheDocument();
     expect(screen.getByText("disconnect_config_stale")).toBeInTheDocument();
     expect(screen.getByText("20")).toBeInTheDocument();

@@ -22,7 +22,9 @@ beforeEach(() => {
   clearAttachmentCache();
 });
 
-function stubAttachmentPort(overrides: Partial<AttachmentPort> = {}): AttachmentPort {
+function stubAttachmentPort(
+  overrides: Partial<AttachmentPort> = {},
+): AttachmentPort {
   return {
     resolveImageSrc: vi.fn().mockResolvedValue(null),
     openExternal: vi.fn().mockResolvedValue(undefined),

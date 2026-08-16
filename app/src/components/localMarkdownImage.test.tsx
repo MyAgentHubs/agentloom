@@ -15,7 +15,9 @@ beforeEach(() => {
   clearAttachmentCache();
 });
 
-function stubAttachmentPort(overrides: Partial<AttachmentPort> = {}): AttachmentPort {
+function stubAttachmentPort(
+  overrides: Partial<AttachmentPort> = {},
+): AttachmentPort {
   return {
     resolveImageSrc: vi.fn().mockResolvedValue(null),
     openExternal: vi.fn().mockResolvedValue(undefined),
@@ -61,9 +63,10 @@ describe("LocalMarkdownImage — 注入 AttachmentPort", () => {
       </AttachmentPortContext.Provider>,
     );
 
-    expect(
-      await screen.findByRole("img", { name: "stubbed" }),
-    ).toHaveAttribute("src", "data:image/png;base64,c3R1Yg==");
+    expect(await screen.findByRole("img", { name: "stubbed" })).toHaveAttribute(
+      "src",
+      "data:image/png;base64,c3R1Yg==",
+    );
     expect(resolveImageSrc).toHaveBeenCalledWith("assets/y.png", "s2");
     expect(invoke).not.toHaveBeenCalled();
   });
