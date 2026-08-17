@@ -409,6 +409,154 @@ async fn normal_stream_with_content_reasoning_and_complete_tool_finalizes() {
         response.tool_calls[0].function.arguments,
         "{\"command\":\"ls\"}"
     );
+    assert!(
+        response.interruption.is_none(),
+        "clean complete stream must not be marked interrupted"
+    );
+}
+
+/// 用裸 TCP 撒谎 Content-Length（宣称的字节数 > 实际发送量）来伪造一次真实的传输层中断：
+/// 发完 SSE 头 + 一段合法 reasoning delta 后提前断连，让 hyper/reqwest 在读 body 时报
+/// "unexpected eof"，从而真正走到 collect() 的 `interrupted=true` 分支（而非清爽 EOF）。
+/// wiremock 不支持这种撒谎响应（它总按实际 body 长度算 Content-Length），所以这里手搭一个
+/// 一次性裸 TCP mock server。
+async fn spawn_truncated_sse_server(body_chunk: &'static str) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        // 把客户端请求读掉一次即可（请求体很小，内核 socket 缓冲足够吸收剩余，不读也不会真死锁，
+        // 读一次纯粹图稳）。
+        let mut discard = [0u8; 4096];
+        let _ = stream.read(&mut discard).await;
+
+        // 撒谎的 Content-Length：比实际发送的 body_chunk 大得多，且故意不发终止用的
+        // "data: [DONE]\n\n"，逼客户端在期望更多字节时遭遇连接被过早关闭。
+        let lied_length = body_chunk.len() + 10_000;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {lied_length}\r\n\r\n{body_chunk}"
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+        // 提前断连：不补满承诺的字节数。
+    });
+    addr
+}
+
+/// 复用撒谎 Content-Length 的裸 TCP 姿势，但发完首个 delta 后既不断连也不再补数据——单纯
+/// 发呆到底，逼客户端在读下一段时撞 `read_timeout`（空闲超时）而不是撞 EOF。用来跟上面
+/// 「提前断连」的场景对照：两者在裸 `reqwest::Error` 的 Display 上长得一模一样（都是
+/// "error decoding response body"），实勘（`e.is_timeout()`）证实只有这条真正超时。
+async fn spawn_stalling_sse_server(body_chunk: &'static str) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut discard = [0u8; 4096];
+        let _ = stream.read(&mut discard).await;
+        let lied_length = body_chunk.len() + 10_000;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {lied_length}\r\n\r\n{body_chunk}"
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+        // 不断连、不补数据：单纯发呆，逼客户端撞 read_timeout（而非撞 EOF）。
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    });
+    addr
+}
+
+/// T2c Minor-1：真空闲超时（而非提前断连）走到 collect() 的中断分支时，落盘的 `interruption`
+/// 文案要带上超时线索，用户才分得清「模型这边一直在等」还是「网络说断就断」。
+#[tokio::test]
+async fn collect_marks_idle_timeout_interruption_with_timeout_hint() {
+    let body_chunk =
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"partial-thought\"}}]}\n\n";
+    let addr = spawn_stalling_sse_server(body_chunk).await;
+    let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+        provider_id: "openai-compatible".to_string(),
+        api_key: "sk-test".to_string(),
+        base_url: format!("http://{addr}"),
+        model: "test-model".to_string(),
+        timeout_secs: 1,
+        temperature: None,
+        sampling: Default::default(),
+        network: NetworkPolicy::On,
+        native_search_enabled: true,
+        fallback_model: None,
+        context_tokens: None,
+        output_tokens: None,
+    })
+    .unwrap();
+    let temp = tempdir().unwrap();
+    let mut events = test_events(&temp);
+
+    let response = provider
+        .next_turn(&[ChatMessage::user("hi")], &[], &mut events)
+        .await
+        .expect("已有部分 reasoning 内容·中断路径应优雅收尾返回 Ok 而非报错");
+
+    let interruption = response
+        .interruption
+        .as_deref()
+        .expect("idle timeout must be marked as interruption");
+    assert!(
+        interruption.contains("idle timeout"),
+        "空闲超时文案应带上超时线索，实际: {interruption:?}"
+    );
+    assert!(
+        interruption.contains("1s"),
+        "文案应带上实际配的超时秒数（timeout_secs=1），实际: {interruption:?}"
+    );
+}
+
+#[tokio::test]
+async fn collect_marks_interruption_when_stream_cuts_off_mid_body() {
+    let body_chunk =
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"partial-thought\"}}]}\n\n";
+    let addr = spawn_truncated_sse_server(body_chunk).await;
+
+    let provider = generic_provider(format!("http://{addr}"));
+    let temp = tempdir().unwrap();
+    let mut events = test_events(&temp);
+
+    let response = provider
+        .next_turn(&[ChatMessage::user("hi")], &[], &mut events)
+        .await
+        .expect("已有部分 reasoning 内容·中断路径应优雅收尾返回 Ok 而非报错");
+
+    assert_eq!(response.reasoning, "partial-thought");
+    assert_eq!(
+        response.interruption.as_deref().map(|s| !s.is_empty()),
+        Some(true),
+        "stream cut off mid-body must set interruption to Some(non-empty error text)"
+    );
+    // T2c Minor-1 回归钉：这是提前断连（撒谎 Content-Length），不是空闲超时——文案不该带
+    // 超时线索，否则用户会被误导去查网络空闲超时而不是查对端为什么提前挂断。
+    assert!(
+        !response
+            .interruption
+            .as_deref()
+            .unwrap_or_default()
+            .contains("idle timeout"),
+        "premature disconnect (not a timeout) must not be mislabeled as idle timeout: {:?}",
+        response.interruption
+    );
+    let journal = std::fs::read_to_string(temp.path().join("events.jsonl")).unwrap();
+    assert!(
+        journal.contains("stream_interrupted"),
+        "warning 事件应照旧 emit；journal:\n{journal}"
+    );
 }
 
 #[tokio::test]

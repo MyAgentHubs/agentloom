@@ -1058,8 +1058,13 @@ pub(crate) fn augmented_path_for_spawn() -> Option<OsString> {
 
 /// harness provider 专属 env 注入：{PREFIX}_API_KEY/{PREFIX}_BASE_URL/{PREFIX}_MODEL（provider 名
 /// 大写转下划线；`MYAGENT` 前缀开头的 provider 名跳过，防撞 MYAGENT_API_KEY 等保留名）+ 通用
-/// MYAGENT_* 别名 + search key/backend。`HarnessBackend::build_command_inner`（Normal/Worker/…）与
-/// L3 队长装配 `harness_lead_cmd_in`（lib.rs）共用同一份——顺序/过滤条件必须逐字节对齐，别各写一份。
+/// MYAGENT_* 别名 + search key/backend + 流式空闲超时。`HarnessBackend::build_command_inner`
+/// （Normal/Worker/…）与 L3 队长装配 `harness_lead_cmd_in`（lib.rs）共用同一份——
+/// 顺序/过滤条件必须逐字节对齐，别各写一份。
+///
+/// `MYAGENT_TIMEOUT_SECS`：`agents.api_timeout_ms`（毫秒，用户在 GUI 配的超时）向上取整转秒，
+/// 下限 1——引擎侧非法值 / 0 会硬报错起不来（`ea9ac648`/`bfc4b210`）。`None` 或 ≤0 时不设该变量，
+/// 让引擎默认 120 秒生效。
 pub(crate) fn apply_harness_provider_env(
     cmd: &mut Command,
     profile: &AgentProfile,
@@ -1092,6 +1097,12 @@ pub(crate) fn apply_harness_provider_env(
         if provider_env {
             cmd.env(format!("{env_prefix}_MODEL"), model);
         }
+    }
+    if let Some(timeout_ms) = profile.api_timeout_ms.filter(|ms| *ms > 0) {
+        // `i64::div_ceil` 的有符号版本在当前工具链未稳定（int_roundings，仅无符号已稳）；
+        // 已用 `filter(*ms > 0)` 保证非负，转 u64 走稳定实现。
+        let timeout_secs = (timeout_ms as u64).div_ceil(1000).max(1);
+        cmd.env("MYAGENT_TIMEOUT_SECS", timeout_secs.to_string());
     }
 }
 
@@ -2842,6 +2853,103 @@ model = "nested-model"
             env_value(&cmd, "MYAGENT_MODEL"),
             Some(Some("glm-4.5".into()))
         );
+    }
+
+    /// T3：`agents.api_timeout_ms`（毫秒）→ `MYAGENT_TIMEOUT_SECS`（秒，向上取整，下限 1）。
+    /// Normal（solo）与 Worker（member）两条模式共用 `HarnessBackend::build_command_inner`，
+    /// 循环两种 mode 确认 env 装配不依赖 ctx.mode——一并盖住 solo/member 两条 spawn 路径。
+    #[test]
+    fn harness_maps_api_timeout_ms_to_myagent_timeout_secs() {
+        let _mode = set_harness_mode_for_test(None);
+        let test = setup_context();
+
+        for mode in [BuildMode::Normal, BuildMode::Worker] {
+            let ctx = BuildContext {
+                prompt: "fix the bug",
+                session_id: &test.session_id,
+                run_id: "test-run",
+                wt: &test.home,
+                conn: &test.conn,
+                mode,
+                locale: crate::Locale::Zh,
+                reasoning_tier: None,
+                criteria: &[],
+            };
+
+            // a) 600000ms → 600s（整除）。
+            let mut profile_a = harness_profile();
+            profile_a.api_timeout_ms = Some(600_000);
+            let backend_a = HarnessBackend {
+                profile: profile_a,
+                api_key: Some("k".to_string()),
+                search_api_key: None,
+                search_backend: None,
+            };
+            let cmd_a = backend_a.build_command(&ctx).unwrap();
+            assert_eq!(
+                env_value(&cmd_a, "MYAGENT_TIMEOUT_SECS"),
+                Some(Some("600".into())),
+                "mode={mode:?}"
+            );
+
+            // b) None → 不设该变量（引擎默认 120 生效）。
+            let mut profile_b = harness_profile();
+            profile_b.api_timeout_ms = None;
+            let backend_b = HarnessBackend {
+                profile: profile_b,
+                api_key: Some("k".to_string()),
+                search_api_key: None,
+                search_backend: None,
+            };
+            let cmd_b = backend_b.build_command(&ctx).unwrap();
+            assert_eq!(
+                env_value(&cmd_b, "MYAGENT_TIMEOUT_SECS"),
+                None,
+                "mode={mode:?}"
+            );
+
+            // c) 边界 500ms → 向上取整 + 下限 1 → 1s（不是 0，避免触发引擎硬报错）。
+            let mut profile_c = harness_profile();
+            profile_c.api_timeout_ms = Some(500);
+            let backend_c = HarnessBackend {
+                profile: profile_c,
+                api_key: Some("k".to_string()),
+                search_api_key: None,
+                search_backend: None,
+            };
+            let cmd_c = backend_c.build_command(&ctx).unwrap();
+            assert_eq!(
+                env_value(&cmd_c, "MYAGENT_TIMEOUT_SECS"),
+                Some(Some("1".into())),
+                "mode={mode:?}"
+            );
+        }
+    }
+
+    /// 边界：`api_timeout_ms` ≤ 0（脏数据/未来 UI 允许输入 0）不该注入 `MYAGENT_TIMEOUT_SECS=0`——
+    /// 引擎侧把非法值/0 当硬报错（`ea9ac648`/`bfc4b210`），必须完全不设该变量、让引擎默认值生效。
+    #[test]
+    fn harness_omits_timeout_env_when_api_timeout_ms_non_positive() {
+        let _mode = set_harness_mode_for_test(None);
+        let test = setup_context();
+        let ctx = build_context(&test, "fix the bug");
+
+        for bad in [0_i64, -1_i64] {
+            let mut profile = harness_profile();
+            profile.api_timeout_ms = Some(bad);
+            let backend = HarnessBackend {
+                profile,
+                api_key: Some("k".to_string()),
+                search_api_key: None,
+                search_backend: None,
+            };
+            let cmd = backend.build_command(&ctx).unwrap();
+            assert_eq!(
+                env_value(&cmd, "MYAGENT_TIMEOUT_SECS"),
+                None,
+                "api_timeout_ms={bad}"
+            );
+        }
     }
 
     #[test]

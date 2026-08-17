@@ -103,6 +103,7 @@ pub async fn run_solo_with_control_scoped<P: ProviderClient>(
     )?;
 
     let mut messages = initial_messages(&options.prompt);
+    inject_model_identity(&mut messages, &options.model);
     if let Some(extra) = options.append_system_prompt.as_deref() {
         append_to_system_prompt(&mut messages, extra);
     }

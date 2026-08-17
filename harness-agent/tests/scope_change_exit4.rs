@@ -213,6 +213,7 @@ impl ProviderClient for ScopeThenFinish {
                     },
                 }],
                 finish_reason: Some(FinishReason::ToolCalls),
+                interruption: None,
             });
         }
         events.emit_text_delta("done")?;
@@ -221,6 +222,7 @@ impl ProviderClient for ScopeThenFinish {
             reasoning: String::new(),
             tool_calls: vec![],
             finish_reason: Some(FinishReason::Stop),
+            interruption: None,
         })
     }
 
@@ -335,6 +337,7 @@ impl ProviderClient for ToolsCaptor {
             reasoning: String::new(),
             tool_calls: vec![],
             finish_reason: None,
+            interruption: None,
         })
     }
 

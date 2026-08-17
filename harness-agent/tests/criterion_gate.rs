@@ -312,6 +312,7 @@ impl myagent::provider::ProviderClient for ToolsCaptor {
             reasoning: String::new(),
             tool_calls: vec![],
             finish_reason: None,
+            interruption: None,
         })
     }
     fn capabilities(&self) -> myagent::provider::ProviderCapabilities {

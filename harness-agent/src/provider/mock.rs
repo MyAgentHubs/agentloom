@@ -273,6 +273,7 @@ fn provider_response(
         reasoning: reasoning.into(),
         tool_calls,
         finish_reason,
+        interruption: None,
     }
 }
 

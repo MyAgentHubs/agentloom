@@ -145,6 +145,10 @@ pub struct ProviderResponse {
     pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: Option<FinishReason>,
+    /// 流被中途打断时的错误文案（None = 完整正常轮）。承载「这轮不是模型交白卷、是传输被掐断」的事实，
+    /// 供上层（主循环）区分「网络故障」与「模型真空转」——本字段目前只做管道搬运，消费逻辑留待后续任务。
+    #[serde(default)]
+    pub interruption: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

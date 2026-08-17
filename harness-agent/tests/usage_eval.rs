@@ -701,16 +701,18 @@ async fn u11_blocked_run_reports_no_usage_and_keeps_frozen_shape() {
 async fn u12_fallback_model_usage_counted_once() {
     let server = MockServer::start().await;
     // 主模型恒 500（重试耗尽·退避 ~3.5s）→ 引擎换 fallback-model 重发 → 成功带 usage。
-    // 用 body 里的 model 名区分两段 mock。
+    // 用 body 里 JSON 的 "model" 字段（带引号+冒号）区分两段 mock：系统提示里现在会带一行
+    // "Underlying model: deepseek-v4-flash" 身份声明，裸 body_string_contains(模型名) 对
+    // fallback 请求也会命中（因为 messages 里仍留着主模型名的文本），必须锚定 JSON 字段本身。
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .and(body_string_contains("deepseek-v4-flash"))
+        .and(body_string_contains("\"model\":\"deepseek-v4-flash\""))
         .respond_with(ResponseTemplate::new(500).set_body_string("primary down"))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .and(body_string_contains("fallback-model"))
+        .and(body_string_contains("\"model\":\"fallback-model\""))
         .respond_with(sse_response(final_text_sse(
             "recovered on fallback",
             71,

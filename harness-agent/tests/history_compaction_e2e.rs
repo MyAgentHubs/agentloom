@@ -53,6 +53,7 @@ impl ProviderClient for RecordingProvider {
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -71,6 +72,7 @@ impl ProviderClient for RecordingProvider {
                 },
             }],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -104,6 +106,7 @@ impl ProviderClient for GiantResultProvider {
                     },
                 }],
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -112,6 +115,7 @@ impl ProviderClient for GiantResultProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
 

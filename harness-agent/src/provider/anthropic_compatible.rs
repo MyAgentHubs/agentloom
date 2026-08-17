@@ -186,6 +186,7 @@ pub(crate) fn parse_anthropic_response(body: &Value) -> Result<ProviderResponse>
             .get("stop_reason")
             .and_then(Value::as_str)
             .map(FinishReason::from_anthropic),
+        interruption: None,
     })
 }
 

@@ -71,6 +71,7 @@ impl ProviderClient for VerifyReflexEditProvider {
                 reasoning: String::new(),
                 tool_calls,
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -79,6 +80,7 @@ impl ProviderClient for VerifyReflexEditProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -143,6 +145,7 @@ impl ProviderClient for WatchdogRepeatingEditProvider {
                 },
             ],
             finish_reason: None,
+            interruption: None,
         })
     }
 

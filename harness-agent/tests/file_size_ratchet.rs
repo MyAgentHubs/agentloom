@@ -10,11 +10,18 @@ use std::path::{Path, PathBuf};
 /// 只留 `orchestrator/run_loop.rs` + `orchestrator/tests.rs`。
 const WHITELIST: &[(&str, usize)] = &[
     // 棘轮重基线：evidence gate 与自适应安全网已合入；后续独立拆 run-loop 阶段处理器。
-    ("orchestrator/run_loop.rs", 2983),
+    // 棘轮收口：ProviderResponse 加 interruption 字段·本文件内测试用构造点机械补 None(+1)
+    // 棘轮收口：T2b 主循环消费 interruption——新增拦截分支+计数器(+24)
+    // 棘轮收口：T2c M-1 断流分支收窄到 finish_reason 也缺失——嵌套 if + 加长注释(+8)
+    ("orchestrator/run_loop.rs", 3016),
     // 棘轮重基线：随 run-loop 行为补齐的大量回归测试；后续按行为域拆测试模块。
-    ("orchestrator/tests.rs", 8521),
+    // 棘轮收口：ProviderResponse 加 interruption 字段·88 处测试构造点机械补 None(+88)
+    // 棘轮收口：T2b 断流轮行为回归测试——5 条新用例 + mock provider/helper(+270)
+    // 棘轮收口：T2c M-1 新增回归测试——finish_reason 已收到的完整轮不误判断流(+64)
+    ("orchestrator/tests.rs", 8943),
     ("orchestrator/probe_runner.rs", 1488),
-    ("plan/run_plan.rs", 4955),
+    // 棘轮收口：ProviderResponse 加 interruption 字段·16 处测试构造点机械补 None(+16)
+    ("plan/run_plan.rs", 4971),
     // 棘轮收口：2155 之后叠加 MCP 管理/注入、fs read/write fence 等已合入 CLI 能力；
     // 本次先同步实际值，后续独立拆分 CLI 参数解析、命令执行与内联测试后再下拉。
     ("cli.rs", 2542),
@@ -23,7 +30,11 @@ const WHITELIST: &[(&str, usize)] = &[
     ("guardrails.rs", 1055),
     ("plan/replan.rs", 1023),
     ("plan/write_audit.rs", 1031),
-    ("provider/openai_compatible.rs", 1068),
+    // 棘轮收口：超时语义改空闲(read_timeout)+连接超时,附约束注释(+4)
+    // 棘轮收口：ProviderResponse 加 interruption 字段——collect() 中断分支把断流事实
+    // 上车 + 本文件内 5 处构造点机械补 None(+8)
+    // 棘轮收口：T2c Minor-1 断流文案区分空闲超时——is_timeout() 分流 + 实勘注释(+13)
+    ("provider/openai_compatible.rs", 1093),
     // 棘轮重基线：跨平台 shell、专属进程组收割和 checkpoint 竞态修复；后续按职责拆分。
     ("exec/controlled/mod.rs", 960),
     // 棘轮重基线：从 controlled.rs 原样搬出的回归测试；后续按行为域拆测试模块。
@@ -33,7 +44,11 @@ const WHITELIST: &[(&str, usize)] = &[
     ("tools/mod.rs", 845),
     ("mcp/tool.rs", 831),
     // 棘轮收口：provider 协议自动判定配置入口(+126)
-    ("config.rs", 1074),
+    // 棘轮收口：timeout_secs 加 {env_prefix}_TIMEOUT_SECS→MYAGENT_TIMEOUT_SECS 覆盖链
+    // + 对应 5 条 env 覆盖/回退测试(+71)
+    // 棘轮收口：timeout_secs 非法值(parse 失败/等于 0)改硬报错——对齐邻居字段
+    // (temperature/top_p/output_tokens)语义，拒绝静默 fail-open(+15)
+    ("config.rs", 1160),
 ];
 
 const HARD_LIMIT: usize = 800;

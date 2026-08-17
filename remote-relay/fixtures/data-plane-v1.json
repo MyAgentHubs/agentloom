@@ -82,6 +82,15 @@
       "gap": null
     },
     {
+      "category": "input.relay_queued",
+      "sample_count": 1,
+      "consumer_tests": [
+        "relay input：桌面离线时 handleInput 入队回一条 input.relay_queued，帧形状与样张深比对",
+        "relay input：同 command_id 幂等命中回一条既存行 expires_at 的 input.relay_queued，帧形状与样张深比对"
+      ],
+      "gap": null
+    },
+    {
       "category": "replay.head",
       "sample_count": 1,
       "consumer_tests": [
@@ -587,6 +596,20 @@
       "valid": true,
       "consumers": [
         "relay 过期 pending_input 行经 webSocketMessage 触发清扫并广播 input.expired"
+      ]
+    },
+    {
+      "name": "input_relay_queued",
+      "desc": "input.relay_queued——relay handleInput 在桌面离线时把 input 暂存进 pending_input 后，定向回给发送方这条帧（不是 input.ack/error）；同 command_id 幂等命中时同一形状原样重发（expires_at 取既存行的值，不是重新计算）。",
+      "frame": {
+        "t": "input.relay_queued",
+        "command_id": "cmd-dp1-relay-queued",
+        "expires_at": 1800000000000
+      },
+      "valid": true,
+      "consumers": [
+        "relay input：桌面离线时 handleInput 入队回一条 input.relay_queued，帧形状与样张深比对",
+        "relay input：同 command_id 幂等命中回一条既存行 expires_at 的 input.relay_queued，帧形状与样张深比对"
       ]
     },
     {

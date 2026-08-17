@@ -48,8 +48,12 @@ pub struct OpenAiCompatibleProvider {
 
 impl OpenAiCompatibleProvider {
     pub fn new(config: OpenAiCompatibleConfig) -> Result<Self> {
+        // 这里必须用空闲超时（read_timeout）而非整请求总超时（timeout）：聊天请求全是
+        // "stream": true 的 SSE，慢思考模型（GLM/deepseek 等）一轮 reasoning 流可能持续
+        // 数分钟——只要还在往回吐字节就是活着，用总时长掐会把长流在中途精确切断。
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(config.timeout_secs))
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(config.timeout_secs))
             .build()?;
         Ok(Self { config, client })
     }
@@ -283,7 +287,20 @@ impl OpenAiCompatibleProvider {
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    interrupt_err = Some(e.into()); // 存下传输错·待收尾判空
+                    // 实勘（temp probe，已剔除）：reqwest 0.12 的 `is_timeout()` 自己会沿
+                    // `source()` 链走到底找 `TimedOut` 标记（不管是 hyper 层还是 io 层），
+                    // 不需要这里手动解链。且两种断连（撒谎 Content-Length 提前关闭 / 真空闲
+                    // 超时）在裸 reqwest::Error 的 Display 上长得一模一样，都是
+                    // "error decoding response body"——不分流用户就永远看不出是哪种。
+                    let interrupted_err = if e.is_timeout() {
+                        HarnessError::Provider(format!(
+                            "{e} (idle timeout: no bytes received for {}s)",
+                            self.config.timeout_secs
+                        ))
+                    } else {
+                        e.into()
+                    };
+                    interrupt_err = Some(interrupted_err); // 存下传输错·待收尾判空
                     interrupted = true;
                     break;
                 }
@@ -345,7 +362,7 @@ impl OpenAiCompatibleProvider {
             }
         }
 
-        let (response, dropped) = finalize_provider_response(
+        let (mut response, dropped) = finalize_provider_response(
             content,
             reasoning,
             tool_accumulators,
@@ -358,13 +375,16 @@ impl OpenAiCompatibleProvider {
                 return Err(interrupt_err.expect("interrupted implies stored error"));
             }
             // 确有可留内容 → 此刻才 emit：先 stream_interrupted，再逐个被丢 tool
+            let interruption_text = interrupt_err.map(|e| e.to_string()).unwrap_or_default();
             events.emit(
                 "provider.warning",
                 json!({
                     "warning": "stream_interrupted",
-                    "error": interrupt_err.map(|e| e.to_string()).unwrap_or_default(),
+                    "error": interruption_text.clone(),
                 }),
             )?;
+            // 断流事实上车：主循环靠这个字段区分「传输被掐断」与「模型真交白卷」(消费逻辑留待后续任务)
+            response.interruption = Some(interruption_text);
             for name in dropped {
                 events.emit(
                     "provider.warning",
@@ -695,6 +715,7 @@ fn finalize_provider_response(
             reasoning,
             tool_calls,
             finish_reason,
+            interruption: None,
         },
         dropped,
     )
@@ -976,6 +997,7 @@ mod tests {
             reasoning: String::new(),
             tool_calls: vec![],
             finish_reason: None,
+            interruption: None,
         };
         assert!(response_is_empty(&empty));
         let with_text = ProviderResponse {
@@ -983,6 +1005,7 @@ mod tests {
             reasoning: String::new(),
             tool_calls: vec![],
             finish_reason: None,
+            interruption: None,
         };
         assert!(!response_is_empty(&with_text));
         let with_reasoning = ProviderResponse {
@@ -990,6 +1013,7 @@ mod tests {
             reasoning: "r".into(),
             tool_calls: vec![],
             finish_reason: None,
+            interruption: None,
         };
         assert!(!response_is_empty(&with_reasoning));
         let with_tool = ProviderResponse {
@@ -1004,6 +1028,7 @@ mod tests {
                 },
             }],
             finish_reason: None,
+            interruption: None,
         };
         assert!(!response_is_empty(&with_tool));
     }

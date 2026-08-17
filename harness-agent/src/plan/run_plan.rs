@@ -2006,6 +2006,7 @@ mod tests {
                 reasoning: String::new(),
                 tool_calls: vec![],
                 finish_reason: None,
+                interruption: None,
             })
         }
         fn capabilities(&self) -> crate::provider::ProviderCapabilities {
@@ -2047,6 +2048,7 @@ mod tests {
                     reasoning: String::new(),
                     tool_calls: vec![],
                     finish_reason: None,
+                    interruption: None,
                 });
             }
             let tool_msgs = messages.iter().filter(|m| m.role == "tool").count();
@@ -2064,6 +2066,7 @@ mod tests {
                         },
                     }],
                     finish_reason: None,
+                    interruption: None,
                 });
             }
             Ok(crate::provider::ProviderResponse {
@@ -2071,6 +2074,7 @@ mod tests {
                 reasoning: String::new(),
                 tool_calls: vec![],
                 finish_reason: None,
+                interruption: None,
             })
         }
         fn capabilities(&self) -> crate::provider::ProviderCapabilities {
@@ -2099,6 +2103,7 @@ mod tests {
                 reasoning: String::new(),
                 tool_calls: vec![],
                 finish_reason: None,
+                interruption: None,
             })
         }
 
@@ -2135,6 +2140,7 @@ mod tests {
                 reasoning: String::new(),
                 tool_calls: vec![],
                 finish_reason: None,
+                interruption: None,
             })
         }
 
@@ -2177,6 +2183,7 @@ mod tests {
                 reasoning: String::new(),
                 tool_calls: vec![],
                 finish_reason: None,
+                interruption: None,
             })
         }
 
@@ -2219,6 +2226,7 @@ mod tests {
                 reasoning: String::new(),
                 tool_calls: vec![],
                 finish_reason: None,
+                interruption: None,
             })
         }
 
@@ -2266,6 +2274,7 @@ mod tests {
                     reasoning: String::new(),
                     tool_calls: vec![],
                     finish_reason: None,
+                    interruption: None,
                 });
             }
             if is_planner {
@@ -2274,6 +2283,7 @@ mod tests {
                     reasoning: String::new(),
                     tool_calls: vec![],
                     finish_reason: None,
+                    interruption: None,
                 });
             }
             if prompt.contains("create fixed marker") && tool_msgs == 0 {
@@ -2290,6 +2300,7 @@ mod tests {
                         },
                     }],
                     finish_reason: None,
+                    interruption: None,
                 });
             }
 
@@ -2298,6 +2309,7 @@ mod tests {
                 reasoning: String::new(),
                 tool_calls: vec![],
                 finish_reason: None,
+                interruption: None,
             })
         }
 
@@ -2345,6 +2357,7 @@ mod tests {
                     reasoning: String::new(),
                     tool_calls: vec![],
                     finish_reason: None,
+                    interruption: None,
                 });
             }
             if is_planner {
@@ -2353,6 +2366,7 @@ mod tests {
                     reasoning: String::new(),
                     tool_calls: vec![],
                     finish_reason: None,
+                    interruption: None,
                 });
             }
             if prompt.contains("create overall marker") && tool_msgs == 0 {
@@ -2369,6 +2383,7 @@ mod tests {
                         },
                     }],
                     finish_reason: None,
+                    interruption: None,
                 });
             }
 
@@ -2377,6 +2392,7 @@ mod tests {
                 reasoning: String::new(),
                 tool_calls: vec![],
                 finish_reason: None,
+                interruption: None,
             })
         }
 

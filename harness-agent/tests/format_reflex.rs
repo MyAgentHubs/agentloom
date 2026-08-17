@@ -33,6 +33,7 @@ impl ProviderClient for ReadEditEditStop {
                     reasoning: String::new(),
                     tool_calls: vec![],
                     finish_reason: None,
+                    interruption: None,
                 });
             }
         };
@@ -49,6 +50,7 @@ impl ProviderClient for ReadEditEditStop {
                 },
             }],
             finish_reason: None,
+            interruption: None,
         })
     }
 

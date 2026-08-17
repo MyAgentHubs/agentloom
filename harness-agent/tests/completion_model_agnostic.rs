@@ -59,6 +59,7 @@ impl ProviderClient for NeverStopsProvider {
                 },
             }],
             finish_reason: None,
+            interruption: None,
         })
     }
     fn capabilities(&self) -> ProviderCapabilities {
@@ -83,6 +84,7 @@ impl ProviderClient for StopsImmediatelyProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
     fn capabilities(&self) -> ProviderCapabilities {
@@ -297,6 +299,7 @@ impl ProviderClient for EditThenReadProvider {
                     },
                 ],
                 finish_reason: None,
+                interruption: None,
             });
         }
         Ok(ProviderResponse {
@@ -311,6 +314,7 @@ impl ProviderClient for EditThenReadProvider {
                 },
             }],
             finish_reason: None,
+            interruption: None,
         })
     }
     fn capabilities(&self) -> ProviderCapabilities {

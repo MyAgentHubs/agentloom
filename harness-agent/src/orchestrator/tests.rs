@@ -106,6 +106,7 @@ async fn run_solo_task_real_time_gate_allows_out_of_allowlist_with_advisory() {
                     reasoning: String::new(),
                     tool_calls: vec![],
                     finish_reason: None,
+                    interruption: None,
                 });
             }
             Ok(crate::provider::ProviderResponse {
@@ -122,6 +123,7 @@ async fn run_solo_task_real_time_gate_allows_out_of_allowlist_with_advisory() {
                     },
                 }],
                 finish_reason: None,
+                interruption: None,
             })
         }
         fn capabilities(&self) -> crate::provider::ProviderCapabilities {
@@ -183,6 +185,7 @@ async fn run_solo_task_real_time_gate_hard_denies_forbidden() {
                     reasoning: String::new(),
                     tool_calls: vec![],
                     finish_reason: None,
+                    interruption: None,
                 });
             }
             Ok(crate::provider::ProviderResponse {
@@ -198,6 +201,7 @@ async fn run_solo_task_real_time_gate_hard_denies_forbidden() {
                     },
                 }],
                 finish_reason: None,
+                interruption: None,
             })
         }
         fn capabilities(&self) -> crate::provider::ProviderCapabilities {
@@ -253,6 +257,7 @@ async fn run_solo_task_injects_task_contract_scope_and_constraints() {
                 reasoning: String::new(),
                 tool_calls: vec![],
                 finish_reason: None,
+                interruption: None,
             })
         }
         fn capabilities(&self) -> crate::provider::ProviderCapabilities {
@@ -311,6 +316,7 @@ async fn propose_scope_change_with_paths_extends_and_continues() {
                     reasoning: String::new(),
                     tool_calls: vec![],
                     finish_reason: None,
+                    interruption: None,
                 });
             }
             Ok(crate::provider::ProviderResponse {
@@ -330,6 +336,7 @@ async fn propose_scope_change_with_paths_extends_and_continues() {
                     },
                 }],
                 finish_reason: None,
+                interruption: None,
             })
         }
 
@@ -488,6 +495,7 @@ impl crate::provider::ProviderClient for EvidenceToolOffProvider {
                     },
                 }],
                 finish_reason: Some(crate::provider::FinishReason::ToolCalls),
+                interruption: None,
             });
         }
 
@@ -505,6 +513,7 @@ impl crate::provider::ProviderClient for EvidenceToolOffProvider {
             reasoning: String::new(),
             tool_calls: vec![],
             finish_reason: Some(crate::provider::FinishReason::Stop),
+            interruption: None,
         })
     }
 
@@ -1021,6 +1030,7 @@ impl crate::provider::ProviderClient for EvidenceEditShellProvider {
                     },
                 }],
                 finish_reason: Some(crate::provider::FinishReason::ToolCalls),
+                interruption: None,
             });
         }
         Ok(crate::provider::ProviderResponse {
@@ -1028,6 +1038,7 @@ impl crate::provider::ProviderClient for EvidenceEditShellProvider {
             reasoning: String::new(),
             tool_calls: vec![],
             finish_reason: Some(crate::provider::FinishReason::Stop),
+            interruption: None,
         })
     }
 
@@ -1398,6 +1409,7 @@ impl crate::provider::ProviderClient for EvidenceEditBlockedProvider {
                     },
                 }],
                 finish_reason: Some(crate::provider::FinishReason::ToolCalls),
+                interruption: None,
             });
         }
         let saw_guidance = messages.iter().any(|message| {
@@ -1414,6 +1426,7 @@ impl crate::provider::ProviderClient for EvidenceEditBlockedProvider {
             reasoning: String::new(),
             tool_calls: vec![],
             finish_reason: Some(crate::provider::FinishReason::Stop),
+            interruption: None,
         })
     }
 
@@ -1512,6 +1525,7 @@ impl crate::provider::ProviderClient for EvidenceEditAcceptedProvider {
                     },
                 ],
                 finish_reason: Some(crate::provider::FinishReason::ToolCalls),
+                interruption: None,
             });
         }
         Ok(crate::provider::ProviderResponse {
@@ -1519,6 +1533,7 @@ impl crate::provider::ProviderClient for EvidenceEditAcceptedProvider {
             reasoning: String::new(),
             tool_calls: vec![],
             finish_reason: Some(crate::provider::FinishReason::Stop),
+            interruption: None,
         })
     }
 
@@ -2279,6 +2294,7 @@ impl ProviderClient for RejectScriptProvider {
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -2294,6 +2310,7 @@ impl ProviderClient for RejectScriptProvider {
                 },
             }],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -2340,6 +2357,7 @@ impl ProviderClient for ToolOutcomeRecoverProvider {
                     },
                 }],
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -2359,6 +2377,7 @@ impl ProviderClient for ToolOutcomeRecoverProvider {
                     reasoning: String::new(),
                     tool_calls: Vec::new(),
                     finish_reason: None,
+                    interruption: None,
                 });
             }
 
@@ -2379,6 +2398,7 @@ impl ProviderClient for ToolOutcomeRecoverProvider {
                     },
                 }],
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -2399,6 +2419,7 @@ impl ProviderClient for ToolOutcomeRecoverProvider {
                 },
             }],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -2433,6 +2454,7 @@ impl ProviderClient for RuntimeErrProvider {
                 },
             }],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -2473,6 +2495,7 @@ impl ProviderClient for CheckpointFatalWriteThenFollowUpProvider {
                         }),
                     )],
                     finish_reason: None,
+                    interruption: None,
                 })
             }
             1 => {
@@ -2491,6 +2514,7 @@ impl ProviderClient for CheckpointFatalWriteThenFollowUpProvider {
                         json!({ "path": "nested/out.txt" }),
                     )],
                     finish_reason: None,
+                    interruption: None,
                 })
             }
             _ => panic!("checkpoint fatal provider should stop after the follow-up turn"),
@@ -2534,6 +2558,7 @@ impl ProviderClient for TwoReadCallsProvider {
                 },
             ],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -2571,6 +2596,7 @@ impl ProviderClient for ScopeChangeWithTrailingToolProvider {
                 ),
             ],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -2604,6 +2630,7 @@ impl ProviderClient for BlockWithQuestionsProvider {
                 }),
             )],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -2641,6 +2668,7 @@ impl ProviderClient for BlockWithQuestionsTrailingToolProvider {
                 ),
             ],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -2701,6 +2729,7 @@ impl ProviderClient for PairingAssertResumeProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -2732,6 +2761,7 @@ impl ProviderClient for ResumeContractReflexProvider {
                     json!({ "path": "touched.txt", "content": "ok\n" }),
                 )],
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -2747,6 +2777,7 @@ impl ProviderClient for ResumeContractReflexProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -2780,6 +2811,7 @@ impl ProviderClient for ResumeRealignProvider {
                     json!({ "path": "realigned.txt", "content": "ok\n" }),
                 )],
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -2795,6 +2827,7 @@ impl ProviderClient for ResumeRealignProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -2818,6 +2851,7 @@ impl ProviderClient for CompleteImmediatelyProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -2844,6 +2878,7 @@ impl ProviderClient for StateFrameCaptorProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -2896,6 +2931,7 @@ impl ProviderClient for UpdateWorkingStateProvider {
                     ),
                 ],
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -2904,6 +2940,7 @@ impl ProviderClient for UpdateWorkingStateProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -2935,6 +2972,7 @@ impl ProviderClient for ProposeCriterionThenFinalProvider {
                     json!({ "claim": "new criterion", "check_cmd": "true" }),
                 )],
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -2954,6 +2992,7 @@ impl ProviderClient for ProposeCriterionThenFinalProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -2989,6 +3028,7 @@ impl ProviderClient for ProposeCriterionObjectSuccessThenFinalProvider {
                     }),
                 )],
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -2997,6 +3037,7 @@ impl ProviderClient for ProposeCriterionObjectSuccessThenFinalProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -3031,6 +3072,7 @@ impl ProviderClient for ProposeCriterionMalformedArgsThenFinalProvider {
                     },
                 }],
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -3039,6 +3081,7 @@ impl ProviderClient for ProposeCriterionMalformedArgsThenFinalProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -3073,6 +3116,7 @@ impl ProviderClient for UpdateWorkingStateMalformedArgsThenFinalProvider {
                     },
                 }],
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -3081,6 +3125,7 @@ impl ProviderClient for UpdateWorkingStateMalformedArgsThenFinalProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -3115,6 +3160,7 @@ impl ProviderClient for BlockWithQuestionsMalformedArgsThenFinalProvider {
                     },
                 }],
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -3123,6 +3169,7 @@ impl ProviderClient for BlockWithQuestionsMalformedArgsThenFinalProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -3157,6 +3204,7 @@ impl ProviderClient for ProposeScopeChangeMalformedArgsThenFinalProvider {
                     },
                 }],
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -3165,6 +3213,7 @@ impl ProviderClient for ProposeScopeChangeMalformedArgsThenFinalProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -3196,6 +3245,7 @@ impl ProviderClient for DisallowedProposeCriterionThenFinalProvider {
                     json!({ "claim": "new criterion", "check_cmd": "true" }),
                 )],
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -3204,6 +3254,7 @@ impl ProviderClient for DisallowedProposeCriterionThenFinalProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -3236,6 +3287,7 @@ impl ProviderClient for PureReaderProvider {
                 json!({ "path": format!("read_{call}.txt") }),
             )],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -3269,6 +3321,7 @@ impl ProviderClient for RepeatReaderProvider {
                 json!({ "path": "same.txt" }),
             )],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -3299,6 +3352,7 @@ impl ProviderClient for EditingProvider {
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -3322,6 +3376,7 @@ impl ProviderClient for EditingProvider {
                 ),
             ],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -3350,6 +3405,7 @@ impl ProviderClient for ShellEditingProvider {
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -3364,6 +3420,7 @@ impl ProviderClient for ShellEditingProvider {
                 }),
             )],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -3392,6 +3449,7 @@ impl ProviderClient for NovelShellProvider {
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -3406,6 +3464,7 @@ impl ProviderClient for NovelShellProvider {
                 }),
             )],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -3436,6 +3495,7 @@ impl ProviderClient for RepeatShellProvider {
                 json!({ "command": "printf 'red\\n'; exit 7" }),
             )],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -3468,6 +3528,7 @@ impl ProviderClient for ReadThenEditRecoveryProvider {
                     json!({"path": "target.txt"}),
                 )],
                 finish_reason: None,
+                interruption: None,
             }),
             1..=6 => Ok(ProviderResponse {
                 text: "Re-reading before editing.".to_string(),
@@ -3478,6 +3539,7 @@ impl ProviderClient for ReadThenEditRecoveryProvider {
                     json!({"path": "target.txt"}),
                 )],
                 finish_reason: None,
+                interruption: None,
             }),
             7 => {
                 for tool in ["grep", "ls", "glob"] {
@@ -3503,6 +3565,7 @@ impl ProviderClient for ReadThenEditRecoveryProvider {
                         }),
                     )],
                     finish_reason: None,
+                    interruption: None,
                 })
             }
             8 => {
@@ -3519,6 +3582,7 @@ impl ProviderClient for ReadThenEditRecoveryProvider {
                     reasoning: String::new(),
                     tool_calls: Vec::new(),
                     finish_reason: None,
+                    interruption: None,
                 })
             }
             _ => panic!("provider should have completed on turn 9"),
@@ -3564,6 +3628,7 @@ impl ProviderClient for IntroduceCompileErrorProvider {
                     ),
                 ],
                 finish_reason: None,
+                interruption: None,
             }),
             1 => {
                 assert!(
@@ -3578,6 +3643,7 @@ impl ProviderClient for IntroduceCompileErrorProvider {
                     reasoning: String::new(),
                     tool_calls: Vec::new(),
                     finish_reason: None,
+                    interruption: None,
                 })
             }
             // K3：criteria 仍不满足 → turn 2 用完预算后，run_loop 在发 NeedsDecision 前多给
@@ -3587,6 +3653,7 @@ impl ProviderClient for IntroduceCompileErrorProvider {
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
                 finish_reason: None,
+                interruption: None,
             }),
             _ => panic!("compile feedback provider should finish on turn 2 (+ one K3 wrapup call)"),
         }
@@ -3621,6 +3688,7 @@ impl ProviderClient for ReadOnlyCompileProvider {
                     json!({ "path": "src/generated.rs" }),
                 )],
                 finish_reason: None,
+                interruption: None,
             }),
             1 => {
                 assert!(
@@ -3633,6 +3701,7 @@ impl ProviderClient for ReadOnlyCompileProvider {
                     reasoning: String::new(),
                     tool_calls: Vec::new(),
                     finish_reason: None,
+                    interruption: None,
                 })
             }
             _ => panic!("read-only provider should finish on turn 2"),
@@ -3678,6 +3747,7 @@ impl ProviderClient for PreExistingCompileErrorProvider {
                     ),
                 ],
                 finish_reason: None,
+                interruption: None,
             }),
             1 => {
                 assert!(
@@ -3697,6 +3767,7 @@ impl ProviderClient for PreExistingCompileErrorProvider {
                     reasoning: String::new(),
                     tool_calls: Vec::new(),
                     finish_reason: None,
+                    interruption: None,
                 })
             }
             // K3：criteria 仍不满足 → turn 2 用完预算后，run_loop 在发 NeedsDecision 前多给
@@ -3706,6 +3777,7 @@ impl ProviderClient for PreExistingCompileErrorProvider {
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
                 finish_reason: None,
+                interruption: None,
             }),
             _ => {
                 panic!("pre-existing-error provider should finish on turn 2 (+ one K3 wrapup call)")
@@ -3833,6 +3905,7 @@ impl ProviderClient for PreflightRejectProvider {
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
                 finish_reason: None,
+                interruption: None,
             });
         }
 
@@ -3848,6 +3921,7 @@ impl ProviderClient for PreflightRejectProvider {
                 },
             }],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -5031,6 +5105,7 @@ impl ProviderClient for FinishReasonProvider {
                     },
                 }],
                 finish_reason: Some(crate::provider::FinishReason::ToolCalls),
+                interruption: None,
             });
         }
         Ok(ProviderResponse {
@@ -5042,6 +5117,7 @@ impl ProviderClient for FinishReasonProvider {
             } else {
                 Some(crate::provider::FinishReason::Stop)
             },
+            interruption: None,
         })
     }
 
@@ -5801,6 +5877,7 @@ fn evidence_completion_response(tool_calls: Vec<ToolCall>) -> ProviderResponse {
             reasoning: String::new(),
             tool_calls,
             finish_reason: Some(crate::provider::FinishReason::Stop),
+            interruption: None,
         }
     } else {
         ProviderResponse {
@@ -5808,6 +5885,7 @@ fn evidence_completion_response(tool_calls: Vec<ToolCall>) -> ProviderResponse {
             reasoning: String::new(),
             tool_calls,
             finish_reason: Some(crate::provider::FinishReason::ToolCalls),
+            interruption: None,
         }
     }
 }
@@ -6079,6 +6157,7 @@ impl ProviderClient for FinishReasonSequenceProvider {
                     .cloned()
                     .unwrap_or(crate::provider::FinishReason::Stop),
             ),
+            interruption: None,
         })
     }
 
@@ -6222,6 +6301,340 @@ async fn final_text_failed_eval_counts_no_progress_and_trips_hard_stop() {
     let events = std::fs::read_to_string(paths.events_path).unwrap();
     assert!(events.contains("\"blocked_reason\":\"no_progress\""));
     assert!(!events.contains("max_turns_exceeded"));
+}
+
+// T2b：主循环消费 `ProviderResponse.interruption`——断流轮（传输层掐断 SSE，非模型交白卷）
+// 原地重试、不记空转、连断 3 次以真实错误收场。下面这组 mock 按调用序号回放一份脚本化
+// 响应序列，最后一条超出序列长度时重复，方便「连续 N 次都断流」这类用例只需一条元素。
+#[derive(Clone)]
+struct StreamInterruptionProvider {
+    calls: Arc<AtomicUsize>,
+    responses: Arc<Vec<ProviderResponse>>,
+    seen_message_lens: Arc<Mutex<Vec<usize>>>,
+}
+
+#[async_trait::async_trait]
+impl ProviderClient for StreamInterruptionProvider {
+    async fn next_turn(
+        &self,
+        messages: &[ChatMessage],
+        _tools: &[Value],
+        _events: &mut EventRecorder,
+    ) -> Result<ProviderResponse> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.seen_message_lens.lock().unwrap().push(messages.len());
+        let idx = call.min(self.responses.len() - 1);
+        Ok(self.responses[idx].clone())
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        test_capabilities("stream-interruption-test")
+    }
+}
+
+fn interrupted_response(err_text: &str) -> ProviderResponse {
+    ProviderResponse {
+        text: String::new(),
+        // 断流轮常见形态：reasoning 已经写了一大段，但流被掐断——text/tool_calls 空。
+        reasoning: format!("{err_text} 之前模型已经在长推理……").repeat(3),
+        tool_calls: Vec::new(),
+        finish_reason: None,
+        interruption: Some(err_text.to_string()),
+    }
+}
+
+fn tool_call_response(id: &str, path: &str) -> ProviderResponse {
+    ProviderResponse {
+        text: String::new(),
+        reasoning: String::new(),
+        tool_calls: vec![ToolCall {
+            id: id.to_string(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "fs_write".into(),
+                arguments: json!({"path": path, "content": "ok"}).to_string(),
+            },
+        }],
+        finish_reason: Some(crate::provider::FinishReason::ToolCalls),
+        interruption: None,
+    }
+}
+
+fn final_text_response(text: &str) -> ProviderResponse {
+    ProviderResponse {
+        text: text.to_string(),
+        reasoning: String::new(),
+        tool_calls: Vec::new(),
+        finish_reason: Some(crate::provider::FinishReason::Stop),
+        interruption: None,
+    }
+}
+
+/// a. 断流后恢复：断流轮 → 正常 tool_call 轮 → 正常收尾，全程 Completed，
+/// 恰有一条 `stream_interrupted_continue`，没有 `run.needs_decision`，
+/// 且断流轮没有把半截 assistant 消息推进 messages（用后续请求看到的消息数校验）。
+#[tokio::test]
+async fn stream_interruption_then_recovery_completes_without_no_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(dir.path().to_path_buf(), "resume after stream interruption");
+    opts.max_turns = 8;
+    opts.permission = PermissionPolicy::Allow;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen_lens = Arc::new(Mutex::new(Vec::new()));
+    let responses = vec![
+        interrupted_response("connection reset by peer"),
+        tool_call_response("write_1", "resumed.txt"),
+        final_text_response("done"),
+    ];
+    let provider = StreamInterruptionProvider {
+        calls: calls.clone(),
+        responses: Arc::new(responses),
+        seen_message_lens: seen_lens.clone(),
+    };
+
+    let result = run_solo_with_judge(provider, Box::new(crate::judge::NoopJudge), opts)
+        .await
+        .unwrap();
+
+    assert_eq!(result.outcome, RunOutcome::Completed);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+    let lens = seen_lens.lock().unwrap();
+    assert_eq!(
+        lens[0], lens[1],
+        "断流轮不该把半截 assistant 消息推进 messages——重试请求看到的历史长度须与被打断那轮完全一致"
+    );
+
+    let events =
+        std::fs::read_to_string(RunPaths::new(dir.path(), "run_test").events_path).unwrap();
+    let interrupted_steps = events
+        .lines()
+        .filter(|l| {
+            l.contains("\"orchestration.step.completed\"")
+                && l.contains("\"stream_interrupted_continue\"")
+        })
+        .count();
+    assert_eq!(interrupted_steps, 1);
+    assert!(!events.contains("run.needs_decision"));
+}
+
+/// b. 连断 3 次：run 以 Failed 收场，且 run.failed 事件的 error 文案里带着底层错误文本
+/// （证明冒泡走的是 entry.rs 既有 `?` 路径，不是本地新拍一个含糊错误）。
+#[tokio::test]
+async fn stream_interruption_three_consecutive_times_fails_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(
+        dir.path().to_path_buf(),
+        "three consecutive stream interruptions",
+    );
+    opts.max_turns = 8;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = StreamInterruptionProvider {
+        calls: calls.clone(),
+        responses: Arc::new(vec![interrupted_response("upstream closed the connection")]),
+        seen_message_lens: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let result = run_solo_with_judge(provider, Box::new(crate::judge::NoopJudge), opts)
+        .await
+        .unwrap();
+
+    assert_eq!(result.outcome, RunOutcome::Failed);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+    let events =
+        std::fs::read_to_string(RunPaths::new(dir.path(), "run_test").events_path).unwrap();
+    let failed_line = events
+        .lines()
+        .find(|l| l.contains("\"run.failed\""))
+        .expect("run.failed should be emitted after 3 consecutive stream interruptions");
+    assert!(failed_line.contains("upstream closed the connection"));
+    assert!(failed_line.contains("stream interrupted"));
+}
+
+/// c. 计数器复位：断流从不连续两次以上（中间总有正常轮插入）→ 全程不失败、正常完成。
+#[tokio::test]
+async fn stream_interruption_counter_resets_between_normal_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(
+        dir.path().to_path_buf(),
+        "interruptions interleaved with normal turns",
+    );
+    opts.max_turns = 10;
+    opts.permission = PermissionPolicy::Allow;
+
+    let responses = vec![
+        interrupted_response("read timeout"),
+        tool_call_response("write_1", "progress1.txt"),
+        interrupted_response("read timeout again"),
+        tool_call_response("write_2", "progress2.txt"),
+        interrupted_response("read timeout a third time"),
+        final_text_response("wrapped up"),
+    ];
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = StreamInterruptionProvider {
+        calls: calls.clone(),
+        responses: Arc::new(responses),
+        seen_message_lens: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let result = run_solo_with_judge(provider, Box::new(crate::judge::NoopJudge), opts)
+        .await
+        .unwrap();
+
+    assert_eq!(result.outcome, RunOutcome::Completed);
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
+}
+
+/// d. 正例回归钉：真交白卷（interruption=None、text 空、tool_calls 空）的轮必须照旧被当成
+/// 空转计数——不能被新分支误吞。同族既有覆盖：`final_text_failed_eval_counts_no_progress_and_trips_hard_stop`
+/// （非空 text 但 tool_calls 空、criteria 恒不过，靠 MockProvider——其 `interruption` 恒 None——
+/// 一路触发 no_progress；该测试在本刀改动下应保持绿，因为 `if let Some(..)` 对 `None` 直接
+/// 不命中、原逻辑分毫未动）。这里再补一条更贴题的：text 也是真空字符串。
+#[tokio::test]
+async fn empty_text_without_interruption_still_counts_as_no_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(
+        dir.path().to_path_buf(),
+        "truly empty final text, no interruption",
+    );
+    opts.max_turns = 16;
+    opts.max_eval_attempts = 99;
+    opts.criteria = crate::goal::parse_criteria(&["cmd: false".to_string()]).unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = StreamInterruptionProvider {
+        calls: calls.clone(),
+        responses: Arc::new(vec![ProviderResponse {
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            finish_reason: Some(crate::provider::FinishReason::Stop),
+            interruption: None,
+        }]),
+        seen_message_lens: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let result = run_solo_with_judge(provider, Box::new(crate::judge::NoopJudge), opts)
+        .await
+        .unwrap();
+
+    assert_eq!(result.outcome, RunOutcome::NeedsDecision);
+    assert!(calls.load(Ordering::SeqCst) < 16);
+    let events =
+        std::fs::read_to_string(RunPaths::new(dir.path(), "run_test").events_path).unwrap();
+    assert!(events.contains("\"blocked_reason\":\"no_progress\""));
+    assert!(!events.contains("stream_interrupted_continue"));
+}
+
+/// e. 断流轮不清 `consecutive_truncations`：两次截断（consecutive_truncations=2）后插一次
+/// 断流（若误清零会把计数打回 0），再来一次截断——若断流没有偷偷清零，第 3 次截断应正好
+/// 撞到 `CONSECUTIVE_TRUNCATION_LIMIT=3` 触发 halt；若断流误清零，则这里只会到 1，不会 halt。
+#[tokio::test]
+async fn stream_interruption_does_not_reset_truncation_counter() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(
+        dir.path().to_path_buf(),
+        "truncation counter survives an interleaved interruption",
+    );
+    opts.max_turns = 10;
+
+    let truncated = ProviderResponse {
+        text: String::new(),
+        reasoning: "thinking forever".into(),
+        tool_calls: Vec::new(),
+        finish_reason: Some(crate::provider::FinishReason::Length),
+        interruption: None,
+    };
+    let responses = vec![
+        truncated.clone(),
+        truncated.clone(),
+        interrupted_response("brief network hiccup"),
+        truncated,
+    ];
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = StreamInterruptionProvider {
+        calls: calls.clone(),
+        responses: Arc::new(responses),
+        seen_message_lens: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let result = run_solo_with_judge(provider, Box::new(crate::judge::NoopJudge), opts)
+        .await
+        .unwrap();
+
+    assert_eq!(result.outcome, RunOutcome::NeedsDecision);
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    let events =
+        std::fs::read_to_string(RunPaths::new(dir.path(), "run_test").events_path).unwrap();
+    assert!(events.contains("\"consecutive_output_truncation\""));
+    assert!(events.contains("\"consecutive_truncated_turns\":3"));
+}
+
+/// f.（T2c opus 审 M-1）断流消费收窄到 `finish_reason` 也缺失：某些 provider / 反代会在语义
+/// 已完整的响应（有完整 tool_calls、`finish_reason` 已收到）发完后不发终止帧直接脏关连接——
+/// 这种轮传输层同样会标 `interruption` Some，但不该被当断流丢弃重试。这里造一个
+/// `finish_reason: Some(ToolCalls)` + 完整 tool_call + `interruption: Some(..)` 的轮，
+/// 断言它被当正常轮处理（tool 正常执行、run 正常推进），journal 里没有
+/// `stream_interrupted_continue`。
+#[tokio::test]
+async fn interruption_with_finish_reason_present_is_not_treated_as_stream_cutoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(
+        dir.path().to_path_buf(),
+        "dirty close after a semantically complete turn",
+    );
+    opts.max_turns = 8;
+    opts.permission = PermissionPolicy::Allow;
+
+    let complete_but_dirty_close = ProviderResponse {
+        text: String::new(),
+        reasoning: String::new(),
+        tool_calls: vec![ToolCall {
+            id: "write_1".to_string(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "fs_write".into(),
+                arguments: json!({"path": "resumed.txt", "content": "ok"}).to_string(),
+            },
+        }],
+        // 关键：finish_reason 已收到——这轮内容语义完整，不是断流。
+        finish_reason: Some(crate::provider::FinishReason::ToolCalls),
+        // 但传输层仍然标了 interruption（反代吐完就脏关连接不发终止帧）。
+        interruption: Some("upstream closed without a clean terminator".to_string()),
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = StreamInterruptionProvider {
+        calls: calls.clone(),
+        responses: Arc::new(vec![complete_but_dirty_close, final_text_response("done")]),
+        seen_message_lens: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let result = run_solo_with_judge(provider, Box::new(crate::judge::NoopJudge), opts)
+        .await
+        .unwrap();
+
+    assert_eq!(result.outcome, RunOutcome::Completed);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "完整轮不该被当断流原地重试——只应正常推进到下一轮"
+    );
+    assert!(
+        dir.path().join("resumed.txt").exists(),
+        "tool_call 应正常执行，不能被断流分支吞掉"
+    );
+
+    let events =
+        std::fs::read_to_string(RunPaths::new(dir.path(), "run_test").events_path).unwrap();
+    assert!(
+        !events.contains("stream_interrupted_continue"),
+        "finish_reason 已收到的完整轮不该被记成 stream_interrupted_continue；journal:\n{events}"
+    );
+    assert!(!events.contains("run.failed"));
 }
 
 #[tokio::test]
@@ -6400,6 +6813,7 @@ impl ProviderClient for StaleHaltWrapupProvider {
                 // K3 承诺"收尾轮的工具调用不会被执行"——这里故意仍然尝试一次，交给测试断言校验。
                 tool_calls: vec![test_tool_call("call_ignored", "fs_read", json!({ "path": "const.txt" }))],
                 finish_reason: None,
+                interruption: None,
             });
         }
         Ok(ProviderResponse {
@@ -6411,6 +6825,7 @@ impl ProviderClient for StaleHaltWrapupProvider {
                 json!({ "path": "const.txt" }),
             )],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -6536,6 +6951,7 @@ impl ProviderClient for UncooperativeWrapupProvider {
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
                 finish_reason: None,
+                interruption: None,
             });
         }
         Ok(ProviderResponse {
@@ -6543,6 +6959,7 @@ impl ProviderClient for UncooperativeWrapupProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -6643,6 +7060,7 @@ impl ProviderClient for TextToolCallWrapupProvider {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -7634,6 +8052,7 @@ impl ProviderClient for OrderCaptor {
             reasoning: String::new(),
             tool_calls: vec![],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -7903,6 +8322,7 @@ impl ProviderClient for RepeatedMcpCallProvider {
                 json!({ "n": 0 }),
             )],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -7934,6 +8354,7 @@ impl ProviderClient for NovelMcpCallProvider {
                 json!({ "n": call }),
             )],
             finish_reason: None,
+            interruption: None,
         })
     }
 
@@ -8171,6 +8592,7 @@ impl ProviderClient for McpThenIdleProvider {
             reasoning: String::new(),
             tool_calls,
             finish_reason: None,
+            interruption: None,
         })
     }
 

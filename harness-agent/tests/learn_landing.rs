@@ -18,7 +18,7 @@ impl ProviderClient for GoodProvider {
     ) -> myagent::error::Result<ProviderResponse> {
         // 提取器只从 ```json 围栏读 observed_commands（8eee401 起不再认模型吐的 frontmatter）：
         // 正文用固定段 + 末尾 ```json 块·与 pipeline.rs GoodProvider/extract.rs 同口径，才过硬闸→转正。
-        Ok(ProviderResponse{ text:"## 问题特征\nE0463\n## 根因\n目标工具链缺失\n## 修复·做法\n`cargo build`\n## 适用条件·边界\nrust repo\n## 反例\n非 rust repo\n```json\n{\"observed_commands\":[\"c\"]}\n```\n".into(), reasoning:String::new(), tool_calls:vec![], finish_reason: None })
+        Ok(ProviderResponse{ text:"## 问题特征\nE0463\n## 根因\n目标工具链缺失\n## 修复·做法\n`cargo build`\n## 适用条件·边界\nrust repo\n## 反例\n非 rust repo\n```json\n{\"observed_commands\":[\"c\"]}\n```\n".into(), reasoning:String::new(), tool_calls:vec![], finish_reason: None, interruption: None})
     }
     fn capabilities(&self) -> ProviderCapabilities {
         unimplemented!()
@@ -38,6 +38,7 @@ impl ProviderClient for AlwaysOk {
             reasoning: String::new(),
             tool_calls: vec![],
             finish_reason: None,
+            interruption: None,
         })
     }
     fn capabilities(&self) -> ProviderCapabilities {

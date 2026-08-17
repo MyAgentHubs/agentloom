@@ -821,8 +821,10 @@ pub(crate) async fn run_loop_with_registry<P: ProviderClient>(
     let mut probe_registration_attempts = 0usize;
     const REJECT_SELF_STOP: usize = 3;
     const CONSECUTIVE_TRUNCATION_LIMIT: usize = 3;
+    const CONSECUTIVE_STREAM_INTERRUPTION_LIMIT: usize = 3;
     let mut consecutive_rejections = 0usize;
     let mut consecutive_truncations = 0usize;
+    let mut consecutive_stream_interruptions = 0usize;
     let edit_format = crate::model_registry::lookup(&options.provider_id, &options.model)
         .map(|s| s.edit_format)
         .unwrap_or(crate::model_registry::EditFormat::Targeted);
@@ -936,6 +938,36 @@ pub(crate) async fn run_loop_with_registry<P: ProviderClient>(
                 "tool_calls": response.tool_calls.len(),
             }),
         )?;
+        // 断流轮（provider 层 SSE 被传输层掐断，非模型交白卷）：不能当成「模型空转」计数——
+        // 半截 reasoning 不进 messages、不跑评估器、不发 ModelFeedback、不碰
+        // consecutive_truncations/安全网计数器。原地重试；连断 CONSECUTIVE_STREAM_INTERRUPTION_LIMIT
+        // 次才以真实错误收场（经 `?` 冒泡到 entry.rs 既有 run.failed 路径，这里不自己 emit）。
+        //
+        // 收窄条件（opus 审 M-1）：只有 `finish_reason` 也缺失才算断流。有些 provider / 反代会在
+        // 语义已完整的响应（有 text、有完整 tool_calls、`finish_reason` 已经收到）发完后不发终止帧、
+        // 直接脏关连接——这种轮传输层同样会标 `interruption` Some，但内容已经完整可用，不该被当
+        // 断流丢弃重试（脏关成瘾的反代会把这类可用配置拖成每 3 轮一次 run.failed）。真实断流事故
+        // 现场的签名恰是 `finish_reason` None——收窄到这个信号不削弱原根修，只是不再误伤已完整的轮。
+        if response.finish_reason.is_none() {
+            if let Some(err_text) = response.interruption.as_deref() {
+                consecutive_stream_interruptions += 1;
+                if consecutive_stream_interruptions >= CONSECUTIVE_STREAM_INTERRUPTION_LIMIT {
+                    return Err(HarnessError::Provider(format!(
+                        "stream interrupted {consecutive_stream_interruptions} consecutive times: {err_text}"
+                    )));
+                }
+                recorder.emit(
+                    "orchestration.step.completed",
+                    json!({
+                        "step_id": format!("solo.turn.{turn}"),
+                        "turn": turn,
+                        "outcome": "stream_interrupted_continue",
+                    }),
+                )?;
+                continue;
+            }
+        }
+        consecutive_stream_interruptions = 0;
         let reasoning_content = {
             let r = response.reasoning.trim();
             if r.is_empty() {
@@ -2599,6 +2631,7 @@ mod offer_wrapup_turn_tests {
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
                 finish_reason: None,
+                interruption: None,
             })
         }
 

@@ -34,6 +34,7 @@ impl ProviderClient for AlwaysWriteProvider {
                 },
             }],
             finish_reason: None,
+            interruption: None,
         })
     }
     fn capabilities(&self) -> ProviderCapabilities {

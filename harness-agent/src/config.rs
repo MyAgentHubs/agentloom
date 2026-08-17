@@ -308,13 +308,34 @@ pub fn provider_config_with_model(
         .transpose()?
         .or_else(|| stored.as_ref().and_then(|s| s.output_tokens))
         .or_else(|| default_output_tokens(&provider, &model));
+    let timeout_secs = env::var(format!("{env_prefix}_TIMEOUT_SECS"))
+        .ok()
+        .map(|raw| (format!("{env_prefix}_TIMEOUT_SECS"), raw))
+        .or_else(|| {
+            env::var("MYAGENT_TIMEOUT_SECS")
+                .ok()
+                .map(|raw| ("MYAGENT_TIMEOUT_SECS".to_string(), raw))
+        })
+        .map(|(var_name, raw)| {
+            let parsed = raw
+                .parse::<u64>()
+                .map_err(|e| HarnessError::InvalidConfig(format!("invalid {var_name}: {e}")))?;
+            if parsed == 0 {
+                return Err(HarnessError::InvalidConfig(format!(
+                    "invalid {var_name}: must be greater than 0"
+                )));
+            }
+            Ok(parsed)
+        })
+        .transpose()?
+        .unwrap_or(120);
 
     Ok(OpenAiCompatibleConfig {
         provider_id: provider,
         api_key,
         base_url,
         model,
-        timeout_secs: 120,
+        timeout_secs,
         temperature,
         sampling: crate::provider::openai_compatible::SamplingParams { top_p, do_sample },
         network: crate::goal::NetworkPolicy::On,
@@ -892,6 +913,71 @@ mod tests {
 
         let config = provider_config_with_model("deepseek", Some("deepseek-v4".into())).unwrap();
         assert_eq!(config.model, "deepseek-v4");
+    }
+
+    #[test]
+    #[serial]
+    fn timeout_secs_defaults_to_120() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("MYAGENT_HOME", dir.path().to_str().unwrap());
+        let _api_key = EnvGuard::set("DEEPSEEK_API_KEY", "sk-test");
+        let _prefixed = EnvGuard::remove("DEEPSEEK_TIMEOUT_SECS");
+        let _global = EnvGuard::remove("MYAGENT_TIMEOUT_SECS");
+
+        let config = provider_config_with_model("deepseek", None).unwrap();
+        assert_eq!(config.timeout_secs, 120);
+    }
+
+    #[test]
+    #[serial]
+    fn timeout_secs_myagent_env_overrides_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("MYAGENT_HOME", dir.path().to_str().unwrap());
+        let _api_key = EnvGuard::set("DEEPSEEK_API_KEY", "sk-test");
+        let _prefixed = EnvGuard::remove("DEEPSEEK_TIMEOUT_SECS");
+        let _global = EnvGuard::set("MYAGENT_TIMEOUT_SECS", "45");
+
+        let config = provider_config_with_model("deepseek", None).unwrap();
+        assert_eq!(config.timeout_secs, 45);
+    }
+
+    #[test]
+    #[serial]
+    fn timeout_secs_prefixed_env_wins_over_myagent() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("MYAGENT_HOME", dir.path().to_str().unwrap());
+        let _api_key = EnvGuard::set("DEEPSEEK_API_KEY", "sk-test");
+        let _prefixed = EnvGuard::set("DEEPSEEK_TIMEOUT_SECS", "30");
+        let _global = EnvGuard::set("MYAGENT_TIMEOUT_SECS", "99");
+
+        let config = provider_config_with_model("deepseek", None).unwrap();
+        assert_eq!(config.timeout_secs, 30);
+    }
+
+    #[test]
+    #[serial]
+    fn timeout_secs_unparseable_value_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("MYAGENT_HOME", dir.path().to_str().unwrap());
+        let _api_key = EnvGuard::set("DEEPSEEK_API_KEY", "sk-test");
+        let _prefixed = EnvGuard::set("DEEPSEEK_TIMEOUT_SECS", "not-a-number");
+        let _global = EnvGuard::remove("MYAGENT_TIMEOUT_SECS");
+
+        let err = provider_config_with_model("deepseek", None).unwrap_err();
+        assert!(err.to_string().contains("DEEPSEEK_TIMEOUT_SECS"));
+    }
+
+    #[test]
+    #[serial]
+    fn timeout_secs_zero_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("MYAGENT_HOME", dir.path().to_str().unwrap());
+        let _api_key = EnvGuard::set("DEEPSEEK_API_KEY", "sk-test");
+        let _prefixed = EnvGuard::set("DEEPSEEK_TIMEOUT_SECS", "0");
+        let _global = EnvGuard::remove("MYAGENT_TIMEOUT_SECS");
+
+        let err = provider_config_with_model("deepseek", None).unwrap_err();
+        assert!(err.to_string().contains("DEEPSEEK_TIMEOUT_SECS"));
     }
 
     #[test]

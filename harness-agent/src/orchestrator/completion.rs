@@ -300,6 +300,7 @@ mod tests {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason,
+            interruption: None,
         }
     }
 
@@ -319,6 +320,7 @@ mod tests {
                 },
             }],
             finish_reason,
+            interruption: None,
         }
     }
 

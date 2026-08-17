@@ -30821,6 +30821,69 @@ mod tests {
         );
     }
 
+    /// T3：lead spawn 路径（`harness_lead_cmd_in`）与 `HarnessBackend` 共用
+    /// `apply_harness_provider_env`——`agents.api_timeout_ms` 同样要能到达 lead 子进程 env。
+    #[test]
+    fn harness_lead_cmd_in_maps_api_timeout_ms_to_myagent_timeout_secs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().join("lead-wt");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        // a) 600000ms → 600s。
+        let mut profile_a = harness_lead_capable_profile("harness-lead-timeout-a");
+        profile_a.api_timeout_ms = Some(600_000);
+        let (cmd_a, _) = harness_lead_cmd_in(
+            &profile_a,
+            Some("k"),
+            None,
+            None,
+            &wt,
+            "session-timeout-a",
+            "hi",
+            "http://127.0.0.1:4321/mcp",
+        )
+        .expect("build harness lead cmd");
+        assert_eq!(
+            env_value(&cmd_a, "MYAGENT_TIMEOUT_SECS"),
+            Some(Some("600".to_string()))
+        );
+
+        // b) None → 不设该变量。
+        let mut profile_b = harness_lead_capable_profile("harness-lead-timeout-b");
+        profile_b.api_timeout_ms = None;
+        let (cmd_b, _) = harness_lead_cmd_in(
+            &profile_b,
+            Some("k"),
+            None,
+            None,
+            &wt,
+            "session-timeout-b",
+            "hi",
+            "http://127.0.0.1:4321/mcp",
+        )
+        .expect("build harness lead cmd");
+        assert_eq!(env_value(&cmd_b, "MYAGENT_TIMEOUT_SECS"), None);
+
+        // c) 边界 500ms → 向上取整 + 下限 1 → 1s。
+        let mut profile_c = harness_lead_capable_profile("harness-lead-timeout-c");
+        profile_c.api_timeout_ms = Some(500);
+        let (cmd_c, _) = harness_lead_cmd_in(
+            &profile_c,
+            Some("k"),
+            None,
+            None,
+            &wt,
+            "session-timeout-c",
+            "hi",
+            "http://127.0.0.1:4321/mcp",
+        )
+        .expect("build harness lead cmd");
+        assert_eq!(
+            env_value(&cmd_c, "MYAGENT_TIMEOUT_SECS"),
+            Some(Some("1".to_string()))
+        );
+    }
+
     /// 接线锁 ①：mac 上 HOME 缺失 / 相对路径必须 fail-closed。
     /// 拆掉 `sandbox::canonicalize_sandbox_home` 这层接线、或把平台守卫写反，这条就红。
     #[cfg(target_os = "macos")]

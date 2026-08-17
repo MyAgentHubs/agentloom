@@ -69,10 +69,10 @@ pub(crate) fn initial_messages(prompt: &str) -> Vec<ChatMessage> {
 }
 
 /// Append `extra` to the first system message's content (does not replace it).
-/// No-op if `messages` has no system message. Used to wire
-/// `RunOptions::append_system_prompt` (`myagent run --append-system-prompt`)
-/// into the assembled conversation without touching every `initial_messages`
-/// call site.
+/// No-op if `messages` has no system message. Used both to wire
+/// `RunOptions::append_system_prompt` (`myagent run --append-system-prompt`,
+/// caller-owned) and by `inject_model_identity` (engine-owned) into the
+/// assembled conversation without touching every `initial_messages` call site.
 pub(crate) fn append_to_system_prompt(messages: &mut [ChatMessage], extra: &str) {
     if let Some(system_message) = messages.iter_mut().find(|m| m.role == "system") {
         match system_message.content.as_mut() {
@@ -82,6 +82,80 @@ pub(crate) fn append_to_system_prompt(messages: &mut [ChatMessage], extra: &str)
             }
             None => system_message.content = Some(extra.to_string()),
         }
+    }
+}
+
+/// Appends a one-line true-identity disclosure naming the underlying model, so a
+/// borrowed-shell model (e.g. GLM/DeepSeek/Kimi run inside this harness) does not
+/// improvise a vendor when the user asks what it runs on. No-op when `model` is
+/// empty (e.g. some resume paths construct `RunOptions` with `model: String::new()`
+/// before it is known) — never emits a dangling "Underlying model: " line.
+///
+/// Engine-owned, distinct from `append_to_system_prompt`'s caller-owned use for
+/// `--append-system-prompt`: called in `entry.rs` right after `initial_messages`,
+/// before any `--append-system-prompt` suffix is applied, so the two stack in a
+/// fixed order instead of racing.
+pub(crate) fn inject_model_identity(messages: &mut [ChatMessage], model: &str) {
+    if model.trim().is_empty() {
+        return;
+    }
+    let identity_line = format!(
+        "Underlying model: {model} (as configured by the user). If asked what you run on, \
+         state this model. Never claim to be built on or driven by any other vendor's model."
+    );
+    append_to_system_prompt(messages, &identity_line);
+}
+
+#[cfg(test)]
+mod model_identity_tests {
+    use super::*;
+
+    #[test]
+    fn inject_model_identity_appends_exactly_once_with_real_name() {
+        let mut messages = initial_messages("do the task");
+        inject_model_identity(&mut messages, "glm-5.1");
+        let system_content = messages[0].content.as_deref().unwrap();
+        let marker = "Underlying model: glm-5.1";
+        assert_eq!(system_content.matches(marker).count(), 1);
+        assert!(system_content.starts_with(EXECUTOR_SYSTEM_PROMPT));
+        // States the vendor-non-impersonation rule, not just the bare model name.
+        assert!(system_content
+            .contains("Never claim to be built on or driven by any other vendor's model."));
+    }
+
+    #[test]
+    fn inject_model_identity_noop_on_empty_model() {
+        let mut messages = initial_messages("do the task");
+        inject_model_identity(&mut messages, "");
+        let system_content = messages[0].content.as_deref().unwrap();
+        assert_eq!(system_content, EXECUTOR_SYSTEM_PROMPT);
+        assert!(!system_content.contains("Underlying model"));
+    }
+
+    #[test]
+    fn inject_model_identity_noop_on_whitespace_only_model() {
+        let mut messages = initial_messages("do the task");
+        inject_model_identity(&mut messages, "   ");
+        let system_content = messages[0].content.as_deref().unwrap();
+        assert_eq!(system_content, EXECUTOR_SYSTEM_PROMPT);
+        assert!(!system_content.contains("Underlying model"));
+    }
+
+    #[test]
+    fn inject_model_identity_then_append_system_prompt_stack_in_order() {
+        // Mirrors entry.rs wiring order: engine-owned identity line first, then
+        // any caller-owned `--append-system-prompt` suffix.
+        let mut messages = initial_messages("do the task");
+        inject_model_identity(&mut messages, "glm-5.1");
+        append_to_system_prompt(&mut messages, "TEAM LEAD MODE: use dispatch_worker.");
+        let system_content = messages[0].content.as_deref().unwrap();
+        let identity_pos = system_content.find("Underlying model: glm-5.1").unwrap();
+        let suffix_pos = system_content.find("TEAM LEAD MODE").unwrap();
+        assert!(
+            identity_pos < suffix_pos,
+            "expected model identity line before caller's --append-system-prompt suffix"
+        );
+        assert!(system_content.ends_with("TEAM LEAD MODE: use dispatch_worker."));
     }
 }
 

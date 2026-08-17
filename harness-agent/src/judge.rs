@@ -174,6 +174,7 @@ mod tests {
                 reasoning: String::new(),
                 tool_calls: vec![],
                 finish_reason: None,
+                interruption: None,
             })
         }
         fn capabilities(&self) -> ProviderCapabilities {

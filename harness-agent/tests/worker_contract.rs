@@ -66,6 +66,7 @@ impl ProviderClient for PgidProbeProvider {
                 reasoning: String::new(),
                 tool_calls: vec![],
                 finish_reason: Some(FinishReason::Stop),
+                interruption: None,
             });
         }
 
@@ -83,6 +84,7 @@ impl ProviderClient for PgidProbeProvider {
                 },
             }],
             finish_reason: Some(FinishReason::ToolCalls),
+            interruption: None,
         })
     }
 
