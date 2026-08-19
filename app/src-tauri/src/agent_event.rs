@@ -1046,6 +1046,26 @@ pub fn parse_codex_line(line: &str) -> Vec<AgentEvent> {
     parse_codex_line_for_locale(line, crate::Locale::Zh)
 }
 
+fn is_codex_reconnect_notice(message: &str) -> bool {
+    let Some(rest) = message.trim().strip_prefix("Reconnecting... ") else {
+        return false;
+    };
+    let Some((attempt, rest)) = rest.split_once('/') else {
+        return false;
+    };
+    let Some((limit, reason)) = rest.split_once(' ') else {
+        return false;
+    };
+    let (Ok(attempt), Ok(limit)) = (attempt.parse::<u32>(), limit.parse::<u32>()) else {
+        return false;
+    };
+    attempt > 0
+        && attempt <= limit
+        && reason.starts_with('(')
+        && reason.ends_with(')')
+        && reason.len() > 2
+}
+
 pub(crate) fn parse_codex_line_for_locale(line: &str, locale: crate::Locale) -> Vec<AgentEvent> {
     let Ok(v): Result<Value, _> = serde_json::from_str(line) else {
         return vec![];
@@ -1062,6 +1082,7 @@ pub(crate) fn parse_codex_line_for_locale(line: &str, locale: crate::Locale) -> 
         Some("error") => v
             .get("message")
             .and_then(Value::as_str)
+            .filter(|message| !is_codex_reconnect_notice(message))
             .map(|message| {
                 vec![AgentEvent::Error {
                     message: message.to_string(),
@@ -2549,6 +2570,23 @@ mod tests {
                 message:
                     "The 'gpt-5' model is not supported when using Codex with a ChatGPT account."
                         .into()
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_codex_reconnect_notice_is_ignored() {
+        let line = r#"{"type":"error","message":"Reconnecting... 2/5 (request timed out)"}"#;
+        assert_eq!(parse_codex_line(line), Vec::<AgentEvent>::new());
+    }
+
+    #[test]
+    fn parse_codex_non_retry_reconnecting_error_remains_visible() {
+        let line = r#"{"type":"error","message":"Reconnecting to the server failed"}"#;
+        assert_eq!(
+            parse_codex_line(line),
+            vec![AgentEvent::Error {
+                message: "Reconnecting to the server failed".into()
             }]
         );
     }
