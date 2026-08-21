@@ -410,6 +410,14 @@ impl DisplayReducer {
             AgentEvent::Completed { .. } => {
                 self.saw_completed = true;
             }
+            AgentEvent::ContextCompacted { .. } => {
+                self.blocks.push(Block::ContextCompacted {});
+            }
+            // T7a：头部超限截断——同 ContextCompacted 一样只在当前位置插一行提示块，
+            // 不携带数值、不改其他归约态。
+            AgentEvent::HeadTruncated {} => {
+                self.blocks.push(Block::ContextTruncated {});
+            }
             // run 开场/目标/审计类事件：只标记 run 已开始（seen_event 已置），不产卡。
             AgentEvent::UsageDelta { .. }
             | AgentEvent::RunCloseout { .. }
@@ -578,6 +586,87 @@ mod tests {
             deletions: None,
             final_text: None,
         }
+    }
+
+    #[test]
+    fn context_compacted_event_adds_exactly_one_block_at_current_position() {
+        let mut reducer = super::DisplayReducer::new("run-1");
+        reducer.feed(&crate::agent_event::AgentEvent::TextDelta {
+            text: "before".to_string(),
+        });
+        reducer.feed(&crate::agent_event::AgentEvent::ContextCompacted {
+            summary: "摘要只落单独存储".to_string(),
+            through_message_id: 42,
+        });
+        reducer.feed(&crate::agent_event::AgentEvent::TextDelta {
+            text: "after".to_string(),
+        });
+
+        let blocks = reducer.snapshot_blocks();
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(
+            blocks.as_slice(),
+            [
+                crate::db::Block::Text { text: before },
+                crate::db::Block::ContextCompacted {},
+                crate::db::Block::Text { text: after },
+            ] if before == "before" && after == "after"
+        ));
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| matches!(block, crate::db::Block::ContextCompacted {}))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn context_truncated_event_adds_exactly_one_block_at_current_position() {
+        let mut reducer = super::DisplayReducer::new("run-1");
+        reducer.feed(&crate::agent_event::AgentEvent::TextDelta {
+            text: "before".to_string(),
+        });
+        reducer.feed(&crate::agent_event::AgentEvent::HeadTruncated {});
+        reducer.feed(&crate::agent_event::AgentEvent::TextDelta {
+            text: "after".to_string(),
+        });
+
+        let blocks = reducer.snapshot_blocks();
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(
+            blocks.as_slice(),
+            [
+                crate::db::Block::Text { text: before },
+                crate::db::Block::ContextTruncated {},
+                crate::db::Block::Text { text: after },
+            ] if before == "before" && after == "after"
+        ));
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| matches!(block, crate::db::Block::ContextTruncated {}))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn context_truncated_and_context_compacted_stay_distinct_blocks() {
+        let mut reducer = super::DisplayReducer::new("run-1");
+        reducer.feed(&crate::agent_event::AgentEvent::ContextCompacted {
+            summary: "摘要只落单独存储".to_string(),
+            through_message_id: 42,
+        });
+        reducer.feed(&crate::agent_event::AgentEvent::HeadTruncated {});
+
+        assert_eq!(
+            reducer.snapshot_blocks(),
+            vec![
+                crate::db::Block::ContextCompacted {},
+                crate::db::Block::ContextTruncated {},
+            ]
+        );
     }
 
     fn dispatch_started(id: &str) -> crate::agent_event::AgentEvent {

@@ -1504,6 +1504,17 @@ pub(crate) fn worktree_is_dirty(wt: &Path) -> bool {
 /// 每个文件单独限制 pathspec，避免把用户同一工作区的其它改动算进本轮。所有 git 读取都
 /// 经 `git_checked_stdout` → `git_read_command` 的只读加固；git/status 失败直接返回 Err，
 /// 由交付门 fail-closed 拒绝远端操作。
+///
+/// ★ 嵌套 git 仓盲区（R-B1 项 1）：agent 在全新空子目录里 `git init` 是常规动作（比如准备
+/// clone 点什么进去）。一旦某个 checkpoint 路径落在这样一个嵌套仓内部，`git status` 对指向
+/// 嵌套仓内部的 pathspec 完全不下钻——恒吐空、无错误、退出码 0（已用最小复现坐实：
+/// `git status --porcelain -- sub/file` 在 `sub/` 是嵌套仓时，即使 `sub/file` 磁盘上确实
+/// 存在且从未提交，输出也是空字符串）。空输出原本被当「干净」放行交付，等于给这个盲区
+/// fail-open。用 `git ls-files --error-unmatch` 核实该路径是否真被外层仓库的索引跟踪——
+/// 已提交 / 已 `git add` 过的文件即便所在目录后来变成嵌套仓，索引记录仍在、仍会命中
+/// （同样最小复现坐实：先提交 `sub/file.txt` 再在 `sub/` 里 `git init`，`ls-files
+/// --error-unmatch` 依然成功，因为它读的是外层仓库的索引而非按目录游走）。跟踪了 → 采信
+/// 「干净」；没跟踪但磁盘上确实有文件 → 按「未提交」处理，恢复 fail-closed。
 pub(crate) fn checkpoint_path_dirty_states(
     repo: &Path,
     checkpoint_paths: &[std::path::PathBuf],
@@ -1537,7 +1548,30 @@ pub(crate) fn checkpoint_path_dirty_states(
                     relative,
                 ],
             )?;
-            Ok((path.clone(), !status.is_empty()))
+            if !status.is_empty() {
+                return Ok((path.clone(), true));
+            }
+            // status 为空不等于「真干净」：核实这条路径是否真被外层仓库的索引跟踪，见上方
+            // 嵌套仓盲区注释。跟踪了才采信「干净」；没跟踪但磁盘上确实有文件，按未提交处理。
+            let tracked = git_checked_stdout(
+                &canonical_repo,
+                &[
+                    "--literal-pathspecs",
+                    "ls-files",
+                    "--error-unmatch",
+                    "--",
+                    relative,
+                ],
+            )
+            .is_ok();
+            // R-B3 项 4（Minor-4·悬空符号链接 fail-open）：`Path::exists` 跟随符号链接——
+            // 指向不存在目标的悬空 symlink 本身在磁盘上确实存在（`git status`
+            // `--untracked-files=all` 也会把它列成未跟踪条目），但 `exists()` 解析目标失败会
+            // 返回 false，让「没跟踪但磁盘上确实有文件」这条 fail-closed 判定对悬空 symlink
+            // 失效、错误判成干净。改用 `symlink_metadata`（不跟随链接，只问「这个路径本身是否
+            // 有一个 inode」）堵住这个盲区。
+            let path_present = std::fs::symlink_metadata(path).is_ok();
+            Ok((path.clone(), !tracked && path_present))
         })
         .collect()
 }
@@ -4515,6 +4549,130 @@ mod tests {
         assert_eq!(
             resolve_git_author_identity(repo),
             Ok(("AgentLoom".to_string(), "agentloom@localhost".to_string()))
+        );
+    }
+
+    /// R-B1 项 1（Major-1·交付闸门 fail-open 修复）：agent 在全新空子目录里 `git init` 是
+    /// 常规动作（准备 clone 点什么进去）。一旦某个 checkpoint 路径落在这样一个嵌套仓内部，
+    /// `git status` 对指向嵌套仓内部的 pathspec 恒吐空、退出码 0——不是「无变化」，是外层
+    /// 仓库的 status 压根不下钻进这条边界。修复前，空输出被直接当「干净」放行；修复后必须
+    /// 用 `git ls-files --error-unmatch` 核实索引真跟踪与否，未跟踪 + 磁盘上有文件 → 判脏。
+    #[test]
+    fn checkpoint_path_dirty_states_treats_nested_git_repo_blind_spot_as_dirty() {
+        let _env_lock = super::test_home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        run_git(repo, &["init", "-q"]).unwrap();
+        run_git(repo, &["config", "user.name", "Nested Repo Test"]).unwrap();
+        run_git(repo, &["config", "user.email", "nested@example.com"]).unwrap();
+        run_git(repo, &["config", "commit.gpgsign", "false"]).unwrap();
+        run_git(repo, &["commit", "--allow-empty", "-qm", "init"]).unwrap();
+
+        // agent 在全新空子目录里 git init（本刀现场复现的常规动作）。
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        run_git(&sub, &["init", "-q"]).unwrap();
+        std::fs::write(sub.join("file.txt"), "never committed\n").unwrap();
+
+        let canonical_repo = std::fs::canonicalize(repo).unwrap();
+        let checkpoint_paths = vec![canonical_repo.join("sub").join("file.txt")];
+        let states = checkpoint_path_dirty_states(repo, &checkpoint_paths).unwrap();
+
+        assert_eq!(states.len(), 1);
+        assert!(
+            states[0].1,
+            "嵌套仓边界内的未提交文件必须判脏——git status 对这条 pathspec 恒吐空，不能被当成干净"
+        );
+    }
+
+    /// R-B3 项 4（Minor-4·悬空符号链接 fail-open）：与上一条同款嵌套仓盲区，但账本路径是一个
+    /// 指向不存在目标的悬空 symlink——`Path::exists()` 跟随链接、解析目标失败会返回 false，
+    /// 让「没跟踪但磁盘上确实有文件」这条 fail-closed 兜底对悬空 symlink 失效、误判成干净。
+    /// 改用 `symlink_metadata`（不跟随链接，只问「这个路径本身是否有 inode」）后必须判脏。
+    #[test]
+    fn checkpoint_path_dirty_states_treats_dangling_symlink_in_blind_spot_as_dirty() {
+        let _env_lock = super::test_home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        run_git(repo, &["init", "-q"]).unwrap();
+        run_git(repo, &["config", "user.name", "Dangling Symlink Test"]).unwrap();
+        run_git(repo, &["config", "user.email", "dangling@example.com"]).unwrap();
+        run_git(repo, &["config", "commit.gpgsign", "false"]).unwrap();
+        run_git(repo, &["commit", "--allow-empty", "-qm", "init"]).unwrap();
+
+        // 同款嵌套仓盲区：agent 在全新空子目录里 git init。
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        run_git(&sub, &["init", "-q"]).unwrap();
+        // 账本路径本身是一个悬空 symlink（指向从未存在过的目标）。
+        std::os::unix::fs::symlink("never-existed-target", sub.join("dangling.txt")).unwrap();
+
+        let canonical_repo = std::fs::canonicalize(repo).unwrap();
+        let checkpoint_paths = vec![canonical_repo.join("sub").join("dangling.txt")];
+        let states = checkpoint_path_dirty_states(repo, &checkpoint_paths).unwrap();
+
+        assert_eq!(states.len(), 1);
+        assert!(
+            states[0].1,
+            "嵌套仓盲区里的悬空 symlink 必须判脏——path.exists() 跟随链接会因目标不存在而误判成干净"
+        );
+    }
+
+    /// 正例配对（别把闸门修成永远关死）：普通、非嵌套场景下真正已提交、工作树干净的文件，
+    /// 仍必须判干净——`ls-files --error-unmatch` 核实应当放行，不能因为加了这层核实就统统判脏。
+    #[test]
+    fn checkpoint_path_dirty_states_still_reports_committed_files_as_clean() {
+        let _env_lock = super::test_home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        run_git(repo, &["init", "-q"]).unwrap();
+        run_git(repo, &["config", "user.name", "Clean Test"]).unwrap();
+        run_git(repo, &["config", "user.email", "clean@example.com"]).unwrap();
+        run_git(repo, &["config", "commit.gpgsign", "false"]).unwrap();
+        std::fs::write(repo.join("agent.txt"), "committed content\n").unwrap();
+        run_git(repo, &["add", "agent.txt"]).unwrap();
+        run_git(repo, &["commit", "-qm", "commit agent file"]).unwrap();
+
+        let canonical_repo = std::fs::canonicalize(repo).unwrap();
+        let checkpoint_paths = vec![canonical_repo.join("agent.txt")];
+        let states = checkpoint_path_dirty_states(repo, &checkpoint_paths).unwrap();
+
+        assert_eq!(states.len(), 1);
+        assert!(
+            !states[0].1,
+            "真正已提交、工作树干净的文件必须仍判干净——嵌套仓修法不能把闸门改成永远关死"
+        );
+    }
+
+    /// 边界正例：文件先在外层仓库提交，所在目录之后才变成嵌套仓（orphan tracked file）。
+    /// 外层仓库索引里的记录不受嵌套 `.git` 影响，`ls-files --error-unmatch` 依然命中——
+    /// 必须继续判干净，不能被「有嵌套仓就一律判脏」的粗暴修法误伤。
+    #[test]
+    fn checkpoint_path_dirty_states_still_clean_when_tracked_dir_later_becomes_nested_repo() {
+        let _env_lock = super::test_home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        run_git(repo, &["init", "-q"]).unwrap();
+        run_git(repo, &["config", "user.name", "Orphan Test"]).unwrap();
+        run_git(repo, &["config", "user.email", "orphan@example.com"]).unwrap();
+        run_git(repo, &["config", "commit.gpgsign", "false"]).unwrap();
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("tracked.txt"), "already committed\n").unwrap();
+        run_git(repo, &["add", "sub/tracked.txt"]).unwrap();
+        run_git(repo, &["commit", "-qm", "commit before nested init"]).unwrap();
+
+        // 之后 agent 在这个已经有被跟踪文件的子目录里 git init。
+        run_git(&sub, &["init", "-q"]).unwrap();
+
+        let canonical_repo = std::fs::canonicalize(repo).unwrap();
+        let checkpoint_paths = vec![canonical_repo.join("sub").join("tracked.txt")];
+        let states = checkpoint_path_dirty_states(repo, &checkpoint_paths).unwrap();
+
+        assert_eq!(states.len(), 1);
+        assert!(
+            !states[0].1,
+            "外层仓库索引里本就跟踪的文件，即使所在目录后来变成嵌套仓，仍必须判干净"
         );
     }
 

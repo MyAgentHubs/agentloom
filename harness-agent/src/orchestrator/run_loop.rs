@@ -796,13 +796,20 @@ pub(crate) async fn run_loop_with_registry<P: ProviderClient>(
 ) -> Result<RunOutcome> {
     let capabilities = provider.capabilities();
     emit_capabilities(recorder, &capabilities)?;
-    // v-K2：写工具是否在场，run 全程恒定（registry 组装一次、disallowed_tools 不会中途变——
-    // 只有 narrow_explore 会临时摘掉 grep/ls/glob，从不碰 fs_write/fs_edit）。算一次喂给
-    // adaptive_safety_net::decide 的纯函数入参，别每轮重算、也别把「身份」概念(is_lead 之类)
-    // 带进去——按能力（这两个工具是否真的可调）判，不按身份判。
-    // P2（2026-07-26）：同一个信号也喂给 `emit_budget_exhausted_needs_decision`——没有
-    // fs_write/fs_edit 的 run（例如全靠 MCP 派单的 lead）从不产生「真编辑」，预算耗尽时不能
-    // 拿这个当 no_progress 的依据。
+    let mut run_start_disallowed = options.disallowed_tools.clone();
+    if options.evidence_gate == EvidenceGate::Off { run_start_disallowed.insert("register_issue_probe".to_string()); }
+    let run_start_tools = build_offered_tools(&registry, &capabilities, options.network, options.native_search_enabled, &run_start_disallowed);
+    crate::context_budget::autocompact::run_start_context_maintenance(
+        &provider,
+        &capabilities,
+        messages,
+        goal,
+        &run_start_tools,
+        recorder,
+    )
+    .await?;
+    // 写工具信号在 run 全程恒定；narrow_explore 只临时摘 grep/ls/glob。
+    // 同一信号也用于预算耗尽判断；无写工具的 run 不把它误作 no_progress 依据。
     let write_tools_offered = ["fs_write", "fs_edit"]
         .into_iter()
         .any(|name| registry.get(name).is_some() && !options.disallowed_tools.contains(name));
@@ -913,16 +920,8 @@ pub(crate) async fn run_loop_with_registry<P: ProviderClient>(
         let wire = match crate::context_budget::fit_to_budget(wire, &limits, tools_reserve) {
             crate::context_budget::FitOutcome::Fit(msgs) => msgs,
             crate::context_budget::FitOutcome::Overflow { estimate, budget } => {
-                // 连最小钉住上下文都超本模型窗口 → 走已有求助出口（needs_decision·exit4）·别静默发超限请求。
-                recorder.emit(
-                    "run.needs_decision",
-                    json!({
-                        "reason": "context_budget_exhausted",
-                        "turn": turn,
-                        "estimate_tokens": estimate,
-                        "budget_tokens": budget,
-                        "next_step": "拆小任务 / 换更大上下文的模型",
-                    }),
+                crate::context_budget::autocompact::emit_context_budget_exhausted(
+                    recorder, turn, estimate, budget,
                 )?;
                 return Ok(RunOutcome::NeedsDecision);
             }
@@ -994,6 +993,16 @@ pub(crate) async fn run_loop_with_registry<P: ProviderClient>(
         let mut ledger_dirty = false;
 
         if response.finish_reason == Some(crate::provider::FinishReason::Length) {
+            // 截断的响应仍可能带着已解析完整的 tool_calls（刚推进 messages 的 assistant 消息）：
+            // 下面两条子路径（撞上限收尾 / 塞反馈继续）都会在这条 assistant 消息之后紧跟别的
+            // 非 tool 消息（needs_decision 快照 或 反馈 user 消息），若不先补占位 tool 结果就
+            // 违反配对不变量，`save_conversation_snapshot` 会报 "conversation pairing invalid"
+            // 直接把整个 run 崩掉。两条子路径共用同一次补占位。
+            append_unpaired_tool_results(
+                messages,
+                &response.tool_calls,
+                "output truncated before tool results",
+            );
             consecutive_truncations += 1;
             progress.note_turn(false, false);
             progress.note_safety_signals(false, false, false);

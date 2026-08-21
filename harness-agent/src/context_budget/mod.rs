@@ -1,6 +1,8 @@
 //! Context Budget: 确定性估 token + 分层压缩，让历史在撑爆 context window 前瘦身。
 //! 只作用于每轮临时 wire；canonical 历史 + journal 永不受影响（零数据丢失）。
 
+pub mod autocompact;
+
 use crate::provider::{ChatMessage, ProviderCapabilities};
 use serde_json::Value;
 
@@ -139,7 +141,7 @@ fn head_split_bytes(body_budget: usize) -> usize {
 /// 把超长正文剪成「头 + 省略标记 + 尾」。UTF-8 边界安全·确定性。
 /// 保证：返回串字节数 <= max_bytes。
 /// 头部三分之五的拆分先除后乘，避免 `body_budget * 3` 发生 usize 溢出。
-fn truncate_middle(s: &str, max_bytes: usize) -> String {
+pub(crate) fn truncate_middle(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }

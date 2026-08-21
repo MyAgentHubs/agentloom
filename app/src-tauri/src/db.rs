@@ -173,6 +173,11 @@ pub enum Block {
     ScopeChange {
         changes: Vec<crate::agent_event::ScopeChange>,
     },
+    /// T4b：引擎自动压实会话上下文后的一行轻提示。摘要另行落库，本块不携带内容。
+    ContextCompacted {},
+    /// T7a：头部超限、早期内容被截掉后的一行告警提示（压实拿不下来时的保底路径）。
+    /// 与 ContextCompacted 同族：无字段，数值只留在 engine 事件里。
+    ContextTruncated {},
     /// 刀 R P0-1/P0-2：每 run 恰一张的收尾卡（归约器 finish 的锚点）。status 用 String
     /// （同 DecisionCard 先例）。
     RunTerminal {
@@ -693,6 +698,13 @@ pub struct MemoryBlock {
     pub updated_run_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactState {
+    pub summary: String,
+    pub through_message_id: i64,
+    pub revision: i64,
+}
+
 /// 覆盖格 upsert (goal/state/next): same (session_id, slot) is unique; write overwrites old value (medical-record "current only").
 pub fn upsert_memory_block(
     conn: &Connection,
@@ -739,6 +751,72 @@ pub fn get_memory_block(
         },
     )
     .optional()
+}
+
+pub fn get_compact_state(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<CompactState>> {
+    let Some(block) = get_memory_block(conn, session_id, "compact")? else {
+        return Ok(None);
+    };
+    let anchors: serde_json::Value = match serde_json::from_str(&block.anchor_refs_json) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let Some(anchors) = anchors.as_array() else {
+        return Ok(None);
+    };
+    if anchors.len() != 1 || anchors[0].get("kind").and_then(|v| v.as_str()) != Some("message") {
+        return Ok(None);
+    }
+    let Some(through_message_id) = anchors[0].get("ref").and_then(|v| v.as_i64()) else {
+        return Ok(None);
+    };
+    Ok(Some(CompactState {
+        summary: block.text,
+        through_message_id,
+        revision: block.revision,
+    }))
+}
+
+pub fn upsert_compact_state(
+    conn: &Connection,
+    session_id: &str,
+    summary: &str,
+    through_message_id: i64,
+    run_id: Option<&str>,
+) -> rusqlite::Result<()> {
+    let anchor_refs_json = serde_json::json!([{
+        "kind": "message",
+        "ref": through_message_id,
+    }])
+    .to_string();
+    conn.execute(
+        "INSERT INTO memory_blocks \
+         (session_id, slot, text, title, anchor_refs_json, updated_by, updated_at, revision, updated_run_id) \
+         VALUES (?1, 'compact', ?2, NULL, ?3, 'autocompact', strftime('%s','now'), 1, ?5) \
+         ON CONFLICT(session_id, slot) DO UPDATE SET \
+           text = excluded.text, title = NULL, anchor_refs_json = excluded.anchor_refs_json, \
+           updated_by = excluded.updated_by, updated_at = excluded.updated_at, \
+           revision = memory_blocks.revision + 1, updated_run_id = excluded.updated_run_id \
+         WHERE CASE \
+           WHEN json_valid(memory_blocks.anchor_refs_json) = 0 THEN 1 \
+           WHEN json_type(memory_blocks.anchor_refs_json) IS NOT 'array' THEN 1 \
+           WHEN json_array_length(memory_blocks.anchor_refs_json) != 1 THEN 1 \
+           WHEN json_extract(memory_blocks.anchor_refs_json, '$[0].kind') IS NOT 'message' THEN 1 \
+           WHEN json_type(memory_blocks.anchor_refs_json, '$[0].ref') IS NOT 'integer' THEN 1 \
+           ELSE json_extract(memory_blocks.anchor_refs_json, '$[0].ref') <= ?4 \
+         END",
+        rusqlite::params![
+            session_id,
+            summary,
+            anchor_refs_json,
+            through_message_id,
+            run_id
+        ],
+    )?;
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -1644,6 +1722,39 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         if !has {
             conn.execute(&format!("ALTER TABLE sessions ADD COLUMN {col} {decl}"), [])?;
         }
+    }
+
+    // R-B2 项 1（隔离刀返工二·祖父条款）：sessions.workspace_scope（nullable）——`'root'` =
+    // 老行为（工作目录=项目根，方案 A per-session 子目录之前 local-default 会话的写法）；
+    // NULL/其它 = 新行为（per-session 子目录）。存量 local-default 会话的旧产物都散落在
+    // 项目根，方案 A 的沙箱只放行 per-session 子目录会让它们连自己以前写过的文件都碰不到——
+    // 只在列刚创建的这一刻（`!has_workspace_scope`）把**当时已存在**的 local-default 会话
+    // 全部回填 'root'，新建会话（列已存在之后才 INSERT 的）留 NULL 走新行为。这个回填只能
+    // 绑在“列刚创建”这个时间点上：若做成每次启动都跑一遍的独立 migration 函数，WHERE
+    // repo_id='local-default' AND workspace_scope IS NULL 会在下一次启动把新建的正常 NULL
+    // 会话也误判成祖父条款、错误打回项目根——所以就地内联在 ALTER 门里，列已存在之后的启动
+    // 会整段跳过，不会误伤后续正常产生的 NULL 行。
+    let has_workspace_scope = {
+        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        cols.iter().any(|c| c == "workspace_scope")
+    };
+    // R-B3 项 3（Minor-2·迁移原子性）：加列 + 回填必须是同一个事务——SQLite 的
+    // `ALTER TABLE ADD COLUMN` 本身是可事务的 DDL，不包一层会让「加列成功、回填 UPDATE 没跑完
+    // 就崩溃（I/O 错误 / 进程被杀）」这类中途失败留下半吊子状态：下次启动 `has_workspace_scope`
+    // 已经是 true（列已存在），上面的加列门直接整段跳过，回填永远补不上——静默丢失祖父条款，
+    // 存量 local-default 会话的旧产物从此再也碰不到。`unchecked_transaction` 是本仓已有的
+    // migration 原子写惯例（见本文件其它加事务的迁移/写入函数）。
+    if !has_workspace_scope {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("ALTER TABLE sessions ADD COLUMN workspace_scope TEXT", [])?;
+        tx.execute(
+            "UPDATE sessions SET workspace_scope = 'root' WHERE repo_id = 'local-default'",
+            [],
+        )?;
+        tx.commit()?;
     }
 
     // T1 migration: session_groups.repo_id（降到 repo 级）· 幂等·处理旧库
@@ -4441,6 +4552,38 @@ pub fn get_session_repo_id(
     }
 }
 
+/// R-B2 项 1（祖父条款）：查会话的 workspace_scope——`'root'` = 老行为（工作目录=项目根，
+/// 方案 A per-session 子目录隔离刀落地前就已存在的 local-default 会话，一次性迁移回填）；
+/// NULL/其它 = 新行为（per-session 子目录）。会话不存在时返回 `Ok(None)`（与其它
+/// `get_session_*` 查询同一容错口径），由调用方按「找不到会话」的既有路径处理。
+pub fn get_session_workspace_scope(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT workspace_scope FROM sessions WHERE id = ?1")?;
+    let res = stmt.query_row([session_id], |r| r.get::<_, Option<String>>(0));
+    match res {
+        Ok(v) => Ok(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// R-B2 项 1（祖父条款）：续会话继承父会话的 workspace_scope——父会话是老 `'root'` 会话，
+/// 续篇也该继续在项目根干活（否则祖父条款只护住了父会话、续篇又被打回子目录形同虚设）；
+/// 父会话是新会话（NULL）则续篇也留 NULL，与新建会话同口径。
+pub fn set_session_workspace_scope(
+    conn: &Connection,
+    session_id: &str,
+    scope: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE sessions SET workspace_scope = ?2 WHERE id = ?1",
+        (session_id, scope),
+    )?;
+    Ok(())
+}
+
 /// 查会话所属 namespace id（NULL / missing = None）。
 pub fn get_session_namespace_id(
     conn: &Connection,
@@ -6480,6 +6623,108 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cnt, 1);
+    }
+
+    #[test]
+    fn compact_state_roundtrip_write_read_consistent() {
+        let conn = mem();
+
+        upsert_compact_state(&conn, "s1", "滚动摘要", 42, Some("run-1")).unwrap();
+
+        assert_eq!(
+            get_compact_state(&conn, "s1").unwrap(),
+            Some(CompactState {
+                summary: "滚动摘要".to_string(),
+                through_message_id: 42,
+                revision: 1,
+            })
+        );
+        let block = get_memory_block(&conn, "s1", "compact").unwrap().unwrap();
+        assert_eq!(block.anchor_refs_json, r#"[{"kind":"message","ref":42}]"#);
+        assert_eq!(block.updated_by.as_deref(), Some("autocompact"));
+        assert_eq!(block.updated_run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn compact_state_missing_returns_none() {
+        let conn = mem();
+
+        assert_eq!(get_compact_state(&conn, "missing").unwrap(), None);
+    }
+
+    #[test]
+    fn compact_state_malformed_anchor_returns_none_without_panicking() {
+        let conn = mem();
+
+        for (session_id, anchor_refs_json) in [
+            ("bad-json", "not-json"),
+            ("empty", "[]"),
+            ("string-ref", r#"[{"kind":"message","ref":"42"}]"#),
+        ] {
+            conn.execute(
+                "INSERT INTO memory_blocks \
+                 (session_id, slot, text, anchor_refs_json, updated_by, updated_at, revision) \
+                 VALUES (?1, 'compact', '摘要', ?2, 'autocompact', 0, 1)",
+                rusqlite::params![session_id, anchor_refs_json],
+            )
+            .unwrap();
+            assert_eq!(get_compact_state(&conn, session_id).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn compact_state_overwrite_increments_revision() {
+        let conn = mem();
+        upsert_compact_state(&conn, "s1", "摘要一", 10, Some("run-1")).unwrap();
+
+        upsert_compact_state(&conn, "s1", "摘要二", 20, Some("run-2")).unwrap();
+
+        assert_eq!(
+            get_compact_state(&conn, "s1").unwrap(),
+            Some(CompactState {
+                summary: "摘要二".to_string(),
+                through_message_id: 20,
+                revision: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn compact_state_watermark_regression_is_rejected() {
+        let conn = mem();
+        upsert_compact_state(&conn, "s1", "较新摘要", 20, Some("run-new")).unwrap();
+
+        upsert_compact_state(&conn, "s1", "过期摘要", 10, Some("run-old")).unwrap();
+
+        assert_eq!(
+            get_compact_state(&conn, "s1").unwrap(),
+            Some(CompactState {
+                summary: "较新摘要".to_string(),
+                through_message_id: 20,
+                revision: 1,
+            })
+        );
+        let block = get_memory_block(&conn, "s1", "compact").unwrap().unwrap();
+        assert_eq!(block.updated_run_id.as_deref(), Some("run-new"));
+    }
+
+    #[test]
+    fn compact_state_equal_watermark_allows_overwrite() {
+        let conn = mem();
+        upsert_compact_state(&conn, "s1", "摘要一", 20, Some("run-1")).unwrap();
+
+        upsert_compact_state(&conn, "s1", "摘要二", 20, Some("run-2")).unwrap();
+
+        assert_eq!(
+            get_compact_state(&conn, "s1").unwrap(),
+            Some(CompactState {
+                summary: "摘要二".to_string(),
+                through_message_id: 20,
+                revision: 2,
+            })
+        );
+        let block = get_memory_block(&conn, "s1", "compact").unwrap().unwrap();
+        assert_eq!(block.updated_run_id.as_deref(), Some("run-2"));
     }
 
     #[test]
@@ -9340,6 +9585,90 @@ mod tests {
         assert_eq!(emoji.as_deref(), Some("📕"));
     }
 
+    /// R-B2 项 1（隔离刀返工二·祖父条款）迁移测试：模拟老 DB（本列刚加时那一刻）——
+    /// 迁移前已存在的 local-default 会话必须回填 `workspace_scope='root'`；同一时刻已存在的
+    /// 非 local-default 会话不受祖父条款影响，留 NULL；迁移**之后**新建的 local-default 会话
+    /// 必须留 NULL（走新行为 · per-session 子目录）；再跑一次 `init_schema`（列已存在）必须
+    /// 是纯 no-op，不得把刚建的正常新会话误判成祖父、回填成 root。
+    /// R-B3 项 3（Minor-2·迁移原子性）确认：加列 + 回填现已包进 `unchecked_transaction`——
+    /// 事务只改变「中途崩溃是否留半吊子状态」这一失败路径，不改变成功路径的可观察结果，所以
+    /// 本测试原有的「加列→回填→幂等复跑」断言链本身就是事务化后行为的回归覆盖，未新增用例。
+    #[test]
+    fn workspace_scope_migration_backfills_only_sessions_that_predate_the_column() {
+        let c = mem();
+        // 模拟老 DB：这一列还不存在（真实历史升级路径 = 从没有这列的旧 schema 启动）。
+        c.execute_batch("ALTER TABLE sessions DROP COLUMN workspace_scope")
+            .unwrap();
+
+        // 迁移前已存在的 local-default 会话（旧产物散落项目根的老数据）。
+        create_session(&c, "s-legacy-local", "t", "local-default", "local").unwrap();
+        // 迁移前已存在的真实 repo 会话——祖父条款只认 local-default，这条不该被动。
+        crate::namespaces_repo::add_namespace(&c, "ns-legacy-real", "github_org", "Real", 0)
+            .unwrap();
+        crate::repos_repo::add_repo(
+            &c,
+            "repo-legacy-real",
+            "ns-legacy-real",
+            "github",
+            Some("owner"),
+            "repo",
+            "/tmp/legacy-real",
+            None,
+        )
+        .unwrap();
+        create_session(
+            &c,
+            "s-legacy-real",
+            "t",
+            "repo-legacy-real",
+            "ns-legacy-real",
+        )
+        .unwrap();
+
+        // 触发迁移：列刚创建的这一刻，加列 + 回填。
+        init_schema(&c).unwrap();
+
+        let scope_of = |id: &str| -> Option<String> {
+            c.query_row(
+                "SELECT workspace_scope FROM sessions WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            scope_of("s-legacy-local").as_deref(),
+            Some("root"),
+            "迁移前已存在的 local-default 会话必须回填 root"
+        );
+        assert_eq!(
+            scope_of("s-legacy-real"),
+            None,
+            "非 local-default 会话不受祖父条款影响，应留 NULL"
+        );
+
+        // 迁移后（列已存在）新建的 local-default 会话必须留 NULL——走新行为。
+        create_session(&c, "s-fresh-local", "t", "local-default", "local").unwrap();
+        assert_eq!(
+            scope_of("s-fresh-local"),
+            None,
+            "迁移后新建会话必须留 NULL（新行为 · per-session 子目录），不能被祖父条款误伤"
+        );
+
+        // 幂等：列已存在后再跑一次 init_schema，不得把刚建的新会话回填成 root。
+        init_schema(&c).unwrap();
+        assert_eq!(
+            scope_of("s-fresh-local"),
+            None,
+            "列已存在之后的启动必须整段跳过回填，否则会把正常新会话打回祖父模式"
+        );
+        assert_eq!(
+            scope_of("s-legacy-local").as_deref(),
+            Some("root"),
+            "幂等：老会话的 root 回填不应被第二次 init_schema 改变"
+        );
+    }
+
     #[test]
     fn project_first_migration_renames_seed_local_default() {
         let c = mem();
@@ -10554,6 +10883,35 @@ mod tests {
         let got = get_messages(&c, "s1").unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].content, blocks);
+    }
+
+    #[test]
+    fn context_truncated_block_uses_its_own_serde_tag() {
+        // T7a：截断块与压实块必须是两个独立 tag——前端按 tag 分流两种文案/视觉。
+        assert_eq!(
+            serde_json::to_string(&Block::ContextTruncated {}).unwrap(),
+            r#"{"type":"context_truncated"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Block>(r#"{"type":"context_truncated"}"#).unwrap(),
+            Block::ContextTruncated {}
+        );
+        assert_ne!(Block::ContextTruncated {}, Block::ContextCompacted {});
+    }
+
+    #[test]
+    fn context_truncated_block_round_trips_through_message_storage() {
+        let c = mem();
+        create_session(&c, "s1", "x", "local-default", "local").unwrap();
+        let blocks = vec![
+            Block::Text {
+                text: "截断前".into(),
+            },
+            Block::ContextTruncated {},
+        ];
+        append_message(&c, "s1", "assistant", &blocks, None, None, None).unwrap();
+
+        assert_eq!(get_messages(&c, "s1").unwrap()[0].content, blocks);
     }
 
     #[test]

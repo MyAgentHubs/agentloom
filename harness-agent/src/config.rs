@@ -384,13 +384,24 @@ pub fn default_model(provider: &str) -> String {
 /// 吃不准的留 `None` 走通用默认，别按 provider 瞎填高了被 API 拒。
 pub fn default_context_tokens(provider: &str, model: &str) -> Option<u32> {
     match provider {
-        "zai" => Some(128_000),
+        // "zai" 走 z.ai 的 anthropic 兼容端点，provider_id 不含 "glm"/"zhipu" 子串，
+        // 不会命中 model_registry 的 ProviderFamily::Glm 分支，故在此单独兜底。
+        // 200_000 与登记表 glm_spec 主线（4.6/5/5-turbo，default_model("zai")="glm-4.6"
+        // 正落这档）对齐——来源 docs.z.ai/guides/llm/glm-4.6，2026-08-21 核；原值
+        // 128_000 是旧登记值残留。注：未按 model 精细分档，走 zai 的 glm-5.2 仍会被
+        // 保守算成 200_000（非其真实 1M）——已知局限，不在本次改动范围内。
+        "zai" => Some(200_000),
         _ => crate::model_registry::lookup(provider, model).map(|spec| spec.context_window),
     }
 }
 
 pub fn default_output_tokens(provider: &str, model: &str) -> Option<u32> {
-    crate::model_registry::lookup(provider, model).map(|spec| spec.max_output)
+    match provider {
+        // 同上："zai" 绕过 model_registry，之前落 None → AnthropicProvider 兜底到
+        // 硬编码 4096（比登记表旧值 8_192 还小）。131_072 对齐登记表 glm_spec 主线输出。
+        "zai" => Some(131_072),
+        _ => crate::model_registry::lookup(provider, model).map(|spec| spec.max_output),
+    }
 }
 
 fn find_stored(provider: &str) -> Option<StoredProvider> {
@@ -647,12 +658,14 @@ mod tests {
 
     #[test]
     fn default_context_tokens_for_known_providers() {
-        // DeepSeek 全系上下文 64K。没这个兜底就落通用默认 16384，历史压缩可用预算
-        // 塌到 ~4157（< 固定系统/任务/地形头），每轮第 2 步即 context_budget_exhausted、
-        // 模型一行代码没写就被掐（2026-06-23 dogfood 实证 + 确证跑：设 65536 后预算墙消失）。
+        // DeepSeek V4 全系官方 1,048,576(1M) 窗口（api-docs.deepseek.com/news/news260424/
+        // + huggingface.co/deepseek-ai/DeepSeek-V4-Pro，2026-08-21 核）。没这个兜底就落
+        // 通用默认 16384，历史压缩可用预算塌到 ~4157（< 固定系统/任务/地形头），每轮
+        // 第 2 步即 context_budget_exhausted、模型一行代码没写就被掐（2026-06-23 dogfood
+        // 实证；旧值 65536 本身也只是 V3 时代残留，写小了 16 倍）。
         assert_eq!(
             default_context_tokens("deepseek", "deepseek-v4-flash"),
-            Some(65_536)
+            Some(1_048_576)
         );
         // 吃不准窗口的 provider 留 None 走通用保守默认——窗口随 model 变（如 kimi 默认
         // moonshot-v1-8k 只有 8K），别按 provider 瞎填高了被 API 拒。
@@ -663,7 +676,7 @@ mod tests {
     fn default_context_tokens_now_covers_non_deepseek() {
         assert_eq!(
             default_context_tokens("deepseek", "deepseek-v4-flash"),
-            Some(65_536)
+            Some(1_048_576)
         );
         assert_eq!(
             default_context_tokens("kimi", "moonshot-v1-128k"),
@@ -675,9 +688,11 @@ mod tests {
 
     #[test]
     fn zai_has_context_default_not_none() {
+        // 200_000 对齐登记表 glm_spec 主线（default_model("zai")="glm-4.6" 正落这档）；
+        // 来源 docs.z.ai/guides/llm/glm-4.6，2026-08-21 核；原值 128_000 是旧登记值残留。
         assert_eq!(
             super::default_context_tokens("zai", "glm-4.6"),
-            Some(128_000)
+            Some(200_000)
         );
     }
 
@@ -685,11 +700,22 @@ mod tests {
     fn default_output_tokens_from_registry() {
         assert_eq!(
             default_output_tokens("deepseek", "deepseek-v4-flash"),
-            Some(8_192)
+            Some(65_536)
         );
         assert_eq!(
             default_output_tokens("kimi", "moonshot-v1-128k"),
             Some(8_192)
+        );
+    }
+
+    #[test]
+    fn zai_has_output_default_not_none() {
+        // "zai" 绕过 model_registry（provider_id 不含 glm/zhipu 子串），之前
+        // default_output_tokens 落 None → AnthropicProvider 兜底到硬编码 4096。
+        // 131_072 对齐登记表 glm_spec 主线输出；来源同上，2026-08-21 核。
+        assert_eq!(
+            super::default_output_tokens("zai", "glm-4.6"),
+            Some(131_072)
         );
     }
 
@@ -860,7 +886,7 @@ mod tests {
         let _api_key = EnvGuard::set("DEEPSEEK_API_KEY", "sk-test");
 
         let config = provider_config_with_model("deepseek", None).unwrap();
-        assert_eq!(config.context_tokens, Some(65_536));
+        assert_eq!(config.context_tokens, Some(1_048_576));
     }
 
     #[test]

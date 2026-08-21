@@ -66,6 +66,14 @@ pub enum AgentEvent {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
     },
+    ContextCompacted {
+        summary: String,
+        through_message_id: i64,
+    },
+    /// T7a：引擎头部超限、截掉早期内容后继续（outcome=head_truncated_continue）。数值字段
+    /// （original/truncated/budget_tokens）只服务 engine 侧留痕，前端一行提示不消费 → 本变体
+    /// 不带字段，payload 缺数值也照常接受。
+    HeadTruncated {},
     Completed {
         cost_usd: Option<f64>,
         input_tokens: Option<u64>,
@@ -1382,6 +1390,31 @@ pub(crate) fn parse_harness_line_for_locale(line: &str, locale: crate::Locale) -
             let id = s("tool_call_id").unwrap_or("").to_string();
             let text = s("text").unwrap_or("").to_string();
             vec![AgentEvent::ToolOutputDelta { id, text }]
+        }
+        Some("orchestration.step.completed") => {
+            // T7a：头部超限截断只认 solo.compact 这一步；数值字段（original/truncated/
+            // budget_tokens）不参与判定，缺了也照常出事件。其余 outcome 走原路不变。
+            if s("outcome") == Some("head_truncated_continue") {
+                if s("step_id") != Some("solo.compact") {
+                    return vec![];
+                }
+                return vec![AgentEvent::HeadTruncated {}];
+            }
+            if s("outcome") != Some("objective_compacted") {
+                return vec![];
+            }
+            let Some(summary) = s("summary").filter(|summary| !summary.is_empty()) else {
+                return vec![];
+            };
+            let Some(through_message_id) =
+                payload.get("through_message_id").and_then(Value::as_i64)
+            else {
+                return vec![];
+            };
+            vec![AgentEvent::ContextCompacted {
+                summary: summary.to_string(),
+                through_message_id,
+            }]
         }
         Some("run.completed") => vec![AgentEvent::Completed {
             cost_usd: None,
@@ -3551,6 +3584,179 @@ mod tests {
                 evs.is_empty(),
                 "{event_type} should yield empty vec, got {evs:?}"
             );
+        }
+    }
+
+    #[test]
+    fn context_compacted_valid_payload_maps_fields() {
+        let events = parse_harness_line(&harness_envelope(
+            "orchestration.step.completed",
+            serde_json::json!({
+                "step_id": "solo.compact",
+                "turn": 0,
+                "outcome": "objective_compacted",
+                "summary": "压实后的摘要",
+                "through_message_id": 42,
+                "original_tokens": 1000,
+                "compacted_tokens": 200,
+                "budget_tokens": 800
+            }),
+        ));
+
+        assert_eq!(
+            events,
+            vec![AgentEvent::ContextCompacted {
+                summary: "压实后的摘要".into(),
+                through_message_id: 42,
+            }]
+        );
+    }
+
+    #[test]
+    fn context_compacted_golden_event_parses() {
+        let events = parse_harness_line_for_locale(
+            include_str!(
+                "../../../harness-agent/tests/fixtures/objective-compacted-event-golden.json"
+            ),
+            crate::Locale::Zh,
+        );
+
+        assert_eq!(
+            events,
+            vec![AgentEvent::ContextCompacted {
+                summary: "## Primary Request and Intent\nShip the deterministic sample.\n## Key Technical Concepts\ncheckpoint\n## Files and Code\n(none)\n## Errors and Fixes\n(none)\n## Pending Jobs\n(none)\n## Current Work\nverify event consumers\n## Next Step\nfinish\n## Critical Context\npreserve the event contract".into(),
+                through_message_id: 27,
+            }]
+        );
+    }
+
+    #[test]
+    fn context_truncated_head_truncated_outcome_maps_to_event() {
+        let events = parse_harness_line(&harness_envelope(
+            "orchestration.step.completed",
+            serde_json::json!({
+                "step_id": "solo.compact",
+                "turn": 0,
+                "outcome": "head_truncated_continue",
+                "original_tokens": 13200,
+                "truncated_tokens": 9000,
+                "budget_tokens": 8000
+            }),
+        ));
+
+        assert_eq!(events, vec![AgentEvent::HeadTruncated {}]);
+    }
+
+    #[test]
+    fn context_truncated_accepts_payload_without_numeric_fields() {
+        let events = parse_harness_line(&harness_envelope(
+            "orchestration.step.completed",
+            serde_json::json!({
+                "step_id": "solo.compact",
+                "outcome": "head_truncated_continue"
+            }),
+        ));
+
+        assert_eq!(events, vec![AgentEvent::HeadTruncated {}]);
+    }
+
+    #[test]
+    fn context_truncated_nonmatching_step_or_outcome_is_silently_dropped() {
+        for payload in [
+            // 对的 outcome、错的 step_id（别的编排步骤借用同名 outcome）
+            serde_json::json!({
+                "step_id": "lead.compact",
+                "outcome": "head_truncated_continue"
+            }),
+            // 对的 outcome、缺 step_id
+            serde_json::json!({ "outcome": "head_truncated_continue" }),
+            // 对的 step_id、别的 outcome
+            serde_json::json!({
+                "step_id": "solo.compact",
+                "outcome": "head_truncate_failed"
+            }),
+            serde_json::json!({
+                "step_id": "solo.compact",
+                "outcome": "head_truncated_continue_extra"
+            }),
+        ] {
+            let events =
+                parse_harness_line(&harness_envelope("orchestration.step.completed", payload));
+            assert!(events.is_empty(), "unexpected events: {events:?}");
+        }
+    }
+
+    #[test]
+    fn context_truncated_does_not_disturb_objective_compacted_path() {
+        let events = parse_harness_line(&harness_envelope(
+            "orchestration.step.completed",
+            serde_json::json!({
+                "step_id": "solo.compact",
+                "outcome": "objective_compacted",
+                "summary": "压实后的摘要",
+                "through_message_id": 42
+            }),
+        ));
+
+        assert_eq!(
+            events,
+            vec![AgentEvent::ContextCompacted {
+                summary: "压实后的摘要".into(),
+                through_message_id: 42,
+            }]
+        );
+    }
+
+    #[test]
+    fn context_compacted_failed_outcome_is_silently_dropped() {
+        let events = parse_harness_line(&harness_envelope(
+            "orchestration.step.completed",
+            serde_json::json!({
+                "outcome": "objective_compact_failed",
+                "summary": "不应落库",
+                "through_message_id": 42
+            }),
+        ));
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn context_compacted_missing_or_empty_summary_is_silently_dropped() {
+        for payload in [
+            serde_json::json!({
+                "outcome": "objective_compacted",
+                "through_message_id": 42
+            }),
+            serde_json::json!({
+                "outcome": "objective_compacted",
+                "summary": "",
+                "through_message_id": 42
+            }),
+        ] {
+            assert!(
+                parse_harness_line(&harness_envelope("orchestration.step.completed", payload))
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn context_compacted_non_integer_watermark_is_silently_dropped() {
+        for through_message_id in [
+            serde_json::json!("42"),
+            serde_json::json!(42.5),
+            serde_json::Value::Null,
+        ] {
+            let events = parse_harness_line(&harness_envelope(
+                "orchestration.step.completed",
+                serde_json::json!({
+                    "outcome": "objective_compacted",
+                    "summary": "摘要",
+                    "through_message_id": through_message_id
+                }),
+            ));
+            assert!(events.is_empty());
         }
     }
 }

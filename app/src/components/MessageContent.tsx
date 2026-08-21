@@ -28,6 +28,7 @@ import { ToolStepsFold } from "./ToolStepsFold";
 import { ApprovalCard } from "./ApprovalCard";
 import { ScopeChangeCard } from "./ScopeChangeCard";
 import { RunTerminalCard } from "./RunTerminalCard";
+import { ContextCompactedChip } from "./ContextCompactedChip";
 import { useI18n } from "../i18n";
 import {
   getAttachmentDataUri,
@@ -1020,6 +1021,12 @@ function MessageContentImpl({
 
         if (block.type === "run_terminal")
           return <RunTerminalCard key={`b-${i}`} block={block} />;
+
+        if (
+          block.type === "context_compacted" ||
+          block.type === "context_truncated"
+        )
+          return <ContextCompactedChip key={`b-${i}`} blockType={block.type} />;
 
         if (block.type === "decision_card") return null; // 决策卡经 lead-turn 路径渲·不走 raw block 循环
 

@@ -2,9 +2,10 @@ use std::sync::{Arc, Mutex};
 
 use myagent::context_budget::{estimate_tokens, BudgetLimits};
 use myagent::events::EventRecorder;
-use myagent::orchestrator::{run_solo, ControlInputKind, RunOptions};
+use myagent::orchestrator::{run_solo, ControlInputKind, RunOptions, RunOutcome};
 use myagent::provider::{
-    ChatMessage, FunctionCall, ProviderCapabilities, ProviderClient, ProviderResponse, ToolCall,
+    ChatMessage, FinishReason, FunctionCall, ProviderCapabilities, ProviderClient,
+    ProviderResponse, ToolCall,
 };
 use serde_json::Value;
 
@@ -52,7 +53,7 @@ impl ProviderClient for RecordingProvider {
                 text: "done".into(),
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
-                finish_reason: None,
+                finish_reason: Some(FinishReason::Stop),
                 interruption: None,
             });
         }
@@ -278,4 +279,91 @@ async fn giant_single_turn_tool_result_does_not_exhaust_budget() {
     let system = last[0].content.as_deref().unwrap_or("");
     assert!(system.contains("Objective"));
     assert!(system.contains("Acceptance criteria"));
+}
+
+#[tokio::test]
+async fn oversized_user_head_is_truncated_and_run_continues() {
+    let ws = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        seen: seen.clone(),
+        turn: Mutex::new(0),
+        max_script: 0,
+    };
+    let giant_task = format!(
+        "USER_TASK_BOOK_START\n{}\nUSER_TASK_BOOK_END",
+        "u".repeat(40_000)
+    );
+    let mut options = opts(ws.path(), &giant_task, &[]);
+    options.memory_enabled = false;
+
+    let result = run_solo(provider, options)
+        .await
+        .expect("run_solo should not error");
+
+    let events_path = ws
+        .path()
+        .join(".myagenthubs/runs")
+        .join(&result.run_id)
+        .join("events.jsonl");
+    let events: Vec<Value> = std::fs::read_to_string(events_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let salvage_events: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "orchestration.step.completed"
+                && event["payload"]["step_id"] == "solo.compact"
+                && event["payload"]["outcome"] == "head_truncated_continue"
+        })
+        .collect();
+    assert_ne!(
+        result.outcome,
+        RunOutcome::NeedsDecision,
+        "salvage_events={}; provider_calls={}",
+        salvage_events.len(),
+        seen.lock().unwrap().len()
+    );
+    assert_eq!(salvage_events.len(), 1);
+    assert!(!seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn oversized_system_head_still_needs_decision() {
+    let ws = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        seen: seen.clone(),
+        turn: Mutex::new(0),
+        max_script: 0,
+    };
+    let mut options = opts(ws.path(), "small task", &[]);
+    options.memory_enabled = false;
+    options.append_system_prompt = Some(format!(
+        "SYSTEM_CONFIG_START\n{}\nSYSTEM_CONFIG_END",
+        "s".repeat(40_000)
+    ));
+
+    let result = run_solo(provider, options)
+        .await
+        .expect("run_solo should not error");
+
+    assert_eq!(result.outcome, RunOutcome::NeedsDecision);
+    let events_path = ws
+        .path()
+        .join(".myagenthubs/runs")
+        .join(&result.run_id)
+        .join("events.jsonl");
+    let events: Vec<Value> = std::fs::read_to_string(events_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(events.iter().any(|event| {
+        event["type"] == "run.needs_decision"
+            && event["payload"]["reason"] == "context_budget_exhausted"
+    }));
+    assert!(seen.lock().unwrap().is_empty());
 }

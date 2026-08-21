@@ -6637,6 +6637,138 @@ async fn interruption_with_finish_reason_present_is_not_treated_as_stream_cutoff
     assert!(!events.contains("run.failed"));
 }
 
+/// g.（截断分支补占位 tool 结果·复现钉）截断响应仍可能带着已解析完整的 tool_calls——
+/// assistant(tool_calls) 消息一旦推进 messages，其后紧跟的任何非 tool 消息（反馈 user 消息 /
+/// needs_decision 快照）都会违反配对不变量，`save_conversation_snapshot` 里的
+/// `validate_tool_pairing` 会报 "conversation pairing invalid ... non-tool message before
+/// result"，整个 run 直接 `Err` 崩掉。断流分支必须先用 `append_unpaired_tool_results` 补一条
+/// 占位 tool 结果，再塞反馈 / 存快照。这里断言：run 不崩、正常收尾到 Completed，且落盘的
+/// conversation 里每个 assistant tool_call 后面都紧跟着恰好一条配对的 tool 结果。
+#[tokio::test]
+async fn output_truncation_with_tool_calls_gets_placeholder_before_feedback() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(
+        dir.path().to_path_buf(),
+        "truncated turn carries tool_calls",
+    );
+    opts.max_turns = 8;
+
+    let truncated_with_tool_call = ProviderResponse {
+        text: String::new(),
+        reasoning: "thinking forever".repeat(3),
+        tool_calls: vec![ToolCall {
+            id: "trunc_call_1".to_string(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "fs_write".into(),
+                arguments: json!({"path": "truncated.txt", "content": "partial"}).to_string(),
+            },
+        }],
+        finish_reason: Some(crate::provider::FinishReason::Length),
+        interruption: None,
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = StreamInterruptionProvider {
+        calls: calls.clone(),
+        responses: Arc::new(vec![truncated_with_tool_call, final_text_response("done")]),
+        seen_message_lens: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let result = run_solo_with_judge(provider, Box::new(crate::judge::NoopJudge), opts)
+        .await
+        .unwrap();
+
+    assert_eq!(result.outcome, RunOutcome::Completed);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let paths = RunPaths::new(dir.path(), &result.run_id);
+    let events = std::fs::read_to_string(&paths.events_path).unwrap();
+    assert!(events.contains("output_truncated_continue"));
+
+    let saved: SavedConversation<ChatMessage> =
+        load_conversation(&paths.conversation_path).unwrap();
+    assert_each_assistant_tool_call_has_exactly_one_tool_result(&saved.messages);
+
+    let assistant_idx = saved
+        .messages
+        .iter()
+        .position(|message| {
+            message.role == "assistant"
+                && message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty())
+        })
+        .expect("truncated assistant tool_calls message should be present");
+    let placeholder = &saved.messages[assistant_idx + 1];
+    assert_eq!(placeholder.role, "tool");
+    assert_eq!(placeholder.tool_call_id.as_deref(), Some("trunc_call_1"));
+    assert_eq!(
+        placeholder.content.as_deref(),
+        Some("output truncated before tool results")
+    );
+    // 占位 tool 结果之后紧接着才是截断反馈的 user 消息。
+    assert_eq!(saved.messages[assistant_idx + 2].role, "user");
+}
+
+/// h.（截断分支补占位 tool 结果·撞连续上限路径）连续 3 轮「截断 + 完整 tool_calls」应正常
+/// 走到 `output_truncated_halt` / `run.needs_decision` 并把快照存下来——不能因为配对校验失败
+/// 而在存快照那步 `Err` 崩掉。
+#[tokio::test]
+async fn output_truncation_halt_path_with_tool_calls_does_not_crash_pairing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(
+        dir.path().to_path_buf(),
+        "repeated truncation carries tool_calls",
+    );
+    opts.max_turns = 40;
+
+    fn truncated_with_tool_call(id: &str) -> ProviderResponse {
+        ProviderResponse {
+            text: String::new(),
+            reasoning: "thinking forever".repeat(3),
+            tool_calls: vec![ToolCall {
+                id: id.to_string(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "fs_write".into(),
+                    arguments: json!({"path": "truncated.txt", "content": "partial"}).to_string(),
+                },
+            }],
+            finish_reason: Some(crate::provider::FinishReason::Length),
+            interruption: None,
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = StreamInterruptionProvider {
+        calls: calls.clone(),
+        responses: Arc::new(vec![
+            truncated_with_tool_call("trunc_call_1"),
+            truncated_with_tool_call("trunc_call_2"),
+            truncated_with_tool_call("trunc_call_3"),
+        ]),
+        seen_message_lens: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let result = run_solo_with_judge(provider, Box::new(crate::judge::NoopJudge), opts)
+        .await
+        .unwrap();
+
+    assert_eq!(result.outcome, RunOutcome::NeedsDecision);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+    let paths = RunPaths::new(dir.path(), &result.run_id);
+    let events = std::fs::read_to_string(&paths.events_path).unwrap();
+    assert!(events.contains("\"reason\":\"consecutive_output_truncation\""));
+    assert!(events.contains("\"consecutive_truncated_turns\":3"));
+
+    let saved: SavedConversation<ChatMessage> =
+        load_conversation(&paths.conversation_path).unwrap();
+    assert_each_assistant_tool_call_has_exactly_one_tool_result(&saved.messages);
+}
+
 #[tokio::test]
 async fn budget_exhausted_after_real_edits_reports_still_progressing() {
     let dir = tempfile::tempdir().unwrap();

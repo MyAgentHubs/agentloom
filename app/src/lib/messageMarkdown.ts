@@ -49,6 +49,10 @@ export function blockToMarkdown(block: Block, t: Translate): string {
       });
     case "scope_change":
       return t("messageMarkdown.scopeChange");
+    case "context_compacted":
+      return t("contextCompacted.label");
+    case "context_truncated":
+      return t("contextTruncated.label");
     case "lead_summary":
       return t("messageMarkdown.leadSummary", {
         source: block.summary_source,

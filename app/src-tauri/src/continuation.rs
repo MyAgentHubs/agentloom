@@ -173,18 +173,28 @@ pub(crate) fn changed_files_for_parent(repo: &Path, parent: &str) -> Result<Vec<
     crate::worktree::changed_paths_between(repo, &base_ref, &head_ref)
 }
 
+/// 把会话 checkpoint 账本里的绝对路径转成交接文档要用的项目相对路径。`project` 是主前缀
+/// （会话实际 cwd：local-default 下是 per-session 子目录，本轮新建的 checkpoint 记的就是这个
+/// 前缀）；`project_root` 是备选前缀（仓库根：切子目录之前落的老 checkpoint 记的是根前缀）。
+/// 先试 `project`，剥不中再试 `project_root`——两者对真实 repo 会话本就相等，不影响那条路径。
+/// 双前缀都剥不中（路径确实落在项目之外）才退回原始绝对路径，与既有行为一致。
 pub(crate) fn changed_files_from_checkpoints(
     conn: &Connection,
     session_id: &str,
     project: &Path,
+    project_root: &Path,
 ) -> Result<Vec<String>, String> {
     let canonical_project = project
         .canonicalize()
         .unwrap_or_else(|_| project.to_path_buf());
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
     let files = crate::checkpoint::changed_file_paths_for_session(conn, session_id)?
         .into_iter()
         .map(|path| {
             path.strip_prefix(&canonical_project)
+                .or_else(|_| path.strip_prefix(&canonical_root))
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .into_owned()
@@ -832,7 +842,8 @@ mod tests {
         }
 
         let files =
-            super::changed_files_from_checkpoints(&c, "parent-checkpoints", &project).unwrap();
+            super::changed_files_from_checkpoints(&c, "parent-checkpoints", &project, &project)
+                .unwrap();
 
         let mut expected_paths = vec![a, z, outside];
         expected_paths.sort();
@@ -870,7 +881,8 @@ mod tests {
         .unwrap();
 
         let files =
-            super::changed_files_from_checkpoints(&c, "parent-canonical", &project).unwrap();
+            super::changed_files_from_checkpoints(&c, "parent-canonical", &project, &project)
+                .unwrap();
 
         assert_eq!(files, vec!["src/lib.rs"]);
     }
@@ -878,14 +890,59 @@ mod tests {
     #[test]
     fn continuation_checkpoint_files_allow_empty_ledger() {
         let c = mem();
-        let files = super::changed_files_from_checkpoints(
-            &c,
-            "parent-without-checkpoints",
-            std::path::Path::new("/tmp/plain-project"),
-        )
-        .unwrap();
+        let plain = std::path::Path::new("/tmp/plain-project");
+        let files =
+            super::changed_files_from_checkpoints(&c, "parent-without-checkpoints", plain, plain)
+                .unwrap();
 
         assert!(files.is_empty());
+    }
+
+    /// R-B1 项 2：老 checkpoint 落在项目根（local-default 引入 per-session 子目录之前记的
+    /// 绝对路径），新 checkpoint 落在会话实际 cwd（per-session 子目录）——两种前缀混在同一个
+    /// 会话的账本里，strip 都要能剥成相对路径，不能有一条退化成宿主机绝对路径漏进交接文档。
+    #[test]
+    fn continuation_checkpoint_files_strip_dual_prefix_root_and_session_subdir() {
+        let c = mem();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("local-default-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        let session_dir = canonical_root.join("s-mixed");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        // 老 checkpoint：切子目录之前落的，绝对路径挂在项目根下。
+        let old_style = canonical_root.join("README.md");
+        // 新 checkpoint：切子目录之后落的，绝对路径挂在 per-session 子目录下。
+        let new_style = session_dir.join("src/new.rs");
+        for (run_id, file_path) in [
+            ("run-old", old_style.as_path()),
+            ("run-new", new_style.as_path()),
+        ] {
+            c.execute(
+                "INSERT INTO checkpoint_entries \
+                 (session_id, run_id, file_path, existed, undone_at, created_at) \
+                 VALUES ('s-mixed', ?1, ?2, 0, NULL, 1)",
+                rusqlite::params![run_id, file_path.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+
+        let mut files =
+            super::changed_files_from_checkpoints(&c, "s-mixed", &session_dir, &canonical_root)
+                .unwrap();
+        files.sort();
+
+        assert_eq!(
+            files,
+            vec!["README.md".to_string(), "src/new.rs".to_string()]
+        );
+        for f in &files {
+            assert!(
+                !std::path::Path::new(f).is_absolute(),
+                "绝不把绝对路径烤进交接文档：{f}"
+            );
+        }
     }
 
     #[test]

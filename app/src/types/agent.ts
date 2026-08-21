@@ -522,6 +522,15 @@ export type Block =
       changes: ScopeChangeItem[];
     }
   | {
+      // T4b：后端无字段压实提示块的镜像；保持独立块型，不收紧其余可前向兼容字段。
+      type: "context_compacted";
+    }
+  | {
+      // T7a：后端 Block::ContextTruncated 的镜像——头部超限、早期内容被截掉的告警提示。
+      // 与 context_compacted 同为无字段块，但语义不同（有损 vs 压实），故独立块型。
+      type: "context_truncated";
+    }
+  | {
       // 刀 R R3-T3：后端归约器持久化的收尾卡块型（db.rs Block::RunTerminal 镜像）。
       // status 取值 "completed"/"error"/"interrupted"/"needs_decision"/"blocked"/"fallback"，
       // 可能出现未来未知值 → 前端按未知态兜底展示，不收紧字面量联合。

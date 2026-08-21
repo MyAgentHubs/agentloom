@@ -1,5 +1,7 @@
 use super::*;
+use crate::events::{EventEnvelope, EventRecorder, EventSink};
 use crate::provider::{ChatMessage, FunctionCall, ProviderCapabilities, ToolCall};
+use std::sync::{Arc, Mutex};
 
 fn caps(max_ctx: Option<u32>, out: Option<u32>) -> ProviderCapabilities {
     ProviderCapabilities {
@@ -103,6 +105,173 @@ fn tight_limits(context_tokens: usize, recent: usize, min_recent: usize) -> Budg
 
 fn fat(n: usize) -> String {
     "x".repeat(n)
+}
+
+struct CapturingSink(Arc<Mutex<Vec<EventEnvelope>>>);
+struct FailingSink;
+
+impl EventSink for CapturingSink {
+    fn handle(&mut self, event: &EventEnvelope) -> crate::error::Result<()> {
+        self.0.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+}
+
+impl EventSink for FailingSink {
+    fn handle(&mut self, _event: &EventEnvelope) -> crate::error::Result<()> {
+        Err(crate::error::HarnessError::Runtime("sink failed".into()))
+    }
+}
+
+fn capturing_recorder() -> (EventRecorder, Arc<Mutex<Vec<EventEnvelope>>>) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let recorder = EventRecorder::with_sinks(
+        "salvage-test",
+        None,
+        None,
+        vec![Box::new(CapturingSink(events.clone()))],
+    );
+    (recorder, events)
+}
+
+fn assert_messages_byte_identical(actual: &[ChatMessage], expected: &[ChatMessage]) {
+    assert_eq!(
+        serde_json::to_vec(actual).unwrap(),
+        serde_json::to_vec(expected).unwrap()
+    );
+}
+
+#[test]
+fn salvage_under_budget_has_zero_side_effects() {
+    let limits = tight_limits(2_000, 3, 1);
+    let mut messages = vec![
+        ChatMessage::system("system"),
+        ChatMessage::user("small task"),
+    ];
+    let before = messages.clone();
+    let (mut recorder, events) = capturing_recorder();
+    assert!(
+        !autocompact::salvage_head_overflow(&mut messages, &limits, 100, &mut recorder).unwrap()
+    );
+    assert_messages_byte_identical(&messages, &before);
+    assert!(events.lock().unwrap().is_empty());
+}
+
+#[test]
+fn salvage_truncates_largest_user_and_emits_once() {
+    let limits = tight_limits(3_000, 3, 1);
+    let mut messages = vec![
+        ChatMessage::system("system"),
+        ChatMessage::user("a".repeat(300)),
+        ChatMessage::user("b".repeat(4_000)),
+    ];
+    let small_user = messages[1].clone();
+    let original_large = messages[2].content.clone().unwrap();
+    let original_tokens = estimate_tokens(&messages, &limits);
+    let (mut recorder, events) = capturing_recorder();
+    assert!(
+        autocompact::salvage_head_overflow(&mut messages, &limits, 100, &mut recorder).unwrap()
+    );
+    assert_messages_byte_identical(&messages[1..2], std::slice::from_ref(&small_user));
+    let truncated = messages[2].content.as_deref().unwrap();
+    assert_ne!(truncated, original_large);
+    assert!(truncated.contains("bytes elided from the middle"));
+    let truncated_tokens = estimate_tokens(&messages, &limits);
+    assert!(truncated_tokens + 100 + 512 <= limits.budget());
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, "orchestration.step.completed");
+    assert_eq!(events[0].payload["step_id"], "solo.compact");
+    assert_eq!(events[0].payload["turn"], 0);
+    assert_eq!(events[0].payload["outcome"], "head_truncated_continue");
+    assert_eq!(events[0].payload["original_tokens"], original_tokens);
+    assert_eq!(events[0].payload["truncated_tokens"], truncated_tokens);
+    assert_eq!(events[0].payload["budget_tokens"], limits.budget());
+}
+
+#[test]
+fn salvage_truncates_user_when_system_is_largest_but_user_cut_is_sufficient() {
+    let limits = tight_limits(3_400, 3, 1);
+    let system = ChatMessage::system("s".repeat(2_000));
+    let original_system = serde_json::to_vec(&system).unwrap();
+    let original_user = "u".repeat(1_600);
+    let mut messages = vec![system, ChatMessage::user(original_user.clone())];
+    assert!(estimate_tokens(&messages[..1], &limits) > estimate_tokens(&messages[1..2], &limits));
+    let (mut recorder, events) = capturing_recorder();
+
+    assert!(autocompact::salvage_head_overflow(&mut messages, &limits, 0, &mut recorder).unwrap());
+    assert_eq!(serde_json::to_vec(&messages[0]).unwrap(), original_system);
+    let truncated_user = messages[1].content.as_deref().unwrap();
+    assert_ne!(truncated_user, original_user);
+    assert!(truncated_user.contains("bytes elided from the middle"));
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, "orchestration.step.completed");
+    assert_eq!(events[0].payload["step_id"], "solo.compact");
+    assert_eq!(events[0].payload["outcome"], "head_truncated_continue");
+}
+
+#[test]
+fn salvage_system_only_overflow_is_unchanged() {
+    let limits = tight_limits(1_000, 3, 1);
+    let mut messages = vec![
+        ChatMessage::system("s".repeat(2_000)),
+        ChatMessage::user("small task"),
+        ChatMessage::user("tiny follow-up"),
+    ];
+    let before = messages.clone();
+    let (mut recorder, events) = capturing_recorder();
+    assert!(!autocompact::salvage_head_overflow(&mut messages, &limits, 0, &mut recorder).unwrap());
+    assert_messages_byte_identical(&messages, &before);
+    assert!(events.lock().unwrap().is_empty());
+}
+
+#[test]
+fn salvage_restores_when_minimum_truncation_still_overflows() {
+    let limits = tight_limits(1_500, 3, 1);
+    let mut messages = vec![
+        ChatMessage::system("s".repeat(1_000)),
+        ChatMessage::user("u".repeat(4_000)),
+    ];
+    let before = messages.clone();
+    let (mut recorder, events) = capturing_recorder();
+    assert!(!autocompact::salvage_head_overflow(&mut messages, &limits, 0, &mut recorder).unwrap());
+    assert_messages_byte_identical(&messages, &before);
+    assert!(events.lock().unwrap().is_empty());
+}
+
+#[test]
+fn salvage_never_truncates_body_user_messages() {
+    let limits = tight_limits(2_000, 3, 1);
+    let mut messages = vec![
+        ChatMessage::system("system"),
+        ChatMessage::user("small head task"),
+        ChatMessage::assistant("started", None, vec![]),
+        ChatMessage::user("body user ".repeat(1_000)),
+    ];
+    let before = messages.clone();
+    let (mut recorder, events) = capturing_recorder();
+    assert!(
+        !autocompact::salvage_head_overflow(&mut messages, &limits, 100, &mut recorder).unwrap()
+    );
+    assert_messages_byte_identical(&messages, &before);
+    assert!(events.lock().unwrap().is_empty());
+}
+
+#[test]
+fn salvage_restores_when_event_emission_fails() {
+    let limits = tight_limits(3_000, 3, 1);
+    let mut messages = vec![
+        ChatMessage::system("system"),
+        ChatMessage::user("u".repeat(4_000)),
+    ];
+    let before = messages.clone();
+    let mut recorder =
+        EventRecorder::with_sinks("salvage-test", None, None, vec![Box::new(FailingSink)]);
+    assert!(
+        autocompact::salvage_head_overflow(&mut messages, &limits, 100, &mut recorder).is_err()
+    );
+    assert_messages_byte_identical(&messages, &before);
 }
 
 // 钉住头（system 含状态帧 marker + 验收标准）+ 任务 + n 个 (assistant + 胖 tool) 轮。

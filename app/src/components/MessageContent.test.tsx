@@ -2027,3 +2027,32 @@ describe("MessageContent run_terminal", () => {
     expect(container.textContent).toBe("");
   });
 });
+
+describe("MessageContent context_compacted", () => {
+  it("context_compacted 块 → 分发为一行压实提示，未落 markdown 默认分支", () => {
+    const { container } = render(
+      <I18nProvider initialLocale="zh">
+        <MessageContent blocks={[{ type: "context_compacted" }]} />
+      </I18nProvider>,
+    );
+
+    expect(container.querySelector(".context-compacted-chip")).not.toBeNull();
+    expect(screen.getByText("会话上下文已自动压实")).toBeInTheDocument();
+  });
+});
+
+describe("MessageContent context_truncated", () => {
+  it("context_truncated 块 → 分发为一行截断告警，未落 markdown 默认分支", () => {
+    const { container } = render(
+      <I18nProvider initialLocale="zh">
+        <MessageContent blocks={[{ type: "context_truncated" }]} />
+      </I18nProvider>,
+    );
+
+    expect(container.querySelector(".context-truncated-chip")).not.toBeNull();
+    expect(container.querySelector(".context-compacted-chip")).toBeNull();
+    expect(
+      screen.getByText("上下文超出模型窗口，已截断部分早期内容"),
+    ).toBeInTheDocument();
+  });
+});

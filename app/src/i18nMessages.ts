@@ -658,6 +658,8 @@ export const messages = {
     "runTerminal.blocked": "已停下",
     "runTerminal.needsDecision": "待决策",
     "runTerminal.fallback": "会话收尾未完成 · 已兜底恢复现场",
+    "contextCompacted.label": "会话上下文已自动压实",
+    "contextTruncated.label": "上下文超出模型窗口，已截断部分早期内容",
     "stopReason.blockedQuestions": "lead 停在待决问题上",
     "stopReason.noProgress": "连续多轮没有实质进展，已自动停下",
     "stopReason.stuckRepeating": "重复同样操作被安全网停下",
@@ -2214,6 +2216,9 @@ export const messages = {
     "runTerminal.blocked": "Blocked",
     "runTerminal.needsDecision": "Awaiting decision",
     "runTerminal.fallback": "Wrap-up incomplete · state recovered via fallback",
+    "contextCompacted.label": "Conversation context compacted",
+    "contextTruncated.label":
+      "Context exceeded the model window; some earlier content was truncated",
     "stopReason.blockedQuestions": "The lead is waiting on an open question",
     "stopReason.noProgress":
       "Stopped automatically after several turns with no real progress",

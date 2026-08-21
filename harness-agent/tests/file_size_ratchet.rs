@@ -13,12 +13,15 @@ const WHITELIST: &[(&str, usize)] = &[
     // 棘轮收口：ProviderResponse 加 interruption 字段·本文件内测试用构造点机械补 None(+1)
     // 棘轮收口：T2b 主循环消费 interruption——新增拦截分支+计数器(+24)
     // 棘轮收口：T2c M-1 断流分支收窄到 finish_reason 也缺失——嵌套 if + 加长注释(+8)
-    ("orchestrator/run_loop.rs", 3016),
+    // 棘轮收口：截断分支补占位工具结果（append_unpaired_tool_results）修 conversation
+    // pairing invalid 崩溃——分支入口一次调用 + 注释(+10)
+    ("orchestrator/run_loop.rs", 3026),
     // 棘轮重基线：随 run-loop 行为补齐的大量回归测试；后续按行为域拆测试模块。
     // 棘轮收口：ProviderResponse 加 interruption 字段·88 处测试构造点机械补 None(+88)
     // 棘轮收口：T2b 断流轮行为回归测试——5 条新用例 + mock provider/helper(+270)
     // 棘轮收口：T2c M-1 新增回归测试——finish_reason 已收到的完整轮不误判断流(+64)
-    ("orchestrator/tests.rs", 8943),
+    // 棘轮收口：截断分支补占位工具结果——复现钉 + 撞连续上限路径回归测试 2 条(+132)
+    ("orchestrator/tests.rs", 9075),
     ("orchestrator/probe_runner.rs", 1488),
     // 棘轮收口：ProviderResponse 加 interruption 字段·16 处测试构造点机械补 None(+16)
     ("plan/run_plan.rs", 4971),
@@ -48,7 +51,10 @@ const WHITELIST: &[(&str, usize)] = &[
     // + 对应 5 条 env 覆盖/回退测试(+71)
     // 棘轮收口：timeout_secs 非法值(parse 失败/等于 0)改硬报错——对齐邻居字段
     // (temperature/top_p/output_tokens)语义，拒绝静默 fail-open(+15)
-    ("config.rs", 1160),
+    // 棘轮收口：模型登记表按官方 API 文档校准——default_context_tokens/
+    // default_output_tokens 补 zai 分支来源注释 + 新增 zai_has_output_default_not_none
+    // 回归测试(+26)
+    ("config.rs", 1186),
 ];
 
 const HARD_LIMIT: usize = 800;

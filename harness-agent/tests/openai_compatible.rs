@@ -13,7 +13,9 @@ use myagent::provider::anthropic_compatible::AnthropicProvider;
 use myagent::provider::openai_compatible::{
     OpenAiCompatibleConfig, OpenAiCompatibleProvider, SamplingParams,
 };
-use myagent::provider::{shell_tool_definition, ChatMessage, ProviderClient};
+use myagent::provider::{
+    shell_tool_definition, ChatMessage, FunctionCall, ProviderClient, ToolCall,
+};
 
 #[tokio::test]
 async fn streams_content_and_reasoning_from_base_url_with_v1() {
@@ -247,7 +249,18 @@ async fn replays_reasoning_content_to_reasoning_provider() {
         myagent::provider::openai_compatible::OpenAiCompatibleProvider::new(cfg).unwrap();
     let messages = vec![
         myagent::provider::ChatMessage::user("do it"),
-        myagent::provider::ChatMessage::assistant("step", Some("my-reasoning".into()), vec![]),
+        myagent::provider::ChatMessage::assistant(
+            "step",
+            Some("my-reasoning".into()),
+            vec![ToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "shell_exec".into(),
+                    arguments: "{}".into(),
+                },
+            }],
+        ),
         myagent::provider::ChatMessage::user("continue"),
     ];
     let dir = tempfile::tempdir().unwrap();
@@ -268,6 +281,66 @@ async fn replays_reasoning_content_to_reasoning_provider() {
         "reasoning must be replayed; got {dumped}"
     );
     assert_eq!(body["temperature"], serde_json::json!(0.0));
+}
+
+#[tokio::test]
+async fn strips_reasoning_without_nonempty_tool_calls_for_reasoning_provider() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+                ),
+        )
+        .mount(&server)
+        .await;
+    let cfg = myagent::provider::openai_compatible::OpenAiCompatibleConfig {
+        provider_id: "deepseek".into(),
+        api_key: "k".into(),
+        base_url: server.uri(),
+        model: "deepseek-v4-flash".into(),
+        timeout_secs: 30,
+        temperature: None,
+        sampling: Default::default(),
+        network: myagent::goal::NetworkPolicy::On,
+        native_search_enabled: true,
+        fallback_model: None,
+        context_tokens: None,
+        output_tokens: None,
+    };
+    let provider =
+        myagent::provider::openai_compatible::OpenAiCompatibleProvider::new(cfg).unwrap();
+    let messages = vec![
+        ChatMessage::assistant("none", Some("reasoning-with-none".into()), vec![]),
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("empty".into()),
+            tool_call_id: None,
+            tool_calls: Some(vec![]),
+            reasoning_content: Some("reasoning-with-empty".into()),
+            name: None,
+        },
+        ChatMessage::user("continue"),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let mut rec = myagent::events::EventRecorder::new(
+        "r",
+        None,
+        None,
+        &dir.path().join("e.jsonl"),
+        myagent::events::OutputMode::Silent,
+    )
+    .unwrap();
+    let _ = provider.next_turn(&messages, &[], &mut rec).await.unwrap();
+    let reqs = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert!(body["messages"][0].get("reasoning_content").is_none());
+    assert!(body["messages"][1].get("reasoning_content").is_none());
 }
 
 #[tokio::test]

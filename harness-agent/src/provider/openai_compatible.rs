@@ -95,20 +95,17 @@ impl OpenAiCompatibleProvider {
         if let Some(do_sample) = self.config.sampling.do_sample {
             body["do_sample"] = json!(do_sample);
         }
-        let wire_messages = if self.supports_reasoning() {
-            serde_json::to_value(messages)?
-        } else {
-            let stripped: Vec<ChatMessage> = messages
-                .iter()
-                .map(|m| {
-                    let mut c = m.clone();
-                    c.reasoning_content = None;
-                    c
-                })
-                .collect();
-            serde_json::to_value(stripped)?
-        };
-        body["messages"] = wire_messages;
+        let supports_reasoning = self.supports_reasoning();
+        let mut wire_messages = messages.to_vec();
+        for message in &mut wire_messages {
+            if !supports_reasoning
+                || message.role != "assistant"
+                || message.tool_calls.as_ref().is_none_or(Vec::is_empty)
+            {
+                message.reasoning_content = None;
+            }
+        }
+        body["messages"] = serde_json::to_value(wire_messages)?;
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.to_vec());
             body["tool_choice"] = json!("auto");
