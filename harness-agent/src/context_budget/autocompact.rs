@@ -4,7 +4,9 @@ use super::{
 use crate::error::Result;
 use crate::events::EventRecorder;
 use crate::goal::GoalState;
+use crate::orchestrator::{build_offered_tools, EvidenceGate, RunOptions};
 use crate::provider::{ChatMessage, FinishReason, ProviderCapabilities, ProviderClient};
+use crate::tools::ToolRegistry;
 use serde_json::json;
 use std::fmt::Write;
 
@@ -584,14 +586,26 @@ pub(crate) fn salvage_head_overflow(
 pub(crate) async fn run_start_context_maintenance<P: ProviderClient>(
     provider: &P,
     capabilities: &ProviderCapabilities,
+    registry: &ToolRegistry,
+    options: &RunOptions,
     messages: &mut Vec<ChatMessage>,
     goal: &mut GoalState,
-    tools: &[serde_json::Value],
     recorder: &mut EventRecorder,
 ) -> Result<()> {
+    let mut run_start_disallowed = options.disallowed_tools.clone();
+    if options.evidence_gate == EvidenceGate::Off {
+        run_start_disallowed.insert("register_issue_probe".to_string());
+    }
+    let tools = build_offered_tools(
+        registry,
+        capabilities,
+        options.network,
+        options.native_search_enabled,
+        &run_start_disallowed,
+    );
     compact_objective_at_run_start(provider, capabilities, messages, goal, recorder).await?;
     let limits = BudgetLimits::from_capabilities(capabilities);
-    let tools_tokens = estimate_tools_tokens(tools, &limits);
+    let tools_tokens = estimate_tools_tokens(&tools, &limits);
     let objective_index = messages.iter().position(|message| {
         message.role == "user" && message.content.as_deref() == Some(&goal.contract.objective)
     });

@@ -796,15 +796,13 @@ pub(crate) async fn run_loop_with_registry<P: ProviderClient>(
 ) -> Result<RunOutcome> {
     let capabilities = provider.capabilities();
     emit_capabilities(recorder, &capabilities)?;
-    let mut run_start_disallowed = options.disallowed_tools.clone();
-    if options.evidence_gate == EvidenceGate::Off { run_start_disallowed.insert("register_issue_probe".to_string()); }
-    let run_start_tools = build_offered_tools(&registry, &capabilities, options.network, options.native_search_enabled, &run_start_disallowed);
     crate::context_budget::autocompact::run_start_context_maintenance(
         &provider,
         &capabilities,
+        &registry,
+        &options,
         messages,
         goal,
-        &run_start_tools,
         recorder,
     )
     .await?;
