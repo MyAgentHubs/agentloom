@@ -174,6 +174,10 @@ AGENTS.md       AI agent 贡献规则
 欢迎提 issue、报 bug、发 PR —— 怎么构建、怎么测、怎么提交见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 第一次贡献时需要签一份很轻的 CLA，在 PR 里点一下就好。
 
+感谢每一位贡献者：
+
+[![Contributors](https://contrib.rocks/image?repo=MyAgentHubs/agentloom)](https://github.com/MyAgentHubs/agentloom/graphs/contributors)
+
 ## 许可
 
 [AGPL-3.0](LICENSE)。一句话：随便用、随便自建、随便 fork ——

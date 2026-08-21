@@ -190,6 +190,10 @@ Issues, bug reports and pull requests are welcome — see [CONTRIBUTING.md](CONT
 for how to build, test and submit. Contributors sign a lightweight CLA (one click in the PR)
 the first time they contribute.
 
+Thanks to everyone who has contributed:
+
+[![Contributors](https://contrib.rocks/image?repo=MyAgentHubs/agentloom)](https://github.com/MyAgentHubs/agentloom/graphs/contributors)
+
 ## License
 
 [AGPL-3.0](LICENSE). In short: use it freely, self-host it, fork it — but if you distribute a
