@@ -1,56 +1,26 @@
-<!--
-Before you fill this in:
+<!-- Thanks for contributing! Plain words beat perfect formatting.
+     Not a UI change? Just delete the Before / After sections. -->
 
-AgentLoom is issue-first. A pull request needs an issue that a maintainer has
-labelled `accepted`. Without one this will be closed — not a judgement on the
-code, we just haven't agreed on the problem yet.
+## Issue
 
-Exceptions: typos, broken links, factual corrections in docs/.
+<!-- What problem does this solve? Link the issue if one exists (e.g. Closes #12). -->
 
-Please write this description yourself, in your own words. Generated
-descriptions get the thread closed. See CONTRIBUTING.md.
--->
+## How to reproduce
 
-## Linked issue
+<!-- e.g. "Using codex with AgentLoom responds with xxx. It happens every time." -->
 
-Closes #
+## Solution
 
-<!-- Required. Must be labelled `accepted`. -->
+<!-- How you fixed it, in a sentence or two. -->
 
-## What this changes
+## What's the change
 
-<!-- One or two sentences, plain language. -->
+<!-- Which files / behavior changed. -->
 
-## Why this approach
+## Before
 
-<!-- What else did you consider, and why this? One sentence is fine. -->
+<!-- screenshot -->
 
-## How you verified it
+## After
 
-<!-- Paste the real output. "Tests pass" on its own is not enough. -->
-
-```
-$ npm run typecheck
-
-$ npm test
-
-```
-
-<!-- UI change? Add before/after screenshots. -->
-
-## AI assistance
-
-<!-- Tick what applies. Disclosure is never a reason for rejection. -->
-
-- [ ] No AI tool was involved in this change.
-- [ ] An AI tool helped write the code. I have read every line, I can explain
-      why each change is there, and I ran the checks above myself.
-- [ ] I wrote this description myself. It is not generated.
-
-## Checklist
-
-- [ ] Single concern; I didn't reformat or refactor unrelated code
-- [ ] I only formatted the files I changed (no repo-wide formatter run)
-- [ ] No new dependencies, or the accepted issue asked for them
-- [ ] No new tests were skipped, disabled, or weakened
-- [ ] I'm ready to sign the CLA (a bot will comment with a link)
+<!-- screenshot -->
