@@ -1059,6 +1059,11 @@ export const messages = {
     "backend.agent.emptyFilteredId": "agent id 过滤后为空",
     "backend.agent.unknownEngine": "未知引擎：{engine}",
     "backend.agent.configDirCreateFailed": "创建配置目录失败：{detail}",
+    "backend.agent.promptFileDirCreateFailed":
+      "创建 prompt 临时目录失败：{detail}",
+    "backend.agent.promptFileCreateFailed":
+      "创建 prompt 临时文件失败：{detail}",
+    "backend.agent.promptFileWriteFailed": "写入 prompt 临时文件失败：{detail}",
     "backend.agent.missingEndpoint": "agent {id} 缺少 endpoint",
     "backend.cliPath.invalidCli": "无法设置 CLI 路径：不支持 {cli}。",
     "backend.cliPath.invalidPath":
@@ -2661,6 +2666,12 @@ export const messages = {
     "backend.agent.unknownEngine": "Unknown engine: {engine}",
     "backend.agent.configDirCreateFailed":
       "Failed to create the configuration directory: {detail}",
+    "backend.agent.promptFileDirCreateFailed":
+      "Failed to create the prompt temporary directory: {detail}",
+    "backend.agent.promptFileCreateFailed":
+      "Failed to create the prompt temporary file: {detail}",
+    "backend.agent.promptFileWriteFailed":
+      "Failed to write the prompt temporary file: {detail}",
     "backend.agent.missingEndpoint": "Agent {id} is missing an endpoint",
     "backend.cliPath.invalidCli":
       "Cannot set the CLI path: {cli} is not supported.",

@@ -1,8 +1,13 @@
 pub use crate::db::AgentProfile;
 
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct BuildContext<'a> {
     pub prompt: &'a str,
@@ -1111,6 +1116,134 @@ pub(crate) fn apply_harness_provider_env(
 /// 机制（`stopReason.budgetExhaustedStillProgressing`）。放宽到 120 轮，只影响 Worker 模式命令。
 const HARNESS_MEMBER_MAX_TURNS: &str = "120";
 
+static HARNESS_PROMPT_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const HARNESS_PROMPT_FILE_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+
+fn cleanup_expired_harness_prompt_files(prompts_dir: &Path, max_age: Duration, now: SystemTime) {
+    let entries = match std::fs::read_dir(prompts_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!(
+                "harness prompt 临时文件清理失败（non-fatal，{}）：{error}",
+                prompts_dir.display()
+            );
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                eprintln!(
+                    "harness prompt 临时文件条目读取失败（non-fatal，{}）：{error}",
+                    prompts_dir.display()
+                );
+                continue;
+            }
+        };
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                eprintln!(
+                    "harness prompt 临时文件元数据读取失败（non-fatal，{}）：{error}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = match metadata.modified() {
+            Ok(modified) => modified,
+            Err(error) => {
+                eprintln!(
+                    "harness prompt 临时文件修改时间读取失败（non-fatal，{}）：{error}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if now.duration_since(modified).is_ok_and(|age| age > max_age) {
+            if let Err(error) = std::fs::remove_file(&path) {
+                eprintln!(
+                    "harness prompt 过期临时文件清理失败（non-fatal，{}）：{error}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// harness 的位置参数天然支持文件输入；统一落到 app 域，避免 prompt 进入 argv 撞系统上限，
+/// 也消除短 prompt 恰好等于现存路径时被引擎误读的歧义。构造期只回收超过一小时的旧文件，
+/// 绝不清理可能尚未被引擎读取的在途文件；session purge 仍会随 journal 目录一并回收。
+pub(crate) fn write_harness_prompt_file(session_id: &str, prompt: &str) -> Result<PathBuf, String> {
+    let prompt_len = prompt.len();
+    let session_id = safe_id(session_id)?;
+    let prompts_dir = crate::worktree::journals_dir()
+        .join(session_id)
+        .join("prompts");
+
+    std::fs::create_dir_all(&prompts_dir).map_err(|error| {
+        crate::ui_msg::al_err(
+            "agent.promptFileDirCreateFailed",
+            &[(
+                "detail",
+                format!(
+                    "prompt {prompt_len} bytes，{}：{error}",
+                    prompts_dir.display()
+                ),
+            )],
+        )
+    })?;
+    cleanup_expired_harness_prompt_files(
+        &prompts_dir,
+        HARNESS_PROMPT_FILE_MAX_AGE,
+        SystemTime::now(),
+    );
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = HARNESS_PROMPT_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let prompt_path = prompts_dir.join(format!(
+        "prompt-{timestamp}-{}-{counter}.txt",
+        std::process::id()
+    ));
+    let mut prompt_file_options = std::fs::OpenOptions::new();
+    prompt_file_options.write(true).create_new(true);
+    #[cfg(unix)]
+    prompt_file_options.mode(0o600);
+    let mut prompt_file = prompt_file_options.open(&prompt_path).map_err(|error| {
+        crate::ui_msg::al_err(
+            "agent.promptFileCreateFailed",
+            &[(
+                "detail",
+                format!(
+                    "prompt {prompt_len} bytes，{}：{error}",
+                    prompt_path.display()
+                ),
+            )],
+        )
+    })?;
+    prompt_file.write_all(prompt.as_bytes()).map_err(|error| {
+        crate::ui_msg::al_err(
+            "agent.promptFileWriteFailed",
+            &[(
+                "detail",
+                format!(
+                    "prompt {prompt_len} bytes，{}：{error}",
+                    prompt_path.display()
+                ),
+            )],
+        )
+    })?;
+    Ok(prompt_path)
+}
+
 impl AgentBackend for HarnessBackend {
     fn build_command_inner(&self, ctx: &BuildContext) -> Result<Command, String> {
         let mut cmd = crate::proc::command(resolve_myagent_bin());
@@ -1118,8 +1251,9 @@ impl AgentBackend for HarnessBackend {
             cmd.env("PATH", path);
         }
         let plan_mode = harness_plan_mode_enabled();
+        let prompt_path = write_harness_prompt_file(ctx.session_id, ctx.prompt)?;
         cmd.arg(if plan_mode { "plan" } else { "run" })
-            .arg(ctx.prompt)
+            .arg(prompt_path)
             .arg("--jsonl")
             .args(["--provider", self.profile.provider.as_str()])
             .args(["--permission", harness_permission_for_mode(ctx.mode)])
@@ -1327,6 +1461,15 @@ mod tests {
         cmd.get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn harness_prompt_path(args: &[String]) -> PathBuf {
+        let path = PathBuf::from(args.get(1).expect("harness prompt path positional missing"));
+        assert!(
+            path.is_file(),
+            "harness prompt positional must be a file: {args:?}"
+        );
+        path
     }
 
     fn contains_adjacent_pair(args: &[String], left: &str, right: &str) -> bool {
@@ -2664,10 +2807,8 @@ model = "nested-model"
         let cmd = backend.build_command(&ctx).unwrap();
         let args = command_args(&cmd);
         assert_eq!(args.first().map(String::as_str), Some("run"));
-        assert!(
-            args.iter().any(|a| a == "fix the bug"),
-            "prompt positional: {args:?}"
-        );
+        let prompt_path = harness_prompt_path(&args);
+        assert_eq!(std::fs::read_to_string(prompt_path).unwrap(), "fix the bug");
         assert!(args.iter().any(|a| a == "--jsonl"), "{args:?}");
         assert!(
             contains_adjacent_pair(&args, "--provider", "deepseek"),
@@ -2698,10 +2839,8 @@ model = "nested-model"
 
         let args = command_args(&cmd);
         assert_eq!(args.first().map(String::as_str), Some("plan"));
-        assert!(
-            args.iter().any(|a| a == "fix the bug"),
-            "prompt positional: {args:?}"
-        );
+        let prompt_path = harness_prompt_path(&args);
+        assert_eq!(std::fs::read_to_string(prompt_path).unwrap(), "fix the bug");
         assert!(args.iter().any(|a| a == "--jsonl"), "{args:?}");
         assert!(
             contains_adjacent_pair(&args, "--provider", "deepseek"),
@@ -2717,6 +2856,92 @@ model = "nested-model"
             !args.iter().any(|a| a == "--client-session-id"),
             "plan mode must not pass --client-session-id because myagent plan does not accept it: {args:?}"
         );
+    }
+
+    #[test]
+    fn harness_build_command_writes_large_prompt_to_app_domain_file() {
+        let _mode = set_harness_mode_for_test(None);
+        let test = setup_context();
+        let workspace = test.home.join("user-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let backend = HarnessBackend {
+            profile: harness_profile(),
+            api_key: Some("k".to_string()),
+            search_api_key: None,
+            search_backend: None,
+        };
+        let first_prompt = "x".repeat(2 * 1024 * 1024 + 1);
+        let second_prompt = "second prompt";
+        let mut ctx = BuildContext {
+            prompt: &first_prompt,
+            session_id: &test.session_id,
+            run_id: "large-prompt-run",
+            wt: &workspace,
+            conn: &test.conn,
+            mode: BuildMode::Normal,
+            locale: crate::Locale::Zh,
+            reasoning_tier: None,
+            criteria: &[],
+        };
+
+        let first_args = command_args(&backend.build_command(&ctx).unwrap());
+        assert!(!first_args.iter().any(|arg| arg == &first_prompt));
+        let first_path = harness_prompt_path(&first_args);
+        assert!(first_path.starts_with(crate::worktree::journals_dir()));
+        assert!(!first_path.starts_with(&workspace));
+        assert_eq!(std::fs::read(&first_path).unwrap(), first_prompt.as_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&first_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        ctx.prompt = second_prompt;
+        let second_args = command_args(&backend.build_command(&ctx).unwrap());
+        let second_path = harness_prompt_path(&second_args);
+        assert_ne!(first_path, second_path);
+        assert!(
+            first_path.exists(),
+            "首个在途 prompt 文件不应在构造期被清理"
+        );
+        assert_eq!(std::fs::read(&first_path).unwrap(), first_prompt.as_bytes());
+        assert_eq!(
+            std::fs::read(&second_path).unwrap(),
+            second_prompt.as_bytes()
+        );
+    }
+
+    #[test]
+    fn harness_prompt_cleanup_removes_only_expired_files() {
+        let test = setup_context();
+        let prompts_dir = crate::worktree::journals_dir()
+            .join(&test.session_id)
+            .join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let old_path = prompts_dir.join("old.txt");
+        std::fs::write(&old_path, b"old").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let new_path = prompts_dir.join("new.txt");
+        std::fs::write(&new_path, b"new").unwrap();
+        let old_modified = std::fs::metadata(&old_path).unwrap().modified().unwrap();
+        let new_modified = std::fs::metadata(&new_path).unwrap().modified().unwrap();
+        assert!(
+            old_modified < new_modified,
+            "测试前置要求新旧文件的 mtime 可区分"
+        );
+
+        cleanup_expired_harness_prompt_files(
+            &prompts_dir,
+            HARNESS_PROMPT_FILE_MAX_AGE,
+            new_modified + HARNESS_PROMPT_FILE_MAX_AGE,
+        );
+
+        assert!(!old_path.exists(), "mtime 早于一小时阈值的旧文件应被清理");
+        assert!(new_path.exists(), "mtime 位于一小时阈值的新文件应保留");
+        assert_eq!(std::fs::read_to_string(new_path).unwrap(), "new");
     }
 
     #[test]

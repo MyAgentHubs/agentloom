@@ -8862,8 +8862,9 @@ fn harness_lead_cmd_in(
     if let Some(path) = agent::augmented_path_for_spawn() {
         cmd.env("PATH", path);
     }
+    let prompt_path = agent::write_harness_prompt_file(session_id, prompt)?;
     cmd.arg("run")
-        .arg(prompt)
+        .arg(prompt_path)
         .arg("--jsonl")
         .args(["--provider", profile.provider.as_str()])
         .arg("--workspace")
@@ -11838,9 +11839,25 @@ fn build_lead_context_prompt_and_record_autofeed_baseline(
     session_id: &str,
     member_pool: &[lead_tools::PoolMember],
     locale: Locale,
+    lead_engine: LeadEngine,
 ) -> Result<String, String> {
-    let prompt =
-        crate::lead_step::build_lead_context_prompt(conn, session_id, member_pool, locale, None)?;
+    let (compact_state, transcript_nonce) = if lead_engine == LeadEngine::Harness {
+        (
+            db::get_compact_state(conn, session_id).map_err(|error| error.to_string())?,
+            Some(uuid::Uuid::new_v4().simple().to_string()),
+        )
+    } else {
+        (None, None)
+    };
+    let prompt = crate::lead_step::build_lead_context_prompt(
+        conn,
+        session_id,
+        member_pool,
+        locale,
+        None,
+        compact_state.as_ref(),
+        transcript_nonce.as_deref(),
+    )?;
     let max_message_id = conn.query_row(
         "SELECT MAX(id) FROM messages WHERE session_id = ?1",
         [session_id],
@@ -13897,6 +13914,7 @@ fn start_lead_session(
                         &session_id_t,
                         &member_pool_t,
                         current_locale(&app_t),
+                        lead_engine_t,
                     )
                     .unwrap_or_else(|_| message_or_fallback.clone())
                 }
@@ -31492,7 +31510,9 @@ mod tests {
     #[test]
     fn harness_lead_cmd_in_builds_run_argv_with_mcp_and_disallow_tools() {
         // L3 A1：myagent 队长 spawn argv 断言——纯函数，不真 spawn（软链的旧 sidecar 不含新 flag）。
+        let _home_lock = crate::worktree::test_home_lock();
         let tmp = tempfile::tempdir().unwrap();
+        let _home_guard = TestHomeGuard::set(tmp.path());
         let wt = tmp.path().join("lead-wt");
         std::fs::create_dir_all(&wt).unwrap();
 
@@ -31515,10 +31535,9 @@ mod tests {
 
         let args = command_args(&cmd);
         assert_eq!(args.first().map(String::as_str), Some("run"));
-        assert!(
-            args.iter().any(|a| a == "hi"),
-            "prompt positional: {args:?}"
-        );
+        let prompt_path = std::path::PathBuf::from(&args[1]);
+        assert!(prompt_path.is_file(), "prompt positional: {args:?}");
+        assert_eq!(std::fs::read_to_string(prompt_path).unwrap(), "hi");
         assert!(args.iter().any(|a| a == "--jsonl"), "{args:?}");
         assert!(
             contains_adjacent_pair(&args, "--provider", "glm"),
@@ -31584,11 +31603,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn harness_lead_cmd_in_writes_large_prompt_to_app_domain_file() {
+        let _home_lock = crate::worktree::test_home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home_guard = TestHomeGuard::set(tmp.path());
+        let wt = tmp.path().join("user-workspace");
+        std::fs::create_dir_all(&wt).unwrap();
+        let profile = harness_lead_capable_profile("harness-lead-large-prompt");
+        let prompt = "x".repeat(2 * 1024 * 1024 + 1);
+
+        let (cmd, _) = harness_lead_cmd_in(
+            &profile,
+            None,
+            None,
+            None,
+            &wt,
+            "session-harness-lead-large-prompt",
+            &prompt,
+            "http://127.0.0.1:4321/mcp",
+        )
+        .expect("build harness lead cmd");
+
+        let args = command_args(&cmd);
+        assert!(!args.iter().any(|arg| arg == &prompt));
+        let prompt_path = std::path::PathBuf::from(&args[1]);
+        assert!(prompt_path.is_file(), "prompt positional: {args:?}");
+        assert!(prompt_path.starts_with(crate::worktree::journals_dir()));
+        assert!(!prompt_path.starts_with(&wt));
+        assert_eq!(std::fs::read(&prompt_path).unwrap(), prompt.as_bytes());
+    }
+
     /// T3：lead spawn 路径（`harness_lead_cmd_in`）与 `HarnessBackend` 共用
     /// `apply_harness_provider_env`——`agents.api_timeout_ms` 同样要能到达 lead 子进程 env。
     #[test]
     fn harness_lead_cmd_in_maps_api_timeout_ms_to_myagent_timeout_secs() {
+        let _home_lock = crate::worktree::test_home_lock();
         let tmp = tempfile::tempdir().unwrap();
+        let _home_guard = TestHomeGuard::set(tmp.path());
         let wt = tmp.path().join("lead-wt");
         std::fs::create_dir_all(&wt).unwrap();
 
@@ -42869,6 +42921,174 @@ mod tests {
         conn.last_insert_rowid()
     }
 
+    fn lead_compact_wiring_transcript_nonce(prompt: &str) -> &str {
+        prompt
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("===== AGENTLOOM-COMPACT-SUMMARY ")
+                    .and_then(|rest| rest.split_once(" through="))
+                    .map(|(nonce, _)| nonce)
+            })
+            .expect("compact summary marker nonce")
+    }
+
+    #[test]
+    fn lead_compact_wiring_harness_reads_state_marks_history_and_refreshes_nonce() {
+        let session_id = "s-lead-compact-wiring-harness";
+        let conn = crate::test_support::mem_db();
+        db::create_session(&conn, session_id, "lead compact", "local-default", "local").unwrap();
+        db::append_message(
+            &conn,
+            session_id,
+            "user",
+            &[db::Block::Text {
+                text: "covered old message".into(),
+            }],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let through_message_id = conn.last_insert_rowid();
+        db::append_message(
+            &conn,
+            session_id,
+            "assistant",
+            &[db::Block::Text {
+                text: "fresh lead message".into(),
+            }],
+            Some("agent-team"),
+            None,
+            None,
+        )
+        .unwrap();
+        db::upsert_compact_state(
+            &conn,
+            session_id,
+            "rolled lead summary",
+            through_message_id,
+            Some("run-compact"),
+        )
+        .unwrap();
+
+        let first = build_lead_context_prompt_and_record_autofeed_baseline(
+            &conn,
+            session_id,
+            &[],
+            Locale::Zh,
+            LeadEngine::Harness,
+        )
+        .unwrap();
+        let second = build_lead_context_prompt_and_record_autofeed_baseline(
+            &conn,
+            session_id,
+            &[],
+            Locale::Zh,
+            LeadEngine::Harness,
+        )
+        .unwrap();
+
+        let first_nonce = lead_compact_wiring_transcript_nonce(&first);
+        let second_nonce = lead_compact_wiring_transcript_nonce(&second);
+        assert_eq!(first_nonce.len(), 32);
+        assert!(first_nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert_ne!(
+            first_nonce, second_nonce,
+            "each assembly gets a fresh nonce"
+        );
+        assert!(first.contains("rolled lead summary"));
+        assert!(first.contains(&format!("===== AGENTLOOM-MSG {first_nonce} ")));
+        assert!(first.contains(&format!("===== AGENTLOOM-HISTORY-END {first_nonce} =====")));
+        assert!(!first.contains("covered old message"));
+        assert!(first.contains("fresh lead message"));
+        let data_nonce = first
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("===== AGENTLOOM-DATA ")
+                    .and_then(|rest| rest.strip_suffix(" ====="))
+            })
+            .expect("DATA fence nonce");
+        assert_ne!(data_nonce, first_nonce);
+    }
+
+    #[test]
+    fn lead_compact_wiring_non_harness_keeps_legacy_unmarked_history() {
+        let session_id = "s-lead-compact-wiring-native";
+        let conn = crate::test_support::mem_db();
+        db::create_session(&conn, session_id, "lead native", "local-default", "local").unwrap();
+        db::append_message(
+            &conn,
+            session_id,
+            "user",
+            &[db::Block::Text {
+                text: "legacy unmarked message".into(),
+            }],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db::upsert_compact_state(
+            &conn,
+            session_id,
+            "must remain invisible",
+            conn.last_insert_rowid(),
+            Some("run-native"),
+        )
+        .unwrap();
+
+        let prompt = build_lead_context_prompt_and_record_autofeed_baseline(
+            &conn,
+            session_id,
+            &[],
+            Locale::Zh,
+            LeadEngine::NativeClaude,
+        )
+        .unwrap();
+
+        assert!(prompt.contains("legacy unmarked message"));
+        assert!(!prompt.contains("AGENTLOOM-MSG"));
+        assert!(!prompt.contains("AGENTLOOM-COMPACT-SUMMARY"));
+        assert!(!prompt.contains("AGENTLOOM-HISTORY-END"));
+        assert!(!prompt.contains("must remain invisible"));
+    }
+
+    #[test]
+    fn lead_compact_wiring_context_compacted_event_persists_renderable_chip_block() {
+        let session_id = "s-lead-compact-wiring-chip";
+        let conn = crate::test_support::mem_db();
+        db::create_session(&conn, session_id, "lead chip", "local-default", "local").unwrap();
+        let mut reducer = display_reduce::DisplayReducer::new("run-lead-compact-chip");
+        reducer.feed(&agent_event::AgentEvent::ContextCompacted {
+            summary: "summary is persisted separately".into(),
+            through_message_id: 7,
+        });
+        let reduced = reducer
+            .finish(&base_run_outcome("run-lead-compact-chip"))
+            .expect("lead event must cross the shared display reducer finalizer");
+        db::append_message_dedup_and_publish(
+            &conn,
+            session_id,
+            "assistant",
+            &reduced.blocks,
+            Some("agent-team"),
+            Some("lead-harness"),
+            Some("Harness Lead"),
+            &reduced.dedup_key,
+        )
+        .unwrap();
+
+        let messages = db::get_messages(&conn, session_id).unwrap();
+        assert!(messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, db::Block::ContextCompacted {}))
+        }));
+    }
+
     #[test]
     fn autofeed_solo_session_returns_none() {
         let session_id = "s-autofeed-solo";
@@ -43261,15 +43481,27 @@ mod tests {
         for turn in 1..=8 {
             append_autofeed_message(&conn, session_id, &format!("lead turn {turn}"));
         }
-        build_lead_context_prompt_and_record_autofeed_baseline(&conn, session_id, &[], Locale::Zh)
-            .unwrap();
+        build_lead_context_prompt_and_record_autofeed_baseline(
+            &conn,
+            session_id,
+            &[],
+            Locale::Zh,
+            LeadEngine::NativeClaude,
+        )
+        .unwrap();
         assert_eq!(autofeed_prompt_baseline(session_id), Some(8));
 
         for turn in 9..=11 {
             append_autofeed_message(&conn, session_id, &format!("lead turn {turn}"));
         }
-        build_lead_context_prompt_and_record_autofeed_baseline(&conn, session_id, &[], Locale::Zh)
-            .unwrap();
+        build_lead_context_prompt_and_record_autofeed_baseline(
+            &conn,
+            session_id,
+            &[],
+            Locale::Zh,
+            LeadEngine::NativeClaude,
+        )
+        .unwrap();
         assert_eq!(autofeed_prompt_baseline(session_id), Some(11));
     }
 

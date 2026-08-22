@@ -1865,6 +1865,10 @@ body {
   overflow-wrap: anywhere;
   word-break: break-word;
 }
+.turn__text > pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
 .inline-path {
   cursor: pointer;
   color: var(--accent);

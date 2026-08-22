@@ -16,6 +16,7 @@ use serde_json::Value;
 const NONCE: &str = "0123456789abcdef0123456789abcdef";
 const SUMMARY: &str = "## Primary Request and Intent\nfinish the task\n## Key Technical Concepts\ncheckpoint\n## Files and Code\n(none)\n## Errors and Fixes\n(none)\n## Pending Jobs\n(none)\n## Current Work\ncontinue\n## Next Step\nrespond\n## Critical Context\npreserve exact facts";
 const TRANSCRIPT_GOLDEN: &str = include_str!("fixtures/transcript-marker-golden.txt");
+const LEAD_TRANSCRIPT_GOLDEN: &str = include_str!("fixtures/lead-transcript-marker-golden.txt");
 
 fn unit_limits(budget: usize) -> BudgetLimits {
     BudgetLimits {
@@ -653,6 +654,54 @@ fn parses_golden_transcript_and_ignores_foreign_nonce_marker() {
 fn golden_parse_render_round_trip_is_byte_exact() {
     let parsed = parse_transcript(TRANSCRIPT_GOLDEN).unwrap();
     assert_eq!(render_transcript(&parsed), TRANSCRIPT_GOLDEN);
+}
+
+#[test]
+fn parses_lead_golden_transcript_and_preserves_contract() {
+    let parsed =
+        parse_transcript(LEAD_TRANSCRIPT_GOLDEN).expect("lead golden transcript should parse");
+    let summary = parsed.old_summary.as_ref().expect("compact summary");
+    assert_eq!(summary.through, 2);
+    assert_eq!(
+        summary.text,
+        "Golden fixture captures the lead transcript contract.\n\
+Both consumers must stay byte-compatible.\n"
+    );
+    assert_eq!(
+        parsed
+            .messages
+            .iter()
+            .map(|message| (message.id, message.role.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(3, "user"), (4, "assistant"), (5, "user")]
+    );
+    assert!(parsed.messages[0]
+        .text
+        .contains("===== AGENTLOOM-MSG deadbeefdeadbeefdeadbeefdeadbeef id=99 role=user ====="));
+    assert_eq!(
+        parsed.messages.len(),
+        3,
+        "foreign nonce must not split a message"
+    );
+
+    let history_end = "===== AGENTLOOM-HISTORY-END 0123456789abcdef0123456789abcdef =====\n";
+    let expected_trailing = LEAD_TRANSCRIPT_GOLDEN
+        .split_once(history_end)
+        .expect("history end in lead golden")
+        .1;
+    assert_eq!(parsed.trailing, expected_trailing);
+    assert!(parsed
+        .trailing
+        .starts_with("\n\nRestate next step: Run both consumer tests"));
+    assert!(parsed
+        .trailing
+        .ends_with("case-card or these memory updates in your reply to the user."));
+}
+
+#[test]
+fn lead_golden_parse_render_round_trip_is_byte_exact() {
+    let parsed = parse_transcript(LEAD_TRANSCRIPT_GOLDEN).unwrap();
+    assert_eq!(render_transcript(&parsed), LEAD_TRANSCRIPT_GOLDEN);
 }
 
 #[test]

@@ -1456,6 +1456,20 @@ describe("MessageContent", () => {
       expect(container?.[2]).toContain("word-break: break-word");
     });
 
+    it("无语言代码块外层 pre 横向溢出受控，且不改变 .mm-code 横滚契约", () => {
+      const { container } = render(
+        <MessageContent blocks={text("```\na-very-long-code-line\n```")} />,
+      );
+
+      expect(
+        container.querySelector(".turn__text > pre > code.inline"),
+      ).not.toBeNull();
+      expect(css).toMatch(/\.turn__text > pre\s*\{[^}]*max-width:\s*100%/);
+      expect(css).toMatch(/\.turn__text > pre\s*\{[^}]*overflow-x:\s*auto/);
+      expect(css).toMatch(/\.mm-code\s*\{[^}]*overflow:\s*hidden/);
+      expect(css).toMatch(/\.mm-code pre\s*\{[^}]*overflow-x:\s*auto/);
+    });
+
     it("用户气泡可撑到与 LLM 回复同列宽，不再被 75% 封顶", () => {
       const bubble = css.match(/\.turn--user \.turn__text\s*\{([^}]*)\}/);
       expect(bubble?.[1]).toContain("width: fit-content");
