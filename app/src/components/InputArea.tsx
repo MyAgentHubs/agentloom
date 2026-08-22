@@ -69,6 +69,9 @@ type Props = {
 };
 
 const MAX_H = 160;
+// 超长文本每键读 scrollHeight 会触发同步强制布局，耗时随全文长度线性增长——
+// 超过此阈值时跳过测量、直接锁最大高度+内部滚动，避免打字卡死。
+const AUTOSIZE_MAX_CHARS = 20000;
 const EMPTY_STREAM_MESSAGES: ChatMessage[] = [];
 
 type RunningStatusDetailsProps = {
@@ -264,6 +267,12 @@ export function InputArea({
 
   function autosize(el = taRef.current) {
     if (!el) return;
+    if (el.value.length > AUTOSIZE_MAX_CHARS) {
+      // 超长文本：不读 scrollHeight，直接锁最大高度+内部滚动。
+      el.style.height = `${MAX_H}px`;
+      el.style.overflowY = "auto";
+      return;
+    }
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, MAX_H)}px`;
     el.style.overflowY = el.scrollHeight > MAX_H ? "auto" : "hidden";

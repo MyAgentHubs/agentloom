@@ -1275,3 +1275,61 @@ describe("composer_permission_and_disabled_icons", () => {
     );
   });
 });
+
+describe("InputArea autosize 超长文本（D3：composer 输入卡）", () => {
+  it("超过 2 万字符阈值：不读 scrollHeight，直接锁最大高度+内部滚动", () => {
+    const getter = vi
+      .spyOn(window.HTMLTextAreaElement.prototype, "scrollHeight", "get")
+      .mockReturnValue(999);
+    render(<InputArea {...base()} />);
+    const ta = screen.getByPlaceholderText(
+      "输入消息…",
+    ) as HTMLTextAreaElement;
+    getter.mockClear();
+
+    const longText = "a".repeat(20_001);
+    fireEvent.change(ta, { target: { value: longText } });
+
+    expect(getter).not.toHaveBeenCalled();
+    expect(ta.style.height).toBe("160px");
+    expect(ta.style.overflowY).toBe("auto");
+    getter.mockRestore();
+  });
+
+  it("阈值内的短文本仍走 scrollHeight 测量路径（体验不变）", () => {
+    const getter = vi
+      .spyOn(window.HTMLTextAreaElement.prototype, "scrollHeight", "get")
+      .mockReturnValue(80);
+    render(<InputArea {...base()} />);
+    const ta = screen.getByPlaceholderText(
+      "输入消息…",
+    ) as HTMLTextAreaElement;
+    getter.mockClear();
+
+    fireEvent.change(ta, { target: { value: "short draft" } });
+
+    expect(getter).toHaveBeenCalled();
+    expect(ta.style.height).toBe("80px");
+    expect(ta.style.overflowY).toBe("hidden");
+    getter.mockRestore();
+  });
+
+  it("长度回落到阈值内后恢复正常测量", () => {
+    const getter = vi
+      .spyOn(window.HTMLTextAreaElement.prototype, "scrollHeight", "get")
+      .mockReturnValue(60);
+    render(<InputArea {...base()} />);
+    const ta = screen.getByPlaceholderText(
+      "输入消息…",
+    ) as HTMLTextAreaElement;
+
+    fireEvent.change(ta, { target: { value: "a".repeat(20_001) } });
+    getter.mockClear();
+    fireEvent.change(ta, { target: { value: "back to short" } });
+
+    expect(getter).toHaveBeenCalled();
+    expect(ta.style.height).toBe("60px");
+    expect(ta.style.overflowY).toBe("hidden");
+    getter.mockRestore();
+  });
+});

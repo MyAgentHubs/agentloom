@@ -1514,6 +1514,92 @@ describe("MessageContent", () => {
   });
 });
 
+describe("MessageContent 巨型文本块折叠（T7）", () => {
+  // 阈值 100_000 字符；用带 markdown 语法的重复串既超阈值又能验证「不整体走 markdown」。
+  const hugeMarkdownish = "# 标题 **粗体** ".repeat(9000); // 108000 字符
+  const previewHead = hugeMarkdownish.slice(0, 4000);
+
+  it("超阈值块默认折叠：只渲染前 4000 字符预览，全文不进 DOM，且不走 MarkdownBody（无 strong/h1）", () => {
+    const { container } = render(
+      <MessageContent blocks={text(hugeMarkdownish)} />,
+    );
+
+    expect(container.textContent).toContain(previewHead);
+    expect(container.textContent).not.toContain(hugeMarkdownish);
+    expect(container.querySelector("strong")).toBeNull();
+    expect(container.querySelector("h1")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: /108000/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("点展开 → 全文以 pre-wrap 纯文本出现（仍不走 markdown）；再点收起回预览", () => {
+    const { container } = render(
+      <MessageContent blocks={text(hugeMarkdownish)} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /108000/ }));
+
+    expect(container.textContent).toContain(hugeMarkdownish);
+    expect(container.querySelector("strong")).toBeNull();
+    expect(container.querySelector("h1")).toBeNull();
+    const body = container.querySelector(".huge-text__body");
+    expect(body).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "收起" }));
+
+    expect(container.textContent).toContain(previewHead);
+    expect(container.textContent).not.toContain(hugeMarkdownish);
+  });
+
+  it("streaming 中的超阈值文本块同样走折叠预览，不整体走 markdown", () => {
+    const { container } = render(
+      <MessageContent blocks={text(hugeMarkdownish)} streaming />,
+    );
+
+    expect(container.textContent).toContain(previewHead);
+    expect(container.textContent).not.toContain(hugeMarkdownish);
+    expect(container.querySelector("strong")).toBeNull();
+  });
+
+  it("阈值内文本块行为不变：仍走 MarkdownBody 正常渲染", () => {
+    const { container } = render(
+      <MessageContent blocks={text("**bold** and `code`\n\n- item")} />,
+    );
+
+    expect(container.querySelector("strong")).not.toBeNull();
+    expect(container.querySelector("code.inline")).not.toBeNull();
+    expect(container.querySelector("li")).not.toBeNull();
+    expect(container.querySelector(".huge-text")).toBeNull();
+  });
+
+  it("恰好 50000 字符仍走 MarkdownBody（阈值取 > 不取 >=，D3 P2①）", () => {
+    const exact = "a".repeat(50_000);
+    const { container } = render(<MessageContent blocks={text(exact)} />);
+    expect(container.querySelector(".huge-text")).toBeNull();
+  });
+
+  it("50001 字符即折叠（超出阈值 1 个字符也要折）", () => {
+    const overByOne = "a".repeat(50_001);
+    const { container } = render(
+      <MessageContent blocks={text(overByOne)} />,
+    );
+    expect(container.querySelector(".huge-text")).not.toBeNull();
+  });
+
+  it("预览末字符恰为高位代理时整体去掉，避免劈半渲出替换字符（D3 P2②）", () => {
+    const prefix = "a".repeat(3999);
+    const emoji = "😀"; // 😀：高位代理 \uD83D + 低位代理 \uDE00
+    const filler = "b".repeat(60_000);
+    const huge = prefix + emoji + filler; // slice(0, 4000) 恰好切在代理对中间
+    const { container } = render(<MessageContent blocks={text(huge)} />);
+    const body = container.querySelector(".huge-text__body");
+    expect(body?.textContent?.length).toBe(3999);
+    expect(body?.textContent).not.toContain("�");
+    expect(body?.textContent).not.toMatch(/[\uD800-\uDBFF]$/);
+  });
+});
+
 const teamRunBlocks: Block[] = [
   {
     type: "team_run",

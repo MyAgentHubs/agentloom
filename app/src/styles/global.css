@@ -1896,6 +1896,11 @@ body {
 .turn--user .turn__text code.inline {
   background: var(--panel);
 }
+/* 巨型文本折叠 toggle 的 hover 底色同为 --bg-sunken，气泡内悬停会跟气泡本底撞
+   色而看不出反馈 → 气泡内同款换白底（D3 整盘审 P2④，跟随上面 inline code 先例）。 */
+.turn--user .turn__text .huge-text__toggle:hover {
+  background: var(--panel);
+}
 .turn__streaming {
   margin: 0;
   color: var(--ink-2);
@@ -4256,6 +4261,39 @@ button.overview__usagerow:hover .overview__usagerepo {
   font-style: italic;
   border-top: 1px solid var(--line-soft, var(--line));
   white-space: pre-wrap;
+}
+
+/* ===== 巨型文本块折叠（T7·贴入超长文本默认不整体走 markdown） ===== */
+.huge-text {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  margin: 8px 0;
+  background: var(--bg);
+}
+.huge-text__body {
+  padding: 9px 13px;
+  font-size: 12.5px;
+  color: var(--ink-2);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 420px;
+  overflow-y: auto;
+}
+.huge-text__toggle {
+  width: 100%;
+  text-align: left;
+  padding: 7px 13px;
+  background: none;
+  border: none;
+  border-top: 1px solid var(--line-soft, var(--line));
+  font-size: 11px;
+  color: var(--accent);
+  font-weight: 650;
+  cursor: pointer;
+}
+.huge-text__toggle:hover {
+  background: var(--bg-sunken);
 }
 
 /* ===== session-hover-menu：行操作 + ⋯ 菜单 + rename + 删除确认 + 未读/pin + 归档区 ===== */

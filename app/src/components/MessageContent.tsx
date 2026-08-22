@@ -72,6 +72,13 @@ type AttachmentContent = {
   mediaType?: string;
 };
 
+// 超过阈值的文本块整体走 markdown 同步解析会阻塞主线程数秒·折叠默认（T7）。
+// 阈值降到 5 万（D3 整盘审 P2①）：实测 remark 解析 99k≈205ms、50k≈25ms，
+// 流式场景每个 chunk 都会重解析一次，WKWebView 比桌面 Chrome 更慢，原 10 万阈值偏松。
+const HUGE_TEXT_BLOCK_CHARS = 50_000;
+// 折叠态预览字符数——够看清粘贴的是什么内容，不整段渲染。
+const HUGE_TEXT_PREVIEW_CHARS = 4000;
+
 const IMAGE_PATH_TOKEN_BOUNDARY = /[\s"'`<>|]+/u;
 const IMAGE_PATH_EXTENSION = /\.(?:png|jpe?g|gif|webp|bmp|svg)$/i;
 const IMAGE_PATH_LEADING_PUNCTUATION = /^[([{<“”‘’「」『』]+/u;
@@ -760,6 +767,34 @@ function ImageBlockContent({
   return <em role="status">{t("messageContent.imageLoading")}</em>;
 }
 
+// 巨型文本块（贴入几十万到 1MB 字符）折叠默认渲染：整体走 markdown 同步解析
+// 会阻塞主线程数秒，收起态只给纯文本预览，展开也不整体走 markdown（粘贴的
+// 几乎都是日志/代码，富渲染不值一次数秒卡·此为拍板行为）。
+function HugeTextBlock({ text }: { text: string }) {
+  const { t } = useI18n();
+  const [open, setOpen] = useState(false);
+  let preview = text.slice(0, HUGE_TEXT_PREVIEW_CHARS);
+  // 硬切在代理对中间会劈半渲出 U+FFFD——若末字符是高位代理，整个字符退让给下一批。
+  if (/[\uD800-\uDBFF]$/.test(preview)) {
+    preview = preview.slice(0, -1);
+  }
+  return (
+    <div className="huge-text">
+      <div className="huge-text__body">{open ? text : preview}</div>
+      <button
+        type="button"
+        className="huge-text__toggle"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+      >
+        {open
+          ? t("chat.hugeTextExpanded")
+          : t("chat.hugeTextCollapsed", { chars: text.length })}
+      </button>
+    </div>
+  );
+}
+
 function MessageContentImpl({
   blocks,
   streaming = false,
@@ -1031,6 +1066,8 @@ function MessageContentImpl({
         if (block.type === "decision_card") return null; // 决策卡经 lead-turn 路径渲·不走 raw block 循环
 
         const key = `b-${i}${streaming ? "-streaming" : ""}`;
+        if (block.text.length > HUGE_TEXT_BLOCK_CHARS)
+          return <HugeTextBlock key={key} text={block.text} />;
         if (!MarkdownBody)
           return (
             <div key={key} style={{ whiteSpace: "pre-wrap" }}>

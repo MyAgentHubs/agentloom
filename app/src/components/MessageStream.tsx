@@ -277,6 +277,36 @@ type MessageTurnProps = {
   readonlyReason?: string | null;
 };
 
+// 字段值判等：非对象（string/number/boolean/null/undefined）走 ===——
+// 巨型 text 字符串这里享受 O(1) 引用短路或 JS 引擎内建 memcmp，
+// 远比整块 JSON.stringify（分配 + 转义）便宜；只有嵌套对象/数组
+// （如 team_run.members、lead_summary.sections）才兜底 stringify。
+function shallowValueEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a === "object" && a !== null && typeof b === "object" && b !== null) {
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+  return false;
+}
+
+// 块判等：先按 type 短路，再逐字段浅比较（含双方 key 并集，容错「字段缺省 vs
+// 显式 undefined」这类边界），避免像旧实现那样对整块（可能内含 1MB 级 text）
+// 反复 JSON.stringify。语义与旧的整块 stringify 判等保持一致，只降开销。
+export function shallowBlockEqual(a: Block, b: Block): boolean {
+  // 导出函数被外部单侧传 undefined 误用时别抛 TypeError——与旧 stringify 判等行为
+  // 保持一致：双 undefined 判等，单侧 undefined 判不等（D3 整盘审 P2③）。
+  if (!a || !b) return a === b;
+  if (a === b) return true;
+  if (a.type !== b.type) return false;
+  const keys = new Set<string>([...Object.keys(a), ...Object.keys(b)]);
+  for (const key of keys) {
+    const av = (a as Record<string, unknown>)[key];
+    const bv = (b as Record<string, unknown>)[key];
+    if (!shallowValueEqual(av, bv)) return false;
+  }
+  return true;
+}
+
 function sameMessage(a: ChatMessage, b: ChatMessage): boolean {
   if (a === b) return true;
   if (
@@ -294,9 +324,7 @@ function sameMessage(a: ChatMessage, b: ChatMessage): boolean {
   // run_card 等派生块才做结构比较，确保状态真变化时不会被 memo 吞掉。
   return a.content.every((block, index) => {
     const nextBlock = b.content[index];
-    return (
-      block === nextBlock || JSON.stringify(block) === JSON.stringify(nextBlock)
-    );
+    return shallowBlockEqual(block, nextBlock);
   });
 }
 
