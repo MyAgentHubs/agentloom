@@ -4155,6 +4155,50 @@ fn save_pasted_image(image_base64: String, media_type: String) -> Result<String,
     save_pasted_image_in(&image_base64, &media_type, &home_dir_for_attachment())
 }
 
+#[tauri::command]
+fn save_pasted_text(text: String) -> Result<String, String> {
+    save_pasted_text_in(&text, &home_dir_for_attachment())
+}
+
+fn save_pasted_text_in(text: &str, base_dir: &std::path::Path) -> Result<String, String> {
+    static PASTE_TEXT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let base_dir = if base_dir.is_absolute() {
+        base_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("cannot resolve pasted text directory: {e}"))?
+            .join(base_dir)
+    };
+    let pasted_dir = base_dir.join(".agentloom").join("pasted");
+    std::fs::create_dir_all(&pasted_dir)
+        .map_err(|e| format!("cannot create pasted text directory: {e}"))?;
+
+    loop {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+        let count = PASTE_TEXT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = pasted_dir.join(format!("paste-{millis}-{count}.txt"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(text.as_bytes()) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!("cannot write pasted text: {error}"));
+                }
+                return Ok(path.to_string_lossy().to_string());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("cannot create pasted text: {error}")),
+        }
+    }
+}
+
 fn save_pasted_image_in(
     image_base64: &str,
     media_type: &str,
@@ -17891,6 +17935,7 @@ pub fn run() {
             read_attachment,
             open_attachment_external,
             save_pasted_image,
+            save_pasted_text,
             remote_pairing_begin,
             remote_pairing_cancel,
             remote_pairing_status,
@@ -32720,6 +32765,33 @@ mod tests {
         let error = save_pasted_image_in("not base64!", "image/png", base.path()).unwrap_err();
 
         assert!(error.contains("invalid pasted image base64"));
+    }
+
+    #[test]
+    fn save_pasted_text_writes_content_byte_for_byte() {
+        let base = tempfile::tempdir().unwrap();
+        let content = "超长粘贴文本\nline two\n";
+
+        let saved = save_pasted_text_in(content, base.path()).unwrap();
+        let path = std::path::PathBuf::from(saved);
+
+        assert!(path.is_absolute());
+        assert!(path.exists());
+        assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("txt"));
+        assert!(path.starts_with(base.path().join(".agentloom").join("pasted")));
+        assert_eq!(std::fs::read(&path).unwrap(), content.as_bytes());
+    }
+
+    #[test]
+    fn save_pasted_text_does_not_clobber_concurrent_pastes() {
+        let base = tempfile::tempdir().unwrap();
+
+        let first = save_pasted_text_in("first paste", base.path()).unwrap();
+        let second = save_pasted_text_in("second paste", base.path()).unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "first paste");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second paste");
     }
 
     #[test]

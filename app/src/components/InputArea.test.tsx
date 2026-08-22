@@ -467,6 +467,81 @@ describe("InputArea", () => {
     expect(preventDefault).not.toHaveBeenCalled();
   });
 
+  it("超阈值纯文本粘贴：转存附件 chip，不进输入框", async () => {
+    invokeMock.mockResolvedValue("/Users/me/.agentloom/pasted/paste-1-0.txt");
+    render(
+      <I18nProvider>
+        <InputArea {...base()} />
+      </I18nProvider>,
+    );
+    const textarea = screen.getByPlaceholderText(
+      /输入消息/,
+    ) as HTMLTextAreaElement;
+    const longText = "x".repeat(10001);
+
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        items: [{ kind: "string", type: "text/plain" }],
+        getData: () => longText,
+      },
+    });
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("save_pasted_text", {
+        text: longText,
+      }),
+    );
+    expect(await screen.findByText("paste-1-0.txt")).toBeInTheDocument();
+    expect(textarea.value).not.toContain(longText);
+  });
+
+  it("阈值内纯文本粘贴：不调用 save_pasted_text，放行默认粘贴", () => {
+    render(<InputArea {...base()} />);
+    const textarea = screen.getByPlaceholderText(/输入消息/);
+    const shortText = "x".repeat(9999);
+    const pasteEvent = createEvent.paste(textarea, {
+      clipboardData: {
+        items: [{ kind: "string", type: "text/plain" }],
+        getData: () => shortText,
+      },
+    });
+    const preventDefault = vi.spyOn(pasteEvent, "preventDefault");
+
+    fireEvent(textarea, pasteEvent);
+
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(preventDefault).not.toHaveBeenCalled();
+  });
+
+  it("超阈值文本转存失败时：回退把原文本插回输入框，不丢用户内容", async () => {
+    invokeMock.mockRejectedValue(new Error("disk full"));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    render(
+      <I18nProvider>
+        <InputArea {...base()} />
+      </I18nProvider>,
+    );
+    const textarea = screen.getByPlaceholderText(
+      /输入消息/,
+    ) as HTMLTextAreaElement;
+    const longText = "y".repeat(10001);
+
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        items: [{ kind: "string", type: "text/plain" }],
+        getData: () => longText,
+      },
+    });
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("save_pasted_text", {
+        text: longText,
+      }),
+    );
+    await waitFor(() => expect(textarea.value).toContain(longText));
+    errorSpy.mockRestore();
+  });
+
   it("点击移除附件后 chip 消失", async () => {
     openMock.mockResolvedValue("/Users/me/spec.md");
     render(

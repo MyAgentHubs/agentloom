@@ -72,6 +72,9 @@ const MAX_H = 160;
 // 超长文本每键读 scrollHeight 会触发同步强制布局，耗时随全文长度线性增长——
 // 超过此阈值时跳过测量、直接锁最大高度+内部滚动，避免打字卡死。
 const AUTOSIZE_MAX_CHARS = 20000;
+// textarea 装几万字符后每次编辑触发全文断行 relayout·原生代价 autosize 早退救不了·
+// 超长粘贴转附件根治：粘贴文本超此阈值时不进输入框，落盘转成附件 chip。
+const PASTE_TO_ATTACHMENT_CHARS = 10_000;
 const EMPTY_STREAM_MESSAGES: ChatMessage[] = [];
 
 type RunningStatusDetailsProps = {
@@ -346,22 +349,40 @@ export function InputArea({
     const imageItems = Array.from(event.clipboardData?.items ?? []).filter(
       (item) => item.kind === "file" && item.type.startsWith("image/"),
     );
-    if (imageItems.length === 0) return;
+    if (imageItems.length > 0) {
+      // 既有语义：剪贴板同时有图+文时，只处理图片（文本部分与改动前一样被丢弃）。
+      event.preventDefault();
+      for (const item of imageItems) {
+        const file = item.getAsFile();
+        if (!file) continue;
+        try {
+          const imageBase64 = arrayBufferToBase64(await file.arrayBuffer());
+          const path = await invoke<string>("save_pasted_image", {
+            imageBase64,
+            mediaType: file.type,
+          });
+          mergeAttachmentPaths([path]);
+        } catch (error) {
+          console.error("Failed to paste image attachment", error);
+        }
+      }
+      return;
+    }
+
+    const text = event.clipboardData?.getData?.("text/plain") ?? "";
+    if (text.length <= PASTE_TO_ATTACHMENT_CHARS) return;
 
     event.preventDefault();
-    for (const item of imageItems) {
-      const file = item.getAsFile();
-      if (!file) continue;
-      try {
-        const imageBase64 = arrayBufferToBase64(await file.arrayBuffer());
-        const path = await invoke<string>("save_pasted_image", {
-          imageBase64,
-          mediaType: file.type,
-        });
-        mergeAttachmentPaths([path]);
-      } catch (error) {
-        console.error("Failed to paste image attachment", error);
-      }
+    try {
+      const path = await invoke<string>("save_pasted_text", { text });
+      mergeAttachmentPaths([path]);
+    } catch (error) {
+      console.error("Failed to paste text attachment", error);
+      // 落盘失败：回退把原文本插回输入框光标处，宁可卡也不丢用户内容。
+      const el = taRef.current;
+      const start = el?.selectionStart ?? draft.length;
+      const end = el?.selectionEnd ?? draft.length;
+      setDraft((prev) => prev.slice(0, start) + text + prev.slice(end));
     }
   }
 
