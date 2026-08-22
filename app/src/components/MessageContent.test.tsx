@@ -1528,9 +1528,7 @@ describe("MessageContent 巨型文本块折叠（T7）", () => {
     expect(container.textContent).not.toContain(hugeMarkdownish);
     expect(container.querySelector("strong")).toBeNull();
     expect(container.querySelector("h1")).toBeNull();
-    expect(
-      screen.getByRole("button", { name: /108000/ }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /108000/ })).toBeInTheDocument();
   });
 
   it("点展开 → 全文以 pre-wrap 纯文本出现（仍不走 markdown）；再点收起回预览", () => {
@@ -1581,9 +1579,7 @@ describe("MessageContent 巨型文本块折叠（T7）", () => {
 
   it("50001 字符即折叠（超出阈值 1 个字符也要折）", () => {
     const overByOne = "a".repeat(50_001);
-    const { container } = render(
-      <MessageContent blocks={text(overByOne)} />,
-    );
+    const { container } = render(<MessageContent blocks={text(overByOne)} />);
     expect(container.querySelector(".huge-text")).not.toBeNull();
   });
 

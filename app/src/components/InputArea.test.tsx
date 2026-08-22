@@ -1282,9 +1282,7 @@ describe("InputArea autosize 超长文本（D3：composer 输入卡）", () => {
       .spyOn(window.HTMLTextAreaElement.prototype, "scrollHeight", "get")
       .mockReturnValue(999);
     render(<InputArea {...base()} />);
-    const ta = screen.getByPlaceholderText(
-      "输入消息…",
-    ) as HTMLTextAreaElement;
+    const ta = screen.getByPlaceholderText("输入消息…") as HTMLTextAreaElement;
     getter.mockClear();
 
     const longText = "a".repeat(20_001);
@@ -1301,9 +1299,7 @@ describe("InputArea autosize 超长文本（D3：composer 输入卡）", () => {
       .spyOn(window.HTMLTextAreaElement.prototype, "scrollHeight", "get")
       .mockReturnValue(80);
     render(<InputArea {...base()} />);
-    const ta = screen.getByPlaceholderText(
-      "输入消息…",
-    ) as HTMLTextAreaElement;
+    const ta = screen.getByPlaceholderText("输入消息…") as HTMLTextAreaElement;
     getter.mockClear();
 
     fireEvent.change(ta, { target: { value: "short draft" } });
@@ -1319,9 +1315,7 @@ describe("InputArea autosize 超长文本（D3：composer 输入卡）", () => {
       .spyOn(window.HTMLTextAreaElement.prototype, "scrollHeight", "get")
       .mockReturnValue(60);
     render(<InputArea {...base()} />);
-    const ta = screen.getByPlaceholderText(
-      "输入消息…",
-    ) as HTMLTextAreaElement;
+    const ta = screen.getByPlaceholderText("输入消息…") as HTMLTextAreaElement;
 
     fireEvent.change(ta, { target: { value: "a".repeat(20_001) } });
     getter.mockClear();

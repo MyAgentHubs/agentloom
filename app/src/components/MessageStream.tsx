@@ -283,7 +283,12 @@ type MessageTurnProps = {
 // （如 team_run.members、lead_summary.sections）才兜底 stringify。
 function shallowValueEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;
-  if (typeof a === "object" && a !== null && typeof b === "object" && b !== null) {
+  if (
+    typeof a === "object" &&
+    a !== null &&
+    typeof b === "object" &&
+    b !== null
+  ) {
     return JSON.stringify(a) === JSON.stringify(b);
   }
   return false;

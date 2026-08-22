@@ -1,8 +1,17 @@
 import { render, screen, fireEvent } from "@testing-library/react";
 import { act, useState } from "react";
 import { afterEach, beforeEach, describe, it, expect, vi, test } from "vitest";
-import { MessageStream, stableMessageKeys, shallowBlockEqual } from "./MessageStream";
-import type { Block, ChatMessage, LeadSummaryBlock, MemberUnit } from "../types/agent";
+import {
+  MessageStream,
+  stableMessageKeys,
+  shallowBlockEqual,
+} from "./MessageStream";
+import type {
+  Block,
+  ChatMessage,
+  LeadSummaryBlock,
+  MemberUnit,
+} from "../types/agent";
 
 const messageContentMountProbe = vi.hoisted(() => vi.fn());
 // 每次实际渲染（不止 mount）都调用，用于分辨「memo 吞掉了重渲」vs「确实又渲了一次」
@@ -1321,12 +1330,8 @@ describe("shallowBlockEqual（T6：判等去掉巨型块全量 JSON.stringify）
 
   it("单侧 undefined 判 false，双 undefined 判 true（D3 P2③ 守卫，不抛 TypeError）", () => {
     const a: Block = { type: "text", text: "hello" };
-    expect(
-      shallowBlockEqual(a, undefined as unknown as Block),
-    ).toBe(false);
-    expect(
-      shallowBlockEqual(undefined as unknown as Block, a),
-    ).toBe(false);
+    expect(shallowBlockEqual(a, undefined as unknown as Block)).toBe(false);
+    expect(shallowBlockEqual(undefined as unknown as Block, a)).toBe(false);
     expect(
       shallowBlockEqual(
         undefined as unknown as Block,
