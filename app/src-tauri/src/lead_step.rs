@@ -381,8 +381,8 @@ pub fn build_lead_context_prompt(
     // T6 M2：交付台账段——最老 N=8 条 pending worker 报告全文，独立 nonce source-data fence
     // （AGENTLOOM-DATA 之后、Recent conversation 之前）。首条无论多大强制纳入（治「单条超预算
     // 永远选零条」）；第二条起累计超预算就停，留给下一批（绝不丢、绝不跳过中间选后面的）。
-    let all_pending_ids =
-        crate::db::pending_member_report_message_ids(conn, session_id).map_err(|e| e.to_string())?;
+    let all_pending_ids = crate::db::pending_member_report_message_ids(conn, session_id)
+        .map_err(|e| e.to_string())?;
     let candidate_report_ids: Vec<i64> = all_pending_ids
         .iter()
         .take(PENDING_LEDGER_MAX_ENTRIES)
@@ -1037,9 +1037,9 @@ pub fn run_lead_step(
         let st = crate::db::get_lead_loop_state(&conn, session_id).map_err(|e| e.to_string())?;
         let mut recent: Vec<(String, String)> =
             build_recent_messages(&conn, session_id, &HashSet::new(), &HashSet::new())?
-            .into_iter()
-            .map(|(_, role, text)| (role, text))
-            .collect();
+                .into_iter()
+                .map(|(_, role, text)| (role, text))
+                .collect();
         if let Some(m) = user_msg.map(str::trim).filter(|m| !m.is_empty()) {
             recent.push(("user".to_string(), clip(m, 2000)));
         }
@@ -2185,8 +2185,10 @@ mod tests {
         )
         .unwrap();
 
-        let p = build_lead_context_prompt(&conn, "s1", &[], crate::Locale::Zh, None, None, None, &[])
-            .unwrap().prompt;
+        let p =
+            build_lead_context_prompt(&conn, "s1", &[], crate::Locale::Zh, None, None, None, &[])
+                .unwrap()
+                .prompt;
         assert!(p.contains("重构感知管线"), "带目标");
         assert!(p.contains("Goal:"), "goal label present");
         assert!(p.contains("AGENTLOOM-DATA"), "fence present");
@@ -2216,8 +2218,18 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_schema(&conn).unwrap();
 
-        let p = build_lead_context_prompt(&conn, "slang", &[], crate::Locale::Zh, None, None, None, &[])
-            .unwrap().prompt;
+        let p = build_lead_context_prompt(
+            &conn,
+            "slang",
+            &[],
+            crate::Locale::Zh,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap()
+        .prompt;
 
         assert!(
             p.contains("if it is Chinese, reply entirely in Chinese"),
@@ -2255,9 +2267,18 @@ mod tests {
                 participant_id: "participant-codex-1".into(),
             },
         ];
-        let p =
-            build_lead_context_prompt(&conn, "sroster", &pool, crate::Locale::Zh, None, None, None, &[])
-                .unwrap().prompt;
+        let p = build_lead_context_prompt(
+            &conn,
+            "sroster",
+            &pool,
+            crate::Locale::Zh,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap()
+        .prompt;
 
         let roster_pos = p.find("可派 worker 花名册").expect("roster present");
         assert!(p.contains("glm-1") && p.contains("GLM"), "含成员 id 与名字");
@@ -2285,9 +2306,18 @@ mod tests {
 
         // 空池 = fence 内仍明确渲染花名册节（防续聊旧花名册残留·2026-07-09 GUI 实测修）；
         // goal 文本本身含「花名册」三字，断言用整节标签「可派 worker 花名册」区分。
-        let p_empty =
-            build_lead_context_prompt(&conn, "sroster", &[], crate::Locale::Zh, None, None, None, &[])
-                .unwrap().prompt;
+        let p_empty = build_lead_context_prompt(
+            &conn,
+            "sroster",
+            &[],
+            crate::Locale::Zh,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap()
+        .prompt;
         let roster_pos_empty = p_empty
             .find("可派 worker 花名册")
             .expect("空池仍要渲染花名册节标签");
@@ -2307,9 +2337,18 @@ mod tests {
             "空池不应残留任何成员条目"
         );
 
-        let p_en =
-            build_lead_context_prompt(&conn, "sroster", &pool, crate::Locale::En, None, None, None, &[])
-                .unwrap().prompt;
+        let p_en = build_lead_context_prompt(
+            &conn,
+            "sroster",
+            &pool,
+            crate::Locale::En,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap()
+        .prompt;
         let roster_pos_en = p_en
             .find("Available worker roster:")
             .expect("English roster present");
@@ -2359,9 +2398,11 @@ mod tests {
             crate::Locale::Zh,
             None,
             None,
-            None, &[]
+            None,
+            &[],
         )
-        .unwrap().prompt;
+        .unwrap()
+        .prompt;
 
         let next_pos = p.find("Next: 派发实现任务").expect("next present");
         let roster_pos = p.find("可派 worker 花名册").expect("roster present");
@@ -2390,8 +2431,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let p = build_lead_context_prompt(&conn, "s2", &[], crate::Locale::Zh, None, None, None, &[])
-            .unwrap().prompt;
+        let p =
+            build_lead_context_prompt(&conn, "s2", &[], crate::Locale::Zh, None, None, None, &[])
+                .unwrap()
+                .prompt;
         assert!(!p.contains("Goal:"), "no goal → no Goal: line");
         assert!(p.contains("AGENTLOOM-DATA"), "fence always present");
         assert!(p.contains("你好"));
@@ -2415,7 +2458,13 @@ mod tests {
         )
         .unwrap();
 
-        let recent = build_recent_messages(&conn, "worker-ledger-session", &HashSet::new(), &HashSet::new()).unwrap();
+        let recent = build_recent_messages(
+            &conn,
+            "worker-ledger-session",
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].1, "assistant");
         assert!(recent[0].2.contains("[Worker report]"));
@@ -2455,7 +2504,8 @@ mod tests {
         )
         .unwrap();
 
-        let recent = build_recent_messages(&conn, "s-echo", &HashSet::new(), &HashSet::new()).unwrap();
+        let recent =
+            build_recent_messages(&conn, "s-echo", &HashSet::new(), &HashSet::new()).unwrap();
         let joined = recent
             .iter()
             .map(|(_, _, t)| t.as_str())
@@ -2471,9 +2521,18 @@ mod tests {
         );
 
         // build_lead_context_prompt 的完整输出同样不能含准点回显。
-        let prompt =
-            build_lead_context_prompt(&conn, "s-echo", &[], crate::Locale::Zh, None, None, None, &[])
-                .unwrap().prompt;
+        let prompt = build_lead_context_prompt(
+            &conn,
+            "s-echo",
+            &[],
+            crate::Locale::Zh,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap()
+        .prompt;
         assert!(
             !prompt.contains("ECHO_MARKER_ONTIME"),
             "build_lead_context_prompt 不应二次投喂准点回显: {prompt}"
@@ -2516,7 +2575,9 @@ mod tests {
         )
         .unwrap();
 
-        let recent = build_recent_messages(&conn, "s-verifier-echo", &HashSet::new(), &HashSet::new()).unwrap();
+        let recent =
+            build_recent_messages(&conn, "s-verifier-echo", &HashSet::new(), &HashSet::new())
+                .unwrap();
         let joined = recent
             .iter()
             .map(|(_, _, t)| t.as_str())
@@ -2586,8 +2647,10 @@ mod tests {
         )
         .unwrap();
 
-        let p = build_lead_context_prompt(&conn, "s3", &[], crate::Locale::Zh, None, None, None, &[])
-            .unwrap().prompt;
+        let p =
+            build_lead_context_prompt(&conn, "s3", &[], crate::Locale::Zh, None, None, None, &[])
+                .unwrap()
+                .prompt;
         assert!(p.contains("AGENTLOOM-DATA"), "fence present");
         assert!(p.contains("Goal: 重构感知管线"), "goal rendered");
         assert!(p.contains("State: 节流已抽出"), "state rendered");
@@ -2617,9 +2680,18 @@ mod tests {
         // 1d 行为闸：每轮上下文包末尾必须点名 memory_set/memory_add（否则队长不写病历）。
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_schema(&conn).unwrap();
-        let p =
-            build_lead_context_prompt(&conn, "snudge", &[], crate::Locale::Zh, None, None, None, &[])
-                .unwrap().prompt;
+        let p = build_lead_context_prompt(
+            &conn,
+            "snudge",
+            &[],
+            crate::Locale::Zh,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap()
+        .prompt;
         assert!(p.contains("memory_set"), "末尾点名 memory_set");
         assert!(p.contains("memory_add"), "末尾点名 memory_add");
         assert!(
@@ -2646,8 +2718,10 @@ mod tests {
         )
         .unwrap();
 
-        let p = build_lead_context_prompt(&conn, "s4", &[], crate::Locale::Zh, None, None, None, &[])
-            .unwrap().prompt;
+        let p =
+            build_lead_context_prompt(&conn, "s4", &[], crate::Locale::Zh, None, None, None, &[])
+                .unwrap()
+                .prompt;
         assert!(p.contains("Goal: 只有目标"), "has goal");
         assert!(p.contains("Recent conversation:"), "has recent");
         assert!(!p.contains("State:"), "no state");
@@ -2675,9 +2749,18 @@ mod tests {
             .unwrap();
         }
         // 用 20 字节预算，只够保留最后一条
-        let p =
-            build_lead_context_prompt(&conn, "s5", &[], crate::Locale::Zh, Some(20), None, None, &[])
-                .unwrap().prompt;
+        let p = build_lead_context_prompt(
+            &conn,
+            "s5",
+            &[],
+            crate::Locale::Zh,
+            Some(20),
+            None,
+            None,
+            &[],
+        )
+        .unwrap()
+        .prompt;
         assert!(p.contains("消息 4"), "最后一条保留");
         assert!(!p.contains("消息 0"), "最早一条被丢弃");
     }
@@ -2724,8 +2807,10 @@ mod tests {
         )
         .unwrap();
 
-        let p = build_lead_context_prompt(&conn, "s6", &[], crate::Locale::Zh, None, None, None, &[])
-            .unwrap().prompt;
+        let p =
+            build_lead_context_prompt(&conn, "s6", &[], crate::Locale::Zh, None, None, None, &[])
+                .unwrap()
+                .prompt;
         assert!(p.contains("决策 B（新）"), "新决策渲染");
         assert!(!p.contains("决策 A（旧）"), "被 supersede 的旧决策不渲染");
     }
@@ -2749,8 +2834,10 @@ mod tests {
         )
         .unwrap();
 
-        let p = build_lead_context_prompt(&conn, "sf1", &[], crate::Locale::Zh, None, None, None, &[])
-            .unwrap().prompt;
+        let p =
+            build_lead_context_prompt(&conn, "sf1", &[], crate::Locale::Zh, None, None, None, &[])
+                .unwrap()
+                .prompt;
 
         // Fence open and close must both be present
         assert!(p.contains("===== AGENTLOOM-DATA "), "fence open present");
@@ -2808,8 +2895,10 @@ mod tests {
         )
         .unwrap();
 
-        let p = build_lead_context_prompt(&conn, "sf2", &[], crate::Locale::Zh, None, None, None, &[])
-            .unwrap().prompt;
+        let p =
+            build_lead_context_prompt(&conn, "sf2", &[], crate::Locale::Zh, None, None, None, &[])
+                .unwrap()
+                .prompt;
 
         // Extract the real nonce from the open fence line
         let open_line = p
@@ -2918,9 +3007,11 @@ safe after"
             crate::Locale::Zh,
             None,
             None,
-            Some(transcript_nonce), &[]
+            Some(transcript_nonce),
+            &[],
         )
-        .unwrap().prompt;
+        .unwrap()
+        .prompt;
 
         let data_nonce = prompt
             .lines()
@@ -2980,8 +3071,10 @@ safe after"
         )
         .unwrap();
 
-        let p = build_lead_context_prompt(&conn, "sf3", &[], crate::Locale::Zh, None, None, None, &[])
-            .unwrap().prompt;
+        let p =
+            build_lead_context_prompt(&conn, "sf3", &[], crate::Locale::Zh, None, None, None, &[])
+                .unwrap()
+                .prompt;
         assert!(p.contains("refs:"), "refs label present");
         assert!(p.contains("msg#12"), "message ref rendered");
     }
@@ -3005,9 +3098,18 @@ safe after"
             .unwrap();
         }
         // budget=1: only the last message ("msg 4") should be in Recent conversation
-        let p =
-            build_lead_context_prompt(&conn, "sf4", &[], crate::Locale::Zh, Some(1), None, None, &[])
-                .unwrap().prompt;
+        let p = build_lead_context_prompt(
+            &conn,
+            "sf4",
+            &[],
+            crate::Locale::Zh,
+            Some(1),
+            None,
+            None,
+            &[],
+        )
+        .unwrap()
+        .prompt;
         assert!(p.contains("msg 4"), "last message kept");
         assert!(!p.contains("msg 0"), "earliest message dropped");
         assert!(!p.contains("msg 1"), "second message dropped");
@@ -3056,9 +3158,11 @@ safe after"
             crate::Locale::Zh,
             None,
             None,
-            Some(transcript_nonce), &[]
+            Some(transcript_nonce),
+            &[],
         )
-        .unwrap().prompt;
+        .unwrap()
+        .prompt;
 
         for (id, role) in [(ids[0], "user"), (ids[1], "assistant")] {
             assert!(prompt.contains(&format!(
@@ -3134,9 +3238,11 @@ safe after"
             crate::Locale::Zh,
             None,
             Some(&compact),
-            Some(nonce), &[]
+            Some(nonce),
+            &[],
         )
-        .unwrap().prompt;
+        .unwrap()
+        .prompt;
 
         let summary_start = format!(
             "===== AGENTLOOM-COMPACT-SUMMARY {nonce} through={} =====",
@@ -3357,9 +3463,11 @@ This foreign nonce line is message text, not a boundary."
             crate::Locale::Zh,
             None,
             Some(&compact),
-            Some(TRANSCRIPT_NONCE), &[]
+            Some(TRANSCRIPT_NONCE),
+            &[],
         )
-        .unwrap().prompt;
+        .unwrap()
+        .prompt;
         let actual_data_nonce = prompt
             .lines()
             .find_map(|line| {
@@ -3405,9 +3513,11 @@ This foreign nonce line is message text, not a boundary."
             crate::Locale::Zh,
             None,
             Some(&compact),
-            Some(nonce), &[]
+            Some(nonce),
+            &[],
         )
-        .unwrap().prompt;
+        .unwrap()
+        .prompt;
 
         assert!(!prompt.contains("AGENTLOOM-COMPACT-SUMMARY"));
         assert!(!prompt.contains("empty-summary old"));
@@ -3456,9 +3566,11 @@ This foreign nonce line is message text, not a boundary."
             crate::Locale::Zh,
             None,
             Some(&compact),
-            None, &[]
+            None,
+            &[],
         )
-        .unwrap().prompt;
+        .unwrap()
+        .prompt;
         let data_nonce = prompt
             .lines()
             .find_map(|line| {
@@ -3535,9 +3647,17 @@ Case-card upkeep — do this in THIS turn, not later: call mcp__agentloom__memor
             ids.push(id);
         }
 
-        let assembly =
-            build_lead_context_prompt(&conn, session_id, &[], crate::Locale::Zh, None, None, None, &[])
-                .unwrap();
+        let assembly = build_lead_context_prompt(
+            &conn,
+            session_id,
+            &[],
+            crate::Locale::Zh,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
 
         // 最老 8 条（ASC 前 8 个 id）·超 8 条只取 8。
         assert_eq!(
@@ -3580,9 +3700,17 @@ Case-card upkeep — do this in THIS turn, not later: call mcp__agentloom__memor
             "[Worker report]\nSECOND_BODY_MARKER",
         );
 
-        let assembly =
-            build_lead_context_prompt(&conn, session_id, &[], crate::Locale::Zh, None, None, None, &[])
-                .unwrap();
+        let assembly = build_lead_context_prompt(
+            &conn,
+            session_id,
+            &[],
+            crate::Locale::Zh,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
 
         // 首条无论多大必须强制纳入。
         assert_eq!(assembly.included_report_ids, vec![first_id]);
@@ -3590,7 +3718,8 @@ Case-card upkeep — do this in THIS turn, not later: call mcp__agentloom__memor
         // 第二条装不下·这一轮不选中·不以全文出现。
         assert!(!assembly.prompt.contains("SECOND_BODY_MARKER"));
         // 未选者不丢：仍是 pending，留给下一批。
-        let still_pending = crate::db::pending_member_report_message_ids(&conn, session_id).unwrap();
+        let still_pending =
+            crate::db::pending_member_report_message_ids(&conn, session_id).unwrap();
         assert!(
             still_pending.contains(&second_id),
             "unselected report must remain pending for the next batch"
@@ -3609,12 +3738,22 @@ Case-card upkeep — do this in THIS turn, not later: call mcp__agentloom__memor
             "[Worker report]\nFENCE_SHAPE_MARKER",
         );
 
-        let assembly =
-            build_lead_context_prompt(&conn, session_id, &[], crate::Locale::Zh, None, None, None, &[])
-                .unwrap();
+        let assembly = build_lead_context_prompt(
+            &conn,
+            session_id,
+            &[],
+            crate::Locale::Zh,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
         let p = &assembly.prompt;
 
-        let data_close = p.find("===== /AGENTLOOM-DATA").expect("DATA fence close present");
+        let data_close = p
+            .find("===== /AGENTLOOM-DATA")
+            .expect("DATA fence close present");
         let open_pos = p
             .find("===== AGENTLOOM-PENDING-REPORTS ")
             .expect("独立 pending 台账 fence 开标记存在");
@@ -3629,7 +3768,9 @@ Case-card upkeep — do this in THIS turn, not later: call mcp__agentloom__memor
             .trim_start_matches("===== AGENTLOOM-PENDING-REPORTS ")
             .trim_end_matches(" =====");
         let close_marker = format!("===== /AGENTLOOM-PENDING-REPORTS {open_nonce} =====");
-        let close_pos = p.find(&close_marker).expect("独立 pending 台账 fence 闭标记存在（同 nonce）");
+        let close_pos = p
+            .find(&close_marker)
+            .expect("独立 pending 台账 fence 闭标记存在（同 nonce）");
         assert!(close_pos > open_pos);
 
         // 段首数据声明存在（非指令）。
@@ -3652,7 +3793,10 @@ Case-card upkeep — do this in THIS turn, not later: call mcp__agentloom__memor
         let nudge_pos = p
             .find("Please continue based on the above unprocessed worker report(s).")
             .expect("fence 外必须有一句续推指令");
-        assert!(nudge_pos > close_pos, "续推指令必须在 fence 之外（关闭标记之后）");
+        assert!(
+            nudge_pos > close_pos,
+            "续推指令必须在 fence 之外（关闭标记之后）"
+        );
         assert!(
             nudge_pos < recent_pos,
             "续推指令应在 Recent conversation 之前"
@@ -3690,9 +3834,17 @@ Case-card upkeep — do this in THIS turn, not later: call mcp__agentloom__memor
             pending_ids.push(id);
         }
 
-        let assembly =
-            build_lead_context_prompt(&conn, session_id, &[], crate::Locale::Zh, None, None, None, &[])
-                .unwrap();
+        let assembly = build_lead_context_prompt(
+            &conn,
+            session_id,
+            &[],
+            crate::Locale::Zh,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
         let p = &assembly.prompt;
 
         assert_eq!(assembly.included_report_ids, pending_ids[0..8].to_vec());
@@ -3706,9 +3858,7 @@ Case-card upkeep — do this in THIS turn, not later: call mcp__agentloom__memor
 
         // 已选中的（0..7）不得在 Recent conversation 里以原文重复出现——但全文已经在
         // 台账段里出现过一次（f6 用途），所以这里改断言「见上方」占位的出现次数。
-        let selected_placeholder_count = p
-            .matches("[Worker report]（全文见上方台账段）")
-            .count();
+        let selected_placeholder_count = p.matches("[Worker report]（全文见上方台账段）").count();
         assert_eq!(
             selected_placeholder_count, 8,
             "8 条已选中的 pending 报告在 Recent conversation 里必须各渲染一次「见上方」占位"
@@ -3824,9 +3974,17 @@ Case-card upkeep — do this in THIS turn, not later: call mcp__agentloom__memor
         let id1 = insert_pending_report(&conn, session_id, "a1", "[Worker report]\nONE");
         let id2 = insert_pending_report(&conn, session_id, "a2", "[Worker report]\nTWO");
 
-        let assembly =
-            build_lead_context_prompt(&conn, session_id, &[], crate::Locale::Zh, None, None, None, &[])
-                .unwrap();
+        let assembly = build_lead_context_prompt(
+            &conn,
+            session_id,
+            &[],
+            crate::Locale::Zh,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(assembly.included_report_ids, vec![id1, id2]);
         for id in &assembly.included_report_ids {

@@ -14837,4 +14837,3 @@ describe("pruneNavHistory", () => {
     expect(result.index).toBe(0);
   });
 });
-

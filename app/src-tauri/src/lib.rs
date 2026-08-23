@@ -12293,7 +12293,9 @@ fn record_resume_failure(app: &AppHandle, session_id: &str, error: &str) {
 /// 发一条结果（正常写完发送，线程创建失败也会立即预置 `Err`，见
 /// `agent::spawn_with_stdin_prompt_ack` 文档）；channel 断开（理论上不该发生，除非 writer 线程
 /// panic 到 `ack_tx` 都没来得及 drop 前就异常退出）同样归为失败，不放过一个「recv 失败」的分支。
-fn resolve_stdin_ack(stdin_ack: Option<std::sync::mpsc::Receiver<std::io::Result<()>>>) -> Result<(), String> {
+fn resolve_stdin_ack(
+    stdin_ack: Option<std::sync::mpsc::Receiver<std::io::Result<()>>>,
+) -> Result<(), String> {
     match stdin_ack {
         Some(rx) => match rx.recv() {
             Ok(Ok(())) => Ok(()),
@@ -14399,142 +14401,15 @@ fn start_lead_session(
     let spawn_result = std::thread::Builder::new()
         .name(format!("lead-runner-{session_id}"))
         .spawn(move || {
-        let lead_run_id = run_id;
-        let mut reducer = display_reduce::DisplayReducer::new(&lead_run_id);
-        // start MCP server — held on thread stack
-        let mcp_srv = match mcp_server::start_mcp_server(tools_arc) {
-            Ok(s) => s,
-            Err(e) => {
-                let message = lead_runtime_failure_message(
-                    current_locale(&app_t),
-                    LeadRuntimeFailure::McpStart(&e.to_string()),
-                );
-                persist_lead_prespawn_failure(
-                    &app_t,
-                    reducer,
-                    &session_id_t,
-                    &lead_run_id,
-                    &lead_agent_id_t,
-                    &profile_t.name,
-                    message.clone(),
-                );
-                // T5 B/I5：先装退避（note_resume_failure，早于摘槽）——沿用 T4 的首次/封顶
-                // 刷屏规则不在这里重复触发（那套可见性通知走 record_resume_failure，这里已经
-                // 有 persist_lead_prespawn_failure 落的这条错误消息，不必再发第二条）；紧随其后
-                // 的 drain_after_run_release 命中 not_before 门时会自己补武装定时器。
-                note_resume_failure(&session_id_t);
-                // M1 修复轮 P0-1（2026-08-11）：释放咽喉——不再预先加锁。`emit_lead_error_and_release`
-                // 签名收 `&crate::db::Db`（未锁句柄），内部短锁短放；旧版本这里预锁的 guard 会
-                // 一路存活到下面 `try_resume_pending` 重新加锁那一刻，同线程二次 lock 直接死锁
-                // （TimedMutex/std::sync::Mutex 不可重入）——这正是本轮要修的死锁。
-                let runtime_db = app_t.state::<crate::db::Db>();
-                emit_lead_error_and_release(
-                    &running_t,
-                    &team_running_t,
-                    &terminated_t,
-                    &session_id_t,
-                    &lead_run_id,
-                    &transport,
-                    message,
-                    Some(runtime_db.inner()),
-                );
-                drain_after_run_release(app_t.clone(), session_id_t.clone());
-                return;
-            }
-        };
-        let mcp_cfg = mcp_server::mcp_config_json(mcp_srv.port);
-        // L3：myagent `--mcp-server <name>=<url>` 吃裸 URL，不是 claude 那份 JSON config。
-        let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_srv.port);
-
-        // 阶段 0 修失忆：seed 会话级 goal + 组装上下文 prompt。
-        // try_lock 有界重试（T8 P1-①）：短暂错峰重试 3 次（50/100/200ms）避开与
-        // drain_remote_inbox 等短暂持锁操作的瞬时竞争——runner 线程此处不持有任何其他锁，
-        // 短暂 sleep 安全、无死锁风险；仍失败才当真正的组装失败处理（见下方 I2 分流）。
-        // T3：message=None（续跑路径）时两处兜底都退到 RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT，
-        // 不喂空字符串给引擎；正常首轮/带话续写路径行为不变。
-        let message_or_fallback: String = message
-            .clone()
-            .unwrap_or_else(|| RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT.to_string());
-        let mut session_has_goal = false;
-        // T6 M2/E：组装函数返回本轮实际纳入的 pending 报告 message_id——从占位空集合改为真实
-        // 选择结果，随后原样穿进既有收尾 ack 管道（`commit_lead_run_delivery`），收尾序不变。
-        let mut in_flight_report_ids_t: Vec<i64> = Vec::new();
-        // T8 P1-②：答案 ack 的真相源改为 assembly 实际纳入结果（同一线程内直接捕获，不再靠
-        // `record_in_flight_answer_ids`/`take_in_flight_answer_ids` 那套全局侧信道）。
-        let mut in_flight_answer_ids_t: Vec<i64> = Vec::new();
-        let db_state = app_t.state::<crate::db::Db>();
-        let mut lock_attempt = db_state.0.try_lock();
-        if lock_attempt.is_err() {
-            for delay_ms in [50u64, 100, 200] {
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                lock_attempt = db_state.0.try_lock();
-                if lock_attempt.is_ok() {
-                    break;
-                }
-            }
-        }
-        let assembly_outcome: Result<String, String> = match lock_attempt {
-            Ok(conn) => {
-                // 显式分支（codex Imp2）：Ok(None) 才首轮 seed·Ok(Some) 不 clobber·Err 不 seed（别把读失败当缺失）。
-                // P1-①（opus 对抗审）：是否 seed 的判定拆进纯函数 `should_seed_goal`（可测）
-                // ——续跑路径（message=None）没有 goal 也绝不能拿
-                // RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT 这句占位文案去 seed goal memory
-                // block（会把「请基于会话最新记录继续推进任务。」永久写进 goal、还 emit
-                // session-goal-updated 上 topbar，污染那些首轮 seed 撞锁走 Err 分支、或
-                // goal 特性上线前的旧会话）。真实首轮消息路径（message=Some）行为不变。
-                match crate::db::get_memory_block(&conn, &session_id_t, "goal") {
-                    Ok(existing_goal) => {
-                        let has_existing = existing_goal.is_some();
-                        if has_existing {
-                            session_has_goal = true;
-                        } else if should_seed_goal(has_existing, message.is_some()) {
-                            match crate::db::upsert_memory_block(
-                                &conn,
-                                &session_id_t,
-                                "goal",
-                                &message_or_fallback,
-                                None,
-                                Some("app"),
-                            ) {
-                                Ok(()) => session_has_goal = true,
-                                Err(e) => {
-                                    eprintln!("seed session goal failed (non-fatal): {e}")
-                                }
-                            }
-                        }
-                        // else：续跑路径（message=None）且没有既存 goal——不 seed，不 emit。
-                    }
-                    Err(e) => eprintln!("read session goal failed (non-fatal): {e}"),
-                }
-                match build_lead_context_prompt_for_session(
-                    &conn,
-                    &session_id_t,
-                    &member_pool_t,
-                    current_locale(&app_t),
-                    lead_engine_t,
-                    resume_answer_ids_t.as_deref().unwrap_or(&[]),
-                ) {
-                    Ok(assembly) => {
-                        in_flight_report_ids_t = assembly.included_report_ids;
-                        in_flight_answer_ids_t = assembly.included_answer_ids;
-                        Ok(assembly.prompt)
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            Err(_) => Err("db lock unavailable for lead context assembly after retries".to_string()),
-        };
-        // T8 P2-④/I2 根修：组装失败时，自动来源（Autofeed/LateAnswer）绝不能只喂兜底句起跑——
-        // 那等于把「run 发生了」包装成「run 交付了」。不起本轮：装退避 → （按 I5 序）
-        // emit_lead_error_and_release 摘槽/terminal → drain_after_run_release → 释放 MCP。
-        // UserMessage 来源保留旧行为：兜底句 + 留日志，正常起跑（用户主动发的消息不能被吞）。
-        let assembled_prompt: String = match assembly_outcome {
-            Ok(prompt) => prompt,
-            Err(detail) => match start_origin_t {
-                StartOrigin::Autofeed | StartOrigin::LateAnswer => {
+            let lead_run_id = run_id;
+            let mut reducer = display_reduce::DisplayReducer::new(&lead_run_id);
+            // start MCP server — held on thread stack
+            let mcp_srv = match mcp_server::start_mcp_server(tools_arc) {
+                Ok(s) => s,
+                Err(e) => {
                     let message = lead_runtime_failure_message(
                         current_locale(&app_t),
-                        LeadRuntimeFailure::ContextAssembly(&detail),
+                        LeadRuntimeFailure::McpStart(&e.to_string()),
                     );
                     persist_lead_prespawn_failure(
                         &app_t,
@@ -14545,8 +14420,15 @@ fn start_lead_session(
                         &profile_t.name,
                         message.clone(),
                     );
-                    // T5 B/I5：先装退避，早于摘槽——理由同 McpStart 分支上方注释。
+                    // T5 B/I5：先装退避（note_resume_failure，早于摘槽）——沿用 T4 的首次/封顶
+                    // 刷屏规则不在这里重复触发（那套可见性通知走 record_resume_failure，这里已经
+                    // 有 persist_lead_prespawn_failure 落的这条错误消息，不必再发第二条）；紧随其后
+                    // 的 drain_after_run_release 命中 not_before 门时会自己补武装定时器。
                     note_resume_failure(&session_id_t);
+                    // M1 修复轮 P0-1（2026-08-11）：释放咽喉——不再预先加锁。`emit_lead_error_and_release`
+                    // 签名收 `&crate::db::Db`（未锁句柄），内部短锁短放；旧版本这里预锁的 guard 会
+                    // 一路存活到下面 `try_resume_pending` 重新加锁那一刻，同线程二次 lock 直接死锁
+                    // （TimedMutex/std::sync::Mutex 不可重入）——这正是本轮要修的死锁。
                     let runtime_db = app_t.state::<crate::db::Db>();
                     emit_lead_error_and_release(
                         &running_t,
@@ -14559,145 +14441,198 @@ fn start_lead_session(
                         Some(runtime_db.inner()),
                     );
                     drain_after_run_release(app_t.clone(), session_id_t.clone());
-                    drop(mcp_srv);
                     return;
                 }
-                StartOrigin::UserMessage => {
-                    eprintln!(
+            };
+            let mcp_cfg = mcp_server::mcp_config_json(mcp_srv.port);
+            // L3：myagent `--mcp-server <name>=<url>` 吃裸 URL，不是 claude 那份 JSON config。
+            let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_srv.port);
+
+            // 阶段 0 修失忆：seed 会话级 goal + 组装上下文 prompt。
+            // try_lock 有界重试（T8 P1-①）：短暂错峰重试 3 次（50/100/200ms）避开与
+            // drain_remote_inbox 等短暂持锁操作的瞬时竞争——runner 线程此处不持有任何其他锁，
+            // 短暂 sleep 安全、无死锁风险；仍失败才当真正的组装失败处理（见下方 I2 分流）。
+            // T3：message=None（续跑路径）时两处兜底都退到 RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT，
+            // 不喂空字符串给引擎；正常首轮/带话续写路径行为不变。
+            let message_or_fallback: String = message
+                .clone()
+                .unwrap_or_else(|| RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT.to_string());
+            let mut session_has_goal = false;
+            // T6 M2/E：组装函数返回本轮实际纳入的 pending 报告 message_id——从占位空集合改为真实
+            // 选择结果，随后原样穿进既有收尾 ack 管道（`commit_lead_run_delivery`），收尾序不变。
+            let mut in_flight_report_ids_t: Vec<i64> = Vec::new();
+            // T8 P1-②：答案 ack 的真相源改为 assembly 实际纳入结果（同一线程内直接捕获，不再靠
+            // `record_in_flight_answer_ids`/`take_in_flight_answer_ids` 那套全局侧信道）。
+            let mut in_flight_answer_ids_t: Vec<i64> = Vec::new();
+            let db_state = app_t.state::<crate::db::Db>();
+            let mut lock_attempt = db_state.0.try_lock();
+            if lock_attempt.is_err() {
+                for delay_ms in [50u64, 100, 200] {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    lock_attempt = db_state.0.try_lock();
+                    if lock_attempt.is_ok() {
+                        break;
+                    }
+                }
+            }
+            let assembly_outcome: Result<String, String> = match lock_attempt {
+                Ok(conn) => {
+                    // 显式分支（codex Imp2）：Ok(None) 才首轮 seed·Ok(Some) 不 clobber·Err 不 seed（别把读失败当缺失）。
+                    // P1-①（opus 对抗审）：是否 seed 的判定拆进纯函数 `should_seed_goal`（可测）
+                    // ——续跑路径（message=None）没有 goal 也绝不能拿
+                    // RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT 这句占位文案去 seed goal memory
+                    // block（会把「请基于会话最新记录继续推进任务。」永久写进 goal、还 emit
+                    // session-goal-updated 上 topbar，污染那些首轮 seed 撞锁走 Err 分支、或
+                    // goal 特性上线前的旧会话）。真实首轮消息路径（message=Some）行为不变。
+                    match crate::db::get_memory_block(&conn, &session_id_t, "goal") {
+                        Ok(existing_goal) => {
+                            let has_existing = existing_goal.is_some();
+                            if has_existing {
+                                session_has_goal = true;
+                            } else if should_seed_goal(has_existing, message.is_some()) {
+                                match crate::db::upsert_memory_block(
+                                    &conn,
+                                    &session_id_t,
+                                    "goal",
+                                    &message_or_fallback,
+                                    None,
+                                    Some("app"),
+                                ) {
+                                    Ok(()) => session_has_goal = true,
+                                    Err(e) => {
+                                        eprintln!("seed session goal failed (non-fatal): {e}")
+                                    }
+                                }
+                            }
+                            // else：续跑路径（message=None）且没有既存 goal——不 seed，不 emit。
+                        }
+                        Err(e) => eprintln!("read session goal failed (non-fatal): {e}"),
+                    }
+                    match build_lead_context_prompt_for_session(
+                        &conn,
+                        &session_id_t,
+                        &member_pool_t,
+                        current_locale(&app_t),
+                        lead_engine_t,
+                        resume_answer_ids_t.as_deref().unwrap_or(&[]),
+                    ) {
+                        Ok(assembly) => {
+                            in_flight_report_ids_t = assembly.included_report_ids;
+                            in_flight_answer_ids_t = assembly.included_answer_ids;
+                            Ok(assembly.prompt)
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(_) => {
+                    Err("db lock unavailable for lead context assembly after retries".to_string())
+                }
+            };
+            // T8 P2-④/I2 根修：组装失败时，自动来源（Autofeed/LateAnswer）绝不能只喂兜底句起跑——
+            // 那等于把「run 发生了」包装成「run 交付了」。不起本轮：装退避 → （按 I5 序）
+            // emit_lead_error_and_release 摘槽/terminal → drain_after_run_release → 释放 MCP。
+            // UserMessage 来源保留旧行为：兜底句 + 留日志，正常起跑（用户主动发的消息不能被吞）。
+            let assembled_prompt: String = match assembly_outcome {
+                Ok(prompt) => prompt,
+                Err(detail) => match start_origin_t {
+                    StartOrigin::Autofeed | StartOrigin::LateAnswer => {
+                        let message = lead_runtime_failure_message(
+                            current_locale(&app_t),
+                            LeadRuntimeFailure::ContextAssembly(&detail),
+                        );
+                        persist_lead_prespawn_failure(
+                            &app_t,
+                            reducer,
+                            &session_id_t,
+                            &lead_run_id,
+                            &lead_agent_id_t,
+                            &profile_t.name,
+                            message.clone(),
+                        );
+                        // T5 B/I5：先装退避，早于摘槽——理由同 McpStart 分支上方注释。
+                        note_resume_failure(&session_id_t);
+                        let runtime_db = app_t.state::<crate::db::Db>();
+                        emit_lead_error_and_release(
+                            &running_t,
+                            &team_running_t,
+                            &terminated_t,
+                            &session_id_t,
+                            &lead_run_id,
+                            &transport,
+                            message,
+                            Some(runtime_db.inner()),
+                        );
+                        drain_after_run_release(app_t.clone(), session_id_t.clone());
+                        drop(mcp_srv);
+                        return;
+                    }
+                    StartOrigin::UserMessage => {
+                        eprintln!(
                         "lead context assembly failed for {session_id_t} (UserMessage origin): \
                          {detail}; falling back to raw message"
                     );
-                    message_or_fallback.clone()
-                }
-            },
-        };
-        // 仅当确有会话 goal 才 emit（避免接前端后假刷新·codex Nit）
-        if session_has_goal {
-            let _ = app_t.emit(
+                        message_or_fallback.clone()
+                    }
+                },
+            };
+            // 仅当确有会话 goal 才 emit（避免接前端后假刷新·codex Nit）
+            if session_has_goal {
+                let _ = app_t.emit(
                 "session-goal-updated",
                 serde_json::json!({ "session_id": session_id_t, "title": serde_json::Value::Null }),
             );
-        }
-        // Build command per lead engine（L1/L3）：native 在共用 lead argv 上叠加
-        // profile model / effort；
-        // borrow 复用同一套 claude_sandboxed_cmd_in + lead_claude_argv_extra，只有
-        // system_prompt（身份提示 + LEAD_SYS_V2 合并）与 env 装配不同；harness（myagent）
-        // 走独立的 harness_lead_cmd_in（不经 claude 沙箱基座，MCP 是裸 URL）。
-        let build_result: Result<(Command, String), String> = match lead_engine_t {
-            LeadEngine::NativeClaude => {
-                let extra_strings = native_lead_argv_extra_for_profile(
-                    &profile_t,
-                    reasoning_tier.as_deref(),
-                    &mcp_cfg,
-                );
-                let extra_refs: Vec<&str> = extra_strings.iter().map(|s| s.as_str()).collect();
-                claude_lead_cmd_in(&wt, &assembled_prompt, &extra_refs)
             }
-            LeadEngine::BorrowClaude => {
-                let identity = agent::borrow_claude_identity_prompt(&profile_t);
-                let system_prompt = format!("{identity}\n\n{LEAD_SYS_V2}");
-                let api_key = borrow_api_key_t.as_deref().unwrap_or_default();
-                borrow_lead_cmd_in(
-                    &profile_t,
-                    api_key,
-                    &wt,
-                    &assembled_prompt,
-                    &mcp_cfg,
-                    &system_prompt,
-                )
-            }
-            LeadEngine::Harness => {
-                let (api_key, search_api_key, search_backend) = harness_creds_t
-                    .as_ref()
-                    .map(|(k, sk, sb)| (k.as_deref(), sk.as_deref(), sb.as_deref()))
-                    .unwrap_or((None, None, None));
-                harness_lead_cmd_in(
-                    &profile_t,
-                    api_key,
-                    search_api_key,
-                    search_backend,
-                    &wt,
-                    &session_id_t,
-                    &assembled_prompt,
-                    &mcp_url,
-                )
-            }
-        };
-        let (mut cmd, claude_bin) = match build_result {
-            Ok(built) => built,
-            Err(e) => {
-                let message = lead_runtime_failure_message(
-                    current_locale(&app_t),
-                    LeadRuntimeFailure::CommandBuild(&e.to_string()),
-                );
-                persist_lead_prespawn_failure(
-                    &app_t,
-                    reducer,
-                    &session_id_t,
-                    &lead_run_id,
-                    &lead_agent_id_t,
-                    &profile_t.name,
-                    message.clone(),
-                );
-                // T5 B/I5：先装退避，早于摘槽——理由同 McpStart 分支上方注释。
-                note_resume_failure(&session_id_t);
-                // M1 修复轮 P0-1（2026-08-11）：释放咽喉——不再预先加锁。`emit_lead_error_and_release`
-                // 签名收 `&crate::db::Db`（未锁句柄），内部短锁短放；旧版本这里预锁的 guard 会
-                // 一路存活到下面 `try_resume_pending` 重新加锁那一刻，同线程二次 lock 直接死锁
-                // （TimedMutex/std::sync::Mutex 不可重入）——这正是本轮要修的死锁。
-                let runtime_db = app_t.state::<crate::db::Db>();
-                emit_lead_error_and_release(
-                    &running_t,
-                    &team_running_t,
-                    &terminated_t,
-                    &session_id_t,
-                    &lead_run_id,
-                    &transport,
-                    message,
-                    Some(runtime_db.inner()),
-                );
-                drain_after_run_release(app_t.clone(), session_id_t.clone());
-                drop(mcp_srv);
-                return;
-            }
-        };
-        log_claude_bin(&session_id_t, &claude_bin);
-        let first_event_binary = claude_bin.clone();
-        // borrow_lead_cmd_in 内部已 apply_clean_env + 叠加 borrow env；这里再调一遍
-        // apply_clean_env 会把刚设好的 ANTHROPIC_* 冲掉，所以只有 native 分支在此处调用
-        // （与改动前行为一致：native 原本就是在这里调 apply_clean_env）。
-        if matches!(lead_engine_t, LeadEngine::NativeClaude) {
-            apply_clean_env(&mut cmd);
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-
-        // claude/borrow 的 argv 已不带 prompt 正文（claude_sandboxed_cmd_in 的 claude_agent_argv
-        // 不再拼 -p <prompt>），正文改走 stdin；harness 仍是 write_harness_prompt_file 落 app 域
-        // 临时文件传路径，不需要 stdin。
-        let stdin_prompt = match lead_engine_t {
-            LeadEngine::NativeClaude | LeadEngine::BorrowClaude => {
-                Some(agent::StdinPrompt::from(assembled_prompt.as_str()))
-            }
-            LeadEngine::Harness => None,
-        };
-        let first_event_started_at = Instant::now();
-        cmd.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        // T2/T5 M3：改走 ack 版 spawn——`stdin_ack` 在 EOF 之后、槽仍持有时用来 recv 写 stdin
-        // 是否真正 I/O 成功（`resolve_stdin_ack`），而不是像旧 `spawn_with_stdin_prompt` 那样
-        // 直接 drop 掉 ack receiver。
-        let (mut child, stdin_ack) =
-            match agent::spawn_with_stdin_prompt_ack(&mut cmd, stdin_prompt.as_ref()) {
-                Ok(agent::SpawnedWithStdinPrompt { child, stdin_ack }) => (child, stdin_ack),
+            // Build command per lead engine（L1/L3）：native 在共用 lead argv 上叠加
+            // profile model / effort；
+            // borrow 复用同一套 claude_sandboxed_cmd_in + lead_claude_argv_extra，只有
+            // system_prompt（身份提示 + LEAD_SYS_V2 合并）与 env 装配不同；harness（myagent）
+            // 走独立的 harness_lead_cmd_in（不经 claude 沙箱基座，MCP 是裸 URL）。
+            let build_result: Result<(Command, String), String> = match lead_engine_t {
+                LeadEngine::NativeClaude => {
+                    let extra_strings = native_lead_argv_extra_for_profile(
+                        &profile_t,
+                        reasoning_tier.as_deref(),
+                        &mcp_cfg,
+                    );
+                    let extra_refs: Vec<&str> = extra_strings.iter().map(|s| s.as_str()).collect();
+                    claude_lead_cmd_in(&wt, &assembled_prompt, &extra_refs)
+                }
+                LeadEngine::BorrowClaude => {
+                    let identity = agent::borrow_claude_identity_prompt(&profile_t);
+                    let system_prompt = format!("{identity}\n\n{LEAD_SYS_V2}");
+                    let api_key = borrow_api_key_t.as_deref().unwrap_or_default();
+                    borrow_lead_cmd_in(
+                        &profile_t,
+                        api_key,
+                        &wt,
+                        &assembled_prompt,
+                        &mcp_cfg,
+                        &system_prompt,
+                    )
+                }
+                LeadEngine::Harness => {
+                    let (api_key, search_api_key, search_backend) = harness_creds_t
+                        .as_ref()
+                        .map(|(k, sk, sb)| (k.as_deref(), sk.as_deref(), sb.as_deref()))
+                        .unwrap_or((None, None, None));
+                    harness_lead_cmd_in(
+                        &profile_t,
+                        api_key,
+                        search_api_key,
+                        search_backend,
+                        &wt,
+                        &session_id_t,
+                        &assembled_prompt,
+                        &mcp_url,
+                    )
+                }
+            };
+            let (mut cmd, claude_bin) = match build_result {
+                Ok(built) => built,
                 Err(e) => {
                     let message = lead_runtime_failure_message(
                         current_locale(&app_t),
-                        LeadRuntimeFailure::ProcessStart(&e.to_string()),
+                        LeadRuntimeFailure::CommandBuild(&e.to_string()),
                     );
                     persist_lead_prespawn_failure(
                         &app_t,
@@ -14730,394 +14665,467 @@ fn start_lead_session(
                     return;
                 }
             };
-        let first_event_deadline =
-            first_event_started_at + std::time::Duration::from_secs(FIRST_EVENT_TIMEOUT_SECS);
+            log_claude_bin(&session_id_t, &claude_bin);
+            let first_event_binary = claude_bin.clone();
+            // borrow_lead_cmd_in 内部已 apply_clean_env + 叠加 borrow env；这里再调一遍
+            // apply_clean_env 会把刚设好的 ANTHROPIC_* 冲掉，所以只有 native 分支在此处调用
+            // （与改动前行为一致：native 原本就是在这里调 apply_clean_env）。
+            if matches!(lead_engine_t, LeadEngine::NativeClaude) {
+                apply_clean_env(&mut cmd);
+            }
 
-        let pid = child.id();
-        // Transition Launching -> Running (or abort if stop was requested)
-        let handoff_runtime_db = app_t.state::<crate::db::Db>();
-        let proceed = match transition_lead_spawn_handoff(
-            &running_t,
-            &team_running_t,
-            Some(handoff_runtime_db.inner()),
-            &terminated_t,
-            &session_id_t,
-            pid,
-            &lead_run_id,
-            kill_process_group,
-            |event| {
-                let _ = transport.flush_barrier(&lead_run_id, vec![event.clone()]);
-            },
-        ) {
-            Ok(proceed) => proceed,
-            Err(_) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                cmd.process_group(0);
+            }
+
+            // claude/borrow 的 argv 已不带 prompt 正文（claude_sandboxed_cmd_in 的 claude_agent_argv
+            // 不再拼 -p <prompt>），正文改走 stdin；harness 仍是 write_harness_prompt_file 落 app 域
+            // 临时文件传路径，不需要 stdin。
+            let stdin_prompt = match lead_engine_t {
+                LeadEngine::NativeClaude | LeadEngine::BorrowClaude => {
+                    Some(agent::StdinPrompt::from(assembled_prompt.as_str()))
+                }
+                LeadEngine::Harness => None,
+            };
+            let first_event_started_at = Instant::now();
+            cmd.stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            // T2/T5 M3：改走 ack 版 spawn——`stdin_ack` 在 EOF 之后、槽仍持有时用来 recv 写 stdin
+            // 是否真正 I/O 成功（`resolve_stdin_ack`），而不是像旧 `spawn_with_stdin_prompt` 那样
+            // 直接 drop 掉 ack receiver。
+            let (mut child, stdin_ack) =
+                match agent::spawn_with_stdin_prompt_ack(&mut cmd, stdin_prompt.as_ref()) {
+                    Ok(agent::SpawnedWithStdinPrompt { child, stdin_ack }) => (child, stdin_ack),
+                    Err(e) => {
+                        let message = lead_runtime_failure_message(
+                            current_locale(&app_t),
+                            LeadRuntimeFailure::ProcessStart(&e.to_string()),
+                        );
+                        persist_lead_prespawn_failure(
+                            &app_t,
+                            reducer,
+                            &session_id_t,
+                            &lead_run_id,
+                            &lead_agent_id_t,
+                            &profile_t.name,
+                            message.clone(),
+                        );
+                        // T5 B/I5：先装退避，早于摘槽——理由同 McpStart 分支上方注释。
+                        note_resume_failure(&session_id_t);
+                        // M1 修复轮 P0-1（2026-08-11）：释放咽喉——不再预先加锁。`emit_lead_error_and_release`
+                        // 签名收 `&crate::db::Db`（未锁句柄），内部短锁短放；旧版本这里预锁的 guard 会
+                        // 一路存活到下面 `try_resume_pending` 重新加锁那一刻，同线程二次 lock 直接死锁
+                        // （TimedMutex/std::sync::Mutex 不可重入）——这正是本轮要修的死锁。
+                        let runtime_db = app_t.state::<crate::db::Db>();
+                        emit_lead_error_and_release(
+                            &running_t,
+                            &team_running_t,
+                            &terminated_t,
+                            &session_id_t,
+                            &lead_run_id,
+                            &transport,
+                            message,
+                            Some(runtime_db.inner()),
+                        );
+                        drain_after_run_release(app_t.clone(), session_id_t.clone());
+                        drop(mcp_srv);
+                        return;
+                    }
+                };
+            let first_event_deadline =
+                first_event_started_at + std::time::Duration::from_secs(FIRST_EVENT_TIMEOUT_SECS);
+
+            let pid = child.id();
+            // Transition Launching -> Running (or abort if stop was requested)
+            let handoff_runtime_db = app_t.state::<crate::db::Db>();
+            let proceed = match transition_lead_spawn_handoff(
+                &running_t,
+                &team_running_t,
+                Some(handoff_runtime_db.inner()),
+                &terminated_t,
+                &session_id_t,
+                pid,
+                &lead_run_id,
+                kill_process_group,
+                |event| {
+                    let _ = transport.flush_barrier(&lead_run_id, vec![event.clone()]);
+                },
+            ) {
+                Ok(proceed) => proceed,
+                Err(_) => {
+                    let _ = child.wait();
+                    // T5 C3：running.0 锁 poisoned 时 transition_lead_spawn_handoff 内部已经
+                    // terminated.store(true)；不确定槽是否被摘干净，但「槽释放之后才 drain」
+                    // 是下限不是上限——这里补一次 drain 保证其余排空源（remote inbox 等）不会
+                    // 因为这条极端早退路径而永远等不到下一次排空机会。
+                    drain_after_run_release(app_t.clone(), session_id_t.clone());
+                    drop(mcp_srv);
+                    return;
+                }
+            };
+            if !proceed {
                 let _ = child.wait();
-                // T5 C3：running.0 锁 poisoned 时 transition_lead_spawn_handoff 内部已经
-                // terminated.store(true)；不确定槽是否被摘干净，但「槽释放之后才 drain」
-                // 是下限不是上限——这里补一次 drain 保证其余排空源（remote inbox 等）不会
-                // 因为这条极端早退路径而永远等不到下一次排空机会。
+                // T5 C3：Stopped/Abort 分支都已经在 transition_lead_spawn_handoff 内部真摘了槽
+                // （摘槽先于本行）——补一次 drain，同上方注释。
                 drain_after_run_release(app_t.clone(), session_id_t.clone());
                 drop(mcp_srv);
                 return;
             }
-        };
-        if !proceed {
-            let _ = child.wait();
-            // T5 C3：Stopped/Abort 分支都已经在 transition_lead_spawn_handoff 内部真摘了槽
-            // （摘槽先于本行）——补一次 drain，同上方注释。
-            drain_after_run_release(app_t.clone(), session_id_t.clone());
-            drop(mcp_srv);
-            return;
-        }
 
-        // Bug1 修复：lead run 起跑（Running 槽已确立）后立刻写旧 run ledger（pending + running），
-        // 让 commit 工具（build_commit_tool 的 run_commit 查找）查得到当前 run，不再落空报
-        // "current run ledger is missing"。刻意放在 transition 成功之后——mcp/build/spawn 失败与
-        // launching 期被停（上面几个 early return）都还没写台账、无需收尾，从源头消除「写了没清」的
-        // 收尾竞争；此后唯一出口是下面的正常收尾点。收尾对偶在 emit_terminal_after_releasing_run_slot
-        // 之前（Running 槽仍被本 run 持有时）调用，避免与随后可能起跑的新 run 的 git_state 相互踩踏。
-        // engine 存 lead 的 agent_id（与 solo 6503 一致）。写库失败仅记日志、不杀已起跑的 child。
-        {
-            let db = app_t.state::<crate::db::Db>();
-            let _ = if let Ok(conn) = db.0.lock() {
-                if let Err(e) =
-                    prepare_run_ledger(&conn, &session_id_t, &lead_run_id, &lead_agent_id_t, &wt)
-                {
-                    eprintln!("lead run ledger prepare failed (non-fatal): {e}");
-                }
-            } else {
-                eprintln!("lead run ledger prepare skipped: db lock poisoned");
-            };
-        }
-
-        // Spawn stderr tail (with log file for debugging)
-        let (stderr_handle, stderr_live_tail) = match child.stderr.take() {
-            Some(stderr) => {
-                let (handle, tail) =
-                    spawn_stderr_tail_thread_shared(stderr, log_file_for(&session_id_t));
-                (Some(handle), tail)
-            }
-            None => (None, Arc::new(Mutex::new(Vec::new()))),
-        };
-        let (first_event_watchdog, first_event_watchdog_handle) = spawn_first_event_watchdog(
-            running_t.clone(),
-            session_id_t.clone(),
-            pid,
-            stderr_live_tail.clone(),
-            first_event_deadline.saturating_duration_since(Instant::now()),
-        );
-
-        // Read stdout, emit events in real time; track terminal events
-        let mut saw_completed = false;
-        let mut saw_error = false;
-        // Bug B 修复：lead 也要记 blocked/needs_decision 终态见证——否则退出码
-        // 3/4（Blocked/NeedsDecision 的正常收工，非崩溃）会被 lead_terminal_decision
-        // 误判成 EmitError（见 harness-agent/src/orchestrator/types.rs:66-74 退出码契约）。
-        let mut saw_blocked = false;
-        let mut saw_needs_decision = false;
-        let mut pending_terminals = Vec::new();
-        // G3-A T2：lead 本体 usage——从本 lead run 自己 stdout 流里最后一条 Completed 事件
-        // 取（同 solo `pending_completed` 那套语义：多条 Completed 只认最后一条）。claude/
-        // borrow lead 走 parse_claude_line_for_locale（已在 T1 修过缓存口径）；myagent lead
-        // 走 parse_agent_line_for_locale(Harness)（`run.completed.payload.usage`，engine 线
-        // 自己的口径，不在本刀改动范围）。落库发生在收尾处、仅这一次，不与
-        // RunInfo.workingTokens（纯显示态、设计上不写 DB）冲突——见下方落库点注释。
-        let mut lead_completed_usage: Option<(Option<u64>, Option<u64>)> = None;
-        let mut latest_context_compacted: Option<(String, i64)> = None;
-        if let Some(stdout) = child.stdout.take() {
-            use std::io::BufRead;
-            for line in std::io::BufReader::new(stdout)
-                .lines()
-                .map_while(Result::ok)
+            // Bug1 修复：lead run 起跑（Running 槽已确立）后立刻写旧 run ledger（pending + running），
+            // 让 commit 工具（build_commit_tool 的 run_commit 查找）查得到当前 run，不再落空报
+            // "current run ledger is missing"。刻意放在 transition 成功之后——mcp/build/spawn 失败与
+            // launching 期被停（上面几个 early return）都还没写台账、无需收尾，从源头消除「写了没清」的
+            // 收尾竞争；此后唯一出口是下面的正常收尾点。收尾对偶在 emit_terminal_after_releasing_run_slot
+            // 之前（Running 槽仍被本 run 持有时）调用，避免与随后可能起跑的新 run 的 git_state 相互踩踏。
+            // engine 存 lead 的 agent_id（与 solo 6503 一致）。写库失败仅记日志、不杀已起跑的 child。
             {
-                first_event_watchdog.first_line_seen();
-                let locale = current_locale(&app_t);
-                // NativeClaude/BorrowClaude 走原路逐字节不变（回归钉死）；Harness 走 myagent 解析
-                // （parse_agent_line_for_locale 已按 ParseFn 分派，见 ~360）。
-                for event in match lead_engine_t {
-                    LeadEngine::NativeClaude | LeadEngine::BorrowClaude => {
-                        if locale == Locale::Zh {
-                            agent_event::parse_claude_line(&line)
-                        } else {
-                            agent_event::parse_claude_line_for_locale(&line, locale)
-                        }
+                let db = app_t.state::<crate::db::Db>();
+                let _ = if let Ok(conn) = db.0.lock() {
+                    if let Err(e) = prepare_run_ledger(
+                        &conn,
+                        &session_id_t,
+                        &lead_run_id,
+                        &lead_agent_id_t,
+                        &wt,
+                    ) {
+                        eprintln!("lead run ledger prepare failed (non-fatal): {e}");
                     }
-                    LeadEngine::Harness => {
-                        parse_agent_line_for_locale(ParseFn::Harness, &line, locale)
-                    }
-                } {
-                    // lead 线转录暂无标记不触发压实·此接线为 lead 压实刀预留（见 BACKLOG）
-                    remember_context_compacted(&mut latest_context_compacted, &event);
-                    reducer.feed(&event);
-                    // G3-A T2：先只读一眼 usage（借用，不消费 event）——lead 本体 usage 账本，
-                    // 多条 Completed 只认最后一条，同 solo `pending_completed` 覆盖语义。
-                    if let agent_event::AgentEvent::Completed {
-                        input_tokens,
-                        output_tokens,
-                        ..
-                    } = &event
-                    {
-                        lead_completed_usage = Some((*input_tokens, *output_tokens));
-                    }
-                    match event {
-                        agent_event::AgentEvent::Completed { .. } => {
-                            saw_completed = true;
-                            pending_terminals.push(event);
-                        }
-                        agent_event::AgentEvent::Error { .. } => {
-                            saw_error = true;
-                            pending_terminals.push(event);
-                        }
-                        agent_event::AgentEvent::NeedsDecision { .. } => {
-                            saw_needs_decision = true;
-                            pending_terminals.push(event);
-                        }
-                        agent_event::AgentEvent::Blocked { .. } => {
-                            saw_blocked = true;
-                            pending_terminals.push(event);
-                        }
-                        agent_event::AgentEvent::RunCloseout { .. } => {
-                            pending_terminals.push(event);
-                        }
-                        event => {
-                            transport.push(&lead_run_id, event);
-                        }
-                    }
-                }
+                } else {
+                    eprintln!("lead run ledger prepare skipped: db lock poisoned");
+                };
             }
-        }
-        let first_line_seen = first_event_watchdog.stdout_closed();
-        let _ = first_event_watchdog_handle.join();
 
-        // Transition to Finalizing；公共收尾点先封死旧 handler，再让该 lead 槽走向释放。
-        let stop_requested = begin_lead_finalizing(&running_t, &terminated_t, &session_id_t);
-
-        let (exit_status, owner_timed_out) = if first_line_seen {
-            (child.wait().ok(), false)
-        } else {
-            match wait_for_first_event_owner(
-                &mut child,
+            // Spawn stderr tail (with log file for debugging)
+            let (stderr_handle, stderr_live_tail) = match child.stderr.take() {
+                Some(stderr) => {
+                    let (handle, tail) =
+                        spawn_stderr_tail_thread_shared(stderr, log_file_for(&session_id_t));
+                    (Some(handle), tail)
+                }
+                None => (None, Arc::new(Mutex::new(Vec::new()))),
+            };
+            let (first_event_watchdog, first_event_watchdog_handle) = spawn_first_event_watchdog(
+                running_t.clone(),
+                session_id_t.clone(),
                 pid,
-                first_event_deadline,
-                Child::try_wait,
-                Child::wait,
-                kill_process_group,
-                Instant::now,
-                std::thread::sleep,
-            ) {
-                FirstEventOwnerWait::Exited(status) => (Some(status), false),
-                FirstEventOwnerWait::TimedOut(status) => (status, true),
-                FirstEventOwnerWait::WaitError => (None, false),
-            }
-        };
-        let owner_timeout_stderr =
-            owner_timed_out.then(|| stderr_tail_last_lines(&stderr_live_tail));
-        let first_event_timeout_stderr = first_event_watchdog
-            .timeout_stderr()
-            .or(owner_timeout_stderr);
-        let exit_success = exit_status.as_ref().is_some_and(|s| s.success());
-        let stderr_tail = stderr_handle
-            .map(|h| h.join().unwrap_or_default())
-            .unwrap_or_default();
-
-        // Check if user stopped during finalizing
-        let stopped = {
-            let stop_now = matches!(
-                running_t
-                    .0
-                    .lock()
-                    .ok()
-                    .and_then(|m| m.get(&session_id_t).cloned()),
-                Some(RunSlot::Finalizing {
-                    stop_requested: true
-                })
+                stderr_live_tail.clone(),
+                first_event_deadline.saturating_duration_since(Instant::now()),
             );
-            stop_requested || stop_now
-        };
 
-        if should_inject_first_event_watchdog_error(
-            stopped,
-            saw_completed,
-            first_event_timeout_stderr.as_deref(),
-        ) {
-            let stderr_summary = first_event_timeout_stderr
-                .expect("watchdog injection predicate requires timeout stderr");
-            let message = first_event_watchdog_error_message(
-                current_locale(&app_t),
-                "run.spawnFailed",
-                "claude",
-                &first_event_binary,
-                &stderr_summary,
-            );
-            let event = record_synthetic_cli_error(&mut reducer, message);
-            pending_terminals.push(event);
-            saw_error = true;
-        }
-
-        // finish not called: internal signal only, not user-facing (decision 2)
-        let finish_called = done_t.load(Ordering::SeqCst);
-        if !finish_called {
-            eprintln!("[lead] finish not called for session {session_id_t}");
-        }
-
-        // Guarantee a release terminal after persistence and after the slot is removed.
-        let terminal_decision = lead_terminal_decision(
-            saw_completed,
-            saw_error,
-            saw_blocked,
-            saw_needs_decision,
-            exit_success,
-            stopped,
-        );
-        // Bug A 修复：合成 error 必须同时喂归约器（reducer.feed），否则落库消息读不到
-        // 真实报错、只能兜底成笼统 fallback 卡——真实原因就活活丢在内存里（live 通道），
-        // 重启即失（对齐 solo 侧 sidecar_exit_error 分支 record_synthetic_cli_error 用法）。
-        // 接住 record_synthetic_cli_error 的返回事件直接 push——不再另从 Option<String>
-        // 重新构造一份 Error{message}，杜绝 barrier payload 与归约器 payload 静默分叉
-        // （两份曾经内容一致纯属巧合，构造点不同迟早会漂）。
-        if terminal_decision == LeadTerminal::EmitError {
-            let locale = current_locale(&app_t);
-            let message = cli_exit_failure_message(
-                locale,
-                match locale {
-                    Locale::Zh => "队长",
-                    Locale::En => "lead",
-                },
-                exit_status.as_ref(),
-                &stderr_tail,
-            );
-            let event = record_synthetic_cli_error(&mut reducer, message);
-            pending_terminals.push(event);
-            saw_error = true;
-        }
-        pending_terminals = lead_terminal_events_for_barrier(
-            &lead_run_id,
-            &terminal_decision,
-            stopped,
-            pending_terminals,
-        );
-
-        let db = app_t.state::<crate::db::Db>();
-        persist_context_compacted(
-            &db,
-            &session_id_t,
-            &lead_run_id,
-            latest_context_compacted.as_ref(),
-        );
-
-        // 刀 R P0-2：归约器收尾判定 → 有产出就写库（display_reduce.rs 是唯一放判断的地方，
-        // 这里只组事实 + 调写库，零判断）。Bug B 修复：saw_blocked/saw_needs_decision 现在填
-        // 事件循环里记的真实见证（lead 也会经历 myagent 退出码 3/4 的正常 Blocked/NeedsDecision
-        // 收工，不再硬编码 false）；engine 用 "agent-team"（与该会话既有决策卡写入一致）。
-        let outcome = display_reduce::RunOutcome {
-            run_id: lead_run_id.clone(),
-            exit_success,
-            interrupted: stopped,
-            saw_error,
-            saw_blocked,
-            saw_needs_decision,
-            finish_called: Some(finish_called),
-            commit_sha: None,
-            files_changed: None,
-            insertions: None,
-            deletions: None,
-            final_text: None,
-        };
-        let locale = current_locale(&app_t);
-        if let Some(mut msg) = reducer.finish_for_locale(&outcome, locale) {
-            localize_reduced_message(locale, &mut msg);
-            let db = app_t.state::<crate::db::Db>();
-            if let Ok(conn) = db.0.lock() {
-                reconcile_running_dispatch_cards(&conn, &session_id_t, &mut msg.blocks);
-                // 决策打扰收敛刀 T4：lead 收尾归约消息同样带身份快照（profile_t/lead_agent_id_t
-                // 此处仍是借用·未被移动，见上方 identity 已声明处的确认注释）。
-                let _ = db::append_message_dedup_and_publish(
-                    &conn,
-                    &session_id_t,
-                    "assistant",
-                    &msg.blocks,
-                    Some("agent-team"),
-                    Some(lead_agent_id_t.as_str()),
-                    Some(profile_t.name.as_str()),
-                    &msg.dedup_key,
-                );
-            };
-        }
-
-        // G3-A T2：lead 本体 usage 落账——唯一写入点，只在这里调一次 add_session_usage
-        // （幂等语义靠「只调一次」保证，同 solo persist_normal_finalizer 那对）。防双记账：
-        // RunInfo.workingTokens 是运行态实时展示用的前端内存态，设计上从不写 DB
-        // （architecture-v2 明文）；这里落的是 lead_completed_usage——来自 stdout 流里真实
-        // Completed 事件的 usage 字段，跟 workingTokens 是两条完全不相交的数据路径，互不
-        // 覆盖也互不重复计数。
-        if let Some((input_tokens, output_tokens)) = lead_completed_usage {
-            let db = app_t.state::<crate::db::Db>();
-            let lock_result = db.0.lock();
-            match lock_result {
-                Ok(conn) => {
-                    if let Err(e) =
-                        db::add_session_usage(&conn, &session_id_t, input_tokens, output_tokens)
-                    {
-                        eprintln!("lead run usage persist failed (non-fatal): {e}");
+            // Read stdout, emit events in real time; track terminal events
+            let mut saw_completed = false;
+            let mut saw_error = false;
+            // Bug B 修复：lead 也要记 blocked/needs_decision 终态见证——否则退出码
+            // 3/4（Blocked/NeedsDecision 的正常收工，非崩溃）会被 lead_terminal_decision
+            // 误判成 EmitError（见 harness-agent/src/orchestrator/types.rs:66-74 退出码契约）。
+            let mut saw_blocked = false;
+            let mut saw_needs_decision = false;
+            let mut pending_terminals = Vec::new();
+            // G3-A T2：lead 本体 usage——从本 lead run 自己 stdout 流里最后一条 Completed 事件
+            // 取（同 solo `pending_completed` 那套语义：多条 Completed 只认最后一条）。claude/
+            // borrow lead 走 parse_claude_line_for_locale（已在 T1 修过缓存口径）；myagent lead
+            // 走 parse_agent_line_for_locale(Harness)（`run.completed.payload.usage`，engine 线
+            // 自己的口径，不在本刀改动范围）。落库发生在收尾处、仅这一次，不与
+            // RunInfo.workingTokens（纯显示态、设计上不写 DB）冲突——见下方落库点注释。
+            let mut lead_completed_usage: Option<(Option<u64>, Option<u64>)> = None;
+            let mut latest_context_compacted: Option<(String, i64)> = None;
+            if let Some(stdout) = child.stdout.take() {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stdout)
+                    .lines()
+                    .map_while(Result::ok)
+                {
+                    first_event_watchdog.first_line_seen();
+                    let locale = current_locale(&app_t);
+                    // NativeClaude/BorrowClaude 走原路逐字节不变（回归钉死）；Harness 走 myagent 解析
+                    // （parse_agent_line_for_locale 已按 ParseFn 分派，见 ~360）。
+                    for event in match lead_engine_t {
+                        LeadEngine::NativeClaude | LeadEngine::BorrowClaude => {
+                            if locale == Locale::Zh {
+                                agent_event::parse_claude_line(&line)
+                            } else {
+                                agent_event::parse_claude_line_for_locale(&line, locale)
+                            }
+                        }
+                        LeadEngine::Harness => {
+                            parse_agent_line_for_locale(ParseFn::Harness, &line, locale)
+                        }
+                    } {
+                        // lead 线转录暂无标记不触发压实·此接线为 lead 压实刀预留（见 BACKLOG）
+                        remember_context_compacted(&mut latest_context_compacted, &event);
+                        reducer.feed(&event);
+                        // G3-A T2：先只读一眼 usage（借用，不消费 event）——lead 本体 usage 账本，
+                        // 多条 Completed 只认最后一条，同 solo `pending_completed` 覆盖语义。
+                        if let agent_event::AgentEvent::Completed {
+                            input_tokens,
+                            output_tokens,
+                            ..
+                        } = &event
+                        {
+                            lead_completed_usage = Some((*input_tokens, *output_tokens));
+                        }
+                        match event {
+                            agent_event::AgentEvent::Completed { .. } => {
+                                saw_completed = true;
+                                pending_terminals.push(event);
+                            }
+                            agent_event::AgentEvent::Error { .. } => {
+                                saw_error = true;
+                                pending_terminals.push(event);
+                            }
+                            agent_event::AgentEvent::NeedsDecision { .. } => {
+                                saw_needs_decision = true;
+                                pending_terminals.push(event);
+                            }
+                            agent_event::AgentEvent::Blocked { .. } => {
+                                saw_blocked = true;
+                                pending_terminals.push(event);
+                            }
+                            agent_event::AgentEvent::RunCloseout { .. } => {
+                                pending_terminals.push(event);
+                            }
+                            event => {
+                                transport.push(&lead_run_id, event);
+                            }
+                        }
                     }
                 }
-                Err(_) => eprintln!("lead run usage persist skipped: db lock poisoned"),
             }
-        }
+            let first_line_seen = first_event_watchdog.stdout_closed();
+            let _ = first_event_watchdog_handle.join();
 
-        // T5 M3/I5：EOF 之后（上面的 stdout 读循环已经跑完）、槽仍持有时的交付 ack——不持任何
-        // DB guard 处 recv `stdin_ack`（harness 无 stdin，`None` 视为 I/O 已在同步文件写时成功，
-        // 见 `resolve_stdin_ack` 文档）。必须发生在 finish_run_without_git_writes/
-        // emit_terminal_after_releasing_run_slot（槽释放）之前——I5 顺序不变量：
-        // ack commit < slot release < drain。`in_flight_report_ids_t`/`in_flight_answer_ids_t`
-        // 都是组装阶段（阶段 0）在同一线程里已经就地捕获的 `assembly.included_report_ids`/
-        // `assembly.included_answer_ids`（T8 P1-②：真相源已改为组装结果本身，不再经全局侧
-        // 信道跨线程登记/取用）；组装失败提前 return 的轮次根本到不了这里，二者恒为空、no-op。
-        let writer_ack = resolve_stdin_ack(stdin_ack);
-        commit_lead_run_delivery(
-            &app_t,
-            &session_id_t,
-            writer_ack,
-            &in_flight_report_ids_t,
-            &in_flight_answer_ids_t,
-        );
+            // Transition to Finalizing；公共收尾点先封死旧 handler，再让该 lead 槽走向释放。
+            let stop_requested = begin_lead_finalizing(&running_t, &terminated_t, &session_id_t);
 
-        // Bug1 修复：lead run 收尾——清本 run 自己写的旧 pending ledger（无 commit intent 时置
-        // git_state=clean，与 solo 4812 同语义）。interrupted 用 `stopped`（被用户停=true），与 solo 对齐。
-        // 必须在 emit_terminal_after_releasing_run_slot（释放 Running 槽）之前调用：槽仍被本 run 持有时
-        // 没有新 run 能起跑，finish 置 clean 不会误踩后续 run 的 running；只要上面 prepare 过就必经此点
-        // 收尾，任何正常/报错/被停的退出都不留 running 行。写库失败仅记日志（非致命）。
-        {
-            let db = app_t.state::<crate::db::Db>();
-            let _ = if let Ok(conn) = db.0.lock() {
-                if let Err(e) =
-                    finish_run_without_git_writes(&conn, &session_id_t, &lead_run_id, stopped)
-                {
-                    eprintln!("lead run ledger cleanup failed (non-fatal): {e}");
-                }
+            let (exit_status, owner_timed_out) = if first_line_seen {
+                (child.wait().ok(), false)
             } else {
-                eprintln!("lead run ledger cleanup skipped: db lock poisoned");
+                match wait_for_first_event_owner(
+                    &mut child,
+                    pid,
+                    first_event_deadline,
+                    Child::try_wait,
+                    Child::wait,
+                    kill_process_group,
+                    Instant::now,
+                    std::thread::sleep,
+                ) {
+                    FirstEventOwnerWait::Exited(status) => (Some(status), false),
+                    FirstEventOwnerWait::TimedOut(status) => (status, true),
+                    FirstEventOwnerWait::WaitError => (None, false),
+                }
             };
-        }
+            let owner_timeout_stderr =
+                owner_timed_out.then(|| stderr_tail_last_lines(&stderr_live_tail));
+            let first_event_timeout_stderr = first_event_watchdog
+                .timeout_stderr()
+                .or(owner_timeout_stderr);
+            let exit_success = exit_status.as_ref().is_some_and(|s| s.success());
+            let stderr_tail = stderr_handle
+                .map(|h| h.join().unwrap_or_default())
+                .unwrap_or_default();
 
-        // M1 修复轮 P0-1（2026-08-11）：释放咽喉——同上，不再预先加锁（旧版本会跟下面
-        // try_resume_pending 的重新加锁死锁）。
-        let runtime_db = app_t.state::<crate::db::Db>();
-        let _ = emit_terminal_after_releasing_run_slot(
-            &running_t,
-            &team_running_t,
-            &session_id_t,
-            &lead_run_id,
-            pending_terminals,
-            &transport,
-            Some(runtime_db.inner()),
-        );
-        // 续喂必须在 run 槽释放之后调用，否则会自撞 SESSION_BUSY 并丢失本次续喂。
-        drain_after_run_release(app_t.clone(), session_id_t.clone());
+            // Check if user stopped during finalizing
+            let stopped = {
+                let stop_now = matches!(
+                    running_t
+                        .0
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&session_id_t).cloned()),
+                    Some(RunSlot::Finalizing {
+                        stop_requested: true
+                    })
+                );
+                stop_requested || stop_now
+            };
 
-        // drop McpServer last — stops accept loop (Drop impl calls server.unblock())
-        drop(mcp_srv);
-    });
+            if should_inject_first_event_watchdog_error(
+                stopped,
+                saw_completed,
+                first_event_timeout_stderr.as_deref(),
+            ) {
+                let stderr_summary = first_event_timeout_stderr
+                    .expect("watchdog injection predicate requires timeout stderr");
+                let message = first_event_watchdog_error_message(
+                    current_locale(&app_t),
+                    "run.spawnFailed",
+                    "claude",
+                    &first_event_binary,
+                    &stderr_summary,
+                );
+                let event = record_synthetic_cli_error(&mut reducer, message);
+                pending_terminals.push(event);
+                saw_error = true;
+            }
+
+            // finish not called: internal signal only, not user-facing (decision 2)
+            let finish_called = done_t.load(Ordering::SeqCst);
+            if !finish_called {
+                eprintln!("[lead] finish not called for session {session_id_t}");
+            }
+
+            // Guarantee a release terminal after persistence and after the slot is removed.
+            let terminal_decision = lead_terminal_decision(
+                saw_completed,
+                saw_error,
+                saw_blocked,
+                saw_needs_decision,
+                exit_success,
+                stopped,
+            );
+            // Bug A 修复：合成 error 必须同时喂归约器（reducer.feed），否则落库消息读不到
+            // 真实报错、只能兜底成笼统 fallback 卡——真实原因就活活丢在内存里（live 通道），
+            // 重启即失（对齐 solo 侧 sidecar_exit_error 分支 record_synthetic_cli_error 用法）。
+            // 接住 record_synthetic_cli_error 的返回事件直接 push——不再另从 Option<String>
+            // 重新构造一份 Error{message}，杜绝 barrier payload 与归约器 payload 静默分叉
+            // （两份曾经内容一致纯属巧合，构造点不同迟早会漂）。
+            if terminal_decision == LeadTerminal::EmitError {
+                let locale = current_locale(&app_t);
+                let message = cli_exit_failure_message(
+                    locale,
+                    match locale {
+                        Locale::Zh => "队长",
+                        Locale::En => "lead",
+                    },
+                    exit_status.as_ref(),
+                    &stderr_tail,
+                );
+                let event = record_synthetic_cli_error(&mut reducer, message);
+                pending_terminals.push(event);
+                saw_error = true;
+            }
+            pending_terminals = lead_terminal_events_for_barrier(
+                &lead_run_id,
+                &terminal_decision,
+                stopped,
+                pending_terminals,
+            );
+
+            let db = app_t.state::<crate::db::Db>();
+            persist_context_compacted(
+                &db,
+                &session_id_t,
+                &lead_run_id,
+                latest_context_compacted.as_ref(),
+            );
+
+            // 刀 R P0-2：归约器收尾判定 → 有产出就写库（display_reduce.rs 是唯一放判断的地方，
+            // 这里只组事实 + 调写库，零判断）。Bug B 修复：saw_blocked/saw_needs_decision 现在填
+            // 事件循环里记的真实见证（lead 也会经历 myagent 退出码 3/4 的正常 Blocked/NeedsDecision
+            // 收工，不再硬编码 false）；engine 用 "agent-team"（与该会话既有决策卡写入一致）。
+            let outcome = display_reduce::RunOutcome {
+                run_id: lead_run_id.clone(),
+                exit_success,
+                interrupted: stopped,
+                saw_error,
+                saw_blocked,
+                saw_needs_decision,
+                finish_called: Some(finish_called),
+                commit_sha: None,
+                files_changed: None,
+                insertions: None,
+                deletions: None,
+                final_text: None,
+            };
+            let locale = current_locale(&app_t);
+            if let Some(mut msg) = reducer.finish_for_locale(&outcome, locale) {
+                localize_reduced_message(locale, &mut msg);
+                let db = app_t.state::<crate::db::Db>();
+                if let Ok(conn) = db.0.lock() {
+                    reconcile_running_dispatch_cards(&conn, &session_id_t, &mut msg.blocks);
+                    // 决策打扰收敛刀 T4：lead 收尾归约消息同样带身份快照（profile_t/lead_agent_id_t
+                    // 此处仍是借用·未被移动，见上方 identity 已声明处的确认注释）。
+                    let _ = db::append_message_dedup_and_publish(
+                        &conn,
+                        &session_id_t,
+                        "assistant",
+                        &msg.blocks,
+                        Some("agent-team"),
+                        Some(lead_agent_id_t.as_str()),
+                        Some(profile_t.name.as_str()),
+                        &msg.dedup_key,
+                    );
+                };
+            }
+
+            // G3-A T2：lead 本体 usage 落账——唯一写入点，只在这里调一次 add_session_usage
+            // （幂等语义靠「只调一次」保证，同 solo persist_normal_finalizer 那对）。防双记账：
+            // RunInfo.workingTokens 是运行态实时展示用的前端内存态，设计上从不写 DB
+            // （architecture-v2 明文）；这里落的是 lead_completed_usage——来自 stdout 流里真实
+            // Completed 事件的 usage 字段，跟 workingTokens 是两条完全不相交的数据路径，互不
+            // 覆盖也互不重复计数。
+            if let Some((input_tokens, output_tokens)) = lead_completed_usage {
+                let db = app_t.state::<crate::db::Db>();
+                let lock_result = db.0.lock();
+                match lock_result {
+                    Ok(conn) => {
+                        if let Err(e) =
+                            db::add_session_usage(&conn, &session_id_t, input_tokens, output_tokens)
+                        {
+                            eprintln!("lead run usage persist failed (non-fatal): {e}");
+                        }
+                    }
+                    Err(_) => eprintln!("lead run usage persist skipped: db lock poisoned"),
+                }
+            }
+
+            // T5 M3/I5：EOF 之后（上面的 stdout 读循环已经跑完）、槽仍持有时的交付 ack——不持任何
+            // DB guard 处 recv `stdin_ack`（harness 无 stdin，`None` 视为 I/O 已在同步文件写时成功，
+            // 见 `resolve_stdin_ack` 文档）。必须发生在 finish_run_without_git_writes/
+            // emit_terminal_after_releasing_run_slot（槽释放）之前——I5 顺序不变量：
+            // ack commit < slot release < drain。`in_flight_report_ids_t`/`in_flight_answer_ids_t`
+            // 都是组装阶段（阶段 0）在同一线程里已经就地捕获的 `assembly.included_report_ids`/
+            // `assembly.included_answer_ids`（T8 P1-②：真相源已改为组装结果本身，不再经全局侧
+            // 信道跨线程登记/取用）；组装失败提前 return 的轮次根本到不了这里，二者恒为空、no-op。
+            let writer_ack = resolve_stdin_ack(stdin_ack);
+            commit_lead_run_delivery(
+                &app_t,
+                &session_id_t,
+                writer_ack,
+                &in_flight_report_ids_t,
+                &in_flight_answer_ids_t,
+            );
+
+            // Bug1 修复：lead run 收尾——清本 run 自己写的旧 pending ledger（无 commit intent 时置
+            // git_state=clean，与 solo 4812 同语义）。interrupted 用 `stopped`（被用户停=true），与 solo 对齐。
+            // 必须在 emit_terminal_after_releasing_run_slot（释放 Running 槽）之前调用：槽仍被本 run 持有时
+            // 没有新 run 能起跑，finish 置 clean 不会误踩后续 run 的 running；只要上面 prepare 过就必经此点
+            // 收尾，任何正常/报错/被停的退出都不留 running 行。写库失败仅记日志（非致命）。
+            {
+                let db = app_t.state::<crate::db::Db>();
+                let _ = if let Ok(conn) = db.0.lock() {
+                    if let Err(e) =
+                        finish_run_without_git_writes(&conn, &session_id_t, &lead_run_id, stopped)
+                    {
+                        eprintln!("lead run ledger cleanup failed (non-fatal): {e}");
+                    }
+                } else {
+                    eprintln!("lead run ledger cleanup skipped: db lock poisoned");
+                };
+            }
+
+            // M1 修复轮 P0-1（2026-08-11）：释放咽喉——同上，不再预先加锁（旧版本会跟下面
+            // try_resume_pending 的重新加锁死锁）。
+            let runtime_db = app_t.state::<crate::db::Db>();
+            let _ = emit_terminal_after_releasing_run_slot(
+                &running_t,
+                &team_running_t,
+                &session_id_t,
+                &lead_run_id,
+                pending_terminals,
+                &transport,
+                Some(runtime_db.inner()),
+            );
+            // 续喂必须在 run 槽释放之后调用，否则会自撞 SESSION_BUSY 并丢失本次续喂。
+            drain_after_run_release(app_t.clone(), session_id_t.clone());
+
+            // drop McpServer last — stops accept loop (Drop impl calls server.unblock())
+            drop(mcp_srv);
+        });
 
     match spawn_result {
         Ok(_join_handle) => {
@@ -42661,7 +42669,10 @@ mod tests {
         )))
         .unwrap();
         let writer_ack = resolve_stdin_ack(Some(rx));
-        assert!(writer_ack.is_err(), "writer 报告 io::Err 必须转成失败 Result");
+        assert!(
+            writer_ack.is_err(),
+            "writer 报告 io::Err 必须转成失败 Result"
+        );
 
         let result = commit_lead_run_delivery_with_conn(
             Some(&conn),
@@ -42695,15 +42706,25 @@ mod tests {
     #[test]
     fn delivery_order_pending_query_error_is_treated_as_undelivered() {
         let conn = crate::test_support::mem_db();
-        db::create_session(&conn, "s-delivery-order-query-err", "t", "local-default", "local")
-            .unwrap();
+        db::create_session(
+            &conn,
+            "s-delivery-order-query-err",
+            "t",
+            "local-default",
+            "local",
+        )
+        .unwrap();
         // 故意打掉底层表，让 `pending_member_report_message_ids`（进而
         // `is_delivery_round_empty_but_pending`）的查询报错，模拟“坏状态”而非正常空结果。
-        conn.execute("DROP TABLE member_report_delivery", []).unwrap();
+        conn.execute("DROP TABLE member_report_delivery", [])
+            .unwrap();
 
         let query_result =
             is_delivery_round_empty_but_pending(&conn, "s-delivery-order-query-err", &[], &[]);
-        assert!(query_result.is_err(), "表缺失时查询必须报错，不能悄悄返回 Ok");
+        assert!(
+            query_result.is_err(),
+            "表缺失时查询必须报错，不能悄悄返回 Ok"
+        );
 
         let outcome = decide_delivery_outcome(&Ok(()), Some(query_result));
         assert!(
@@ -42725,12 +42746,8 @@ mod tests {
     /// 悄悄当成功放行——顺序上先装退避、调用方随后才可能走到槽释放，天然满足 I5。
     #[test]
     fn delivery_order_ack_db_unavailable_is_treated_as_ack_failure() {
-        let result = commit_lead_run_delivery_with_conn(
-            None,
-            "s-delivery-order-db-err",
-            Ok(()),
-            &[1],
-        );
+        let result =
+            commit_lead_run_delivery_with_conn(None, "s-delivery-order-db-err", Ok(()), &[1]);
         assert!(
             result.is_err(),
             "conn 不可用（DB 锁失败）必须算 ack 失败，不能悄悄当成功放行"
@@ -42749,8 +42766,14 @@ mod tests {
     #[test]
     fn delivery_order_empty_round_with_pending_reports_is_treated_as_undelivered() {
         let conn = crate::test_support::mem_db();
-        db::create_session(&conn, "s-delivery-order-empty-pending", "t", "local-default", "local")
-            .unwrap();
+        db::create_session(
+            &conn,
+            "s-delivery-order-empty-pending",
+            "t",
+            "local-default",
+            "local",
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO member_report_delivery (session_id, message_id, assignment_id) \
              VALUES ('s-delivery-order-empty-pending', 55, 'a1')",
@@ -42758,13 +42781,9 @@ mod tests {
         )
         .unwrap();
 
-        let empty_but_pending = is_delivery_round_empty_but_pending(
-            &conn,
-            "s-delivery-order-empty-pending",
-            &[],
-            &[],
-        )
-        .unwrap();
+        let empty_but_pending =
+            is_delivery_round_empty_but_pending(&conn, "s-delivery-order-empty-pending", &[], &[])
+                .unwrap();
         assert!(
             empty_but_pending,
             "零纳入且该 session 仍有 pending 报告行时必须判定为未交付"
@@ -42786,16 +42805,18 @@ mod tests {
     #[test]
     fn delivery_order_empty_round_without_pending_reports_is_normal_success() {
         let conn = crate::test_support::mem_db();
-        db::create_session(&conn, "s-delivery-order-empty-clean", "t", "local-default", "local")
-            .unwrap();
-
-        let empty_but_pending = is_delivery_round_empty_but_pending(
+        db::create_session(
             &conn,
             "s-delivery-order-empty-clean",
-            &[],
-            &[],
+            "t",
+            "local-default",
+            "local",
         )
         .unwrap();
+
+        let empty_but_pending =
+            is_delivery_round_empty_but_pending(&conn, "s-delivery-order-empty-clean", &[], &[])
+                .unwrap();
         assert!(
             !empty_but_pending,
             "纯用户轮（无 pending 报告）零纳入必须视为正常成功，不得误判未交付"
@@ -42814,8 +42835,14 @@ mod tests {
     #[test]
     fn delivery_order_nonempty_round_is_never_treated_as_undelivered_even_with_other_pending() {
         let conn = crate::test_support::mem_db();
-        db::create_session(&conn, "s-delivery-order-nonempty-pending", "t", "local-default", "local")
-            .unwrap();
+        db::create_session(
+            &conn,
+            "s-delivery-order-nonempty-pending",
+            "t",
+            "local-default",
+            "local",
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO member_report_delivery (session_id, message_id, assignment_id) \
              VALUES ('s-delivery-order-nonempty-pending', 61, 'a1'), \
@@ -42832,7 +42859,10 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert!(!empty_but_pending, "只要本轮纳入非空，即使还有其它 pending 也不算未交付");
+        assert!(
+            !empty_but_pending,
+            "只要本轮纳入非空，即使还有其它 pending 也不算未交付"
+        );
 
         // 报告为空但答案非空同理——只要有一项非空就不算「零纳入」。
         let empty_but_pending_answer_only = is_delivery_round_empty_but_pending(
@@ -43101,10 +43131,7 @@ mod tests {
             persist_idx < emit_idx,
             "落库必须先于统一摘槽（emit_lead_error_and_release）"
         );
-        assert!(
-            emit_idx < drain_idx,
-            "槽释放必须先于 drain（I5）"
-        );
+        assert!(emit_idx < drain_idx, "槽释放必须先于 drain（I5）");
     }
 
     /// `start_lead_session` 里 `std::thread::Builder::spawn` 的 `Ok`/`Err` 两分支：只有 `Ok`
@@ -43177,8 +43204,7 @@ mod tests {
                 _ => {}
             }
         }
-        let close_rel =
-            close_rel.expect("match spawn_result { ... } 没有找到匹配的收尾 `}`");
+        let close_rel = close_rel.expect("match spawn_result { ... } 没有找到匹配的收尾 `}`");
         let match_block = &after_match_kw[..close_rel];
         let after_match_block = &after_match_kw[close_rel + 1..];
 
@@ -45482,8 +45508,7 @@ mod tests {
     }
 
     #[test]
-    fn answer_question_inner_late_path_registers_resume_pending_answer_id_for_team_session_only()
-     {
+    fn answer_question_inner_late_path_registers_resume_pending_answer_id_for_team_session_only() {
         // S-2：Late 路径落库成功后经 register_pending_answer_id_if_team 登记——Team 会话
         // （session_agent_configs 有 lead_agent_id）必须登记进 RESUME_STATE，供
         // try_resume_pending_with_gate 的快照纳入「含答案」触发原因；Solo 会话（无该行）绝不能
@@ -45565,8 +45590,8 @@ mod tests {
     }
 
     #[test]
-    fn answer_question_inner_missing_slot_pending_card_registers_resume_pending_answer_id_for_team_session()
-     {
+    fn answer_question_inner_missing_slot_pending_card_registers_resume_pending_answer_id_for_team_session(
+    ) {
         // 覆盖 Missing 路由（内存 map 里没有这个槽位、DB 卡仍 pending，等同迟到答案）——落库
         // 与登记复用的是同一段代码路径（同一个 register_pending_answer_id_if_team 助手），Solo
         // 侧「不登记」的判断已经在上面 late 路径的测试里覆盖过，这里只需确认 Team 会话在
@@ -46351,7 +46376,8 @@ mod tests {
              Err 分支』这种变异"
         );
         assert_eq!(
-            rest.matches("record_resume_failure(app, session_id,").count(),
+            rest.matches("record_resume_failure(app, session_id,")
+                .count(),
             1,
             "recheck 失败仍必须唯一一次调用 record_resume_failure——本测试要能杀死『把\
              recheck 分支的 record_resume_failure 删掉』这种变异"
@@ -46667,7 +46693,10 @@ mod tests {
             }
         });
 
-        assert_eq!(rounds, 2, "晚到的释放触发必须换来恰好一次原地重放，不多不少");
+        assert_eq!(
+            rounds, 2,
+            "晚到的释放触发必须换来恰好一次原地重放，不多不少"
+        );
         assert_eq!(
             consumed, 1,
             "报告必须被消费恰好一次：round 1 快照拍早了消费不到，脏位重放的 round 2 补上，不丢唤醒"
@@ -46705,7 +46734,10 @@ mod tests {
             }
         });
 
-        assert_eq!(rounds, 2, "晚到的 settled 触发必须换来恰好一次原地重放，不多不少");
+        assert_eq!(
+            rounds, 2,
+            "晚到的 settled 触发必须换来恰好一次原地重放，不多不少"
+        );
         assert_eq!(
             consumed, 1,
             "报告必须被消费恰好一次：round 1 快照拍早了消费不到，脏位重放的 round 2 补上，不丢唤醒"

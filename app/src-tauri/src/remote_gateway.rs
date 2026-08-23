@@ -14985,14 +14985,19 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("实时翻转帧应该紧随其后入队");
         assert_eq!(first.t, "run.status");
-        assert_eq!(first.payload["status"], "running", "补发帧携带 provider 读到的陈旧状态");
+        assert_eq!(
+            first.payload["status"], "running",
+            "补发帧携带 provider 读到的陈旧状态"
+        );
         assert_eq!(second.t, "run.status");
         assert_eq!(
             second.payload["status"], "idle",
             "实时翻转帧必须排在补发帧之后——客户端最终看到的是新状态，不会被陈旧帧倒灌覆盖"
         );
         assert!(
-            milestone_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            milestone_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
             "不该有第三帧"
         );
     }
