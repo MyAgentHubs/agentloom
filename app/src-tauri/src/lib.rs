@@ -42999,7 +42999,7 @@ mod tests {
             .split("let assembled_prompt: String = match assembly_outcome {")
             .nth(1)
             .expect("组装结果分流代码块缺失")
-            .split("\n        let (mut cmd, claude_bin) = match build_result {")
+            .split("\n            let (mut cmd, claude_bin) = match build_result {")
             .next()
             .expect("找不到组装分流块与命令构建块的边界");
 
