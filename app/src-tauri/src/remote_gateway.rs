@@ -154,6 +154,12 @@ pub(crate) type SessionIndexSnapshotProvider =
 /// background thread, short DB read only, returns `None` on failure without panicking.
 pub(crate) type MilestoneReplayProvider =
     Box<dyn Fn() -> Option<Vec<crate::db::MilestoneReplayRow>> + Send + Sync>;
+/// idlefix-T1 缺口②：连接后补发批用——短锁 DB 读取全部（未软删会话的）`session_runtime`
+/// 现状行，供 `publish_milestone_replay_batch_on_connect` 把 `run.status` 现状帧一并塞进补发批
+/// （不新增帧类型，复用 `publish_run_status_milestone` 同款帧构造）。Provider 契约同上：只在
+/// `remote-index-snapshot` 后台线程跑，失败返回 `None`，不 panic。
+pub(crate) type SessionRuntimeReplayProvider =
+    Box<dyn Fn() -> Option<Vec<crate::db::SessionRuntimeReplayRow>> + Send + Sync>;
 /// M2-4c：session → 归属 repo id 查询（`Ok(None)` = 会话不存在 / 无归属，两者对归属闸而言
 /// 同一处理——都不属于任何 active repo）。`Err` = 查询本身失败（DB 错误），调用方一律
 /// fail-closed 处理，不当"未知即放行"。生产实现见 lib.rs `remote_gateway_session_repo_provider`
@@ -873,6 +879,7 @@ struct Inner {
     k_room_provider: KRoomProvider,
     session_index_snapshot_provider: SessionIndexSnapshotProvider,
     milestone_replay_provider: MilestoneReplayProvider,
+    session_runtime_replay_provider: SessionRuntimeReplayProvider,
     pair_hello_handler: PairHelloHandler,
     pair_done_handler: PairDoneHandler,
     registry: Arc<Mutex<RegistryState>>,
@@ -992,6 +999,13 @@ struct GatewayInnerState {
     /// `msg.completed` 工具 output 截断后，完整明文帧仍超过发送预算而被跳过的条数。
     /// 连接回放与 live 发布共用同一入队闸和同一计数。
     replay_oversized_dropped: AtomicU64,
+    /// idlefix-T1 补针 C（TOCTOU）：`publish_run_status_replay_rows`（连接后补发批读 DB + 逐行
+    /// 入队 `run.status` 现状帧）与 `enqueue_run_status_milestone_with_gate`（真实运行时
+    /// `publish_run_status_milestone` 的实时入队路径）共享这把锁——保证"该连接的 run.status
+    /// 现状补发帧必须先于其后任何实时 run.status 帧入队"这一顺序不变量：补发批持锁跨越整个
+    /// "读 DB + 入队"过程，期间任何真实状态翻转要么在读之前已落库（读到的就是新值，天然一致），
+    /// 要么必须等补发批放锁后才能把新状态入队（必然排在补发帧之后，不会被陈旧帧倒灌覆盖）。
+    run_status_replay_gate: Mutex<()>,
 }
 
 /// Tool-name correlation table between ToolStarted and ToolCompleted.
@@ -1053,6 +1067,7 @@ impl Default for GatewayInnerState {
             snapshot_oversized_dropped: AtomicU64::new(0),
             history_oversized_dropped: AtomicU64::new(0),
             replay_oversized_dropped: AtomicU64::new(0),
+            run_status_replay_gate: Mutex::new(()),
         }
     }
 }
@@ -1254,6 +1269,7 @@ pub(crate) fn setup(
     k_room_provider: KRoomProvider,
     session_index_snapshot_provider: SessionIndexSnapshotProvider,
     milestone_replay_provider: MilestoneReplayProvider,
+    session_runtime_replay_provider: SessionRuntimeReplayProvider,
     pair_hello_handler: PairHelloHandler,
     pair_done_handler: PairDoneHandler,
     registry: Arc<Mutex<RegistryState>>,
@@ -1285,6 +1301,7 @@ pub(crate) fn setup(
         k_room_provider,
         session_index_snapshot_provider,
         milestone_replay_provider,
+        session_runtime_replay_provider,
         pair_hello_handler,
         pair_done_handler,
         registry,
@@ -2157,7 +2174,17 @@ fn publish_session_index_snapshot_on_connect(inner: &Inner, connection_generatio
 /// 不允许另起拼接逻辑（防漂移，见函数级测试）。generation 语义同
 /// publish_session_index_snapshot_on_connect：调用方捕获的 connection_generation 原样透传给
 /// enqueue_milestone_with_generation，这里不重读"当前"值。
+/// idlefix-T1 缺口②追加：msg.completed/card.* 之外，同一批还追加 `run.status` 现状帧（见下面
+/// `publish_run_status_replay_rows`）——拆成两个子函数，各自独立 provider、独立失败。
 fn publish_milestone_replay_batch_on_connect(inner: &Inner, connection_generation: u64) {
+    publish_msg_and_card_replay_rows(inner, connection_generation);
+    publish_run_status_replay_rows(inner, connection_generation);
+}
+
+/// 拆出 msg.completed/card.* 那段（原 `publish_milestone_replay_batch_on_connect` 函数体），
+/// 与下面的 `publish_run_status_replay_rows` 各自独立 provider、独立失败——`milestone_replay_
+/// provider` 读失败不该连累 `run.status` 现状帧补发也一起跳过，两者是各自 best-effort 的 DB 读。
+fn publish_msg_and_card_replay_rows(inner: &Inner, connection_generation: u64) {
     let Some(rows) = (inner.milestone_replay_provider)() else {
         return;
     };
@@ -2231,6 +2258,40 @@ fn publish_milestone_replay_batch_on_connect(inner: &Inner, connection_generatio
                 );
             }
         }
+    }
+}
+
+/// idlefix-T1 缺口②：连接后补发批追加——除了 msg.completed/card.*，把 `session_runtime`
+/// 现状也逐会话重建成 `run.status` 帧一并塞进补发批（不新增帧类型/不改帧结构，只是把既有类型
+/// 的现状帧加进这批）。手机顶栏唯一数据源就是 `run.status` 里程碑，此前只在状态变化时 publish
+/// 一次、错过就永久卡住——现在中途接入也能补到当前状态，与会话列表绿点（session.index 行
+/// status，同样连接后必补发）同源，不会再灰绿不一致。
+fn publish_run_status_replay_rows(inner: &Inner, connection_generation: u64) {
+    // idlefix-T1 补针 C（TOCTOU）：持锁跨越"读 DB + 逐行入队"整个过程，不是只护入队循环——见
+    // `run_status_replay_gate` 字段头注的顺序不变量论证；`enqueue_run_status_milestone_with_gate`
+    // 是唯一另一个持有同一把锁的调用方。
+    let _replay_gate = lock(&inner.state.run_status_replay_gate);
+    let Some(rows) = (inner.session_runtime_replay_provider)() else {
+        return;
+    };
+    for row in rows {
+        let client_msg_id = derive_run_status_replay_client_msg_id(
+            &row.session_id,
+            &row.status,
+            row.run_id.as_deref(),
+        );
+        let payload = build_run_status_payload(&row.session_id, &row.status, row.run_id.as_deref());
+        enqueue_milestone_with_generation(
+            &inner.state,
+            &inner.milestone_tx,
+            connection_generation,
+            MilestoneItem {
+                session: Some(row.session_id.clone()),
+                t: "run.status".to_owned(),
+                payload,
+                client_msg_id,
+            },
+        );
     }
 }
 
@@ -4232,6 +4293,21 @@ pub(crate) fn derive_msg_completed_client_msg_id(session_id: &str, dedup_key: &s
     derive_client_msg_id(&format!("msg.completed|{session_id}|{dedup_key}"))
 }
 
+/// idlefix-T1 缺口②：连接后补发批里的 `run.status` 现状帧专用——与首发（live，
+/// `publish_run_status_milestone` 走 `try_random_client_msg_id`）区分开：补发是"重放当前已知
+/// 状态"，同一状态/run_id 组合确定性推导同一个 client_msg_id，避免每次重连补发都造出不同的
+/// client_msg_id（同 msg.completed/card.* 补发的确定性推导惯例）。
+pub(crate) fn derive_run_status_replay_client_msg_id(
+    session_id: &str,
+    status: &str,
+    run_id: Option<&str>,
+) -> String {
+    derive_client_msg_id(&format!(
+        "run.status|{session_id}|{status}|{}",
+        run_id.unwrap_or("")
+    ))
+}
+
 pub(crate) fn publish_msg_completed_milestone(
     session_id: &str,
     dedup_key: &str,
@@ -4301,13 +4377,41 @@ pub(crate) fn build_run_status_payload(
     })
 }
 
+/// idlefix-T1 补针 C（TOCTOU）：`publish_run_status_milestone`（真实运行时经全局 `GATEWAY` 调用
+/// 的实时入队路径）真正落地的入队逻辑拆到这里、显式接收 `&Inner`——单测里 `GATEWAY` 故意不装
+/// （见 `entropy_failure_does_not_panic_in_random_id_publish_facades` 头注），若把入队逻辑锁在
+/// `GATEWAY.get()` 后面，测试就没有任何办法绕开全局单例去验证锁的互斥语义。持有
+/// `inner.state.run_status_replay_gate` 期间入队——与 `publish_run_status_replay_rows`（补发批
+/// 读 DB + 入队）共享同一把锁，维持"补发帧必须先于其后任何实时帧入队"的顺序不变量。
+fn enqueue_run_status_milestone_with_gate(
+    inner: &Inner,
+    session_id: &str,
+    payload: Value,
+    client_msg_id: String,
+) {
+    let _replay_gate = lock(&inner.state.run_status_replay_gate);
+    enqueue_milestone_for_upstream(
+        &inner.state,
+        &inner.milestone_tx,
+        MilestoneItem {
+            session: Some(session_id.to_owned()),
+            t: "run.status".to_owned(),
+            payload,
+            client_msg_id,
+        },
+    );
+}
+
 pub(crate) fn publish_run_status_milestone(session_id: &str, status: &str, run_id: Option<&str>) {
     record_test_publish("run.status");
     let client_msg_id = try_random_client_msg_id().unwrap_or_default();
     let payload = build_run_status_payload(session_id, status, run_id);
     #[cfg(test)]
     TEST_RUN_STATUS_PAYLOAD_LOG.with(|log| log.borrow_mut().push(payload.clone()));
-    publish_milestone(Some(session_id), "run.status", payload, client_msg_id);
+    let Some(inner) = GATEWAY.get() else {
+        return;
+    };
+    enqueue_run_status_milestone_with_gate(inner, session_id, payload, client_msg_id);
 }
 
 /// `repo_name`：手机端会话列表副标题要的人类可读项目名（M2-4x）——None 时序列化成
@@ -9322,6 +9426,7 @@ mod tests {
             k_room_provider: Box::new(|_| None),
             session_index_snapshot_provider: Box::new(|| None),
             milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
             pair_hello_handler: Box::new(|_| None),
             pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
             registry: test_registry(),
@@ -9410,6 +9515,7 @@ mod tests {
             k_room_provider: Box::new(|_| None),
             session_index_snapshot_provider: Box::new(|| None),
             milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
             pair_hello_handler: Box::new(|_| None),
             pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
             registry: test_registry(),
@@ -14416,6 +14522,7 @@ mod tests {
             |_| Some(Zeroizing::new([1_u8; 32])),
             || Some(serde_json::json!([])),
             move || Some(rows.clone()),
+            || None,
         );
         let generation = inner.state.advance_generation_and_set_gate(true);
 
@@ -14451,6 +14558,7 @@ mod tests {
             |_| Some(Zeroizing::new([1_u8; 32])),
             || Some(serde_json::json!([])),
             move || Some(vec![replay_row.clone()]),
+            || None,
         );
         let generation = inner.state.advance_generation_and_set_gate(true);
 
@@ -14496,6 +14604,7 @@ mod tests {
             |_| Some(Zeroizing::new([1_u8; 32])),
             || Some(serde_json::json!([])),
             move || Some(vec![replay_row.clone()]),
+            || None,
         );
         let generation = inner.state.advance_generation_and_set_gate(true);
 
@@ -14535,6 +14644,7 @@ mod tests {
             |_| Some(Zeroizing::new([1_u8; 32])),
             || Some(serde_json::json!([])),
             move || Some(vec![replay_row.clone()]),
+            || None,
         );
         let generation = inner.state.advance_generation_and_set_gate(true);
 
@@ -14585,6 +14695,7 @@ mod tests {
             |_| Some(Zeroizing::new([1_u8; 32])),
             || Some(serde_json::json!([])),
             move || Some(rows.clone()),
+            || None,
         );
         let generation = inner.state.advance_generation_and_set_gate(true);
 
@@ -14626,6 +14737,7 @@ mod tests {
             |_| Some(Zeroizing::new([1_u8; 32])),
             || Some(serde_json::json!([])),
             move || Some(replay_rows.clone()),
+            || None,
         );
         let generation = inner.state.advance_generation_and_set_gate(true);
 
@@ -14669,6 +14781,7 @@ mod tests {
             |_| Some(Zeroizing::new([1_u8; 32])),
             || Some(serde_json::json!([])),
             move || Some(vec![chosen_row.clone()]),
+            || None,
         );
         let generation = inner.state.advance_generation_and_set_gate(true);
         request_session_index_snapshot(&inner, generation);
@@ -14712,6 +14825,7 @@ mod tests {
             |_| Some(Zeroizing::new([1_u8; 32])),
             || Some(serde_json::json!([])),
             move || Some(vec![pending_row.clone()]),
+            || None,
         );
         let pending_generation = pending_inner.state.advance_generation_and_set_gate(true);
         request_session_index_snapshot(&pending_inner, pending_generation);
@@ -14729,6 +14843,157 @@ mod tests {
         assert!(
             pending_rx.recv_timeout(Duration::from_millis(200)).is_err(),
             "pending card must not emit card.resolved"
+        );
+    }
+
+    /// idlefix-T1 缺口②：连接后补发批必须追加 `run.status` 现状帧——手机顶栏唯一数据源就是它，
+    /// 此前只在状态变化时 publish 一次、连接后补发批没有它，中途接入/错过一帧顶栏就永久卡在
+    /// Idle。这里断言补发批（session.index 之后）含一帧 `run.status`，值来自
+    /// `session_runtime_replay_provider`，且 client_msg_id 走确定性推导（不是每次重连都变）。
+    #[test]
+    fn milestone_replay_batch_includes_run_status_current_state_frame() {
+        let runtime_row = crate::db::SessionRuntimeReplayRow {
+            session_id: "runstatus-session".into(),
+            status: "running".into(),
+            run_id: Some("run-77".into()),
+        };
+        let (inner, milestone_rx) = test_inner_with_k_room_snapshot_and_replay_providers(
+            || None,
+            |_| Some(Zeroizing::new([1_u8; 32])),
+            || Some(serde_json::json!([])),
+            || None,
+            move || Some(vec![runtime_row.clone()]),
+        );
+        let generation = inner.state.advance_generation_and_set_gate(true);
+
+        request_session_index_snapshot(&inner, generation);
+
+        let (_, snapshot) = milestone_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("session.index should precede replay");
+        assert_eq!(snapshot.t, "session.index");
+        let (item_generation, run_status) = milestone_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("run.status replay frame should be delivered");
+        assert_eq!(item_generation, generation);
+        assert_eq!(run_status.t, "run.status");
+        assert_eq!(run_status.payload["session_id"], "runstatus-session");
+        assert_eq!(run_status.payload["status"], "running");
+        assert_eq!(run_status.payload["run_id"], "run-77");
+        assert_eq!(
+            run_status.client_msg_id,
+            derive_run_status_replay_client_msg_id("runstatus-session", "running", Some("run-77"))
+        );
+    }
+
+    /// 缺口② round-trip：`session_runtime_replay_provider` 读失败（返回 None）不该连累
+    /// msg.completed/card.* 那半补发——两个 provider 各自 best-effort，互不拖累。
+    #[test]
+    fn milestone_replay_batch_msg_completed_survives_run_status_provider_failure() {
+        let replay_row = crate::db::MilestoneReplayRow {
+            session_id: "runstatus-fail-session".into(),
+            message_id: 31,
+            role: "assistant".into(),
+            content_json: serde_json::json!([]),
+            dedup_key: "d-runstatus-fail".into(),
+        };
+        let (inner, milestone_rx) = test_inner_with_k_room_snapshot_and_replay_providers(
+            || None,
+            |_| Some(Zeroizing::new([1_u8; 32])),
+            || Some(serde_json::json!([])),
+            move || Some(vec![replay_row.clone()]),
+            || None,
+        );
+        let generation = inner.state.advance_generation_and_set_gate(true);
+
+        request_session_index_snapshot(&inner, generation);
+
+        let (_, snapshot) = milestone_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (_, completed) = milestone_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(snapshot.t, "session.index");
+        assert_eq!(completed.t, "msg.completed");
+        assert!(
+            milestone_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "run_status provider 返回 None 时不该有 run.status 帧，但也不该吞掉上面已发的 msg.completed"
+        );
+    }
+
+    /// idlefix-T1 补针 C（skeptic 点名 TOCTOU）：`list_session_runtime_replay_rows` 读出的是
+    /// "读那一刻"的现状——本用例里故意造出陈旧行（status=running），且让 provider 阻塞在"已被
+    /// 调用、尚未返回"这个窗口里，模拟"读之后、入队之前，真实状态已经翻转"。这个窗口期间，一次
+    /// "真实"翻转（走 `enqueue_run_status_milestone_with_gate`——`publish_run_status_milestone`
+    /// 真正落地时调的同一份函数）并发尝试把新状态（idle）入队。断言：客户端最终收到的最后一帧
+    /// 是新状态，陈旧的补发帧排不到它后面——不是靠时序侥幸，是靠 `run_status_replay_gate`
+    /// 强制互斥（provider 未放行前，"实时"入队被挡在锁外）。
+    #[test]
+    fn run_status_replay_batch_is_ordered_before_a_racing_live_transition_toctou() {
+        let stale_row = crate::db::SessionRuntimeReplayRow {
+            session_id: "toctou-sess".into(),
+            status: "running".into(),
+            run_id: Some("run-old".into()),
+        };
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let provider_release_rx = Arc::clone(&release_rx);
+        let (inner, milestone_rx) = test_inner_with_k_room_snapshot_and_replay_providers(
+            || None,
+            |_| Some(Zeroizing::new([1_u8; 32])),
+            || Some(serde_json::json!([])),
+            || None,
+            move || {
+                // provider 被调用即代表 replay worker 已经拿到锁、正在"读 DB"——发信号让测试
+                // 主线程确定性地知道这一刻，再阻塞直到测试放行，撑大"读后、入队前"的窗口。
+                started_tx.send(()).unwrap();
+                provider_release_rx.lock().unwrap().recv().unwrap();
+                Some(vec![stale_row.clone()])
+            },
+        );
+        let generation = inner.state.advance_generation_and_set_gate(true);
+
+        let worker_inner = Arc::clone(&inner);
+        let worker = thread::spawn(move || {
+            publish_run_status_replay_rows(&worker_inner, generation);
+        });
+
+        // 确定性等待：provider 已经被调用（= replay worker 已经持有 run_status_replay_gate），
+        // 而不是用 sleep 赌时序。
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let live_inner = Arc::clone(&inner);
+        let live = thread::spawn(move || {
+            enqueue_run_status_milestone_with_gate(
+                &live_inner,
+                "toctou-sess",
+                build_run_status_payload("toctou-sess", "idle", None),
+                "live-idle".to_owned(),
+            );
+        });
+
+        // 不需要额外 sleep 硬等"实时"线程真正排到锁上——正确性不依赖调度时机：无论 `live`
+        // 线程此刻是否已经开始阻塞在 `lock()` 上，它都不可能在 worker 释放 `run_status_replay_
+        // gate` 之前完成入队；这里放行 provider 让补发批走完它自己的读+入队。
+        release_tx.send(()).unwrap();
+
+        worker.join().unwrap();
+        live.join().unwrap();
+
+        let (_, first) = milestone_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("补发的陈旧现状帧应该先入队");
+        let (_, second) = milestone_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("实时翻转帧应该紧随其后入队");
+        assert_eq!(first.t, "run.status");
+        assert_eq!(first.payload["status"], "running", "补发帧携带 provider 读到的陈旧状态");
+        assert_eq!(second.t, "run.status");
+        assert_eq!(
+            second.payload["status"], "idle",
+            "实时翻转帧必须排在补发帧之后——客户端最终看到的是新状态，不会被陈旧帧倒灌覆盖"
+        );
+        assert!(
+            milestone_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "不该有第三帧"
         );
     }
 
@@ -16597,6 +16862,7 @@ mod tests {
             k_room_provider: Box::new(k_room_provider),
             session_index_snapshot_provider: Box::new(|| None),
             milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
             pair_hello_handler: Box::new(|_| None),
             pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
             registry: test_registry(),
@@ -16658,6 +16924,7 @@ mod tests {
             k_room_provider: Box::new(|_| None),
             session_index_snapshot_provider: Box::new(|| None),
             milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
             pair_hello_handler: Box::new(|_| None),
             pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
             registry: test_registry(),
@@ -16704,6 +16971,7 @@ mod tests {
             k_room_provider: Box::new(k_room_provider),
             session_index_snapshot_provider: Box::new(|| None),
             milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
             pair_hello_handler: Box::new(|_| None),
             pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
             registry: test_registry(),
@@ -16773,6 +17041,7 @@ mod tests {
             k_room_provider: Box::new(|_| Some(Zeroizing::new([9_u8; 32]))),
             session_index_snapshot_provider: Box::new(|| None),
             milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
             pair_hello_handler: Box::new(|_| None),
             pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
             registry: test_registry(),
@@ -16833,6 +17102,7 @@ mod tests {
             k_room_provider: Box::new(|_| Some(Zeroizing::new([9_u8; 32]))),
             session_index_snapshot_provider,
             milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
             pair_hello_handler: Box::new(|_| None),
             pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
             registry: test_registry(),
@@ -16881,6 +17151,7 @@ mod tests {
             k_room_provider: Box::new(|_| None),
             session_index_snapshot_provider: Box::new(|| None),
             milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
             pair_hello_handler: Box::new(|_| None),
             pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
             registry: test_registry(),
@@ -16933,6 +17204,7 @@ mod tests {
             k_room_provider: Box::new(|_| None),
             session_index_snapshot_provider: Box::new(|| None),
             milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
             pair_hello_handler: Box::new(|_| None),
             pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
             registry: test_registry(),
@@ -16973,6 +17245,7 @@ mod tests {
             k_room_provider: Box::new(|_| None),
             session_index_snapshot_provider: Box::new(|| None),
             milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
             pair_hello_handler: Box::new(pair_hello_handler),
             pair_done_handler: Box::new(pair_done_handler),
             registry: test_registry(),
@@ -17023,6 +17296,7 @@ mod tests {
             k_room_provider: Box::new(|_| None),
             session_index_snapshot_provider: Box::new(|| None),
             milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
             pair_hello_handler: Box::new(|_| None),
             pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
             registry: test_registry(),
@@ -17064,6 +17338,7 @@ mod tests {
             k_room_provider: Box::new(|_| None),
             session_index_snapshot_provider: Box::new(|| None),
             milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
             pair_hello_handler: Box::new(|_| None),
             pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
             registry: test_registry(),
@@ -17110,6 +17385,7 @@ mod tests {
             k_room_provider: Box::new(|_| None),
             session_index_snapshot_provider: Box::new(|| None),
             milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
             pair_hello_handler: Box::new(|_| None),
             pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
             registry: test_registry(),
@@ -17156,6 +17432,7 @@ mod tests {
             k_room_provider: Box::new(|_| None),
             session_index_snapshot_provider: Box::new(|| None),
             milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
             pair_hello_handler: Box::new(|_| None),
             pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
             registry: test_registry(),
@@ -17197,6 +17474,7 @@ mod tests {
             k_room_provider: Box::new(k_room_provider),
             session_index_snapshot_provider: Box::new(session_index_snapshot_provider),
             milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
             pair_hello_handler: Box::new(|_| None),
             pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
             registry: test_registry(),
@@ -17242,6 +17520,7 @@ mod tests {
             k_room_provider: Box::new(|_| None),
             session_index_snapshot_provider: Box::new(|| None),
             milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
             pair_hello_handler: Box::new(|_| None),
             pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
             registry: test_registry(),
@@ -17289,6 +17568,7 @@ mod tests {
             k_room_provider: Box::new(|_| None),
             session_index_snapshot_provider: Box::new(|| None),
             milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
             pair_hello_handler: Box::new(|_| None),
             pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
             registry: test_registry(),
@@ -17325,6 +17605,10 @@ mod tests {
             + Send
             + Sync
             + 'static,
+        session_runtime_replay_provider: impl Fn() -> Option<Vec<crate::db::SessionRuntimeReplayRow>>
+            + Send
+            + Sync
+            + 'static,
     ) -> (Arc<Inner>, Receiver<(u64, MilestoneItem)>) {
         let (upstream_tx, _upstream_rx) = mpsc::sync_channel(1);
         let (milestone_tx, milestone_rx) = mpsc::sync_channel(16);
@@ -17338,6 +17622,7 @@ mod tests {
             k_room_provider: Box::new(k_room_provider),
             session_index_snapshot_provider: Box::new(session_index_snapshot_provider),
             milestone_replay_provider: Box::new(milestone_replay_provider),
+            session_runtime_replay_provider: Box::new(session_runtime_replay_provider),
             pair_hello_handler: Box::new(|_| None),
             pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
             registry: test_registry(),

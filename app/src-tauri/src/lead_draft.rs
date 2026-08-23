@@ -735,34 +735,6 @@ pub(crate) fn build_draft_prompt(
     p
 }
 
-/// 构造真 claude driver 命令（B1 first-cut·仅 native claude·borrow-claude/codex driver = follow-up·诚实标）。
-/// 复用 claude_sandboxed_cmd_in（沙箱 worktree·bypassPermissions·与 worker 同容器）+ append draft system prompt。
-/// T0 spike 若验通 --json-schema·此处追加（plan 顶部 fork #2）。
-#[allow(dead_code)]
-pub(crate) fn build_lead_draft_command(
-    profile: &crate::db::AgentProfile,
-    draft_prompt: &str,
-    wt: &std::path::Path,
-) -> Result<std::process::Command, String> {
-    if profile.access != "native" || profile.provider != "claude" {
-        return Err(crate::ui_msg::al_err(
-            "lead.claudeOnlyDraft",
-            &[
-                ("access", profile.access.clone()),
-                ("provider", profile.provider.clone()),
-            ],
-        ));
-    }
-    let extra = [
-        "--append-system-prompt".to_string(),
-        LEAD_DRAFT_SYS_PROMPT.to_string(),
-    ];
-    let extra_ref: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
-    let (mut cmd, _) = crate::claude_sandboxed_cmd_in(wt, draft_prompt, &extra_ref)?;
-    crate::apply_clean_env(&mut cmd);
-    Ok(cmd)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

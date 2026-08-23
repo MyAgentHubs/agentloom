@@ -39,6 +39,12 @@ pub enum ParseFn {
     HarnessPlan,
 }
 
+/// claude / codex 的 prompt 正文改走子进程 stdin（argv 不再带正文，超长 prompt 撞 ARG_MAX
+/// 会报 `Argument list too long (os error 7)`，见 `spawn_with_stdin_prompt`）。`Arc<str>` 而非
+/// `String`：team member 的 auth-retry 会对同一份 payload 重复 spawn+写，克隆 `Arc` 是 O(1)，
+/// 不会每次重复拷贝整段正文。
+pub(crate) type StdinPrompt = std::sync::Arc<str>;
+
 pub trait AgentBackend {
     fn build_command(&self, ctx: &BuildContext) -> Result<Command, String> {
         let mut cmd = self.build_command_inner(ctx)?;
@@ -47,6 +53,81 @@ pub trait AgentBackend {
     }
     fn build_command_inner(&self, ctx: &BuildContext) -> Result<Command, String>;
     fn parse_fn(&self) -> ParseFn;
+    /// argv 不带 prompt 正文的 backend（claude / codex）在这里返回 `Some(payload)`：调用方
+    /// spawn 前必须把它写进子进程 stdin 再关闭（EOF）——见 `spawn_with_stdin_prompt`。
+    /// 默认 `None`（如 harness：prompt 走 app 域临时文件传路径，不用 stdin）。
+    fn stdin_prompt(&self, _ctx: &BuildContext) -> Option<StdinPrompt> {
+        None
+    }
+}
+
+pub(crate) struct SpawnedWithStdinPrompt {
+    pub child: std::process::Child,
+    /// `Some` 仅表示本次有 prompt：receiver 在 `write_all + flush + drop(stdin)` 后收到 I/O
+    /// 结果。无 prompt 时 stdin 直接接空设备，因此为 `None`，没有需要等待的 writer ack。
+    pub stdin_ack: Option<std::sync::mpsc::Receiver<std::io::Result<()>>>,
+}
+
+/// 带显式 stdin writer ack 的 spawn 入口。writer 线程只负责 I/O，不持 DB 状态或业务回调；
+/// `write_all + flush + drop(stdin)` 完成后发送其 `io::Result<()>`。线程创建失败也会立即预置为
+/// `Err`，不会留下永不返回的 receiver。
+///
+/// `stdin_prompt` 为 `None` 时显式 `Stdio::null()`，返回的 `stdin_ack` 为 `None`。调用前不能已经
+/// 对 `command` 调过 `.stdin(..)`——本函数是唯一决定 stdin 去向的地方。
+pub(crate) fn spawn_with_stdin_prompt_ack(
+    command: &mut Command,
+    stdin_prompt: Option<&StdinPrompt>,
+) -> std::io::Result<SpawnedWithStdinPrompt> {
+    match stdin_prompt {
+        Some(_) => command.stdin(std::process::Stdio::piped()),
+        None => command.stdin(std::process::Stdio::null()),
+    };
+    let mut child = command.spawn()?;
+    let stdin_ack = if let Some(prompt) = stdin_prompt {
+        let mut stdin = child
+            .stdin
+            .take()
+            .expect("stdin piped when stdin_prompt is Some");
+        let prompt = prompt.clone();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        let spawn_error_tx = ack_tx.clone();
+        let spawn_result = std::thread::Builder::new()
+            .name("agent-stdin-writer".into())
+            .spawn(move || {
+                let write_result = stdin.write_all(prompt.as_bytes());
+                let flush_result = stdin.flush();
+                let result = write_result.and(flush_result);
+                drop(stdin);
+                let _ = ack_tx.send(result);
+            });
+        match spawn_result {
+            Ok(_) => drop(spawn_error_tx),
+            Err(error) => {
+                // spawn 失败会 drop 掉闭包（连同其中的 stdin/ack_tx）；用保留 sender 预置
+                // 明确错误，保证调用方不会面对一个永远收不到结果的 receiver。
+                let _ = spawn_error_tx.send(Err(error));
+            }
+        }
+        Some(ack_rx)
+    } else {
+        None
+    };
+    Ok(SpawnedWithStdinPrompt { child, stdin_ack })
+}
+
+/// 全仓 claude/codex/borrow spawn 的兼容入口：`stdin_prompt` 非空时设 `Stdio::piped()`、spawn
+/// 后起独立线程写完整段正文并关闭 fd（EOF）。同步写可能超过管道缓冲（64KB）把调用线程堵死，
+/// 故必须用独立线程写，不能就地写。现有调用方无需消费 ack；需要按 I5 等待交付结果的新调用方
+/// 使用 [`spawn_with_stdin_prompt_ack`]。
+pub(crate) fn spawn_with_stdin_prompt(
+    command: &mut Command,
+    stdin_prompt: Option<&StdinPrompt>,
+) -> std::io::Result<std::process::Child> {
+    spawn_with_stdin_prompt_ack(command, stdin_prompt).map(|spawned| {
+        let SpawnedWithStdinPrompt { child, stdin_ack } = spawned;
+        drop(stdin_ack);
+        child
+    })
 }
 
 pub fn safe_id(id: &str) -> Result<String, String> {
@@ -100,24 +181,6 @@ pub(crate) fn resolve_codex_bin() -> Result<OsString, String> {
             .then(|| crate::detect::which_or_fallback("codex", &[]))
             .flatten()
     })
-    .map(|path| {
-        path.map(OsString::from)
-            .unwrap_or_else(|| OsString::from("codex"))
-    })
-}
-
-fn resolve_codex_bin_from(
-    override_path: Option<&str>,
-    windows: bool,
-    path_is_file: impl FnMut(&Path) -> bool,
-    automatic_path: impl FnMut() -> Option<String>,
-) -> Result<OsString, String> {
-    crate::detect::resolve_cli_path_with_override_from(
-        override_path,
-        windows,
-        path_is_file,
-        automatic_path,
-    )
     .map(|path| {
         path.map(OsString::from)
             .unwrap_or_else(|| OsString::from("codex"))
@@ -243,7 +306,8 @@ pub(crate) fn claude_effort_for_reasoning_tier(tier: &str) -> Option<&'static st
 pub(crate) const SOLO_IMAGE_OUTPUT_GUIDANCE: &str = "\
 If you produce or generate an image file (such as a screenshot or chart) that you want the user \
 to see directly in chat, reference it in your reply with the Markdown inline image syntax \
-`![](absolute image path)`; a bare path will not display inline.";
+`![](absolute image path)`; a bare path will not display inline. If the path contains spaces, \
+wrap it in angle brackets: `![](</path/with space.png>)`.";
 
 fn system_prompt_for_mode(mode: BuildMode) -> Option<&'static str> {
     match mode {
@@ -255,7 +319,7 @@ fn system_prompt_for_mode(mode: BuildMode) -> Option<&'static str> {
     }
 }
 
-const CODEX_IMAGE_OUTPUT_INSTRUCTION: &str = "If you generate any image files, save or copy them into the current workspace and state each image's absolute path in your final reply. Do not leave generated images only under $CODEX_HOME/generated_images. Also reference each image in your final reply with Markdown inline image syntax `![](absolute path)`; a bare path will not display inline.";
+const CODEX_IMAGE_OUTPUT_INSTRUCTION: &str = "If you generate any image files, save or copy them into the current workspace and state each image's absolute path in your final reply. Do not leave generated images only under $CODEX_HOME/generated_images. Also reference each image in your final reply with Markdown inline image syntax `![](absolute path)`; a bare path will not display inline. If the path contains spaces, wrap it in angle brackets: `![](</path/with space.png>)`.";
 
 fn prompt_for_mode(mode: BuildMode, prompt: &str) -> String {
     let prompt = match system_prompt_for_mode(mode) {
@@ -409,8 +473,7 @@ impl AgentBackend for NativeBackend {
                     extra.push(effort.to_string());
                 }
                 let extra_ref: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
-                let (mut cmd, claude_bin) =
-                    crate::claude_sandboxed_cmd_in(ctx.wt, ctx.prompt, &extra_ref)?;
+                let (mut cmd, claude_bin) = crate::claude_sandboxed_cmd_in(ctx.wt, &extra_ref)?;
                 crate::log_claude_bin(ctx.session_id, &claude_bin);
                 scrub_checkpoint_env(&mut cmd);
                 crate::apply_clean_env(&mut cmd);
@@ -438,7 +501,6 @@ impl AgentBackend for NativeBackend {
                 if let Some(hook) = &hook {
                     crate::checkpoint_hook::configure_codex_command(&mut cmd, hook);
                 }
-                let prompt = prompt_for_mode(ctx.mode, ctx.prompt);
                 let sandbox = if matches!(
                     ctx.mode,
                     BuildMode::LeadDraft | BuildMode::LeadAction | BuildMode::Summarize
@@ -447,6 +509,9 @@ impl AgentBackend for NativeBackend {
                 } else {
                     "workspace-write"
                 };
+                // prompt 正文不再进 argv（超长 prompt 会撞 ARG_MAX）：位置参数传 "-"，
+                // 实测确认 `codex exec ... -` 从 stdin 读正文；真正的正文由 `stdin_prompt()`
+                // 提供，调用方经 `spawn_with_stdin_prompt` 写入子进程 stdin。
                 cmd.args([
                     "exec",
                     "--json",
@@ -454,7 +519,7 @@ impl AgentBackend for NativeBackend {
                     "--skip-git-repo-check",
                     "--sandbox",
                     sandbox,
-                    prompt.as_str(),
+                    "-",
                 ]);
                 crate::apply_workdir(&mut cmd, ctx.wt);
                 Ok(cmd)
@@ -470,6 +535,17 @@ impl AgentBackend for NativeBackend {
         match self.provider.as_str() {
             "codex" => ParseFn::Codex,
             _ => ParseFn::Claude,
+        }
+    }
+
+    fn stdin_prompt(&self, ctx: &BuildContext) -> Option<StdinPrompt> {
+        match self.provider.as_str() {
+            "claude" => Some(StdinPrompt::from(ctx.prompt)),
+            // codex 的 argv 已经不带正文（build_command_inner 传 "-" 代替 prompt 位置参数），
+            // stdin 必须写 prompt_for_mode 处理过的同一份文本（含 mode 相关的 system 前缀/
+            // 图片输出指引），不能直接写 ctx.prompt 原文，否则跟 argv 版本语义对不上。
+            "codex" => Some(StdinPrompt::from(prompt_for_mode(ctx.mode, ctx.prompt))),
+            _ => None,
         }
     }
 }
@@ -619,11 +695,9 @@ impl AgentBackend for BorrowClaudeBackend {
             Some(mode_prompt) => format!("{identity_prompt}\n\n{mode_prompt}"),
             None => identity_prompt.clone(),
         };
-        let mut extra: Vec<String> = vec![
-            "--disable-slash-commands".to_string(),
-            "--append-system-prompt".to_string(),
-            system_prompt,
-        ];
+        // --disable-slash-commands 已下沉进 claude_agent_argv()（全线共用基础项），
+        // 这里不再 ad-hoc 加，避免同一 flag 出现两次。
+        let mut extra: Vec<String> = vec!["--append-system-prompt".to_string(), system_prompt];
         let hook = checkpoint_hook_for_mode(ctx)?;
         if let Some(hook) = &hook {
             extra.push("--settings".to_string());
@@ -637,7 +711,7 @@ impl AgentBackend for BorrowClaudeBackend {
         }
         append_lead_read_only_tools(ctx.mode, &mut extra);
         let extra_ref: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
-        let (mut cmd, claude_bin) = crate::claude_sandboxed_cmd_in(ctx.wt, ctx.prompt, &extra_ref)?;
+        let (mut cmd, claude_bin) = crate::claude_sandboxed_cmd_in(ctx.wt, &extra_ref)?;
         crate::log_claude_bin(ctx.session_id, &claude_bin);
 
         scrub_checkpoint_env(&mut cmd);
@@ -653,6 +727,10 @@ impl AgentBackend for BorrowClaudeBackend {
 
     fn parse_fn(&self) -> ParseFn {
         ParseFn::Claude
+    }
+
+    fn stdin_prompt(&self, ctx: &BuildContext) -> Option<StdinPrompt> {
+        Some(StdinPrompt::from(ctx.prompt))
     }
 }
 
@@ -1387,6 +1465,104 @@ mod tests {
         }
     }
 
+    /// 从 `idx` 往前找最近一个 `fn ` 关键字，取其后的标识符——用来给一处裸 `.spawn()` 定位
+    /// 「它在哪个函数体里」。这是文本启发式，不是 AST 作用域分析：足够给白名单当身份锚点，
+    /// 不足以当安全边界（详见 `agent_backend_commands_spawn_via_stdin_prompt_helper` 的白名单
+    /// 注释，每条例外都已人工核实附近没有会误命中的嵌套 `fn `/注释）。
+    fn enclosing_fn_name(text: &str, idx: usize) -> Option<String> {
+        let prefix = &text[..idx];
+        let fn_idx = prefix.rfind("fn ")?;
+        let after = &prefix[fn_idx + 3..];
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// stdin 刀 P1-1：钉住「claude/codex/myagent 子进程一律走 `spawn_with_stdin_prompt`，不得裸
+    /// `Command::spawn()`」——这是本刀新设的统一口（见本文件顶部 `spawn_with_stdin_prompt` 文档
+    /// 注释），谁绕过它谁就悄悄把 argv/stdin 决策权收窄回旧路径，可能重新踩回 ARG_MAX 或 stdin
+    /// 语义不一致的坑。用源码文本扫描而非运行时断言：新增的裸 spawn 调用点在改动当下就会让这条
+    /// 测试变红，而不是等到真的撞见超长 prompt 才发现。
+    ///
+    /// 用精确字面量 `.spawn()`（零参数、紧跟右括号）而不是宽泛的 `.spawn(` 子串：`Command::spawn`
+    /// 恰好零参，而 `thread::spawn(closure)` / `Builder::spawn(closure)` / `scope.spawn(closure)`
+    /// 都带闭包实参，字面量层面天然区分，不需要额外排除线程 spawn 的分支。
+    ///
+    /// 白名单——已逐条核实身份、不是 agent CLI 子进程，允许留在统一口之外：
+    /// - `agent.rs::spawn_with_stdin_prompt_ack` —— 本身就是统一口的实现，不能自己调自己。
+    /// - `agent.rs::path_from_login_shell` —— 探测用户 login shell 的真实 PATH，不是 agent 进程。
+    /// - `detect.rs::query_registry_value` —— Windows `reg query` 注册表探针。
+    /// - `github.rs::command_output_with_timeout` —— git/gh 命令的通用超时执行器。
+    /// - `lib.rs::windows_taskkill_tree` —— Windows `taskkill` 树杀探针。
+    /// - `worktree.rs::reject_ignored_exact_paths` —— `git check-ignore` 校验。
+    ///
+    /// 若未来新增一处裸 spawn 且确认不是 agent CLI 子进程，往这张表加一行并写清身份；
+    /// 若是 agent CLI 子进程，改走 `spawn_with_stdin_prompt`，不要加白名单。
+    #[test]
+    fn agent_backend_commands_spawn_via_stdin_prompt_helper() {
+        const ALLOWLIST: &[(&str, &str)] = &[
+            ("agent.rs", "spawn_with_stdin_prompt_ack"),
+            ("agent.rs", "path_from_login_shell"),
+            ("detect.rs", "query_registry_value"),
+            ("github.rs", "command_output_with_timeout"),
+            ("lib.rs", "windows_taskkill_tree"),
+            ("worktree.rs", "reject_ignored_exact_paths"),
+        ];
+
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut violations = Vec::new();
+        let mut entries: Vec<_> = std::fs::read_dir(&src_dir)
+            .expect("read src dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("rs"))
+            .collect();
+        entries.sort();
+
+        for path in entries {
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("utf8 file name")
+                .to_string();
+            let source = std::fs::read_to_string(&path).expect("read source file");
+            // `mod tests {` 之后是本文件自己的测试模块（含 fixture 用的裸 spawn），不受本规则约束；
+            // 每个源文件恰好一个顶层 `mod tests {`（由本测试的姊妹 grep 核实过），未匹配到时整份
+            // 文件都是生产代码。
+            let production = match source.find("\nmod tests {") {
+                Some(idx) => &source[..idx],
+                None => source.as_str(),
+            };
+
+            let mut search_from = 0;
+            while let Some(rel_idx) = production[search_from..].find(".spawn()") {
+                let idx = search_from + rel_idx;
+                search_from = idx + ".spawn()".len();
+                let enclosing_fn = enclosing_fn_name(production, idx);
+                let allowed = ALLOWLIST.iter().any(|(allowed_file, allowed_fn)| {
+                    *allowed_file == file_name.as_str()
+                        && enclosing_fn.as_deref() == Some(*allowed_fn)
+                });
+                if allowed {
+                    continue;
+                }
+                let line_no = production[..idx].matches('\n').count() + 1;
+                violations.push(format!(
+                    "{file_name}:{line_no}（函数 {enclosing_fn:?}）出现裸 .spawn()，须改走 \
+                     agent::spawn_with_stdin_prompt；若确认不是 agent CLI 子进程，把它加进本测试的\
+                     白名单并写明身份"
+                ));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "发现未走 spawn_with_stdin_prompt 的裸 Command spawn：\n{}",
+            violations.join("\n")
+        );
+    }
+
     #[test]
     fn sidecar_exit_error_truth_table() {
         assert!(sidecar_exit_error(false, false, false, false, false));
@@ -1512,63 +1688,6 @@ mod tests {
         crate::detect::replace_cached_cli_paths([]).unwrap();
 
         assert_eq!(resolved, OsString::from("codex"));
-    }
-
-    #[test]
-    fn resolve_codex_bin_override_short_circuits_automatic_resolution() {
-        let automatic_calls = std::cell::Cell::new(0);
-        let resolved = resolve_codex_bin_from(
-            Some("/custom/bin/codex"),
-            false,
-            |path| path == Path::new("/custom/bin/codex"),
-            || {
-                automatic_calls.set(automatic_calls.get() + 1);
-                Some("/automatic/bin/codex".to_string())
-            },
-        )
-        .unwrap();
-
-        assert_eq!(resolved, OsString::from("/custom/bin/codex"));
-        assert_eq!(automatic_calls.get(), 0);
-    }
-
-    #[test]
-    fn resolve_codex_bin_invalid_override_fails_closed_without_automatic_resolution() {
-        let automatic_calls = std::cell::Cell::new(0);
-        let error = resolve_codex_bin_from(
-            Some("/missing/bin/codex"),
-            false,
-            |_| false,
-            || {
-                automatic_calls.set(automatic_calls.get() + 1);
-                Some("/automatic/bin/codex".to_string())
-            },
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            error,
-            r#"AL_ERR:cliPath.invalidPath:{"path":"/missing/bin/codex"}"#
-        );
-        assert_eq!(automatic_calls.get(), 0);
-    }
-
-    #[test]
-    fn resolve_codex_bin_without_override_keeps_automatic_resolution_unchanged() {
-        let automatic_calls = std::cell::Cell::new(0);
-        let resolved = resolve_codex_bin_from(
-            None,
-            false,
-            |_| panic!("override validation must not run"),
-            || {
-                automatic_calls.set(automatic_calls.get() + 1);
-                Some("/automatic/bin/codex".to_string())
-            },
-        )
-        .unwrap();
-
-        assert_eq!(resolved, OsString::from("/automatic/bin/codex"));
-        assert_eq!(automatic_calls.get(), 1);
     }
 
     #[test]
@@ -2288,6 +2407,30 @@ mod tests {
         );
     }
 
+    /// solo / native lead 都经 `NativeBackend` → `claude_sandboxed_cmd_in` →
+    /// `claude_agent_argv()`；正文走 stdin 后该基础项必须恰好出现 1 次，不能被
+    /// 上层再 ad-hoc 加一遍出现两次。
+    #[test]
+    fn native_claude_argv_has_exactly_one_disable_slash_commands() {
+        let test = setup_context();
+        let backend = NativeBackend {
+            provider: "claude".to_string(),
+            primary_model: None,
+        };
+        let ctx = build_context(&test, "hi");
+
+        let cmd = backend.build_command(&ctx).unwrap();
+        let args = command_args(&cmd);
+
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.as_str() == "--disable-slash-commands")
+                .count(),
+            1,
+            "native claude（solo / native lead 共用）必须恰好带 1 条 --disable-slash-commands: {args:?}"
+        );
+    }
+
     #[test]
     fn native_claude_lead_draft_appends_lead_system_prompt() {
         let test = setup_context();
@@ -2319,8 +2462,13 @@ mod tests {
             "expected lead draft system prompt in Claude args: {args:?}"
         );
         assert!(
-            args.iter().any(|arg| arg == "draft this"),
-            "expected original prompt as Claude prompt arg: {args:?}"
+            !args.iter().any(|arg| arg == "draft this"),
+            "prompt 正文不再进 argv，应改走 stdin: {args:?}"
+        );
+        assert_eq!(
+            backend.stdin_prompt(&ctx).as_deref(),
+            Some("draft this"),
+            "expected original prompt via stdin_prompt"
         );
         assert!(
             contains_adjacent_pair(
@@ -2513,6 +2661,240 @@ mod tests {
         );
     }
 
+    /// D5 续刀防回归：超长 prompt（>2MB）走 claude / codex / borrow-claude 起 run 时，argv 里
+    /// 绝不能出现正文——否则超过 ARG_MAX 会报 `Argument list too long (os error 7)`，run 起不来。
+    /// 正文改走 `stdin_prompt()`，逐字节比对必须与原始 prompt 一致。
+    #[test]
+    fn oversized_prompt_never_lands_in_argv_for_claude_codex_and_borrow() {
+        let test = setup_context();
+        let huge_prompt = "x".repeat(2 * 1024 * 1024 + 1);
+
+        let native_claude = NativeBackend {
+            provider: "claude".to_string(),
+            primary_model: None,
+        };
+        let ctx = build_context(&test, &huge_prompt);
+        let cmd = native_claude.build_command(&ctx).unwrap();
+        let args = command_args(&cmd);
+        assert!(
+            !args.iter().any(|arg| arg.contains(&huge_prompt)),
+            "claude argv 不该含超长 prompt 正文"
+        );
+        assert_eq!(
+            native_claude.stdin_prompt(&ctx).as_deref(),
+            Some(huge_prompt.as_str()),
+            "claude stdin_prompt 必须与原始 prompt 逐字节相同"
+        );
+
+        let native_codex = NativeBackend {
+            provider: "codex".to_string(),
+            primary_model: None,
+        };
+        let ctx = build_context(&test, &huge_prompt);
+        let cmd = native_codex.build_command(&ctx).unwrap();
+        let args = command_args(&cmd);
+        assert!(
+            !args.iter().any(|arg| arg.contains(&huge_prompt)),
+            "codex argv 不该含超长 prompt 正文"
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("-"),
+            "codex 位置参数应是 \"-\"（从 stdin 读），实得 {args:?}"
+        );
+        let codex_stdin_prompt = native_codex
+            .stdin_prompt(&ctx)
+            .expect("codex stdin_prompt should exist");
+        assert!(
+            codex_stdin_prompt.starts_with(&huge_prompt),
+            "codex stdin_prompt 应以原始 prompt 开头（Normal 模式会在后面追加图片输出指引）"
+        );
+
+        let borrow = BorrowClaudeBackend {
+            profile: borrow_profile(),
+            api_key: "borrow-test-key".to_string(),
+        };
+        let ctx = build_context(&test, &huge_prompt);
+        let cmd = borrow.build_command(&ctx).unwrap();
+        let args = command_args(&cmd);
+        assert!(
+            !args.iter().any(|arg| arg.contains(&huge_prompt)),
+            "borrow-claude argv 不该含超长 prompt 正文"
+        );
+        assert_eq!(
+            borrow.stdin_prompt(&ctx).as_deref(),
+            Some(huge_prompt.as_str()),
+            "borrow-claude stdin_prompt 必须与原始 prompt 逐字节相同"
+        );
+    }
+
+    /// D5 续刀：`spawn_with_stdin_prompt` 是全仓写 stdin 正文的唯一口——用 `cat` 当子进程验证
+    /// 写进去的字节原样从 stdout 收回，且超过管道缓冲区（64KB）也不会卡死（独立线程写，
+    /// 不占用调用线程；调用线程这里直接 `wait_with_output()` 阻塞到子进程结束，不会永远挂住
+    /// 就证明没死锁）。
+    #[cfg(unix)]
+    #[test]
+    fn spawn_with_stdin_prompt_writes_full_payload_without_deadlock() {
+        let payload = StdinPrompt::from("y".repeat(200 * 1024).as_str());
+        let mut cmd = crate::proc::command("cat");
+        cmd.stdout(std::process::Stdio::piped());
+        let child = spawn_with_stdin_prompt(&mut cmd, Some(&payload)).expect("spawn cat");
+        let output = child.wait_with_output().expect("wait for cat");
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout.as_slice(),
+            payload.as_bytes(),
+            "cat 回显的字节必须与写入的 payload 逐字节相同"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdin_writer_ack_reports_success() {
+        let payload = StdinPrompt::from("stdin writer ack");
+        let mut cmd = crate::proc::command("/bin/cat");
+        cmd.stdout(std::process::Stdio::null());
+        let mut spawned = spawn_with_stdin_prompt_ack(&mut cmd, Some(&payload)).expect("spawn cat");
+        let ack = spawned.stdin_ack.expect("prompt spawn should expose ack");
+        assert!(
+            ack.recv_timeout(Duration::from_secs(2))
+                .expect("stdin writer ack should not hang")
+                .is_ok(),
+            "cat should accept the complete stdin payload"
+        );
+        assert!(spawned.child.wait().expect("wait for cat").success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdin_writer_ack_reports_write_failure() {
+        let payload = StdinPrompt::from("x".repeat(8 * 1024 * 1024).as_str());
+        let mut cmd = crate::proc::command("/usr/bin/true");
+        let mut spawned =
+            spawn_with_stdin_prompt_ack(&mut cmd, Some(&payload)).expect("spawn true");
+        assert!(spawned.child.wait().expect("wait for true").success());
+        let ack = spawned.stdin_ack.expect("prompt spawn should expose ack");
+        assert!(
+            ack.recv_timeout(Duration::from_secs(2))
+                .expect("stdin writer failure ack should not hang")
+                .is_err(),
+            "writing a large payload to an exited child should report broken pipe"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdin_writer_ack_does_not_interlock_with_stdout_eof() {
+        use std::io::Read;
+
+        let payload = StdinPrompt::from("z".repeat(200 * 1024).as_str());
+        let mut cmd = crate::proc::command("/bin/cat");
+        cmd.stdout(std::process::Stdio::piped());
+        let mut spawned = spawn_with_stdin_prompt_ack(&mut cmd, Some(&payload)).expect("spawn cat");
+        let mut echoed = Vec::new();
+        spawned
+            .child
+            .stdout
+            .take()
+            .expect("cat stdout should be piped")
+            .read_to_end(&mut echoed)
+            .expect("read cat stdout through EOF before receiving ack");
+        assert_eq!(echoed.as_slice(), payload.as_bytes());
+        let ack = spawned.stdin_ack.expect("prompt spawn should expose ack");
+        assert!(ack
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stdin writer ack should arrive after stdout EOF")
+            .is_ok());
+        assert!(spawned.child.wait().expect("wait for cat").success());
+    }
+
+    /// `stdin_prompt` 为 `None` 时必须显式 `Stdio::null()`——不能让子进程继承本进程的真实
+    /// stdin（否则 harness/无 prompt 场景会意外读到 app 自己的输入流）。
+    ///
+    /// 光跑 `cat` 判空在 CI/沙箱里没有判别力：父进程 stdin 本来就是 `/dev/null`，「继承」和
+    /// 「显式接空」看起来一模一样。这里制造一个「父 stdin 挂着一根写过数据的管道」的环境再验证：
+    /// 把当前测试二进制当子进程重新执行、只跑 `spawn_with_stdin_prompt_none_probe_child`
+    /// 这一个探针用例（`--exact --nocapture`），把探针进程自己的 stdin（fd0）接上那根管道；
+    /// 探针内部再调用 `spawn_with_stdin_prompt(None)` 起一个 `cat`，把 cat 读到的字节数打印
+    /// 回来。若 None 分支是 `Stdio::null()`（正确实现），cat 的 stdin 与这根管道无关，恒读到
+    /// 0 字节；若被误改成 `Stdio::inherit()`，cat 会继承探针进程的 fd0、读到管道里的数据，
+    /// 长度 >0——用真实数据流向而非「看起来像 EOF」区分两种实现。
+    #[cfg(unix)]
+    #[test]
+    fn spawn_with_stdin_prompt_none_closes_stdin_instead_of_inheriting() {
+        let mut cmd = crate::proc::command("cat");
+        let child = spawn_with_stdin_prompt(&mut cmd, None).expect("spawn cat");
+        let output = child.wait_with_output().expect("wait for cat");
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+
+        let probe_stdin = probe_pipe_with_payload(b"leaked-parent-stdin-bytes");
+        let exe = std::env::current_exe().expect("current_exe for probe re-exec");
+        let mut probe = crate::proc::command(&exe);
+        probe
+            .args([
+                "agent::tests::spawn_with_stdin_prompt_none_probe_child",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("AGENTLOOM_TEST_STDIN_PROBE", "1")
+            .stdin(probe_stdin)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let out = probe.output().expect("spawn probe child re-exec");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // 用 find 而非按行 strip_prefix：libtest 的 `test NAME ... ` 进度前缀和我们的
+        // println! 输出在同一行（进度前缀没带换行），标记不在行首。
+        let marker = "AGENT_STDIN_PROBE_LEN:";
+        let after_marker = stdout
+            .find(marker)
+            .map(|idx| &stdout[idx + marker.len()..])
+            .unwrap_or_else(|| panic!("probe child 没打印判别标记，stdout={stdout}"));
+        let len: usize = after_marker
+            .split_whitespace()
+            .next()
+            .expect("探针标记后应跟数字")
+            .parse()
+            .expect("探针标记后应是数字");
+        assert_eq!(
+            len, 0,
+            "None 分支必须显式 Stdio::null()：探针进程 fd0 挂着带数据的管道，若被继承，\
+             子进程 cat 会读到 leaked-parent-stdin-bytes（len>0）"
+        );
+    }
+
+    /// 只在 `AGENTLOOM_TEST_STDIN_PROBE=1` 时跑真正探针逻辑——避免全量 `cargo test` 把它当
+    /// 独立用例跑时踩到不受控的真实 stdin；由上面用例经子进程 `--exact` 单独拉起。
+    #[cfg(unix)]
+    #[test]
+    fn spawn_with_stdin_prompt_none_probe_child() {
+        if std::env::var("AGENTLOOM_TEST_STDIN_PROBE").as_deref() != Ok("1") {
+            return;
+        }
+        let mut cmd = crate::proc::command("cat");
+        cmd.stdout(std::process::Stdio::piped());
+        let child = spawn_with_stdin_prompt(&mut cmd, None).expect("spawn cat in probe child");
+        let output = child
+            .wait_with_output()
+            .expect("wait for cat in probe child");
+        println!("AGENT_STDIN_PROBE_LEN:{}", output.stdout.len());
+    }
+
+    /// 造一根管道、写入 `payload` 后立刻关写端（数据留在缓冲区，读端仍能读到，随后遇 EOF——
+    /// 不需要一直吊着写端）；返回读端包成 `Stdio`，给 `Command::stdin` 直接用。
+    #[cfg(unix)]
+    fn probe_pipe_with_payload(payload: &[u8]) -> std::process::Stdio {
+        use std::os::unix::io::FromRawFd;
+        let mut fds = [0i32; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "libc::pipe 建管道失败");
+        let mut write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        write_end.write_all(payload).expect("写探针管道 payload");
+        drop(write_end);
+        unsafe { std::process::Stdio::from_raw_fd(fds[0]) }
+    }
+
     #[test]
     fn native_codex_write_modes_instruct_image_outputs_to_persist_in_workspace() {
         const IMAGE_OUTPUT_INSTRUCTION: &str =
@@ -2528,11 +2910,18 @@ mod tests {
             let ctx = build_context_for_mode(&test, "create an image", mode);
             let cmd = backend.build_command(&ctx).unwrap();
             let args = command_args(&cmd);
-            let prompt_arg = args.last().expect("codex prompt arg should exist");
+            assert_eq!(
+                args.last().map(String::as_str),
+                Some("-"),
+                "prompt 正文不再进 argv，位置参数应是 \"-\"：{args:?}"
+            );
+            let stdin_prompt = backend
+                .stdin_prompt(&ctx)
+                .expect("codex stdin prompt should exist");
 
             assert!(
-                prompt_arg.contains(IMAGE_OUTPUT_INSTRUCTION),
-                "expected image persistence instruction for {mode:?}: {args:?}"
+                stdin_prompt.contains(IMAGE_OUTPUT_INSTRUCTION),
+                "expected image persistence instruction for {mode:?}: {stdin_prompt:?}"
             );
         }
 
@@ -2544,11 +2933,14 @@ mod tests {
             let ctx = build_context_for_mode(&test, "review an image request", mode);
             let cmd = backend.build_command(&ctx).unwrap();
             let args = command_args(&cmd);
-            let prompt_arg = args.last().expect("codex prompt arg should exist");
+            assert_eq!(args.last().map(String::as_str), Some("-"), "{args:?}");
+            let stdin_prompt = backend
+                .stdin_prompt(&ctx)
+                .expect("codex stdin prompt should exist");
 
             assert!(
-                !prompt_arg.contains(IMAGE_OUTPUT_INSTRUCTION),
-                "did not expect image persistence instruction for {mode:?}: {args:?}"
+                !stdin_prompt.contains(IMAGE_OUTPUT_INSTRUCTION),
+                "did not expect image persistence instruction for {mode:?}: {stdin_prompt:?}"
             );
         }
     }
@@ -2565,11 +2957,14 @@ mod tests {
             let ctx = build_context_for_mode(&test, "create an image", mode);
             let cmd = backend.build_command(&ctx).unwrap();
             let args = command_args(&cmd);
-            let prompt_arg = args.last().expect("codex prompt arg should exist");
+            assert_eq!(args.last().map(String::as_str), Some("-"), "{args:?}");
+            let stdin_prompt = backend
+                .stdin_prompt(&ctx)
+                .expect("codex stdin prompt should exist");
 
             assert!(
-                prompt_arg.contains("![]("),
-                "expected Markdown inline image syntax guidance for {mode:?}: {args:?}"
+                stdin_prompt.contains("![]("),
+                "expected Markdown inline image syntax guidance for {mode:?}: {stdin_prompt:?}"
             );
         }
     }
@@ -2744,15 +3139,18 @@ model = "nested-model"
 
         let cmd = backend.build_command(&ctx).unwrap();
         let args = command_args(&cmd);
-        let prompt_arg = args.last().expect("codex prompt arg should exist");
+        assert_eq!(args.last().map(String::as_str), Some("-"), "{args:?}");
+        let stdin_prompt = backend
+            .stdin_prompt(&ctx)
+            .expect("codex stdin prompt should exist");
 
         assert!(
-            prompt_arg.contains(crate::lead_step::LEAD_DECISION_SYS_PROMPT),
-            "expected lead action system prompt in Codex prompt arg: {args:?}"
+            stdin_prompt.contains(crate::lead_step::LEAD_DECISION_SYS_PROMPT),
+            "expected lead action system prompt in Codex stdin prompt: {stdin_prompt:?}"
         );
         assert!(
-            prompt_arg.ends_with("decide next"),
-            "expected user prompt after system prompt: {args:?}"
+            stdin_prompt.ends_with("decide next"),
+            "expected user prompt after system prompt: {stdin_prompt:?}"
         );
         assert!(
             contains_adjacent_pair(&args, "--sandbox", "read-only"),

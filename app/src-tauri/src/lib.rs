@@ -57,19 +57,14 @@ const MAX_CRITERIA: usize = 16;
 const MAX_CRITERION_LEN: usize = 2000;
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 static EVENT_TRANSPORT: OnceLock<event_transport::EventTransport> = OnceLock::new();
-static AUTOFEED_STARTED_REPORTS: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
-static AUTOFEED_PROMPT_BASELINE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
 /// session -> 用户点全局停止时的 MAX(messages.id)。这是进程内静默：进程重启后丢失可接受，
 /// 重启后至多被已落库的 stopped worker report 唤醒一次。
 static AUTOFEED_GLOBAL_STOP: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
-/// T-4b（remote control M0 §3/§4b）挂账①：迟到答案续跑（`try_resume_after_answer`）撞上活 run
-/// 时的进程内挂账——形态照 `AUTOFEED_PROMPT_BASELINE`。`finish_resume_after_answer` 的 busy 分支
-/// 负责登记；`drain_after_run_release` 在 run 槽释放后摘除并重试，若重试又 busy，登记分支原样
-/// 再挂回去（同一分支自然复触发，调用方不必自己判 busy）。这是纯进程内 best-effort 挂账，进程
-/// 重启即丢失，也没有自动机制补上这次续跑；但迟到答案已是历史中的真实 user 消息，用户下次手动
-/// 发新消息时，`send_message` / `start_lead_session` 启动的新 run 会自然读到它。它与另有持久化及
-/// 启动重扫的 `remote_inbox` FIFO 是两条独立机制，不能互相兜底。
-static PENDING_ANSWER_RESUME: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// T4：统一自动恢复状态机的 per-session 进程内状态表，取代旧 `PENDING_ANSWER_RESUME` 布尔挂账
+/// + autofeed 各自为政的门。见 `ResumeState`/`try_resume_pending_with_gate`（lib.rs 下方，
+/// `try_autofeed_lead` 原址）。纯进程内 best-effort：进程重启即清零退避与未确认答案 id 登记；
+/// 迟到答案已是历史中的真实 user 消息，重启后用户手动发消息会自然带出它，不需要额外补救。
+static RESUME_STATE: OnceLock<Mutex<HashMap<String, ResumeState>>> = OnceLock::new();
 /// T-4b（remote control M0 §4b）同会话排空互斥：map 值是 `DrainSlot { generation, dirty }`；
 /// `dirty` 合并进行中再次收到的释放通知，当前轮收尾会原子复位并重放一轮，直至无脏位才摘除
 /// session_id。`generation` 标记本轮登记，供 `DrainingGuard::drop` 防止旧 guard 延迟释放时误删
@@ -599,6 +594,20 @@ fn remote_gateway_milestone_replay_provider(
         let db = app.try_state::<Db>()?;
         let conn = db.inner().0.lock().ok()?;
         db::list_recent_milestone_replay_rows(&conn, db::RECENT_MILESTONE_REPLAY_LIMIT).ok()
+    })
+}
+
+/// idlefix-T1 缺口②：连接后补发批用——把 `run.status` 现状（`session_runtime` 全表，排除软删
+/// 会话）交给 `publish_run_status_replay_rows` 逐会话重建帧重发。同 milestone_replay_provider
+/// 惯例：短锁 DB 读，失败静默返回 None（不 panic）。
+fn remote_gateway_session_runtime_replay_provider(
+    app: &AppHandle,
+) -> remote_gateway::SessionRuntimeReplayProvider {
+    let app = app.clone();
+    Box::new(move || {
+        let db = app.try_state::<Db>()?;
+        let conn = db.inner().0.lock().ok()?;
+        db::list_session_runtime_replay_rows(&conn).ok()
     })
 }
 
@@ -1833,10 +1842,10 @@ fn build_lead_backend_command(
     reasoning_tier: Option<&str>,
     key: Option<String>,
     search: HarnessSearchCreds,
-) -> Result<(Command, ParseFn), String> {
+) -> Result<(Command, ParseFn, Option<agent::StdinPrompt>), String> {
     let backend = make_backend(profile, key, search, locale)?;
     let parse_fn = backend.parse_fn();
-    let command = backend.build_command(&agent::BuildContext {
+    let ctx = agent::BuildContext {
         prompt,
         session_id,
         run_id,
@@ -1846,8 +1855,10 @@ fn build_lead_backend_command(
         locale,
         reasoning_tier,
         criteria: &[],
-    })?;
-    Ok((command, parse_fn))
+    };
+    let command = backend.build_command(&ctx)?;
+    let stdin_prompt = backend.stdin_prompt(&ctx);
+    Ok((command, parse_fn, stdin_prompt))
 }
 
 #[allow(dead_code)] // 一次性调用 profile→key→wt→command 全流程的参考实现；生产代码已全部
@@ -1862,6 +1873,7 @@ type BuiltMemberCommand = (
     ParseFn,
     std::path::PathBuf,
     member_runner::TextGranularity,
+    Option<agent::StdinPrompt>,
 );
 
 /// 为一个队员构造（命令, parser, parse_fn, cwd, 回传文本累积粒度）：缝4 经 make_backend·member。
@@ -1905,10 +1917,10 @@ pub(crate) fn build_member_command(
         HarnessSearchCreds::default()
     };
     let wt = resolve_member_wt(conn, session_id, &spec.assignment_id)?;
-    let (command, parser, parse_fn, granularity) = build_member_command_with(
+    let (command, parser, parse_fn, granularity, stdin_prompt) = build_member_command_with(
         conn, session_id, run_id, spec, &profile, key, search, &wt, locale,
     )?;
-    Ok((command, parser, parse_fn, wt, granularity))
+    Ok((command, parser, parse_fn, wt, granularity, stdin_prompt))
 }
 
 /// build_member_command 第①段：读 DB 拿 agent profile（快·需要 conn）。
@@ -1961,11 +1973,12 @@ pub(crate) fn build_member_command_with(
         fn(&str) -> Vec<agent_event::AgentEvent>,
         ParseFn,
         member_runner::TextGranularity,
+        Option<agent::StdinPrompt>,
     ),
     String,
 > {
     let backend = make_backend(profile, key, search, locale)?;
-    let command = backend.build_command(&agent::BuildContext {
+    let ctx = agent::BuildContext {
         prompt: &spec.prompt,
         session_id,
         run_id,
@@ -1975,11 +1988,13 @@ pub(crate) fn build_member_command_with(
         locale,
         reasoning_tier: None,
         criteria: &[],
-    })?;
+    };
+    let command = backend.build_command(&ctx)?;
+    let stdin_prompt = backend.stdin_prompt(&ctx);
     let parse_fn = backend.parse_fn();
     let parser = parser_for_parse_fn(parse_fn);
     let granularity = member_runner::TextGranularity::for_parse_fn(parse_fn);
-    Ok((command, parser, parse_fn, granularity))
+    Ok((command, parser, parse_fn, granularity, stdin_prompt))
 }
 
 struct SendPlan {
@@ -1990,6 +2005,7 @@ struct SendPlan {
     wt: std::path::PathBuf,
     command: Command,
     parse_fn: ParseFn,
+    stdin_prompt: Option<agent::StdinPrompt>,
 }
 
 fn build_send_plan_with(
@@ -2029,7 +2045,7 @@ fn build_send_plan_with(
     };
     let (_, wt) = ensure_session_workspace(conn, session_id)?;
     let parse_fn = backend.parse_fn();
-    let command = backend.build_command(&BuildContext {
+    let ctx = BuildContext {
         prompt: &prompt,
         session_id,
         run_id,
@@ -2039,7 +2055,9 @@ fn build_send_plan_with(
         locale,
         reasoning_tier,
         criteria,
-    })?;
+    };
+    let command = backend.build_command(&ctx)?;
+    let stdin_prompt = backend.stdin_prompt(&ctx);
 
     Ok(SendPlan {
         profile,
@@ -2049,6 +2067,7 @@ fn build_send_plan_with(
         wt,
         command,
         parse_fn,
+        stdin_prompt,
     })
 }
 
@@ -3031,6 +3050,12 @@ pub(crate) fn answer_question_inner(
         AnswerRoute::Late => {
             let conn = db.0.lock().map_err(|e| e.to_string())?;
             let appended = commit_late_answer(&conn, session_id, decision_id, &answer, locale)?;
+            // T4 C1：commit_late_answer 落库成功即登记未确认答案 id（S-2：仅 Team 会话才登记，
+            // 见 register_pending_answer_id_if_team）——不在这里/spawn 前消费，交付 ack 前一直
+            // 留着（真正 ack 由 T5 在 stdin I/O 确认后调 ack_pending_answers）。
+            if let Some(message) = &appended {
+                register_pending_answer_id_if_team(&conn, session_id, message.id);
+            }
             Ok(AnswerQuestionResult {
                 resolved: appended.is_some(),
                 appended,
@@ -3044,6 +3069,9 @@ pub(crate) fn answer_question_inner(
                 Some((_, status)) if status == "pending" => {
                     let appended =
                         commit_late_answer(&conn, session_id, decision_id, &answer, locale)?;
+                    if let Some(message) = &appended {
+                        register_pending_answer_id_if_team(&conn, session_id, message.id);
+                    }
                     Ok(AnswerQuestionResult {
                         resolved: appended.is_some(),
                         appended,
@@ -3058,9 +3086,9 @@ pub(crate) fn answer_question_inner(
 /// T3（AgentLoom remote control M0 §4a·别与「决策打扰收敛刀」旧 T1 系列内部的 T3 子步骤
 /// 混淆）：`answer_lead_question` 的返回值——`resumed` 告诉前端「后端是否已经自己触发了
 /// 续跑」，成功时 `lead_agent_id` 是实际用于启动的 saved lead；非 busy 启动失败才通过
-/// `resume_error` 回传原始错误。前端据此只做乐观绘制，绝不再自己 invoke
-/// `resume_lead_session`（否则本机路径会双触发：后端先占槽、前端随后 resume 撞 busy，给
-/// 用户弹假错误）。
+/// `resume_error` 回传原始错误。前端据此只做乐观绘制，绝不再自己 invoke 任何续跑命令
+/// （否则本机路径会双触发：后端先占槽、前端随后 resume 撞 busy，给用户弹假错误；T7 起
+/// 前端已无任何自触发续跑的 IPC 入口）。
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 struct AnswerLeadQuestionOutcome {
     resumed: bool,
@@ -3127,78 +3155,11 @@ fn answer_lead_question(
     Ok(outcome)
 }
 
-/// T3（remote control M0 §4a）：迟到答案落库成功后，续跑权收归后端——不再依赖前端自己
-/// invoke `resume_lead_session`。起因：「远程控制」答卡走的是同一条 `answer_lead_question`
-/// IPC，背后没有前端替它触发续跑，若续跑权仍留在前端，远程答卡后 lead 会永远停摆。
-///
-/// 短锁读 `SessionAgentConfig` 判门（`resume_after_answer_candidate`，纯内核·team 会话才续，
-/// solo 会话——没有 lead_agent_id——留给下一轮普通 run 自然消费答案，不续），锁在判门块结束
-/// 时立即释放，绝不带着 db 锁进 `start_lead_session`（M1-T1 死锁血案同款红线：
-/// `std::sync::Mutex` 不可重入，同线程二次 `db.0.lock()` 直接死锁；写法学
-/// `try_autofeed_lead` 的「短锁短放」块状作用域）。
-///
-/// 去重不新造锁：`commit_late_answer` 的 CAS 保证只有一个调用者能拿到 `Some(message)`（并发
-/// 双击/多路径同时落库时，第二个必然拿到 `Ok(None)`，本函数根本不会被调用）；
-/// `start_lead_session` 自己的 `reserve_new_session_run` 占槽闸兜底并发启动——占槽被抢
-/// （`autofeed_busy_error` 命中）静默收敛为「会话已在跑」，非 busy 的失败打一行非致命日志，
-/// 不 panic、不把 `Err` 冒泡成 command 失败；返回值携带是否续跑、实际 saved lead 与非 busy
-/// 错误原文。
-fn try_resume_after_answer(app: &AppHandle, session_id: &str) -> AnswerLeadQuestionOutcome {
-    let mut recheck_after_busy = true;
-    loop {
-        let db_state = app.state::<Db>();
-        let candidate = {
-            let Ok(conn) = db_state.0.lock() else {
-                return AnswerLeadQuestionOutcome::quietly_not_resumed();
-            };
-            let Ok(config) = db::get_session_agent_config(&conn, session_id) else {
-                return AnswerLeadQuestionOutcome::quietly_not_resumed();
-            };
-            resume_after_answer_candidate(&config)
-        };
-        let Some((lead_agent_id, member_agent_ids)) = candidate else {
-            return AnswerLeadQuestionOutcome::quietly_not_resumed();
-        };
-
-        // 判门锁已在上面的块结束时释放；绝不持 db 锁进入 lead 启动路径。
-        let result = start_lead_session(
-            app.clone(),
-            app.state::<Db>(),
-            app.state::<Running>(),
-            app.state::<member_runner::TeamRunning>(),
-            session_id.to_string(),
-            lead_agent_id.clone(),
-            None,
-            member_agent_ids,
-            None,
-            // 迟到答案续跑：message=None，dedup_key 不会被用到（persist_lead_start_message
-            // 提前返回），无需真实 user_dedup_key。
-            None,
-        );
-        let was_busy = matches!(&result, Err(e) if autofeed_busy_error(e));
-        let outcome = finish_resume_after_answer(session_id, lead_agent_id, result);
-
-        // F6：旧 run 可能恰在「start 看见 busy」之后、「finish 登记 pending」之前释放；它的
-        // drain 会先扫过空集合，随后才补上的登记便再也等不到释放事件。busy 已经由 finish 登记后，
-        // 这里立即 take 一次；拿得到就完整重判门、重启动一次，正好接住这个丢唤醒窗口。
-        // 重试闸在 take 前先关闭：第二轮若仍 busy，finish 会把账重新挂回，留给未来真实释放消费；
-        // 绝不能原地第三轮，否则持续 busy 会退化成无限热循环。若登记已被并发 drain 摘走，take
-        // 返回 false，说明续跑责任已交给那条 drain，本调用也不重复启动。
-        if was_busy && recheck_after_busy {
-            recheck_after_busy = false;
-            if take_pending_answer_resume(session_id) {
-                continue;
-            }
-        }
-        return outcome;
-    }
-}
-
-/// T-4b（remote control M0 §3/§4b）挂账①收口：busy 分支新增登记 `PENDING_ANSWER_RESUME`——
-/// 此前这里纯静默，答案落库后若正撞活 run 就永久丢续跑，没人再回头补喂。
-/// `drain_after_run_release` 会在 run 槽释放后摘除并重试。门/占槽语义不变。
-fn finish_resume_after_answer(
-    session_id: &str,
+/// 纯函数：把 `try_resume_pending_with_gate` 的 `(lead_agent_id, start 结果)` 转换成
+/// `AnswerLeadQuestionOutcome`——busy（占槽被抢=会话已在跑）静默收敛为
+/// `quietly_not_resumed()`，非 busy 保留错误原文，成功携带实际 saved lead。不做任何记账
+/// （记账副作用留给调用方按 busy/非 busy/成功三路各自处理），因此可以脱离 AppHandle 单测。
+fn classify_resume_attempt_outcome(
     lead_agent_id: String,
     result: Result<(), String>,
 ) -> AnswerLeadQuestionOutcome {
@@ -3208,37 +3169,52 @@ fn finish_resume_after_answer(
             lead_agent_id: Some(lead_agent_id),
             resume_error: None,
         },
-        Err(e) => {
-            if !autofeed_busy_error(&e) {
-                eprintln!("resume after late answer failed (non-fatal): {e}");
-                return AnswerLeadQuestionOutcome {
-                    resumed: false,
-                    lead_agent_id: None,
-                    resume_error: Some(e),
-                };
-            }
-            register_pending_answer_resume(session_id);
-            AnswerLeadQuestionOutcome::quietly_not_resumed()
-        }
+        Err(e) if autofeed_busy_error(&e) => AnswerLeadQuestionOutcome::quietly_not_resumed(),
+        Err(e) => AnswerLeadQuestionOutcome {
+            resumed: false,
+            lead_agent_id: None,
+            resume_error: Some(e),
+        },
     }
 }
 
-fn register_pending_answer_resume(session_id: &str) {
-    let set = PENDING_ANSWER_RESUME.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut guard = set.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.insert(session_id.to_string());
+/// T4（统一自动恢复状态机 C1）：迟到答案落库成功后的交互入口——新鲜用户点击（含远程答卡）
+/// 绕过共享 `not_before` 退避立即尝试一次；委托给统一入口
+/// `try_resume_pending_with_gate(..., ResumeGate::Bypass)`：原子快照两类触发原因（台账 pending
+/// 报告 + 未确认迟到答案 id，含刚落库的这一条）+ global-stop/team 门，跳过 `not_before` 门；
+/// 一轮成功交付同时消费两种原因。短锁读判门、绝不带着 db 锁进 `start_lead_session`（M1-T1
+/// 死锁血案同款红线）。
+///
+/// 去重不新造锁：`commit_late_answer` 的 CAS 保证只有一个调用者能拿到 `Some(message)`；
+/// `start_lead_session` 自己的 `reserve_new_session_run` 占槽闸兜底并发启动——占槽被抢
+/// （`autofeed_busy_error` 命中）静默收敛为「会话已在跑」（busy 不计入共享退避失败计数，交给
+/// 已经登记的 `pending_answer_ids` 等下一次 run 槽释放的 drain 自然重试，不需要单独的
+/// 「立即二次探测」补丁——答案 id 在起跑尝试之前已经登记，任何交错释放的 drain 天然可见）；
+/// 非 busy 的失败打一行非致命日志 + 计入共享退避（`record_resume_failure`）；不 panic、
+/// 不把 `Err` 冒泡成 command 失败；返回值携带是否续跑、实际 saved lead 与非 busy 错误原文。
+fn try_resume_after_answer(app: &AppHandle, session_id: &str) -> AnswerLeadQuestionOutcome {
+    let Some((lead_agent_id, result)) =
+        try_resume_pending_with_gate(app, session_id, ResumeGate::Bypass)
+    else {
+        return AnswerLeadQuestionOutcome::quietly_not_resumed();
+    };
+    let was_busy = matches!(&result, Err(e) if autofeed_busy_error(e));
+    let outcome = classify_resume_attempt_outcome(lead_agent_id, result);
+    if !was_busy {
+        if let Some(error) = &outcome.resume_error {
+            eprintln!("resume after late answer failed (non-fatal): {error}");
+            record_resume_failure(app, session_id, error);
+        }
+        // T5-fix A：起跑成功（`resume_error` 为 `None`）不再在这里清零退避——「runner 线程创建
+        // 成功、run 移交」只表示这一轮尝试起跑了，不代表已经真正交付；过早清零会把仍在排队的
+        // 连续失败状态在下一轮 MCP/build/spawn 失败前抹掉，退避永远卡在最短档。真正的清零
+        // 只在真实 I/O ack 之后发生——`commit_lead_run_delivery` 的 `Ok` 分支调用
+        // `note_resume_success`（T5 M3/I5）。
+    }
+    outcome
 }
 
-/// check-and-remove：命中返回 `true` 并清除登记，未命中返回 `false`。
-/// `drain_after_run_release` 用它做「先摘除、再重试」；重试若又撞 busy，
-/// `finish_resume_after_answer` 的既有分支会自己重新登记，这里不需要二次判断。
-fn take_pending_answer_resume(session_id: &str) -> bool {
-    let set = PENDING_ANSWER_RESUME.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut guard = set.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.remove(session_id)
-}
-
-/// `try_resume_after_answer` 的判门可测纯内核：team 会话（`session_agent_configs` 有
+/// `try_resume_pending_with_gate` 的判门可测纯内核：team 会话（`session_agent_configs` 有
 /// `lead_agent_id`）续跑门开，返回 `Some((lead_agent_id, member_agent_ids))`；solo 会话
 /// （无该行 / `lead_agent_id` 为 `NULL`）不续，返回 `None`——迟到答案已由 `commit_late_answer`
 /// 落成真实 user 消息，留给下一轮普通 run 自然消费，不能把它误当 team 续跑触发。
@@ -3939,6 +3915,13 @@ enum LeadRuntimeFailure<'a> {
     McpStart(&'a str),
     CommandBuild(&'a str),
     ProcessStart(&'a str),
+    // T5 D：runner OS 线程（`std::thread::Builder::spawn`）创建失败——闭包整体从未执行，
+    // child/MCP server 都还没起来；与 `ProcessStart`（child 进程 spawn 失败）是不同的失败点，
+    // 单独一个 variant 避免消息混淆两类完全不同的失败原因。
+    ThreadSpawn(&'a str),
+    // T8 P2-④/I2：组装上下文失败（DB 锁重试后仍拿不到，或 `build_lead_context_prompt_for_session`
+    // 返回 Err）——自动来源（Autofeed/LateAnswer）据此中止本轮而不是只喂兜底句起跑。
+    ContextAssembly(&'a str),
 }
 
 fn lead_runtime_failure_message(locale: Locale, failure: LeadRuntimeFailure<'_>) -> String {
@@ -3965,6 +3948,18 @@ fn lead_runtime_failure_message(locale: Locale, failure: LeadRuntimeFailure<'_>)
         }
         (Locale::En, LeadRuntimeFailure::ProcessStart(detail)) => {
             format!("Lead failed to start: {detail}")
+        }
+        (Locale::Zh, LeadRuntimeFailure::ThreadSpawn(detail)) => {
+            format!("队长运行线程创建失败：{detail}")
+        }
+        (Locale::En, LeadRuntimeFailure::ThreadSpawn(detail)) => {
+            format!("Failed to create the lead runner thread: {detail}")
+        }
+        (Locale::Zh, LeadRuntimeFailure::ContextAssembly(detail)) => {
+            format!("组装队长上下文失败：{detail}")
+        }
+        (Locale::En, LeadRuntimeFailure::ContextAssembly(detail)) => {
+            format!("Failed to assemble lead context: {detail}")
         }
     }
 }
@@ -6867,7 +6862,7 @@ fn start_repo_generation(
     let search =
         resolve_harness_search_creds(db.inner(), &profile, &crate::keychain::KeyringStore)?;
     let key = resolve_member_key(&profile)?;
-    let (mut command, parse_fn) = {
+    let (mut command, parse_fn, stdin_prompt) = {
         let conn = db.0.lock().map_err(|error| error.to_string())?;
         build_lead_backend_command(
             &conn,
@@ -6891,12 +6886,10 @@ fn start_repo_generation(
     let repo_id_t = repo_id.clone();
     let run_id_t = run_id.clone();
     std::thread::spawn(move || {
-        command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null());
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let result = (|| -> Result<db::GeneratedRepoDocument, String> {
-            let mut child = command.spawn().map_err(|error| error.to_string())?;
+            let mut child = agent::spawn_with_stdin_prompt(&mut command, stdin_prompt.as_ref())
+                .map_err(|error| error.to_string())?;
             let stdout = child
                 .stdout
                 .take()
@@ -7555,36 +7548,61 @@ where
         Stream,
         Stopped,
         Abort,
+        Poisoned(String),
     }
 
     let action = {
-        let mut slots = running.0.lock().map_err(|error| {
-            terminated.store(true, Ordering::SeqCst);
-            error.to_string()
-        })?;
-        match slots.get(session_id).cloned() {
-            Some(RunSlot::Launching {
-                stop_requested: true,
-            }) => {
-                kill(pid);
+        match running.0.lock() {
+            Ok(mut slots) => match slots.get(session_id).cloned() {
+                Some(RunSlot::Launching {
+                    stop_requested: true,
+                }) => {
+                    kill(pid);
+                    terminated.store(true, Ordering::SeqCst);
+                    // T5 C3：Stopped 是用户已明确表达的意图（global-stop），不装退避——
+                    // `note_resume_failure` 故意不调用；摘槽即该状态的终态，无需额外一步。
+                    slots.remove(session_id);
+                    Action::Stopped
+                }
+                Some(RunSlot::Launching {
+                    stop_requested: false,
+                }) => {
+                    slots.insert(session_id.to_string(), RunSlot::Running(pid));
+                    Action::Stream
+                }
+                _ => {
+                    kill(pid);
+                    terminated.store(true, Ordering::SeqCst);
+                    // T5 C3：Abort 是非预期状态竞态（槽已不是本次 Launching），先装退避
+                    // （`note_resume_failure`）再摘槽——遵守 I5「先状态后摘槽」的顺序协议：
+                    // note_resume_failure 只碰 RESUME_STATE 这把独立 Mutex，不与 `slots`
+                    // （running.0 的锁）冲突/重入，调用完仍在同一临界区内才 `slots.remove`，
+                    // 堵死「槽已对外表现为空、但退避状态还没落定」那扇并发窗口（并发 drain
+                    // 若抢在 `slots.remove` 之后立刻拿到 running.0 锁看到槽已空，此时退避早已装好）。
+                    note_resume_failure(session_id);
+                    slots.remove(session_id);
+                    Action::Abort
+                }
+            },
+            Err(poisoned) => {
+                // T5-fix D：`running.0` poisoned 时，旧实现直接 `map_err(...)?` 提前 return——
+                // 从未拿到 guard，也就从未 `slots.remove`，但外层调用方（:14554 附近）仍会在
+                // `Err(_)` 分支照样调 `drain_after_run_release`，违反「slot release < drain」
+                // 顺序不变量（槽到底摘没摘、drain 的人不知道）。std::sync::Mutex 的 poison 不丢
+                // 数据——`PoisonError::into_inner` 能拿回被污染前最后一次持锁时的内部状态，这里
+                // 借它恢复 guard，按 Abort 同款收尾（kill、terminated 置位、`note_resume_failure`
+                // 留痕、真正 `slots.remove`）后再把 poisoned 错误透传给调用方——调用方看到的仍是
+                // `Err`，但这次槽已经真的空了，drain 不会踩着一个仍占着的槽走。
+                let error = poisoned.to_string();
                 terminated.store(true, Ordering::SeqCst);
-                slots.remove(session_id);
-                Action::Stopped
-            }
-            Some(RunSlot::Launching {
-                stop_requested: false,
-            }) => {
-                slots.insert(session_id.to_string(), RunSlot::Running(pid));
-                Action::Stream
-            }
-            _ => {
+                let mut slots = poisoned.into_inner();
                 kill(pid);
-                terminated.store(true, Ordering::SeqCst);
+                note_resume_failure(session_id);
                 slots.remove(session_id);
-                Action::Abort
+                Action::Poisoned(error)
             }
         }
-        // `slots`（running.0 的锁）在这个块结束时 drop——下面 match action 分支里调用
+        // `slots`（running.0 的锁）在各分支结束时 drop——下面 match action 分支里调用
         // refresh_session_runtime 会重新加锁，P0-1 教训：绝不能带着这把锁走过去。
     };
 
@@ -7607,6 +7625,13 @@ where
                 refresh_session_runtime(db, running, team_running, session_id);
             }
             Ok(false)
+        }
+        Action::Poisoned(error) => {
+            // T5-fix D：poisoned 分支同 Abort，也真摘了槽——照样 refresh 再把错误透传出去。
+            if let Some(db) = db {
+                refresh_session_runtime(db, running, team_running, session_id);
+            }
+            Err(error)
         }
     }
 }
@@ -7732,6 +7757,54 @@ fn persist_lead_prespawn_failure_with_conn(
         }
     }
     event
+}
+
+/// T5 D：runner OS 线程创建失败（`std::thread::Builder::spawn` 在 `start_lead_session` 里返回
+/// `Err`）时的统一收尾——此时闭包整体从未执行，child/MCP server 都还没起来，只有 Launching 槽
+/// + 已注册的 EventTransport run（`register_run`）需要收干净。顺序：先
+/// `note_resume_failure`（装退避，早于摘槽，I5）→ `persist_lead_prespawn_failure`（落一条可见
+/// 错误，与另外三个 prespawn 失败点同款落库）→ `emit_lead_error_and_release`（统一摘槽 + 经
+/// `flush_barrier` 把已注册的 EventTransport lane 转 Closed，天然完成「清理已注册 run」）→
+/// `drain_after_run_release`（槽释放之后才排空）。抽成独立函数：这条路径要在真实 OS 线程创建
+/// 失败时触发几乎不可能，抽出来才能脱离该条件直接单测（调用点见 `start_lead_session` 里
+/// `std::thread::Builder::spawn` 的 `Err` 分支，那里的 `guard.disarm()` 紧跟在本函数调用之后，
+/// 避免 `ReservationGuard::drop` 对已经手动摘掉的槽做一次多余的二次摘槽 + 二次 refresh）。
+#[allow(clippy::too_many_arguments)]
+fn handle_lead_runner_thread_spawn_failure(
+    app: &AppHandle,
+    running: &Running,
+    team_running: &member_runner::TeamRunning,
+    db: &crate::db::Db,
+    terminated: &AtomicBool,
+    session_id: &str,
+    run_id: &str,
+    lead_agent_id: &str,
+    lead_agent_name: &str,
+    error: &str,
+) {
+    note_resume_failure(session_id);
+    let message =
+        lead_runtime_failure_message(current_locale(app), LeadRuntimeFailure::ThreadSpawn(error));
+    persist_lead_prespawn_failure(
+        app,
+        display_reduce::DisplayReducer::new(run_id),
+        session_id,
+        run_id,
+        lead_agent_id,
+        lead_agent_name,
+        message.clone(),
+    );
+    emit_lead_error_and_release(
+        running,
+        team_running,
+        terminated,
+        session_id,
+        run_id,
+        event_transport(),
+        message,
+        Some(db),
+    );
+    drain_after_run_release(app.clone(), session_id.to_string());
 }
 
 fn reconcile_running_dispatch_cards(
@@ -7898,7 +7971,7 @@ pub(crate) fn refresh_session_runtime(
 /// `Running` 槽（锁在摘完立刻 drop，见下），再经 `refresh_session_runtime` 重算 session_runtime
 /// （`runtime_db` 传 `Some` 时才写；测试调用点传 `None` 跳过，不关心运行态表），最后才
 /// `flush_barrier`。P0-1（2026-08-11 opus 深审）：db 锁必须在这里短锁短放——旧版本调用方在
-/// 外层预先锁住 db 再传一个裸 `&Connection` 进来，锁会一路存活到 `try_autofeed_lead` 重新
+/// 外层预先锁住 db 再传一个裸 `&Connection` 进来，锁会一路存活到 `try_resume_pending` 重新
 /// 加锁那一刻，同线程二次 lock 直接死锁；现在函数签名收 `&crate::db::Db`（未锁的句柄），
 /// 锁的获取/释放完全封在 `refresh_session_runtime` 内部，调用方拿到的从来不是一个存活的
 /// guard，天然不可能带出去撞车。
@@ -8103,6 +8176,7 @@ fn spawn_and_stream(
     wt: std::path::PathBuf,
     engine: String,
     mut command: Command,
+    stdin_prompt: Option<agent::StdinPrompt>,
     parser: fn(&str) -> Vec<agent_event::AgentEvent>,
     parse_fn: ParseFn,
     guard: &mut ReservationGuard,
@@ -8126,10 +8200,8 @@ fn spawn_and_stream(
 
     let run_started_at = std::time::SystemTime::now();
     let first_event_started_at = Instant::now();
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .spawn()
+    command.stdout(Stdio::piped());
+    let mut child = agent::spawn_with_stdin_prompt(&mut command, stdin_prompt.as_ref())
         .map_err(|e| ui_msg::al_err("run.spawnFailed", &[("detail", e.to_string())]))?;
     let first_event_deadline =
         first_event_started_at + std::time::Duration::from_secs(FIRST_EVENT_TIMEOUT_SECS);
@@ -8405,12 +8477,8 @@ fn spawn_and_stream(
                     350 * u64::from(retry_count),
                 ));
                 let retry_started_at = Instant::now();
-                match command
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                {
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+                match agent::spawn_with_stdin_prompt(&mut command, stdin_prompt.as_ref()) {
                     Ok(mut retry_child) => {
                         let retry_pid = retry_child.id();
                         let handoff =
@@ -8591,16 +8659,23 @@ fn spawn_and_stream(
 
 /// claude 全自动「干活」命令行参数(不含 program)，便于 sandbox-exec 包裹。
 /// 默认 config dir(不设 CLAUDE_CONFIG_DIR)→ 照常读 keychain OAuth。
-fn claude_agent_argv(message: &str) -> Vec<String> {
+/// prompt 正文不再进 argv（超长 prompt 撞 ARG_MAX 报 `Argument list too long`）：`-p`/`--print`
+/// 本身是布尔开关，不带位置参数时 claude 从 stdin 读正文（实测确认：`printf '...' | claude -p`
+/// 正常应答）。真正的正文由 `AgentBackend::stdin_prompt()` 提供，调用方经
+/// `agent::spawn_with_stdin_prompt` 写入子进程 stdin。
+/// `--disable-slash-commands` 是全线共用基础项（solo / native lead / borrow lead /
+/// `BorrowClaudeBackend` 都经本函数）：正文经 stdin 送入，若正文以 `/` 开头，claude 可能
+/// 把它误当 slash command 处理而非普通对话正文——禁掉 slash command 解析防止误吞。
+fn claude_agent_argv() -> Vec<String> {
     vec![
         "-p".into(),
-        message.into(),
         "--output-format".into(),
         "stream-json".into(),
         "--verbose".into(),
         "--include-partial-messages".into(),
         "--permission-mode".into(),
         "bypassPermissions".into(),
+        "--disable-slash-commands".into(),
         "--setting-sources".into(),
         // 用户在 ~/.claude 配的 permissions / env / MCP / hooks 本来就该在 app 里生效，
         // agent 拿到的环境应与用户终端里裸跑一致。
@@ -8777,7 +8852,6 @@ fn apply_augmented_spawn_path(command: &mut Command, augmented_path: Option<std:
 
 pub(crate) fn claude_sandboxed_cmd_in(
     wt: &std::path::Path,
-    prompt: &str,
     extra_args: &[&str],
 ) -> Result<(Command, String), String> {
     // canonical 工作区：Seatbelt 规则字符串不解析 symlink，非 canonical 的 subpath 等于不生效。
@@ -8804,7 +8878,7 @@ pub(crate) fn claude_sandboxed_cmd_in(
     };
 
     let claude_bin = sandbox::resolve_claude_bin_for_spawn()?;
-    let mut argv = claude_agent_argv(prompt);
+    let mut argv = claude_agent_argv();
     for a in extra_args {
         argv.push((*a).to_string());
     }
@@ -8834,10 +8908,10 @@ pub(crate) fn claude_sandboxed_cmd_in(
 /// 构造带 MCP 配置的 lead 命令：CLI 的连接与同步工具调用超时都与 config 的 24h 对齐。
 fn claude_lead_cmd_in(
     wt: &std::path::Path,
-    prompt: &str,
+    _prompt: &str,
     extra_args: &[&str],
 ) -> Result<(Command, String), String> {
-    let (mut cmd, claude_bin) = claude_sandboxed_cmd_in(wt, prompt, extra_args)?;
+    let (mut cmd, claude_bin) = claude_sandboxed_cmd_in(wt, extra_args)?;
     let timeout = mcp_server::CLAUDE_MCP_TIMEOUT_MS.to_string();
     cmd.env("MCP_TOOL_TIMEOUT", &timeout);
     cmd.env("MCP_TIMEOUT", timeout);
@@ -8846,7 +8920,8 @@ fn claude_lead_cmd_in(
 
 /// L1：borrow-claude 队长 spawn。与 native lead 共用同一沙箱基座（`claude_sandboxed_cmd_in`）+
 /// 同一 `lead_claude_argv_extra`（MCP/allowedTools/disallowedTools 序列同 native，只有
-/// system_prompt 内容不同）；额外加 `--disable-slash-commands`（与 `BorrowClaudeBackend` 一致）。
+/// system_prompt 内容不同）；`--disable-slash-commands` 已下沉进 `claude_agent_argv()` 基础项
+/// （全线共用，不再在这里 ad-hoc 加）。
 /// env 装配委托 `agent::apply_borrow_claude_env`（与 `BorrowClaudeBackend` 同源，不复制）——
 /// 必须先 `apply_clean_env` 再叠加 borrow env，顺序反了 borrow 的 ANTHROPIC_* 会被 clean 冲掉。
 /// `system_prompt` 必须已由调用方合并好「身份提示 + LEAD_SYS_V2」——只发一条
@@ -8855,14 +8930,13 @@ fn borrow_lead_cmd_in(
     profile: &db::AgentProfile,
     api_key: &str,
     wt: &std::path::Path,
-    prompt: &str,
+    _prompt: &str,
     mcp_cfg: &str,
     system_prompt: &str,
 ) -> Result<(Command, String), String> {
-    let mut extra: Vec<String> = vec!["--disable-slash-commands".to_string()];
-    extra.extend(lead_claude_argv_extra(mcp_cfg, system_prompt));
+    let extra: Vec<String> = lead_claude_argv_extra(mcp_cfg, system_prompt);
     let extra_refs: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
-    let (mut cmd, claude_bin) = claude_sandboxed_cmd_in(wt, prompt, &extra_refs)?;
+    let (mut cmd, claude_bin) = claude_sandboxed_cmd_in(wt, &extra_refs)?;
     let timeout = mcp_server::CLAUDE_MCP_TIMEOUT_MS.to_string();
     cmd.env("MCP_TOOL_TIMEOUT", &timeout);
     cmd.env("MCP_TIMEOUT", timeout);
@@ -8930,13 +9004,13 @@ fn harness_lead_cmd_in(
 /// 旧入口保持签名不变（Normal 路径调用方不动）：推 session wt 后委托显式版。
 #[allow(dead_code)]
 pub(crate) fn claude_sandboxed_cmd(
-    prompt: &str,
+    _prompt: &str,
     extra_args: &[&str],
     conn: &rusqlite::Connection,
     session_id: &str,
 ) -> Result<Command, String> {
     let (_workspace, wt) = ensure_session_workspace(conn, session_id)?;
-    claude_sandboxed_cmd_in(&wt, prompt, extra_args).map(|(cmd, _)| cmd)
+    claude_sandboxed_cmd_in(&wt, extra_args).map(|(cmd, _)| cmd)
 }
 
 /// env sanitize：删会抢占/改写订阅 OAuth 的变量(强制走 keychain)。
@@ -9073,9 +9147,9 @@ async fn propose_team_plan(
                 resolve_harness_search_creds(db.inner(), &driver, &crate::keychain::KeyringStore)?;
             let key = resolve_member_key(&driver)?;
             // 锁作用域收窄（H1/A3·可做可不做项）：与 A1 同款——build 完立即释放 guard 再 spawn。
-            let mut cmd = {
+            let (mut cmd, stdin_prompt) = {
                 let conn = db.0.lock().map_err(|e| e.to_string())?;
-                let (cmd, _) = build_lead_backend_command(
+                let (cmd, _, stdin_prompt) = build_lead_backend_command(
                     &conn,
                     &session_id,
                     &hook_run_id,
@@ -9088,12 +9162,12 @@ async fn propose_team_plan(
                     key,
                     search,
                 )?;
-                cmd
+                (cmd, stdin_prompt)
             };
             cmd.stdout(std::process::Stdio::piped());
             // A 子片 Fix3：pipe stderr·拟失败时尾部进 last_error 供 GUI 诊断（曾被丢到 app stderr 看不到）。
             cmd.stderr(std::process::Stdio::piped());
-            cmd.spawn()
+            agent::spawn_with_stdin_prompt(&mut cmd, stdin_prompt.as_ref())
                 .map_err(|e| ui_msg::al_err("lead.spawnDriverFailed", &[("detail", e.to_string())]))
         };
         if strict_member_pool {
@@ -9274,7 +9348,7 @@ async fn lead_step(
             let search =
                 resolve_harness_search_creds(db.inner(), &driver, &crate::keychain::KeyringStore)?;
             let key = resolve_member_key(&driver)?;
-            let (mut cmd, parse_fn) = {
+            let (mut cmd, parse_fn, stdin_prompt) = {
                 // 锁作用域收窄（H1/A1）：build_lead_backend_command 只在函数体内借用 conn
                 // 构造 Command（读 profile/history 等 DB 只读数据），返回的 Command 不持有
                 // conn 的借用；guard 在这个块结束时立即释放，子进程 spawn + 读 stdout 到 EOF
@@ -9296,9 +9370,11 @@ async fn lead_step(
             };
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
-            let child = cmd.spawn().map_err(|e| {
+            let spawn_err = |e: std::io::Error| {
                 ui_msg::al_err("lead.spawnLeadFailed", &[("detail", e.to_string())])
-            })?;
+            };
+            let child = agent::spawn_with_stdin_prompt(&mut cmd, stdin_prompt.as_ref())
+                .map_err(spawn_err)?;
             match lead_draft::read_draft_final_text(child, parser_for_parse_fn(parse_fn)) {
                 (Some(text), _) => Ok(text),
                 (None, stderr) if stderr.is_empty() => Err(ui_msg::al_err("lead.noFinalText", &[])),
@@ -9392,8 +9468,9 @@ fn record_lead_dispatch(
 
 /// Generic one-shot (non-streaming) LLM call for an already-built agent command.
 ///
-/// Runs `command.output()` (non-streaming, synchronous), checks the exit status, and
-/// extracts the assistant text via `collect_assistant_text`.
+/// Spawns via `agent::spawn_with_stdin_prompt` and collects output with `wait_with_output()`
+/// (non-streaming, synchronous), checks the exit status, and extracts the assistant text via
+/// `collect_assistant_text`.
 ///
 /// Does NOT require a lead agent ID, a workers list, or any Team-synthesis assumptions —
 /// the caller is responsible for building the command and choosing the prompt.
@@ -9401,12 +9478,21 @@ fn record_lead_dispatch(
 ///
 /// Returns `Err` if the process fails to start, exits non-zero, or produces no
 /// assistant text.
-fn run_oneshot_llm(mut command: Command, parse_fn: ParseFn) -> Result<String, String> {
+fn run_oneshot_llm(
+    mut command: Command,
+    parse_fn: ParseFn,
+    stdin_prompt: Option<agent::StdinPrompt>,
+) -> Result<String, String> {
     let _hook_guard = checkpoint_hook::guard_for_command(&command);
-    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let out = command
-        .output()
+    // prompt 走 stdin 时不能用 `Command::output()`（它内部一手包办 spawn+wait，拿不到
+    // child.stdin 写正文的机会）：改手动 spawn（帮手已经处理 piped+写线程+EOF）+
+    // `wait_with_output()` 收 stdout/stderr。
+    let child = agent::spawn_with_stdin_prompt(&mut command, stdin_prompt.as_ref())
+        .map_err(|e| ui_msg::al_err("team.oneshotSpawnFailed", &[("detail", e.to_string())]))?;
+    let out = child
+        .wait_with_output()
         .map_err(|e| ui_msg::al_err("team.oneshotSpawnFailed", &[("detail", e.to_string())]))?;
 
     if !out.status.success() {
@@ -9614,6 +9700,7 @@ fn finish_handoff_oneshot(
 fn run_oneshot_llm_with_timeout(
     command: Command,
     parse_fn: ParseFn,
+    stdin_prompt: Option<agent::StdinPrompt>,
     timeout: std::time::Duration,
     registry: &HandoffProcesses,
     session_id: &str,
@@ -9623,6 +9710,7 @@ fn run_oneshot_llm_with_timeout(
     run_oneshot_llm_with_timeout_and_kill(
         command,
         parse_fn,
+        stdin_prompt,
         timeout,
         registry,
         session_id,
@@ -9635,6 +9723,7 @@ fn run_oneshot_llm_with_timeout(
 fn run_oneshot_llm_with_timeout_and_kill<K>(
     mut command: Command,
     parse_fn: ParseFn,
+    stdin_prompt: Option<agent::StdinPrompt>,
     timeout: std::time::Duration,
     registry: &HandoffProcesses,
     session_id: &str,
@@ -9649,18 +9738,14 @@ where
         return Err("AL_ERR:continuation.handoffCancelled".to_string());
     }
     let _hook_guard = checkpoint_hook::guard_for_command(&command);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
 
-    let mut child = command
-        .spawn()
+    let mut child = agent::spawn_with_stdin_prompt(&mut command, stdin_prompt.as_ref())
         .map_err(|e| ui_msg::al_err("team.oneshotSpawnFailed", &[("detail", e.to_string())]))?;
     let stdout = child.stdout.take().expect("piped handoff stdout");
     let stderr = child.stderr.take().expect("piped handoff stderr");
@@ -9883,12 +9968,12 @@ async fn lead_summarize(
     };
     let search = resolve_harness_search_creds(&db, &profile, &KeyringStore)?;
     let hook_run_id = new_run_id();
-    let (command, parse_fn) = {
+    let (command, parse_fn, stdin_prompt) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         let (_, wt) = ensure_session_workspace(&conn, &session_id)?;
         let backend = make_backend(&profile, key, search, locale)?;
         let parse_fn = backend.parse_fn();
-        let command = backend.build_command(&BuildContext {
+        let ctx = BuildContext {
             prompt: &prompt,
             session_id: &session_id,
             run_id: &hook_run_id,
@@ -9898,14 +9983,18 @@ async fn lead_summarize(
             locale,
             reasoning_tier: None,
             criteria: &[],
-        })?;
-        (command, parse_fn)
+        };
+        let command = backend.build_command(&ctx)?;
+        let stdin_prompt = backend.stdin_prompt(&ctx);
+        (command, parse_fn, stdin_prompt)
     };
 
-    let text = tauri::async_runtime::spawn_blocking(move || run_oneshot_llm(command, parse_fn))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(remap_oneshot_error)?;
+    let text = tauri::async_runtime::spawn_blocking(move || {
+        run_oneshot_llm(command, parse_fn, stdin_prompt)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(remap_oneshot_error)?;
     Ok(text)
 }
 
@@ -10951,6 +11040,7 @@ fn send_message(
         wt,
         command,
         parse_fn,
+        stdin_prompt,
         profile: _profile,
         prompt: _prompt,
     } = plan;
@@ -10998,6 +11088,7 @@ fn send_message(
         wt,
         agent_id,
         command,
+        stdin_prompt,
         parser,
         parse_fn,
         &mut guard,
@@ -11665,6 +11756,13 @@ enum LeadEngine {
     Harness,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+enum StartOrigin {
+    Autofeed,
+    UserMessage,
+    LateAnswer,
+}
+
 /// 纯函数门禁（可单测）：从 provider/access 判定该 profile 能否当 lead、走哪条引擎。
 ///
 /// 规则：门禁只按 provider/access 映射到当前版本实际实现的 spawn 引擎，未实现 spawn
@@ -11698,69 +11796,6 @@ fn lead_engine_for_profile(profile: &db::AgentProfile) -> Result<LeadEngine, Str
     ))
 }
 
-/// 决策打扰收敛刀 T3：用户迟到补答 MCP 决策卡（`commit_late_answer` 已经落了一条
-/// `[用户对『问题』的回答] X` user 消息）之后，若该会话的 run 已经收工（不在跑），续跑
-/// lead——绝不能再落第二条消息（否则答案在 transcript 里重复），故复用
-/// `start_lead_session` 本体、message 传 `None`：build_lead_context_prompt 直接读现有
-/// 历史（已含刚落的答案），不额外 append。并发安全同 `start_lead_session`——走同一套
-/// `reserve_new_session_run` 互斥闸，会话已在跑（比如用户在 handler 还活着时点的卡，
-/// 那条路径不会调这个命令）时天然幂等拒绝，不新造锁。
-#[tauri::command]
-fn resume_lead_session(
-    app: AppHandle,
-    db: State<Db>,
-    running: State<Running>,
-    team_running: State<member_runner::TeamRunning>,
-    session_id: String,
-    lead_agent_id: String,
-    member_ids: Vec<String>,
-) -> Result<(), String> {
-    start_lead_session(
-        app,
-        db,
-        running,
-        team_running,
-        session_id,
-        lead_agent_id,
-        None,
-        member_ids,
-        None,
-        // message=None 续跑：dedup_key 不会被用到。
-        None,
-    )
-}
-
-fn autofeed_message_is_worker_report(content_json: &str) -> Option<bool> {
-    let content = serde_json::from_str::<serde_json::Value>(content_json).ok()?;
-    let blocks = content.as_array()?;
-    let first_text = blocks.iter().find_map(|block| {
-        let block = block.as_object()?;
-        (block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-            .then(|| block.get("text").and_then(serde_json::Value::as_str))
-            .flatten()
-    });
-    Some(first_text.is_some_and(|text| text.starts_with("[Worker report]")))
-}
-
-fn record_autofeed_prompt_baseline(session_id: &str, max_message_id: i64) {
-    let baselines = AUTOFEED_PROMPT_BASELINE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = baselines
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard
-        .entry(session_id.to_string())
-        .and_modify(|current| *current = (*current).max(max_message_id))
-        .or_insert(max_message_id);
-}
-
-fn autofeed_prompt_baseline(session_id: &str) -> Option<i64> {
-    let baselines = AUTOFEED_PROMPT_BASELINE.get_or_init(|| Mutex::new(HashMap::new()));
-    let guard = baselines
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.get(session_id).copied()
-}
-
 fn record_autofeed_global_stop(session_id: &str, max_message_id: i64) {
     let stops = AUTOFEED_GLOBAL_STOP.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = stops
@@ -11780,7 +11815,10 @@ fn clear_autofeed_global_stop(session_id: &str) {
     guard.remove(session_id);
 }
 
-fn autofeed_global_stop_allows_decision(conn: &Connection, session_id: &str) -> bool {
+fn autofeed_global_stop_allows_decision(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<bool> {
     let stops = AUTOFEED_GLOBAL_STOP.get_or_init(|| Mutex::new(HashMap::new()));
     let stopped_at = {
         let guard = stops
@@ -11789,7 +11827,7 @@ fn autofeed_global_stop_allows_decision(conn: &Connection, session_id: &str) -> 
         guard.get(session_id).copied()
     };
     let Some(stopped_at) = stopped_at else {
-        return true;
+        return Ok(true);
     };
 
     let latest_user_id = conn
@@ -11797,94 +11835,52 @@ fn autofeed_global_stop_allows_decision(conn: &Connection, session_id: &str) -> 
             "SELECT MAX(id) FROM messages WHERE session_id = ?1 AND role = 'user'",
             [session_id],
             |row| row.get::<_, Option<i64>>(0),
-        )
-        .ok()
-        .flatten()
+        )?
         .unwrap_or(0);
     if latest_user_id <= stopped_at {
-        return false;
+        return Ok(false);
     }
 
     let mut guard = stops
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match guard.get(session_id).copied() {
+    Ok(match guard.get(session_id).copied() {
         Some(current_stop) if latest_user_id > current_stop => {
             guard.remove(session_id);
             true
         }
         Some(_) => false,
         None => true,
-    }
+    })
 }
 
-fn autofeed_message_is_worker_report_for_assignment(
-    content_json: &str,
-    assignment_id: &str,
-) -> Option<bool> {
-    let content = serde_json::from_str::<serde_json::Value>(content_json).ok()?;
-    let blocks = content.as_array()?;
-    let assignment_line = format!("assignment_id: {assignment_id}");
-    let first_text = blocks.iter().find_map(|block| {
-        let block = block.as_object()?;
-        (block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-            .then(|| block.get("text").and_then(serde_json::Value::as_str))
-            .flatten()
-    });
-    Some(first_text.is_some_and(|text| {
-        text.starts_with("[Worker report]") && text.lines().any(|line| line == assignment_line)
-    }))
-}
-
-/// 标记 dispatch_worker 等到分支已把指定报告同步交付给本回合 lead。查询只用 LIKE
-/// 预筛候选，最终仍解析 JSON 并核对 `[Worker report]` 与精确 assignment_id 行。
-///
-/// 这里刻意维持 session 级水位而不做 per-report 追踪：若同一回合先有另一 worker 的超时报告
-/// 未消费、后有一个等到结果完成交付，水位会一并盖过前者，使那份超时报告漏掉自动续喂；它会在
-/// 下一次任意 prompt 中自然被消费。这个失败方向不会多跑或错跑，优先保持实现与现有水位模型一致。
-fn record_autofeed_result_delivered(
+/// 快路径只确认当前 assignment 对应的 pending 报告，不影响同 session 其他台账行。
+fn ack_autofeed_result_delivery(
     conn: &Connection,
     session_id: &str,
     assignment_id: &str,
-) -> Option<i64> {
-    let assignment_pattern = format!("%{assignment_id}%");
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, content
-               FROM messages
-              WHERE session_id = ?1
-                AND role = 'assistant'
-                AND engine = 'agent-team'
-                AND content LIKE ?2
-                AND content LIKE ?3
-              ORDER BY id DESC",
-        )
-        .ok()?;
-    let mut rows = stmt
-        .query(rusqlite::params![
-            session_id,
-            "%[Worker report]%",
-            assignment_pattern
-        ])
-        .ok()?;
-    while let Some(row) = rows.next().ok()? {
-        let id = row.get::<_, i64>(0).ok()?;
-        let content = row.get::<_, String>(1).ok()?;
-        if autofeed_message_is_worker_report_for_assignment(&content, assignment_id) == Some(true) {
-            record_autofeed_prompt_baseline(session_id, id);
-            return Some(id);
-        }
-    }
-    None
+) -> rusqlite::Result<bool> {
+    conn.execute(
+        "UPDATE member_report_delivery
+            SET delivered_at = strftime('%s','now')
+          WHERE session_id = ?1
+            AND assignment_id = ?2
+            AND delivered_at IS NULL",
+        (session_id, assignment_id),
+    )
+    .map(|updated| updated > 0)
 }
 
-fn build_lead_context_prompt_and_record_autofeed_baseline(
+/// forced_answer_ids（T6 · C1）：本轮未确认迟到答案 message_id——由调用方（`start_lead_session`
+/// 的 `resume_answer_ids`）传入，强制纳入 prompt；非续答起跑路径传 `&[]`。
+fn build_lead_context_prompt_for_session(
     conn: &Connection,
     session_id: &str,
     member_pool: &[lead_tools::PoolMember],
     locale: Locale,
     lead_engine: LeadEngine,
-) -> Result<String, String> {
+    forced_answer_ids: &[i64],
+) -> Result<lead_step::PromptAssembly, String> {
     let (compact_state, transcript_nonce) = if lead_engine == LeadEngine::Harness {
         (
             db::get_compact_state(conn, session_id).map_err(|error| error.to_string())?,
@@ -11893,7 +11889,7 @@ fn build_lead_context_prompt_and_record_autofeed_baseline(
     } else {
         (None, None)
     };
-    let prompt = crate::lead_step::build_lead_context_prompt(
+    crate::lead_step::build_lead_context_prompt(
         conn,
         session_id,
         member_pool,
@@ -11901,116 +11897,24 @@ fn build_lead_context_prompt_and_record_autofeed_baseline(
         None,
         compact_state.as_ref(),
         transcript_nonce.as_deref(),
-    )?;
-    let max_message_id = conn.query_row(
-        "SELECT MAX(id) FROM messages WHERE session_id = ?1",
-        [session_id],
-        |row| row.get::<_, Option<i64>>(0),
-    );
-    if let Ok(max_message_id) = max_message_id {
-        record_autofeed_prompt_baseline(session_id, max_message_id.unwrap_or(0));
-    }
-    Ok(prompt)
+        forced_answer_ids,
+    )
 }
 
-/// 自动续喂的纯 DB 决策：solo 会话永不续喂；team 会话只在最新
-/// worker report 尚未被本进程最近一次 lead prompt 消费时返回该 report id；进程重启后
-/// 尚无 prompt 水位时，回退到最新 lead assistant 消息 id。
-/// SQL LIKE 只做候选预筛，报告身份以 JSON 中首个 text 块的前缀为准。
-fn autofeed_decision(conn: &Connection, session_id: &str) -> Option<i64> {
-    if !autofeed_global_stop_allows_decision(conn, session_id) {
-        return None;
+/// 自动续喂的纯 DB 决策：保留 global-stop 与 team 配置门；最老 pending 台账行触发。
+fn autofeed_decision(conn: &Connection, session_id: &str) -> rusqlite::Result<Option<i64>> {
+    if !autofeed_global_stop_allows_decision(conn, session_id)? {
+        return Ok(None);
     }
 
-    let config = db::get_session_agent_config(conn, session_id).ok()?;
-    config.lead_agent_id.as_ref()?;
-
-    let latest_report_id = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, content
-                   FROM messages
-                  WHERE session_id = ?1
-                    AND role = 'assistant'
-                    AND engine = 'agent-team'
-                    AND content LIKE ?2
-                  ORDER BY id DESC",
-            )
-            .ok()?;
-        let mut rows = stmt
-            .query(rusqlite::params![session_id, "%[Worker report]%"])
-            .ok()?;
-        let mut found = None;
-        while let Some(row) = rows.next().ok()? {
-            let id = row.get::<_, i64>(0).ok()?;
-            let content = row.get::<_, String>(1).ok()?;
-            if autofeed_message_is_worker_report(&content) == Some(true) {
-                found = Some(id);
-                break;
-            }
-        }
-        found?
-    };
-
-    let consumed_through_id = match autofeed_prompt_baseline(session_id) {
-        Some(prompt_baseline) => prompt_baseline,
-        None => {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, content
-                       FROM messages
-                      WHERE session_id = ?1
-                        AND role = 'assistant'
-                        AND engine = 'agent-team'
-                      ORDER BY id DESC",
-                )
-                .ok()?;
-            let mut rows = stmt.query([session_id]).ok()?;
-            let mut found = 0;
-            while let Some(row) = rows.next().ok()? {
-                let id = row.get::<_, i64>(0).ok()?;
-                let content = row.get::<_, String>(1).ok()?;
-                if autofeed_message_is_worker_report(&content) == Some(false) {
-                    found = id;
-                    break;
-                }
-            }
-            found
-        }
-    };
-
-    (latest_report_id > consumed_through_id).then_some(latest_report_id)
-}
-
-fn autofeed_claim_report(
-    started_reports: &mut HashMap<String, i64>,
-    session_id: &str,
-    candidate_report_id: i64,
-) -> Option<Option<i64>> {
-    let previous_report_id = started_reports.get(session_id).copied();
-    if previous_report_id.is_some_and(|last| candidate_report_id <= last) {
-        return None;
+    let config = db::get_session_agent_config(conn, session_id)?;
+    if config.lead_agent_id.is_none() {
+        return Ok(None);
     }
 
-    started_reports.insert(session_id.to_string(), candidate_report_id);
-    Some(previous_report_id)
-}
-
-fn autofeed_rollback_claim(
-    started_reports: &mut HashMap<String, i64>,
-    session_id: &str,
-    claimed_report_id: i64,
-    previous_report_id: Option<i64>,
-) {
-    if started_reports.get(session_id).copied() != Some(claimed_report_id) {
-        return;
-    }
-
-    if let Some(previous_report_id) = previous_report_id {
-        started_reports.insert(session_id.to_string(), previous_report_id);
-    } else {
-        started_reports.remove(session_id);
-    }
+    Ok(db::pending_member_report_message_ids(conn, session_id)?
+        .into_iter()
+        .next())
 }
 
 fn autofeed_busy_error(error: &str) -> bool {
@@ -12019,7 +11923,7 @@ fn autofeed_busy_error(error: &str) -> bool {
         || error.starts_with("AL_ERR:run.teamMembersActive:")
 }
 
-fn autofeed_recheck_before_start(conn: &Connection, session_id: &str) -> bool {
+fn autofeed_recheck_before_start(conn: &Connection, session_id: &str) -> rusqlite::Result<bool> {
     autofeed_global_stop_allows_decision(conn, session_id)
 }
 
@@ -12075,92 +11979,664 @@ fn reserve_lead_start_after_globalstop(
     Ok(Some(guard))
 }
 
-fn try_autofeed_lead(app: AppHandle, session_id: String) {
-    let candidate = {
-        let db_state = app.state::<Db>();
-        let Ok(conn) = db_state.0.lock() else {
-            return;
-        };
-        let Some(report_id) = autofeed_decision(&conn, &session_id) else {
-            return;
-        };
-        let Ok(config) = db::get_session_agent_config(&conn, &session_id) else {
-            return;
-        };
-        let Some(lead_agent_id) = config.lead_agent_id else {
-            return;
-        };
-        (report_id, lead_agent_id, config.member_agent_ids)
-    };
+/// T4：per-session 恢复状态——取代旧「autofeed 退避门 + 迟到答案独立重挂」各自为政。
+/// `consecutive_failures`/`not_before`/`timer_generation`/`timer_armed` 是共享退避与武装
+/// 定时器的账本；`pending_answer_ids` 是未确认迟到答案的 message id 集合（`answer_question_inner`
+/// 的 `commit_late_answer` 落库成功后登记，交付 ack 前一直留着——绝不在起跑/spawn 前消费）。
+/// T8 P1-②：原 `in_flight_answer_ids` 全局侧信道字段已删——答案 ack 的真相源改为 lead runner
+/// 线程内组装阶段直接捕获的 `assembly.included_answer_ids`（同线程、无跨线程登记/取用竞态）。
+#[derive(Default)]
+struct ResumeState {
+    consecutive_failures: u32,
+    not_before: Option<Instant>,
+    timer_generation: u64,
+    timer_armed: bool,
+    /// 已经为「首次进入封顶低频」发过一次提示；成功交付 ack 后随其余字段一起复位。
+    cap_notified: bool,
+    pending_answer_ids: HashSet<i64>,
+}
 
-    let (report_id, lead_agent_id, member_agent_ids) = candidate;
-    let started_reports = AUTOFEED_STARTED_REPORTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let previous_report_id = {
-        let mut guard = started_reports
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(previous_report_id) = autofeed_claim_report(&mut guard, &session_id, report_id)
-        else {
-            return;
-        };
-        previous_report_id
-    };
+fn resume_state_map() -> &'static Mutex<HashMap<String, ResumeState>> {
+    RESUME_STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
-    // 这里保留纯读预检，只为省掉一次注定会静默释放的空占槽；正确性以
-    // `reserve_lead_start_after_globalstop` 的占槽后门为准。
-    let start_allowed = {
-        let db_state = app.state::<Db>();
-        let Ok(conn) = db_state.0.lock() else {
-            let mut guard = started_reports
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            autofeed_rollback_claim(&mut guard, &session_id, report_id, previous_report_id);
-            return;
-        };
-        autofeed_recheck_before_start(&conn, &session_id)
+/// 生产退避表：2s → 10s → 60s → 封顶 300s 低频维持。索引即 `consecutive_failures - 1`（超出
+/// 表长的失败次数一律封顶在最后一档）。纯函数，测试按次数断言而不必真的等待。
+const RESUME_BACKOFF_SECONDS: [u64; 4] = [2, 10, 60, 300];
+
+fn resume_backoff_duration(consecutive_failures: u32) -> std::time::Duration {
+    let idx =
+        (consecutive_failures.saturating_sub(1) as usize).min(RESUME_BACKOFF_SECONDS.len() - 1);
+    std::time::Duration::from_secs(RESUME_BACKOFF_SECONDS[idx])
+}
+
+/// C1：`commit_late_answer` 落库成功后登记未确认答案 id；交付 ack 前一直留着，供
+/// `try_resume_pending_with_gate` 的快照纳入「含答案」原因。
+fn register_pending_answer_id(session_id: &str, message_id: i64) {
+    let mut guard = resume_state_map().lock().unwrap_or_else(|p| p.into_inner());
+    guard
+        .entry(session_id.to_string())
+        .or_default()
+        .pending_answer_ids
+        .insert(message_id);
+}
+
+/// S-2：登记前先判 team-ness。Solo 会话永远不会触发续跑（`snapshot_resume_candidate` 在无
+/// lead 时直接返回 `None`），登记了也永远不会被 `ack_pending_answers` 摘除——`RESUME_STATE`
+/// 里这个 session 的集合只会随每次补答只增不减，是进程内内存微泄。
+///
+/// `db::get_session_agent_config` 本身查询失败时选择**照常登记**而非放弃：这时同一把 conn
+/// 刚成功落完库，Err 概率极低；而一旦真是 Team 会话却因为这次查询失败漏登记，这条迟到答案
+/// 就会失去续跑触发、把会话卡住——是真 bug，比「Solo 多攒一个不会被摘除的 id」严重得多。这
+/// 与 `try_resume_pending_with_gate` 快照失败那处「读不出来就什么都不做」的取舍方向相反：
+/// 那边不作为是安全侧（判不出 team-ness 就不弹用户可见的续喂消息/不装退避 timer），这边不
+/// 作为是危险侧（漏登记=丢触发），所以两处对同一种「config 读不出来」故障选了相反的默认值。
+fn register_pending_answer_id_if_team(conn: &Connection, session_id: &str, message_id: i64) {
+    match db::get_session_agent_config(conn, session_id) {
+        Ok(config) if resume_after_answer_candidate(&config).is_none() => {
+            // Solo 会话：不登记，避免 RESUME_STATE 只增不减的泄漏。
+        }
+        Ok(_) => register_pending_answer_id(session_id, message_id),
+        Err(error) => {
+            eprintln!(
+                "register_pending_answer_id_if_team: config lookup failed for {session_id}: \
+                 {error}; registering anyway to avoid stranding a possible team resume trigger"
+            );
+            register_pending_answer_id(session_id, message_id);
+        }
+    }
+}
+
+fn snapshot_pending_answer_ids(session_id: &str) -> Vec<i64> {
+    let guard = resume_state_map().lock().unwrap_or_else(|p| p.into_inner());
+    guard
+        .get(session_id)
+        .map(|state| state.pending_answer_ids.iter().copied().collect())
+        .unwrap_or_default()
+}
+
+/// T5 将在真正 I/O ack 之后调用：只摘除本轮实际交付的答案 id，未纳入/未确认的留给下一轮。
+fn ack_pending_answers(session_id: &str, ids: &[i64]) {
+    let mut guard = resume_state_map().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(state) = guard.get_mut(session_id) {
+        for id in ids {
+            state.pending_answer_ids.remove(id);
+        }
+    }
+}
+
+fn resume_not_before_allows(session_id: &str) -> bool {
+    let guard = resume_state_map().lock().unwrap_or_else(|p| p.into_inner());
+    match guard.get(session_id).and_then(|state| state.not_before) {
+        Some(not_before) => Instant::now() >= not_before,
+        None => true,
+    }
+}
+
+/// `note_resume_failure` 的纯状态转移结果：`delay` 供调用方武装定时器；`first_failure`/
+/// `entered_cap` 供调用方按 E 的规则决定是否发一次可见性通知（首次失败 / 首次进入封顶低频，
+/// 中间重试不刷屏）。
+struct ResumeFailureOutcome {
+    delay: std::time::Duration,
+    first_failure: bool,
+    entered_cap: bool,
+}
+
+/// T4：交付前失败的记账入口（brief 点名的最小签名 `note_resume_failure(session)`）——纯状态
+/// 转移，不碰 AppHandle/timer/通知：`consecutive_failures+1`、`not_before = now + backoff`、
+/// 首次达到封顶时翻 `cap_notified`。T5 会在其余失败点（DB 锁/组装/MCP/命令构建/进程 spawn/
+/// runner 线程创建/stdin 写/ack DB）直接调用它；本 task 只在 `try_resume_pending`/
+/// `try_resume_after_answer` 自己的起跑同步失败分支接上（经 `record_resume_failure`）。
+/// busy 不算失败——调用方按 `autofeed_busy_error` 分流，busy 分支根本不会调用这里。
+fn note_resume_failure(session_id: &str) -> ResumeFailureOutcome {
+    let mut guard = resume_state_map().lock().unwrap_or_else(|p| p.into_inner());
+    let state = guard.entry(session_id.to_string()).or_default();
+    let first_failure = state.consecutive_failures == 0;
+    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+    let delay = resume_backoff_duration(state.consecutive_failures);
+    state.not_before = Some(Instant::now() + delay);
+    let entered_cap =
+        !state.cap_notified && state.consecutive_failures as usize >= RESUME_BACKOFF_SECONDS.len();
+    if entered_cap {
+        state.cap_notified = true;
+    }
+    ResumeFailureOutcome {
+        delay,
+        first_failure,
+        entered_cap,
+    }
+}
+
+/// T4：成功交付 ack 后清零（brief 点名的最小签名 `note_resume_success(session)`）——失败计数、
+/// 退避门与封顶提示标记全部复位；`timer_generation` 一并递增，武装中的旧定时器到点时
+/// generation 失配会自动放弃，不需要主动 cancel 线程。
+fn note_resume_success(session_id: &str) {
+    let mut guard = resume_state_map().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(state) = guard.get_mut(session_id) {
+        state.consecutive_failures = 0;
+        state.not_before = None;
+        state.cap_notified = false;
+        state.timer_generation += 1;
+        state.timer_armed = false;
+    }
+}
+
+/// C2 纯内核：武装一次性延时回调、generation 防旧火——不依赖 AppHandle/DB，可直接单测（生产
+/// 用 `arm_resume_timer` 把 `on_fire` 接到 `drain_after_run_release`）。武装时 bump generation
+/// 并置 `timer_armed=true`；到点先检查 generation 仍匹配才置 `timer_armed=false` 并执行回调，
+/// 否则原样放弃、不触碰状态（说明已被更晚一次武装/一次成功清零取代）。
+/// T4-fix A 兜底：`arm_resume_timer_with` 把 `timer_armed` 乐观置 true 之后，如果 OS 线程创建
+/// 本身失败（`Builder::spawn` 返回 `Err`），线程根本没跑起来——不复原的话账面会一直显示「已
+/// 武装」，`ensure_resume_timer_armed`/`resume_needs_timer_rearm` 会误判「不需要重新武装」，
+/// 造成同类永等洞。只有 `generation` 仍等于这次武装时的世代才复原；若已被更晚一次
+/// `arm_resume_timer_with`/`note_resume_success` 取代，原样放弃（同到点回调的 generation 判别
+/// 逻辑，不能反过来把更晚一次真正武装的状态踩掉）。
+fn note_resume_timer_spawn_failed(session_id: &str, generation: u64) {
+    let mut guard = resume_state_map().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(state) = guard.get_mut(session_id) {
+        if state.timer_generation == generation {
+            state.timer_armed = false;
+        }
+    }
+}
+
+fn arm_resume_timer_with<F>(session_id: String, delay: std::time::Duration, on_fire: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    let generation = {
+        let mut guard = resume_state_map().lock().unwrap_or_else(|p| p.into_inner());
+        let state = guard.entry(session_id.clone()).or_default();
+        state.timer_generation += 1;
+        state.timer_armed = true;
+        state.timer_generation
     };
-    if !start_allowed {
-        let mut guard = started_reports
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        autofeed_rollback_claim(&mut guard, &session_id, report_id, previous_report_id);
+    let spawn_session_id = session_id.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("resume-timer-{session_id}"))
+        .spawn(move || {
+            std::thread::sleep(delay);
+            let should_fire = {
+                let mut guard = resume_state_map().lock().unwrap_or_else(|p| p.into_inner());
+                match guard.get_mut(&session_id) {
+                    Some(state) if state.timer_generation == generation => {
+                        state.timer_armed = false;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if should_fire {
+                on_fire();
+            }
+        });
+    if let Err(error) = spawn_result {
+        eprintln!("resume timer thread spawn failed for {spawn_session_id}: {error}");
+        note_resume_timer_spawn_failed(&spawn_session_id, generation);
+    }
+}
+
+fn arm_resume_timer(app: AppHandle, session_id: String, delay: std::time::Duration) {
+    let session_for_cb = session_id.clone();
+    arm_resume_timer_with(session_id, delay, move || {
+        drain_after_run_release(app, session_for_cb);
+    });
+}
+
+/// 纯函数：`not_before` 门叫停时，判断是否需要补武装一个 timer；`Some(delay)` 时同时给出
+/// 用于 sleep 的时长（对齐剩余 `not_before`，已过期则视为 0，交给回调自己立即再判一次）。
+/// `None` 表示已有武装中的 timer，不需要重复武装。
+fn resume_needs_timer_rearm(session_id: &str) -> Option<std::time::Duration> {
+    let guard = resume_state_map().lock().unwrap_or_else(|p| p.into_inner());
+    let state = guard.get(session_id)?;
+    if state.timer_armed {
+        return None;
+    }
+    let now = Instant::now();
+    Some(
+        state
+            .not_before
+            .map(|not_before| not_before.saturating_duration_since(now))
+            .unwrap_or(std::time::Duration::from_millis(0)),
+    )
+}
+
+/// C2：命中 `not_before` 门时必须确认已有武装 timer，不能只 return——没有就补武装一个。
+fn ensure_resume_timer_armed(app: &AppHandle, session_id: &str) {
+    if let Some(delay) = resume_needs_timer_rearm(session_id) {
+        arm_resume_timer(app.clone(), session_id.to_string(), delay);
+    }
+}
+
+/// E：自动恢复失败的错误可见性——只在两个时刻各发一次（首次失败、首次进入封顶低频），中间
+/// 重试不刷屏。
+#[derive(Clone, Copy)]
+enum ResumeNotice<'a> {
+    FirstFailure(&'a str),
+    EnteredCap,
+}
+
+fn resume_failure_message(locale: Locale, error: &str) -> String {
+    match locale {
+        Locale::Zh => format!("自动续喂失败，稍后会按退避节奏自动重试：{error}"),
+        Locale::En => format!("Automatic resume failed; it will retry later with backoff: {error}"),
+    }
+}
+
+fn resume_throttled_message(locale: Locale) -> String {
+    match locale {
+        Locale::Zh => "自动续喂连续失败，已转入低频重试（约每 5 分钟一次）；后续重试不再逐条提示。"
+            .to_string(),
+        Locale::En => {
+            "Automatic resume keeps failing; it has entered low-frequency retry (about every 5 \
+             minutes) — further retries will not surface individual notices."
+                .to_string()
+        }
+    }
+}
+
+/// live agent-event（前端即时可见）+ 一条 assistant 消息落库（翻历史/重启后也能看到）双通道，
+/// 复用既有错误事件通道 `emit_agent_event`/`AgentEvent::Error`。
+fn notify_resume_status(app: &AppHandle, session_id: &str, notice: ResumeNotice<'_>) {
+    let locale = current_locale(app);
+    let message = match notice {
+        ResumeNotice::FirstFailure(error) => resume_failure_message(locale, error),
+        ResumeNotice::EnteredCap => resume_throttled_message(locale),
+    };
+    emit_agent_event(
+        app,
+        session_id,
+        None,
+        &agent_event::AgentEvent::Error {
+            message: message.clone(),
+        },
+    );
+    let db_state = app.state::<Db>();
+    let Ok(conn) = db_state.0.lock() else {
         return;
+    };
+    let kind = match notice {
+        ResumeNotice::FirstFailure(_) => "first",
+        ResumeNotice::EnteredCap => "cap",
+    };
+    let dedup_key = format!("resume-notice:{session_id}:{kind}:{}", now_unix_millis());
+    let _ = db::append_message_dedup_and_publish(
+        &conn,
+        session_id,
+        "assistant",
+        &[db::Block::Text { text: message }],
+        None,
+        None,
+        None,
+        &dedup_key,
+    );
+}
+
+/// 便利封装：记账（`note_resume_failure`）+ 装/续武装 timer（`arm_resume_timer`）+ 按需可见性
+/// 通知（`notify_resume_status`）三步一次做完。本 task 在 `try_resume_pending`/
+/// `try_resume_after_answer` 的非 busy 失败分支调用；T5 在其余失败点也可以直接调这个，不必
+/// 自己重复三步。
+fn record_resume_failure(app: &AppHandle, session_id: &str, error: &str) {
+    let outcome = note_resume_failure(session_id);
+    arm_resume_timer(app.clone(), session_id.to_string(), outcome.delay);
+    if outcome.first_failure {
+        notify_resume_status(app, session_id, ResumeNotice::FirstFailure(error));
+    } else if outcome.entered_cap {
+        notify_resume_status(app, session_id, ResumeNotice::EnteredCap);
+    }
+}
+
+/// T5 M3：把 lead runner 收到的 stdin writer ack 结果统一成 `Result<(), String>`——`None`
+/// （harness 引擎无 stdin prompt，或本轮压根没有 prompt 要写）视为 `Ok(())`：harness 的 prompt
+/// 走 app 域临时文件，`write_all` 早已在 `build_result` 成功那一刻同步完成，能走到这里说明写
+/// 文件已经成功，语义上等价于「I/O ack 已完成」。`Some(rx)` 时阻塞 `recv`：writer 线程始终会
+/// 发一条结果（正常写完发送，线程创建失败也会立即预置 `Err`，见
+/// `agent::spawn_with_stdin_prompt_ack` 文档）；channel 断开（理论上不该发生，除非 writer 线程
+/// panic 到 `ack_tx` 都没来得及 drop 前就异常退出）同样归为失败，不放过一个「recv 失败」的分支。
+fn resolve_stdin_ack(stdin_ack: Option<std::sync::mpsc::Receiver<std::io::Result<()>>>) -> Result<(), String> {
+    match stdin_ack {
+        Some(rx) => match rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(io_err)) => Err(format!("stdin writer ack failed: {io_err}")),
+            Err(_) => Err("stdin writer ack channel disconnected".to_string()),
+        },
+        None => Ok(()),
+    }
+}
+
+/// T5 M3 纯核心：`conn` 为 `None`（DB 锁获取失败）与 `writer_ack` 为 `Err` 同归为 ack 失败——
+/// 两者都不做任何 DB 写入，报告台账行原样保留 pending，供调用方（AppHandle 薄壳）分流到
+/// `note_resume_failure`。`Ok` 分支短事务把 `report_message_ids` 逐条置 `delivered_at`
+/// （`db::mark_member_reports_delivered` 内部事务，空集合是 no-op——T6 接线「本轮纳入」选择前，
+/// 生产调用恒传空集合）。拆出 `_with_conn` 是为了让这条判断不依赖 `AppHandle`，可直接用
+/// `mem_db()` 之类的裸 `Connection` 单测（同 `persist_lead_prespawn_failure`/
+/// `persist_lead_prespawn_failure_with_conn` 那对的拆法）。
+fn commit_lead_run_delivery_with_conn(
+    conn: Option<&Connection>,
+    session_id: &str,
+    writer_ack: Result<(), String>,
+    report_message_ids: &[i64],
+) -> Result<(), String> {
+    writer_ack?;
+    match conn {
+        Some(conn) => db::mark_member_reports_delivered(conn, session_id, report_message_ids)
+            .map_err(|e| format!("delivery ack db failed: {e}")),
+        None => Err("delivery ack db lock unavailable".to_string()),
+    }
+}
+
+/// T8 P1-①治标：本轮零纳入（既没交付新报告也没确认答案）但该 session 在 DB 里仍有 pending
+/// 报告行——说明「run 发生了」但什么都没消化掉，绝不能当成功清零退避（那样自动续喂会误以为
+/// 已经交付、不再重试，真正卡住的 session 反而看起来风平浪静）。纯函数（只读一次 DB 查询），
+/// 拆出来可直接用 `mem_db()` 单测，不依赖 `AppHandle`。
+fn is_delivery_round_empty_but_pending(
+    conn: &Connection,
+    session_id: &str,
+    report_message_ids: &[i64],
+    answer_ids: &[i64],
+) -> rusqlite::Result<bool> {
+    if !report_message_ids.is_empty() || !answer_ids.is_empty() {
+        return Ok(false);
+    }
+    Ok(!db::pending_member_report_message_ids(conn, session_id)?.is_empty())
+}
+
+/// T8-fix：`commit_lead_run_delivery` 收尾判定的可能结果——从 `commit_lead_run_delivery_with_conn`
+/// 的 `Result` 与（若其 Ok 且 conn 可用）`is_delivery_round_empty_but_pending` 的查询结果合成。
+/// 拆成纯函数（不依赖 `AppHandle`）方便直接单测：**pending 查询本身报错（DB 损坏/表缺失等）
+/// 绝不能被悄悄当成「查出来没有 pending」**——那等于把「读失败」和「读到真没有」混为一谈，会
+/// 把本该保守判未交付的一轮误判成交付成功、清零退避。
+enum DeliveryOutcome {
+    Success,
+    UndeliveredEmptyButPending,
+    UndeliveredPendingQueryError(String),
+    UndeliveredCommitError(String),
+}
+
+fn decide_delivery_outcome(
+    commit_result: &Result<(), String>,
+    empty_but_pending_query: Option<rusqlite::Result<bool>>,
+) -> DeliveryOutcome {
+    match commit_result {
+        Err(error) => DeliveryOutcome::UndeliveredCommitError(error.clone()),
+        Ok(()) => match empty_but_pending_query {
+            Some(Ok(true)) => DeliveryOutcome::UndeliveredEmptyButPending,
+            Some(Err(query_err)) => {
+                DeliveryOutcome::UndeliveredPendingQueryError(query_err.to_string())
+            }
+            Some(Ok(false)) | None => DeliveryOutcome::Success,
+        },
+    }
+}
+
+/// T5 M3：lead run EOF 之后、槽仍持有时的交付 ack 收尾——调用方（lead runner 线程尾部）必须
+/// 保证这一步发生在 `finish_run_without_git_writes`/`emit_terminal_after_releasing_run_slot`
+/// （槽释放）之前：I5 顺序不变量 ack commit < slot release < drain。`Ok`：短事务提交报告台账
+/// + 摘除本轮纳入的答案 id（`ack_pending_answers`，只摘这些，未纳入的留给下一轮）+
+/// `note_resume_success`（清零退避）——**除非**（T8 P1-①）本轮零纳入且该 session 仍有 pending
+/// 报告行，这种情况视为未交付，走 `note_resume_failure` 而不清零退避；**或者**（T8-fix）判定
+/// 本身的 pending 查询报错——同样保守视为未交付，不能拿 `.unwrap_or(false)` 把「查不出来」悄悄
+/// 当成「查出来没有」。`Err`（写失败/recv 断开/ack DB 失败）：`note_resume_failure` 装退避——
+/// 报告仍 pending、答案仍未确认，紧随其后的 `drain_after_run_release` 会在需要时补武装定时器
+/// （同三个 prespawn 失败点的既有模式，这里不重复 `record_resume_failure` 那套武装/通知，避免
+/// 和随后的 drain 重复武装）。
+fn commit_lead_run_delivery(
+    app: &AppHandle,
+    session_id: &str,
+    writer_ack: Result<(), String>,
+    report_message_ids: &[i64],
+    answer_ids: &[i64],
+) {
+    let db_state = app.state::<crate::db::Db>();
+    let conn = db_state.0.lock().ok();
+    let result = commit_lead_run_delivery_with_conn(
+        conn.as_deref(),
+        session_id,
+        writer_ack,
+        report_message_ids,
+    );
+    let empty_but_pending_query = match (&result, conn.as_deref()) {
+        (Ok(()), Some(c)) => Some(is_delivery_round_empty_but_pending(
+            c,
+            session_id,
+            report_message_ids,
+            answer_ids,
+        )),
+        _ => None,
+    };
+    drop(conn);
+    match decide_delivery_outcome(&result, empty_but_pending_query) {
+        DeliveryOutcome::Success => {
+            ack_pending_answers(session_id, answer_ids);
+            note_resume_success(session_id);
+        }
+        DeliveryOutcome::UndeliveredEmptyButPending => {
+            eprintln!(
+                "lead run delivery for {session_id}: round delivered nothing (no report/answer \
+                 included) but session still has pending reports — treating as undelivered"
+            );
+            note_resume_failure(session_id);
+        }
+        DeliveryOutcome::UndeliveredPendingQueryError(query_err) => {
+            eprintln!(
+                "lead run delivery for {session_id}: empty-but-pending query failed \
+                 ({query_err}) — cannot confirm delivery, treating as undelivered (conservative)"
+            );
+            note_resume_failure(session_id);
+        }
+        DeliveryOutcome::UndeliveredCommitError(error) => {
+            eprintln!("lead run delivery ack failed for {session_id}: {error}");
+            note_resume_failure(session_id);
+        }
+    }
+}
+
+/// C2：自动路径受共享 `not_before` 门限制；C1：新鲜用户点击绕过该门立即尝试一次。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResumeGate {
+    Normal,
+    Bypass,
+}
+
+struct ResumeCandidate {
+    lead_agent_id: String,
+    member_agent_ids: Vec<String>,
+    has_reports: bool,
+}
+
+/// C2：原子快照两类触发原因——`autofeed_decision` 的台账 pending 报告（含 global-stop 门 + 决策
+/// 内部 team 配置门）+ 调用方随后另取的 in-memory 未确认答案 id（见 `try_resume_pending_with_gate`）。
+/// door 未过（无 `lead_agent_id` / global-stop 生效）时两个原因一律不适用，返回 `None`——迟到
+/// 答案仍留在 `pending_answer_ids`，门重开后自然被下一次 drain 捡起。
+fn snapshot_resume_candidate(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<ResumeCandidate>> {
+    let has_reports = autofeed_decision(conn, session_id)?.is_some();
+    let config = db::get_session_agent_config(conn, session_id)?;
+    let Some((lead_agent_id, member_agent_ids)) = resume_after_answer_candidate(&config) else {
+        return Ok(None);
+    };
+    if !autofeed_global_stop_allows_decision(conn, session_id)? {
+        return Ok(None);
+    }
+    Ok(Some(ResumeCandidate {
+        lead_agent_id,
+        member_agent_ids,
+        has_reports,
+    }))
+}
+
+/// 纯函数：两类原因合成一个 `StartOrigin`——两者都无则 `None`（不起跑）；含答案（不论是否
+/// 同时有报告）→ `LateAnswer`；仅报告 → `Autofeed`。两原因并存只产出一个 origin，配合
+/// `try_resume_pending_with_gate` 只调用一次 `start_lead_session` 的事实，即是「快照原子性→
+/// 只起一轮」的完整证明。
+fn resume_origin_for(has_reports: bool, answer_ids: &[i64]) -> Option<StartOrigin> {
+    if !has_reports && answer_ids.is_empty() {
+        return None;
+    }
+    Some(if answer_ids.is_empty() {
+        StartOrigin::Autofeed
+    } else {
+        StartOrigin::LateAnswer
+    })
+}
+
+/// T4 C2：统一自动恢复单一入口的核心——原子快照两类触发原因（T4-fix B：两者在同一临界区内、
+/// 仍持有 conn 锁时联合读出，中途不给新提交的答案留穿插空当——`commit_late_answer` 对新答案
+/// 的 DB 写入必须先拿到这把 conn 锁才能提交，我们不释放它，就不存在「has_reports 读完、
+/// answer_ids 读之前」被新提交答案插队的窗口；插队进来的留给下一轮自然捡起，不算丢），任一
+/// 存在、且过门（global-stop/team 配置门 + `gate` 指定的 `not_before` 门）→ 起一轮 lead
+/// （origin 见 `resume_origin_for`）。命中 `not_before` 门时确认已有武装 timer（没有则补），
+/// 不能只 return——防唤醒丢失（remote inbox 段不经这里，不受影响）。
+///
+/// 返回 `None`：无触发原因 / 未过门（已按需补武装 timer）/ DB 读失败。DB 读失败分两处，
+/// 取舍不对称（S-1 已改）：
+/// - **快照失败**（联合快照本身读不出来，见下方 `snapshot` 的 `Err` 分支）：这时我们连
+///   `snapshot_resume_candidate` 都没跑完，根本判不出这是不是 team 会话——只 `eprintln!`
+///   留日志、直接 `return None`，**不调 `record_resume_failure`**（不发用户可见的「续喂
+///   失败」消息、不设 not_before、不武装 timer）。判不出 team-ness 时装上这些机制，等于
+///   凭空给一个可能压根没有 lead 的 Solo 会话挂上文不对题的续喂话术和一个永不会被清零的
+///   重试 timer（Solo 没有续跑成功路径去调用 `note_resume_success` 清零它）。
+/// - **recheck 失败**（`autofeed_recheck_before_start` 的 `Err` 分支，在快照之后）：这时
+///   `candidate` 已经是 `Some`，已经确认是 team 会话且过了门，仍然调用 `record_resume_failure`
+///   （计失败+设 not_before+重武装 timer），因为两个调用方结构上只看得到笼统的 `None`，区分
+///   不出「本轮无触发原因」与「原因存在但 DB 读炸了」，若不在这里记账、之后又没有新的自然
+///   drain 边沿，pending 报告/答案就会永远悬空。
+/// 返回 `Some((lead_agent_id, result))`：确实尝试起了一轮，`result` 是 `start_lead_session`
+/// 的原始结果——`start_lead_session` 本身的失败仍留给两个调用方（`try_resume_pending`/
+/// `try_resume_after_answer`）各自记账（前者 fire-and-forget，后者要把 outcome 传回前端）；
+/// 联合快照读到的 `answer_ids` 原样随 `Some(answer_ids)` 传给 `start_lead_session`，交给它在
+/// 组装阶段（`build_lead_context_prompt_for_session` 的 `forced_answer_ids`）强制纳入 prompt；
+/// 真正「本轮消化了哪些答案」的真相源是组装返回的 `assembly.included_answer_ids`（runner 线程
+/// 内同线程直接捕获、收尾 ack 时消费）——这里不存在另一份「登记 in-flight 集合」的侧信道，
+/// busy/失败路径也就无所谓「覆盖既有集合」（T8 P1-② 已把该侧信道整套删除，见
+/// `start_lead_session` 内 `resume_answer_ids` 参数注释）。
+fn try_resume_pending_with_gate(
+    app: &AppHandle,
+    session_id: &str,
+    gate: ResumeGate,
+) -> Option<(String, Result<(), String>)> {
+    let snapshot: Result<(Option<ResumeCandidate>, Vec<i64>), String> = {
+        let db_state = app.state::<Db>();
+        let lock_result = db_state.0.lock();
+        match lock_result {
+            Ok(conn) => match snapshot_resume_candidate(&conn, session_id) {
+                Ok(candidate) => {
+                    // 仍持有 conn 锁：answer_ids 的读取嵌在同一临界区内完成，联合原子快照。
+                    let answer_ids = snapshot_pending_answer_ids(session_id);
+                    Ok((candidate, answer_ids))
+                }
+                Err(error) => Err(format!(
+                    "resume_pending snapshot DB failed for {session_id}: {error}"
+                )),
+            },
+            Err(error) => Err(format!(
+                "resume_pending snapshot DB lock failed for {session_id}: {error}"
+            )),
+        }
+    };
+    let (candidate, answer_ids) = match snapshot {
+        Ok(pair) => pair,
+        Err(message) => {
+            // S-1：这里还没跑到 `snapshot_resume_candidate` 内部判 team-ness 的那一步（DB 锁
+            // 或联合查询本身就炸了），判不出这是不是 team 会话——只留日志，不记账/不发用户可见
+            // 消息/不装 timer。详见本函数上方文档注释「快照失败」一段。
+            eprintln!("{message}");
+            return None;
+        }
+    };
+    let candidate = candidate?;
+
+    let origin = resume_origin_for(candidate.has_reports, &answer_ids)?;
+
+    if gate == ResumeGate::Normal && !resume_not_before_allows(session_id) {
+        ensure_resume_timer_armed(app, session_id);
+        return None;
     }
 
-    // DB 锁已在上面的决策块释放；绝不持 DB 锁进入 lead 启动路径。
+    // 这里保留纯读预检，只为省掉一次注定会静默释放的空占槽；正确性以
+    // `reserve_lead_start_after_globalstop` 的占槽后门为准（同 `try_autofeed_lead` 旧法）。
+    let recheck: Result<bool, String> = {
+        let db_state = app.state::<Db>();
+        let lock_result = db_state.0.lock();
+        match lock_result {
+            Ok(conn) => match autofeed_recheck_before_start(&conn, session_id) {
+                Ok(allowed) => Ok(allowed),
+                Err(error) => Err(format!(
+                    "resume_pending recheck DB failed for {session_id}: {error}"
+                )),
+            },
+            Err(error) => Err(format!(
+                "resume_pending recheck DB lock failed for {session_id}: {error}"
+            )),
+        }
+    };
+    let start_allowed = match recheck {
+        Ok(allowed) => allowed,
+        Err(message) => {
+            eprintln!("{message}");
+            record_resume_failure(app, session_id, &message);
+            return None;
+        }
+    };
+    if !start_allowed {
+        return None;
+    }
+
+    // DB 锁已在上面的块结束时释放；绝不持 DB 锁进入 lead 启动路径。
+    // T5-fix C（T8 P1-②后已改道）：不再由这里在 `start_lead_session` 返回之后才登记 in-flight
+    // 答案 id 快照——那个「调用方登记」窗口正是竞态本身（runner 线程可能已经跑完 EOF 抢先 take
+    // 到空集）。现在把本轮联合快照读到的 `answer_ids` 原样传给 `start_lead_session`
+    // （`Some(answer_ids)`），它只作为组装阶段的 `forced_answer_ids` 候选，由 runner 自己的
+    // 线程在真正跑到组装步骤时决定实际纳入哪些（`assembly.included_answer_ids`）——这里没有
+    // 任何「登记」动作，也没有全局侧信道可覆盖：T8 P1-② 已把整套 record/take 全局状态删除，
+    // busy/prespawn 早退路径也就无所谓「覆盖既有集合」（见 `start_lead_session` 内
+    // `resume_answer_ids` 参数注释）。
     let result = start_lead_session(
         app.clone(),
         app.state::<Db>(),
         app.state::<Running>(),
         app.state::<member_runner::TeamRunning>(),
-        session_id.clone(),
-        lead_agent_id,
+        session_id.to_string(),
+        candidate.lead_agent_id.clone(),
         None,
-        member_agent_ids,
+        candidate.member_agent_ids,
         None,
-        // autofeed 续跑：message=None，dedup_key 不会被用到。
+        Some(origin),
+        // 自动续跑（无论 autofeed 报告还是迟到答案）：message=None，dedup_key 不会被用到。
         None,
+        Some(answer_ids),
     );
-    if let Err(error) = result {
-        let mut guard = started_reports
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        autofeed_rollback_claim(&mut guard, &session_id, report_id, previous_report_id);
-        if !autofeed_busy_error(&error) {
-            eprintln!("autofeed lead start failed (non-fatal): {error}");
+    Some((candidate.lead_agent_id, result))
+}
+
+/// C2：drain 触发的自动路径——受共享 `not_before` 门限制；busy 不计入失败，非 busy 失败装
+/// 退避（`record_resume_failure`）。T5-fix A：起跑成功（`Ok(())`）不再在这里清零——「线程创建
+/// 成功、run 移交」不等于真正交付，过早清零是两个真相源打架的根因（连续失败会在下一轮真失败
+/// 之前被提前抹掉）；真正的清零只在真实 I/O ack 之后发生（`commit_lead_run_delivery` 的 `Ok`
+/// 分支调用 `note_resume_success`，T5 M3/I5）。
+fn try_resume_pending(app: &AppHandle, session_id: &str) {
+    match try_resume_pending_with_gate(app, session_id, ResumeGate::Normal) {
+        None => {}
+        Some((_, Ok(()))) => {}
+        Some((_, Err(e))) if autofeed_busy_error(&e) => {}
+        Some((_, Err(e))) => {
+            eprintln!("resume_pending lead start failed (non-fatal): {e}");
+            record_resume_failure(app, session_id, &e);
         }
     }
 }
 
-/// T-4b（remote control M0 §3/§4b）：run 槽释放后的统一排空咽喉——原来 5 处直接调
-/// `try_autofeed_lead` 的触发点全部改调这里。排空序固定三段，顺序即语义，不可调换（见结构断言
-/// `drain_after_run_release_runs_autofeed_before_pending_answer_before_inbox`）：
-///   a) autofeed（worker report 续喂，原有语义、原有函数完全不动）；
-///   b) 迟到答案占槽被抢的挂账续跑——`take_pending_answer_resume` 先摘除，命中才重试
-///      `try_resume_after_answer`；若又撞 busy，`finish_resume_after_answer` 的既有 busy 分支
-///      会自己把登记放回去，这里不需要额外处理；
-///   c) remote_inbox FIFO 排空——撞忙即停，留给下次释放。
-/// 同 session 排空进行中若再次收到释放通知，不并发进入三段排空，而是合并为脏位；当前轮收尾
+/// T4：run 槽释放后的统一排空咽喉——原来 5 处直接调 `try_autofeed_lead` 的触发点全部改调
+/// 这里。排空序固定两段，顺序即语义，不可调换（见结构断言
+/// `drain_owned_runs_resume_pending_before_remote_inbox_and_inbox_not_gated`）：
+///   a) `try_resume_pending`——统一自动恢复单一入口，一次原子快照同时处理 autofeed 报告与
+///      迟到答案两类原因，成功/失败/busy 各自记账（原有语义不变，旧「autofeed→迟到答案挂账」
+///      两段顺序调用已合并为一次快照+一次起跑）；
+///   b) remote_inbox FIFO 排空——撞忙即停，留给下次释放；不受 `try_resume_pending` 的
+///      `not_before` 门影响（门只挡自动恢复，不挡用户消息通道）。
+/// 同 session 排空进行中若再次收到释放通知，不并发进入两段排空，而是合并为脏位；当前轮收尾
 /// 原子消费脏位并原地重放，直至某轮收尾确认无脏位后摘除互斥登记。
 /// 每段各自短锁短放，段与段之间、循环各迭代之间绝不跨锁——绝不持 db 锁调 start_lead_session /
 /// send_message 内核（M1-T1/M1-T3 死锁血案红线同款）。
@@ -12173,11 +12649,7 @@ fn drain_after_run_release(app: AppHandle, session_id: String) {
 
 fn drain_owned(app: AppHandle, session_id: String, _guard: DrainingGuard) {
     drain_with_dirty_replay(&session_id, || {
-        try_autofeed_lead(app.clone(), session_id.clone());
-
-        if take_pending_answer_resume(&session_id) {
-            try_resume_after_answer(&app, &session_id);
-        }
+        try_resume_pending(&app, &session_id);
 
         drain_remote_inbox(&app, &session_id);
     });
@@ -12523,7 +12995,10 @@ fn deliver_remote_inbox_entry(
             Some(text),
             member_agent_ids,
             None,
+            Some(StartOrigin::UserMessage),
             Some(display_reduce::remote_input_key(command_id)),
+            // T5-fix C：这是一条全新用户消息投递，不携带待续答的答案 id 快照。
+            None,
         );
         emit_remote_inbox_message_if_new(app, session_id, &dedup_key, existed_before);
         return result;
@@ -13241,12 +13716,12 @@ fn remote_device_revoke(db: State<Db>, device_id: String) -> Result<(), String> 
 }
 
 /// 会话没有任何 memory goal block 时才会用到的兜底种子文本——目前唯一走得到这条分支的
-/// 是 `resume_lead_session`（message=None）遇上一个理论上不该发生的状态（早该在首条用户
+/// 是 `try_resume_pending`（message=None）遇上一个理论上不该发生的状态（早该在首条用户
 /// 消息时就已 seed 过 goal）；留一句人话兜底，不喂空字符串给引擎。
 const RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT: &str = "请基于会话最新记录继续推进任务。";
 
 /// P1-①（opus 对抗审）：goal seed 判定的纯函数内核（可测，故拆出来）——只有「会话还没有
-/// 既存 goal」且「这轮真带了用户消息」才该 seed。续跑路径（`resume_lead_session`，
+/// 既存 goal」且「这轮真带了用户消息」才该 seed。续跑路径（`try_resume_pending`，
 /// message=None）即使会话没有既存 goal 也绝不 seed：不然会把
 /// `RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT` 这句占位兜底文案永久写进 goal memory block、
 /// 还 emit `session-goal-updated` 上 topbar，污染那些首轮 seed 撞锁走 Err 分支、或 goal
@@ -13256,7 +13731,7 @@ fn should_seed_goal(has_existing_goal: bool, has_message: bool) -> bool {
 }
 
 /// P1-②（opus 对抗审）：`start_lead_session` 步骤 4「持久化用户消息」的可测内核——
-/// message=None（`resume_lead_session` 续跑路径）必须绝不落库：迟到答案已经由
+/// message=None（`try_resume_pending` 续跑路径）必须绝不落库：迟到答案已经由
 /// `commit_late_answer` 落过一条 `[用户对『问题』的回答] X` 消息，这里若再落一条，答案就
 /// 在 transcript 里重复出现两次。拆成纯 `&Connection` 函数，直接用 `test_db()` 断言
 /// `db::get_messages` 前后行数，不必绕 Tauri `State`/`AppHandle` 起停整套命令。
@@ -13300,18 +13775,30 @@ fn start_lead_session(
     team_running: State<member_runner::TeamRunning>,
     session_id: String,
     lead_agent_id: String,
-    // T3：`resume_lead_session` 传 `None`——不落新用户消息（迟到答案已经由
+    // T3：`try_resume_pending` 传 `None`——不落新用户消息（迟到答案已经由
     // `commit_late_answer` 落过），直接以现有历史起新 run。
     message: Option<String>,
     member_ids: Vec<String>,
     reasoning_tier: Option<String>,
+    // 前端 composer 是该 Tauri command 的直接调用方，缺省参数即用户消息来源。
+    start_origin: Option<StartOrigin>,
     // P0-c：user 消息落库防重复键——前端不传（Tauri 对缺失的 Option 入参解析为 None），
     // None 时用 `display_reduce::user_send_key(&run_id)` 兜底；remote inbox 投递路
     // （`deliver_remote_inbox_entry`）传 `remote_input_key(command_id)`，供 at-least-once
     // 重投去重。message=None 时这把键不会被用到（`persist_lead_start_message` 提前返回）。
     user_dedup_key: Option<String>,
+    // T5-fix C（T8 P1-②更新）：本轮若是 `try_resume_pending_with_gate` 触发的续跑，携带它在
+    // 同一临界区快照的答案 id——喂给组装阶段（`build_lead_context_prompt_for_session` 的
+    // `forced_answer_ids`）强制纳入 prompt。答案 ack 的真相源已改为组装结果
+    // `assembly.included_answer_ids`（runner 线程内直接捕获、同线程 happens-before，无需再
+    // 靠跨线程全局侧信道登记/取用）。前端 invoke 不传这个字段（Tauri 对缺失的 Option 入参
+    // 解析为 None）；其余内部调用方（`deliver_remote_inbox_entry`/`start_continuation_session`）
+    // 也一律传 `None`——它们不携带待续答的答案 id。
+    resume_answer_ids: Option<Vec<i64>>,
 ) -> Result<(), String> {
     use std::sync::atomic::Ordering;
+
+    let start_origin = start_origin.unwrap_or(StartOrigin::UserMessage);
 
     {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -13413,6 +13900,21 @@ fn start_lead_session(
             message.as_deref(),
             &dedup_key,
         )?;
+        // idlefix-T1 缺口①：`reserve_lead_start_after_globalstop`（经 `reserve_new_session_run`）
+        // 早先已把这条 session_runtime 行写成 running(run_id=None)（占槽当时 run_id 还没现场生成）；
+        // solo 路径在 lib.rs:11058 同样场景有回填，lead 路径此前漏掉——UPSERT 的
+        // `run_id = excluded.run_id` 会让这个 NULL 永久卡住，手机端 appRuntimeCore.ts 的
+        // `runId===null` 守卫会把这个会话之后所有 live delta 全部丢弃（liveDroppedNoRun）。
+        // 这里仿 solo 写法尽早回填（run_id 在 4a 已生成，此处是拿到 conn 后最早的写点），
+        // 非独立咽喉，只是同一条 running 行的字段补全；失败非致命不全吞。
+        if let Err(e) = db::set_session_runtime(
+            &conn,
+            &session_id,
+            db::SESSION_RUNTIME_RUNNING,
+            Some(&run_id),
+        ) {
+            eprintln!("session_runtime run_id backfill (lead) failed (non-fatal): {e}");
+        }
     }
 
     // 5. 构造 member_pool
@@ -13460,16 +13962,29 @@ fn start_lead_session(
 
     let lead_ctx = std::sync::Arc::new(lead_tools::LeadCtx {
         on_result_delivered: std::sync::Arc::new(move |assignment_id| {
-            // 短锁只做报告定位与水位推进；报告落库失败/未找到时保持原水位不动。
+            // 短锁只确认当前 assignment 的台账行；其他 pending 报告保持不动。
             let db_state = result_delivered_app.state::<Db>();
-            let Ok(conn) = db_state.0.lock() else {
-                return;
+            let conn = match db_state.0.lock() {
+                Ok(conn) => conn,
+                Err(error) => {
+                    eprintln!(
+                        "autofeed result ack DB lock failed for {} assignment {}: {}",
+                        result_delivered_session_id, assignment_id, error
+                    );
+                    return;
+                }
             };
-            let _ = record_autofeed_result_delivered(
-                &conn,
-                &result_delivered_session_id,
-                assignment_id,
-            );
+            match ack_autofeed_result_delivery(&conn, &result_delivered_session_id, assignment_id) {
+                Ok(true) => {}
+                Ok(false) => eprintln!(
+                    "autofeed result ack found no pending ledger row for {} assignment {}",
+                    result_delivered_session_id, assignment_id
+                ),
+                Err(error) => eprintln!(
+                    "autofeed result ack DB failed for {} assignment {}: {}",
+                    result_delivered_session_id, assignment_id, error
+                ),
+            }
         }),
         on_worker_settled: std::sync::Arc::new(move || {
             drain_after_run_release(autofeed_app.clone(), autofeed_session_id.clone());
@@ -13833,15 +14348,17 @@ fn start_lead_session(
         )
         .map_err(|e| format!("EventTransport register_run failed: {e:?}"))?;
 
-    // 9. disarm guard — thread owns the Running slot from here
-    guard.disarm();
+    // T5 D：不再在这里无条件 `guard.disarm()`——runner OS 线程创建本身也可能失败
+    // （`std::thread::Builder::spawn` 返回 `Err`，裸 `std::thread::spawn` 那种失败是 panic 不是
+    // `Result`，测不出来）。guard 暂时继续武装：若下面 `Builder::spawn` 失败，Launching 槽
+    // 从未被摘过，让 guard 的 Drop 兜底摘槽——但那条路径需要先落一条可见错误 + 装退避 + drain，
+    // 所以改成显式 `match`，只在确认线程真正接管（`Ok`）之后才 disarm。
 
-    // G3：旧清理若放在 spawn 之后，会有 ABA 窗口：runner 可能已读完历史快照，随后落库并因
-    // busy 新登记的迟到答案，会被旧清理误删。改在 spawn 前清理后，reserve 占槽至 runner 读
-    // 快照前已落库的答案必在历史中，无需挂账续跑；清理后才落库并登记的答案不会再被误删，会在
-    // run 释放时由 drain_after_run_release 摘到并续跑。极少数答案已进历史却仍留登记的交错，至多
-    // 多触发一次无害续跑，不会丢答案，比误删更安全。此处在所有短锁块及 spawn 闭包之外，不跨锁执行。
-    let _ = take_pending_answer_resume(&session_id);
+    // T4 C1：旧「spawn 前清空 pending answer 挂账」（原 G3 修复）已删——新模型下
+    // `pending_answer_ids` 是按 message id 精确记账的未确认答案集合，只在真正 I/O ack 之后
+    // 才由 `ack_pending_answers` 摘除，不再需要在这里做一次尽力而为的提前清理；任何一轮
+    // run（不论因何种 origin 起跑）只要实际交付了答案，交付 ack 会精确摘掉对应 id，未交付的
+    // 留给下一次 `drain_after_run_release` 触发的 `try_resume_pending` 自然继续尝试。
 
     // 10. 专用 lead runner 线程：McpServer 持在线程栈活到 child 退出
     let app_t = app.clone();
@@ -13857,6 +14374,11 @@ fn start_lead_session(
     // AGENTLOOM-DATA fence 数据区（不追加 prompt 末尾·保住语言提醒/upkeep nudge 末位杠杆）；
     // 此处 clone 一份 member_pool 带进线程。
     let member_pool_t = lead_ctx.member_pool.clone();
+    // T5 D：`profile`/`run_id` 马上要被下面的闭包按值 move 走（`profile` 经 `profile_t`
+    // 中转、`run_id` 闭包里直接用）——runner 线程创建失败分支（`handle_lead_runner_thread_
+    // spawn_failure`）跑在闭包之外，需要各留一份克隆，否则闭包捕获之后这两个名字就不能再用了。
+    let profile_name_for_thread_spawn_failure = profile.name.clone();
+    let run_id_for_thread_spawn_failure = run_id.clone();
     // L1：profile / borrow_api_key 只在门禁判定后用过一次（append_message 的 name 快照），
     // 之后没人再用了，直接 move 进线程（不是 clone）。lead_engine 是 Copy。
     let profile_t = profile;
@@ -13866,8 +14388,17 @@ fn start_lead_session(
     // run_commits.engine 存 agent_id（旧列名·见 solo 6503 注释）：clone 一份 lead 的 agent_id
     // 带进线程，供 open_lead_run_ledger 写台账。
     let lead_agent_id_t = lead_agent_id.clone();
+    // T6 C1：`resume_answer_ids`（本轮迟到答案 id，若由 `try_resume_pending_with_gate` 携带）
+    // 也要带进线程，喂给 `build_lead_context_prompt_for_session` 强制纳入 prompt。T8 P1-②：
+    // 答案 ack 的真相源已改为组装阶段实际纳入的 `assembly.included_answer_ids`（线程内直接
+    // 捕获），不再需要全局侧信道登记这份「请求纳入」的快照。
+    let resume_answer_ids_t = resume_answer_ids.clone();
+    // T8 P2-④：I2 分流依据——组装失败时按来源决定「静默中止不起跑」还是「兜底句 + 日志」。
+    let start_origin_t = start_origin;
 
-    std::thread::spawn(move || {
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("lead-runner-{session_id}"))
+        .spawn(move || {
         let lead_run_id = run_id;
         let mut reducer = display_reduce::DisplayReducer::new(&lead_run_id);
         // start MCP server — held on thread stack
@@ -13887,9 +14418,14 @@ fn start_lead_session(
                     &profile_t.name,
                     message.clone(),
                 );
+                // T5 B/I5：先装退避（note_resume_failure，早于摘槽）——沿用 T4 的首次/封顶
+                // 刷屏规则不在这里重复触发（那套可见性通知走 record_resume_failure，这里已经
+                // 有 persist_lead_prespawn_failure 落的这条错误消息，不必再发第二条）；紧随其后
+                // 的 drain_after_run_release 命中 not_before 门时会自己补武装定时器。
+                note_resume_failure(&session_id_t);
                 // M1 修复轮 P0-1（2026-08-11）：释放咽喉——不再预先加锁。`emit_lead_error_and_release`
                 // 签名收 `&crate::db::Db`（未锁句柄），内部短锁短放；旧版本这里预锁的 guard 会
-                // 一路存活到下面 `try_autofeed_lead` 重新加锁那一刻，同线程二次 lock 直接死锁
+                // 一路存活到下面 `try_resume_pending` 重新加锁那一刻，同线程二次 lock 直接死锁
                 // （TimedMutex/std::sync::Mutex 不可重入）——这正是本轮要修的死锁。
                 let runtime_db = app_t.state::<crate::db::Db>();
                 emit_lead_error_and_release(
@@ -13911,60 +14447,129 @@ fn start_lead_session(
         let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_srv.port);
 
         // 阶段 0 修失忆：seed 会话级 goal + 组装上下文 prompt。
-        // try_lock（非阻塞·codex Imp1）：锁被其它命令占用（git/FS 慢操作）或中毒都退回 raw·绝不卡 lead 启动。
+        // try_lock 有界重试（T8 P1-①）：短暂错峰重试 3 次（50/100/200ms）避开与
+        // drain_remote_inbox 等短暂持锁操作的瞬时竞争——runner 线程此处不持有任何其他锁，
+        // 短暂 sleep 安全、无死锁风险；仍失败才当真正的组装失败处理（见下方 I2 分流）。
         // T3：message=None（续跑路径）时两处兜底都退到 RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT，
         // 不喂空字符串给引擎；正常首轮/带话续写路径行为不变。
         let message_or_fallback: String = message
             .clone()
             .unwrap_or_else(|| RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT.to_string());
         let mut session_has_goal = false;
-        let assembled_prompt: String = {
-            let db_state = app_t.state::<crate::db::Db>();
-            let assembled = match db_state.0.try_lock() {
-                Ok(conn) => {
-                    // 显式分支（codex Imp2）：Ok(None) 才首轮 seed·Ok(Some) 不 clobber·Err 不 seed（别把读失败当缺失）。
-                    // P1-①（opus 对抗审）：是否 seed 的判定拆进纯函数 `should_seed_goal`（可测）
-                    // ——续跑路径（message=None）没有 goal 也绝不能拿
-                    // RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT 这句占位文案去 seed goal memory
-                    // block（会把「请基于会话最新记录继续推进任务。」永久写进 goal、还 emit
-                    // session-goal-updated 上 topbar，污染那些首轮 seed 撞锁走 Err 分支、或
-                    // goal 特性上线前的旧会话）。真实首轮消息路径（message=Some）行为不变。
-                    match crate::db::get_memory_block(&conn, &session_id_t, "goal") {
-                        Ok(existing_goal) => {
-                            let has_existing = existing_goal.is_some();
-                            if has_existing {
-                                session_has_goal = true;
-                            } else if should_seed_goal(has_existing, message.is_some()) {
-                                match crate::db::upsert_memory_block(
-                                    &conn,
-                                    &session_id_t,
-                                    "goal",
-                                    &message_or_fallback,
-                                    None,
-                                    Some("app"),
-                                ) {
-                                    Ok(()) => session_has_goal = true,
-                                    Err(e) => {
-                                        eprintln!("seed session goal failed (non-fatal): {e}")
-                                    }
+        // T6 M2/E：组装函数返回本轮实际纳入的 pending 报告 message_id——从占位空集合改为真实
+        // 选择结果，随后原样穿进既有收尾 ack 管道（`commit_lead_run_delivery`），收尾序不变。
+        let mut in_flight_report_ids_t: Vec<i64> = Vec::new();
+        // T8 P1-②：答案 ack 的真相源改为 assembly 实际纳入结果（同一线程内直接捕获，不再靠
+        // `record_in_flight_answer_ids`/`take_in_flight_answer_ids` 那套全局侧信道）。
+        let mut in_flight_answer_ids_t: Vec<i64> = Vec::new();
+        let db_state = app_t.state::<crate::db::Db>();
+        let mut lock_attempt = db_state.0.try_lock();
+        if lock_attempt.is_err() {
+            for delay_ms in [50u64, 100, 200] {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                lock_attempt = db_state.0.try_lock();
+                if lock_attempt.is_ok() {
+                    break;
+                }
+            }
+        }
+        let assembly_outcome: Result<String, String> = match lock_attempt {
+            Ok(conn) => {
+                // 显式分支（codex Imp2）：Ok(None) 才首轮 seed·Ok(Some) 不 clobber·Err 不 seed（别把读失败当缺失）。
+                // P1-①（opus 对抗审）：是否 seed 的判定拆进纯函数 `should_seed_goal`（可测）
+                // ——续跑路径（message=None）没有 goal 也绝不能拿
+                // RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT 这句占位文案去 seed goal memory
+                // block（会把「请基于会话最新记录继续推进任务。」永久写进 goal、还 emit
+                // session-goal-updated 上 topbar，污染那些首轮 seed 撞锁走 Err 分支、或
+                // goal 特性上线前的旧会话）。真实首轮消息路径（message=Some）行为不变。
+                match crate::db::get_memory_block(&conn, &session_id_t, "goal") {
+                    Ok(existing_goal) => {
+                        let has_existing = existing_goal.is_some();
+                        if has_existing {
+                            session_has_goal = true;
+                        } else if should_seed_goal(has_existing, message.is_some()) {
+                            match crate::db::upsert_memory_block(
+                                &conn,
+                                &session_id_t,
+                                "goal",
+                                &message_or_fallback,
+                                None,
+                                Some("app"),
+                            ) {
+                                Ok(()) => session_has_goal = true,
+                                Err(e) => {
+                                    eprintln!("seed session goal failed (non-fatal): {e}")
                                 }
                             }
-                            // else：续跑路径（message=None）且没有既存 goal——不 seed，不 emit。
                         }
-                        Err(e) => eprintln!("read session goal failed (non-fatal): {e}"),
+                        // else：续跑路径（message=None）且没有既存 goal——不 seed，不 emit。
                     }
-                    build_lead_context_prompt_and_record_autofeed_baseline(
-                        &conn,
-                        &session_id_t,
-                        &member_pool_t,
-                        current_locale(&app_t),
-                        lead_engine_t,
-                    )
-                    .unwrap_or_else(|_| message_or_fallback.clone())
+                    Err(e) => eprintln!("read session goal failed (non-fatal): {e}"),
                 }
-                Err(_) => message_or_fallback.clone(), // 锁被占/中毒：喂 raw·绝不卡 lead 启动
-            };
-            assembled
+                match build_lead_context_prompt_for_session(
+                    &conn,
+                    &session_id_t,
+                    &member_pool_t,
+                    current_locale(&app_t),
+                    lead_engine_t,
+                    resume_answer_ids_t.as_deref().unwrap_or(&[]),
+                ) {
+                    Ok(assembly) => {
+                        in_flight_report_ids_t = assembly.included_report_ids;
+                        in_flight_answer_ids_t = assembly.included_answer_ids;
+                        Ok(assembly.prompt)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Err(_) => Err("db lock unavailable for lead context assembly after retries".to_string()),
+        };
+        // T8 P2-④/I2 根修：组装失败时，自动来源（Autofeed/LateAnswer）绝不能只喂兜底句起跑——
+        // 那等于把「run 发生了」包装成「run 交付了」。不起本轮：装退避 → （按 I5 序）
+        // emit_lead_error_and_release 摘槽/terminal → drain_after_run_release → 释放 MCP。
+        // UserMessage 来源保留旧行为：兜底句 + 留日志，正常起跑（用户主动发的消息不能被吞）。
+        let assembled_prompt: String = match assembly_outcome {
+            Ok(prompt) => prompt,
+            Err(detail) => match start_origin_t {
+                StartOrigin::Autofeed | StartOrigin::LateAnswer => {
+                    let message = lead_runtime_failure_message(
+                        current_locale(&app_t),
+                        LeadRuntimeFailure::ContextAssembly(&detail),
+                    );
+                    persist_lead_prespawn_failure(
+                        &app_t,
+                        reducer,
+                        &session_id_t,
+                        &lead_run_id,
+                        &lead_agent_id_t,
+                        &profile_t.name,
+                        message.clone(),
+                    );
+                    // T5 B/I5：先装退避，早于摘槽——理由同 McpStart 分支上方注释。
+                    note_resume_failure(&session_id_t);
+                    let runtime_db = app_t.state::<crate::db::Db>();
+                    emit_lead_error_and_release(
+                        &running_t,
+                        &team_running_t,
+                        &terminated_t,
+                        &session_id_t,
+                        &lead_run_id,
+                        &transport,
+                        message,
+                        Some(runtime_db.inner()),
+                    );
+                    drain_after_run_release(app_t.clone(), session_id_t.clone());
+                    drop(mcp_srv);
+                    return;
+                }
+                StartOrigin::UserMessage => {
+                    eprintln!(
+                        "lead context assembly failed for {session_id_t} (UserMessage origin): \
+                         {detail}; falling back to raw message"
+                    );
+                    message_or_fallback.clone()
+                }
+            },
         };
         // 仅当确有会话 goal 才 emit（避免接前端后假刷新·codex Nit）
         if session_has_goal {
@@ -14034,9 +14639,11 @@ fn start_lead_session(
                     &profile_t.name,
                     message.clone(),
                 );
+                // T5 B/I5：先装退避，早于摘槽——理由同 McpStart 分支上方注释。
+                note_resume_failure(&session_id_t);
                 // M1 修复轮 P0-1（2026-08-11）：释放咽喉——不再预先加锁。`emit_lead_error_and_release`
                 // 签名收 `&crate::db::Db`（未锁句柄），内部短锁短放；旧版本这里预锁的 guard 会
-                // 一路存活到下面 `try_autofeed_lead` 重新加锁那一刻，同线程二次 lock 直接死锁
+                // 一路存活到下面 `try_resume_pending` 重新加锁那一刻，同线程二次 lock 直接死锁
                 // （TimedMutex/std::sync::Mutex 不可重入）——这正是本轮要修的死锁。
                 let runtime_db = app_t.state::<crate::db::Db>();
                 emit_lead_error_and_release(
@@ -14069,48 +14676,60 @@ fn start_lead_session(
             cmd.process_group(0);
         }
 
-        let first_event_started_at = Instant::now();
-        let mut child = match cmd
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                let message = lead_runtime_failure_message(
-                    current_locale(&app_t),
-                    LeadRuntimeFailure::ProcessStart(&e.to_string()),
-                );
-                persist_lead_prespawn_failure(
-                    &app_t,
-                    reducer,
-                    &session_id_t,
-                    &lead_run_id,
-                    &lead_agent_id_t,
-                    &profile_t.name,
-                    message.clone(),
-                );
-                // M1 修复轮 P0-1（2026-08-11）：释放咽喉——不再预先加锁。`emit_lead_error_and_release`
-                // 签名收 `&crate::db::Db`（未锁句柄），内部短锁短放；旧版本这里预锁的 guard 会
-                // 一路存活到下面 `try_autofeed_lead` 重新加锁那一刻，同线程二次 lock 直接死锁
-                // （TimedMutex/std::sync::Mutex 不可重入）——这正是本轮要修的死锁。
-                let runtime_db = app_t.state::<crate::db::Db>();
-                emit_lead_error_and_release(
-                    &running_t,
-                    &team_running_t,
-                    &terminated_t,
-                    &session_id_t,
-                    &lead_run_id,
-                    &transport,
-                    message,
-                    Some(runtime_db.inner()),
-                );
-                drain_after_run_release(app_t.clone(), session_id_t.clone());
-                drop(mcp_srv);
-                return;
+        // claude/borrow 的 argv 已不带 prompt 正文（claude_sandboxed_cmd_in 的 claude_agent_argv
+        // 不再拼 -p <prompt>），正文改走 stdin；harness 仍是 write_harness_prompt_file 落 app 域
+        // 临时文件传路径，不需要 stdin。
+        let stdin_prompt = match lead_engine_t {
+            LeadEngine::NativeClaude | LeadEngine::BorrowClaude => {
+                Some(agent::StdinPrompt::from(assembled_prompt.as_str()))
             }
+            LeadEngine::Harness => None,
         };
+        let first_event_started_at = Instant::now();
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // T2/T5 M3：改走 ack 版 spawn——`stdin_ack` 在 EOF 之后、槽仍持有时用来 recv 写 stdin
+        // 是否真正 I/O 成功（`resolve_stdin_ack`），而不是像旧 `spawn_with_stdin_prompt` 那样
+        // 直接 drop 掉 ack receiver。
+        let (mut child, stdin_ack) =
+            match agent::spawn_with_stdin_prompt_ack(&mut cmd, stdin_prompt.as_ref()) {
+                Ok(agent::SpawnedWithStdinPrompt { child, stdin_ack }) => (child, stdin_ack),
+                Err(e) => {
+                    let message = lead_runtime_failure_message(
+                        current_locale(&app_t),
+                        LeadRuntimeFailure::ProcessStart(&e.to_string()),
+                    );
+                    persist_lead_prespawn_failure(
+                        &app_t,
+                        reducer,
+                        &session_id_t,
+                        &lead_run_id,
+                        &lead_agent_id_t,
+                        &profile_t.name,
+                        message.clone(),
+                    );
+                    // T5 B/I5：先装退避，早于摘槽——理由同 McpStart 分支上方注释。
+                    note_resume_failure(&session_id_t);
+                    // M1 修复轮 P0-1（2026-08-11）：释放咽喉——不再预先加锁。`emit_lead_error_and_release`
+                    // 签名收 `&crate::db::Db`（未锁句柄），内部短锁短放；旧版本这里预锁的 guard 会
+                    // 一路存活到下面 `try_resume_pending` 重新加锁那一刻，同线程二次 lock 直接死锁
+                    // （TimedMutex/std::sync::Mutex 不可重入）——这正是本轮要修的死锁。
+                    let runtime_db = app_t.state::<crate::db::Db>();
+                    emit_lead_error_and_release(
+                        &running_t,
+                        &team_running_t,
+                        &terminated_t,
+                        &session_id_t,
+                        &lead_run_id,
+                        &transport,
+                        message,
+                        Some(runtime_db.inner()),
+                    );
+                    drain_after_run_release(app_t.clone(), session_id_t.clone());
+                    drop(mcp_srv);
+                    return;
+                }
+            };
         let first_event_deadline =
             first_event_started_at + std::time::Duration::from_secs(FIRST_EVENT_TIMEOUT_SECS);
 
@@ -14133,12 +14752,20 @@ fn start_lead_session(
             Ok(proceed) => proceed,
             Err(_) => {
                 let _ = child.wait();
+                // T5 C3：running.0 锁 poisoned 时 transition_lead_spawn_handoff 内部已经
+                // terminated.store(true)；不确定槽是否被摘干净，但「槽释放之后才 drain」
+                // 是下限不是上限——这里补一次 drain 保证其余排空源（remote inbox 等）不会
+                // 因为这条极端早退路径而永远等不到下一次排空机会。
+                drain_after_run_release(app_t.clone(), session_id_t.clone());
                 drop(mcp_srv);
                 return;
             }
         };
         if !proceed {
             let _ = child.wait();
+            // T5 C3：Stopped/Abort 分支都已经在 transition_lead_spawn_handoff 内部真摘了槽
+            // （摘槽先于本行）——补一次 drain，同上方注释。
+            drain_after_run_release(app_t.clone(), session_id_t.clone());
             drop(mcp_srv);
             return;
         }
@@ -14438,6 +15065,23 @@ fn start_lead_session(
             }
         }
 
+        // T5 M3/I5：EOF 之后（上面的 stdout 读循环已经跑完）、槽仍持有时的交付 ack——不持任何
+        // DB guard 处 recv `stdin_ack`（harness 无 stdin，`None` 视为 I/O 已在同步文件写时成功，
+        // 见 `resolve_stdin_ack` 文档）。必须发生在 finish_run_without_git_writes/
+        // emit_terminal_after_releasing_run_slot（槽释放）之前——I5 顺序不变量：
+        // ack commit < slot release < drain。`in_flight_report_ids_t`/`in_flight_answer_ids_t`
+        // 都是组装阶段（阶段 0）在同一线程里已经就地捕获的 `assembly.included_report_ids`/
+        // `assembly.included_answer_ids`（T8 P1-②：真相源已改为组装结果本身，不再经全局侧
+        // 信道跨线程登记/取用）；组装失败提前 return 的轮次根本到不了这里，二者恒为空、no-op。
+        let writer_ack = resolve_stdin_ack(stdin_ack);
+        commit_lead_run_delivery(
+            &app_t,
+            &session_id_t,
+            writer_ack,
+            &in_flight_report_ids_t,
+            &in_flight_answer_ids_t,
+        );
+
         // Bug1 修复：lead run 收尾——清本 run 自己写的旧 pending ledger（无 commit intent 时置
         // git_state=clean，与 solo 4812 同语义）。interrupted 用 `stopped`（被用户停=true），与 solo 对齐。
         // 必须在 emit_terminal_after_releasing_run_slot（释放 Running 槽）之前调用：槽仍被本 run 持有时
@@ -14457,7 +15101,7 @@ fn start_lead_session(
         }
 
         // M1 修复轮 P0-1（2026-08-11）：释放咽喉——同上，不再预先加锁（旧版本会跟下面
-        // try_autofeed_lead 的重新加锁死锁）。
+        // try_resume_pending 的重新加锁死锁）。
         let runtime_db = app_t.state::<crate::db::Db>();
         let _ = emit_terminal_after_releasing_run_slot(
             &running_t,
@@ -14475,7 +15119,40 @@ fn start_lead_session(
         drop(mcp_srv);
     });
 
-    Ok(())
+    match spawn_result {
+        Ok(_join_handle) => {
+            // 9. disarm guard — thread owns the Running slot from here.
+            guard.disarm();
+            Ok(())
+        }
+        Err(e) => {
+            // T5 D：runner OS 线程创建失败——上面的闭包整体从未执行（child/MCP server 都还没
+            // 起来），Launching 槽仍是 guard 摘之前的原样。统一收尾走
+            // `handle_lead_runner_thread_spawn_failure`（先装退避、再落库可见错误、再摘槽+
+            // terminal、再 drain），随后才 disarm guard——避免它的 Drop 对已经手动摘掉的槽
+            // 做一次多余的二次摘槽/二次 refresh。
+            handle_lead_runner_thread_spawn_failure(
+                &app,
+                &running_inner,
+                &team_running_inner,
+                db.inner(),
+                &terminated,
+                &session_id,
+                &run_id_for_thread_spawn_failure,
+                &lead_agent_id,
+                &profile_name_for_thread_spawn_failure,
+                &e.to_string(),
+            );
+            guard.disarm();
+            // T5-fix B：绝不能落到统一 `Ok(())`——上面已经整套走完失败收尾（记账/落库/摘槽/
+            // drain），但调用方（`try_resume_pending_with_gate`）仍要能看见这是一次失败，才不会
+            // 误把它当成功清零退避（`Ok(())` 分支会让调用方以为「slot 真正拿到、run 线程移交」，
+            // 从而误触发 `note_resume_success`）。T8 P1-②：runner 线程整体从未起跑，组装阶段
+            // 根本没机会执行，`assembly.included_answer_ids` 天然拿不到——答案仍留在
+            // `pending_answer_ids` 里，不存在「误登记」的顾虑，也没有全局侧信道需要清理。
+            Err(format!("lead runner thread spawn failed: {e}"))
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -16744,7 +17421,7 @@ async fn generate_handoff_doc(
     };
 
     let hook_run_id = new_run_id();
-    let (command, parse_fn) = {
+    let (command, parse_fn, stdin_prompt) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         let (_, wt) = ensure_session_workspace(&conn, &session_id)?;
         build_lead_backend_command(
@@ -16770,6 +17447,7 @@ async fn generate_handoff_doc(
         run_oneshot_llm_with_timeout(
             command,
             parse_fn,
+            stdin_prompt,
             HANDOFF_GENERATION_TIMEOUT,
             &handoff_processes,
             &handoff_session_id,
@@ -17235,8 +17913,11 @@ fn start_continuation_session(
                 Some(message.to_string()),
                 member_ids,
                 None,
+                Some(StartOrigin::UserMessage),
                 // 续会话种子：本地生成、非 remote inbox 投递，None 时兜底
                 // user_send_key(&run_id)。
+                None,
+                // T5-fix C：续会话种子消息，不携带待续答的答案 id 快照。
                 None,
             )
         },
@@ -17321,6 +18002,7 @@ fn start_continuation_session(
                 wt,
                 command,
                 parse_fn,
+                stdin_prompt,
                 profile: _profile,
                 prompt: _prompt,
             } = plan;
@@ -17334,6 +18016,7 @@ fn start_continuation_session(
                 wt,
                 aid,
                 command,
+                stdin_prompt,
                 parser,
                 parse_fn,
                 &mut guard,
@@ -17762,6 +18445,7 @@ pub fn run() {
                 remote_gateway_k_room_provider(),
                 remote_gateway_session_index_snapshot_provider(app.handle()),
                 remote_gateway_milestone_replay_provider(app.handle()),
+                remote_gateway_session_runtime_replay_provider(app.handle()),
                 remote_gateway_pair_hello_handler(),
                 remote_gateway_pair_done_handler(app.handle()),
                 Arc::clone(remote_registry()),
@@ -17836,7 +18520,6 @@ pub fn run() {
             test_search_service,
             send_message,
             start_lead_session,
-            resume_lead_session,
             is_team_session_running,
             stop_session,
             session_review,
@@ -23608,7 +24291,7 @@ mod tests {
 
     #[test]
     fn should_seed_goal_p1_1_resume_without_message_never_seeds() {
-        // P1-①（opus 对抗审）核心钉子：message=None（resume_lead_session 续跑路径）即使
+        // P1-①（opus 对抗审）核心钉子：message=None（try_resume_pending 续跑路径）即使
         // 会话没有既存 goal，也绝不该 seed——不然占位兜底文案会被永久写进 goal memory
         // block。变异测试：把 `should_seed_goal` 里的 `has_message` 条件删掉/永真化，
         // 这条测试立刻变红。
@@ -25654,7 +26337,7 @@ mod tests {
 
         let port = 4317;
         let mcp_config = mcp_server::mcp_config_json(port);
-        let mut args = claude_agent_argv("hi");
+        let mut args = claude_agent_argv();
         args.extend(agent::solo_commit_mcp_argv_extra(&profile, port));
 
         let config_index = args
@@ -26169,8 +26852,11 @@ mod tests {
     fn run_oneshot_llm_exists_with_correct_signature() {
         // Compile-time proof: verify run_oneshot_llm has the expected signature
         // by taking a function pointer. If signature changes, this won't compile.
-        let _f: fn(std::process::Command, crate::ParseFn) -> Result<String, String> =
-            run_oneshot_llm;
+        let _f: fn(
+            std::process::Command,
+            crate::ParseFn,
+            Option<agent::StdinPrompt>,
+        ) -> Result<String, String> = run_oneshot_llm;
         // No live LLM needed — signature check is the test.
     }
 
@@ -26178,12 +26864,15 @@ mod tests {
     fn run_oneshot_llm_errors_use_envelope_codes_and_params() {
         const MISSING_COMMAND: &str = "/definitely/missing/agentloom-command";
         let expected_detail = std::process::Command::new(MISSING_COMMAND)
-            .output()
+            .spawn()
             .unwrap_err()
             .to_string();
-        let spawn_err =
-            run_oneshot_llm(std::process::Command::new(MISSING_COMMAND), ParseFn::Claude)
-                .unwrap_err();
+        let spawn_err = run_oneshot_llm(
+            std::process::Command::new(MISSING_COMMAND),
+            ParseFn::Claude,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(
             spawn_err,
             ui_msg::al_err("team.oneshotSpawnFailed", &[("detail", expected_detail)])
@@ -26192,14 +26881,14 @@ mod tests {
         let mut failed = std::process::Command::new("/bin/sh");
         failed.arg("-c").arg("echo 'provider failed' >&2; exit 7");
         assert_eq!(
-            run_oneshot_llm(failed, ParseFn::Claude).unwrap_err(),
+            run_oneshot_llm(failed, ParseFn::Claude, None).unwrap_err(),
             r#"AL_ERR:team.oneshotFailed:{"detail":"provider failed"}"#
         );
 
         let mut no_text = std::process::Command::new("/bin/sh");
         no_text.arg("-c").arg("true");
         assert_eq!(
-            run_oneshot_llm(no_text, ParseFn::Claude).unwrap_err(),
+            run_oneshot_llm(no_text, ParseFn::Claude, None).unwrap_err(),
             "AL_ERR:team.oneshotNoText"
         );
     }
@@ -26218,6 +26907,7 @@ mod tests {
         let err = run_oneshot_llm_with_timeout(
             command,
             ParseFn::Claude,
+            None,
             std::time::Duration::from_millis(50),
             &registry,
             "handoff-timeout",
@@ -26253,6 +26943,7 @@ mod tests {
             let error = run_oneshot_llm_with_timeout_and_kill(
                 command,
                 ParseFn::Claude,
+                None,
                 std::time::Duration::from_millis(50),
                 &registry,
                 "handoff-kill-failure",
@@ -26438,6 +27129,7 @@ mod tests {
             run_oneshot_llm_with_timeout(
                 command,
                 ParseFn::Claude,
+                None,
                 std::time::Duration::from_secs(10),
                 &registry_for_thread,
                 "handoff-reopened",
@@ -26496,6 +27188,7 @@ mod tests {
             let error = run_oneshot_llm_with_timeout(
                 command,
                 ParseFn::Claude,
+                None,
                 std::time::Duration::from_secs(2),
                 &registry,
                 "handoff-crash",
@@ -26532,6 +27225,7 @@ mod tests {
             let error = run_oneshot_llm_with_timeout(
                 command,
                 ParseFn::Claude,
+                None,
                 std::time::Duration::from_millis(50),
                 &registry,
                 "handoff-lingering-pipe",
@@ -26565,6 +27259,7 @@ mod tests {
             run_oneshot_llm_with_timeout(
                 command,
                 ParseFn::Claude,
+                None,
                 std::time::Duration::from_secs(10),
                 &foreign_registry,
                 "handoff-foreign",
@@ -26592,6 +27287,7 @@ mod tests {
             run_oneshot_llm_with_timeout(
                 command,
                 ParseFn::Claude,
+                None,
                 std::time::Duration::from_secs(10),
                 &registry_for_thread,
                 "handoff-cancel",
@@ -26663,6 +27359,7 @@ mod tests {
         let err = run_oneshot_llm_with_timeout(
             command,
             ParseFn::Claude,
+            None,
             std::time::Duration::from_secs(2),
             &registry,
             "handoff-early-cancel",
@@ -26689,6 +27386,7 @@ mod tests {
         let text = run_oneshot_llm_with_timeout(
             command,
             ParseFn::Claude,
+            None,
             std::time::Duration::from_secs(2),
             &registry,
             "handoff-normal",
@@ -26719,6 +27417,7 @@ mod tests {
         let text = run_oneshot_llm_with_timeout(
             command,
             ParseFn::Claude,
+            None,
             std::time::Duration::from_secs(2),
             &registry,
             "handoff-lingering-normal-pipe",
@@ -31366,12 +32065,38 @@ mod tests {
 
     #[test]
     fn claude_agent_argv_loads_user_project_and_local_settings() {
-        let argv = claude_agent_argv("hi");
+        let argv = claude_agent_argv();
         assert!(
             argv.windows(2)
                 .any(|w| w[0] == "--setting-sources" && w[1] == "user,project,local"),
             "{argv:?}"
         );
+    }
+
+    /// D5 续刀防回归：argv 不再带 prompt 正文（超长 prompt 撞 ARG_MAX 会报
+    /// `Argument list too long (os error 7)`）——`-p` 是布尔开关，不带位置参数，
+    /// prompt 改走 stdin（见 `agent::spawn_with_stdin_prompt`）。
+    #[test]
+    fn claude_agent_argv_never_carries_prompt_body_as_positional_arg() {
+        let argv = claude_agent_argv();
+        assert_eq!(argv.first().map(String::as_str), Some("-p"), "{argv:?}");
+        assert_eq!(
+            argv.get(1).map(String::as_str),
+            Some("--output-format"),
+            "-p 后紧跟下一个 flag，说明 argv 里没有插入 prompt 位置参数：{argv:?}"
+        );
+    }
+
+    /// 正文走 stdin 后 `--disable-slash-commands` 下沉进基础 argv（全线共用），防止同一 flag
+    /// 被调用方再 ad-hoc 加一遍出现两次。
+    #[test]
+    fn claude_agent_argv_carries_exactly_one_disable_slash_commands() {
+        let argv = claude_agent_argv();
+        let count = argv
+            .iter()
+            .filter(|a| a.as_str() == "--disable-slash-commands")
+            .count();
+        assert_eq!(count, 1, "{argv:?}");
     }
 
     /// HOME 是进程级全局，下面几条用例要临时把它改成 temp dir / 非法值，
@@ -31408,7 +32133,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wt = tmp.path().join("member-wt");
         std::fs::create_dir_all(&wt).unwrap();
-        let (cmd, _) = claude_sandboxed_cmd_in(&wt, "hi", &[]).expect("build cmd");
+        let (cmd, _) = claude_sandboxed_cmd_in(&wt, &[]).expect("build cmd");
         let got = cmd.get_current_dir().map(|p| p.to_path_buf());
         assert_eq!(
             got,
@@ -31427,7 +32152,7 @@ mod tests {
         let expected = crate::agent::augmented_path_for_spawn()
             .map(|path| path.to_string_lossy().into_owned());
 
-        let (cmd, _) = claude_sandboxed_cmd_in(&wt, "hi", &[]).expect("build cmd");
+        let (cmd, _) = claude_sandboxed_cmd_in(&wt, &[]).expect("build cmd");
 
         assert_eq!(env_value(&cmd, "PATH").flatten(), expected);
     }
@@ -31506,10 +32231,14 @@ mod tests {
         );
         assert_eq!(env_value(&cmd, "MCP_TIMEOUT"), Some(Some(expected_timeout)));
 
-        // --disable-slash-commands（与 BorrowClaudeBackend 一致）。
-        assert!(
-            args.contains(&"--disable-slash-commands".to_string()),
-            "borrow lead 必须带 --disable-slash-commands: {args:?}"
+        // --disable-slash-commands 来自 claude_agent_argv() 基础项（与 BorrowClaudeBackend
+        // 一致），必须恰好一条——不能被 borrow_lead_cmd_in 再 ad-hoc 加一遍。
+        assert_eq!(
+            args.iter()
+                .filter(|a| a.as_str() == "--disable-slash-commands")
+                .count(),
+            1,
+            "borrow lead 必须恰好带 1 条 --disable-slash-commands: {args:?}"
         );
 
         // 恰好一条 --append-system-prompt，且同时含身份片段 + LEAD_SYS_V2 片段（合并、不覆盖）。
@@ -31757,7 +32486,7 @@ mod tests {
         for bad_home in ["", "relative/home"] {
             let _home_guard = TestHomeGuard::set(std::path::Path::new(bad_home));
             assert!(
-                claude_sandboxed_cmd_in(&wt, "hi", &[]).is_err(),
+                claude_sandboxed_cmd_in(&wt, &[]).is_err(),
                 "HOME={bad_home:?} 时 Seatbelt app 域 deny 会退化成相对 subpath，必须 fail-closed"
             );
         }
@@ -31775,7 +32504,7 @@ mod tests {
 
         let _home_guard = TestHomeGuard::set(std::path::Path::new(""));
         assert!(
-            claude_sandboxed_cmd_in(&wt, "hi", &[]).is_ok(),
+            claude_sandboxed_cmd_in(&wt, &[]).is_ok(),
             "非 mac 走 wrap 的 None 降级分支，不该被 HOME 卡住"
         );
     }
@@ -31791,7 +32520,7 @@ mod tests {
         let wt = tmp.path().join("plain-project");
         std::fs::create_dir_all(&wt).unwrap();
 
-        let (cmd, _) = claude_sandboxed_cmd_in(&wt, "hi", &[]).expect("build cmd");
+        let (cmd, _) = claude_sandboxed_cmd_in(&wt, &[]).expect("build cmd");
         let profile = seatbelt_profile_of(&cmd);
 
         let canonical_home = std::fs::canonicalize(home.path()).unwrap();
@@ -31820,7 +32549,7 @@ mod tests {
         let wt = home.path().join(".agentloom/local/default");
         std::fs::create_dir_all(&wt).unwrap();
 
-        let (cmd, _) = claude_sandboxed_cmd_in(&wt, "hi", &[]).expect("build cmd");
+        let (cmd, _) = claude_sandboxed_cmd_in(&wt, &[]).expect("build cmd");
         let profile = seatbelt_profile_of(&cmd);
 
         let canonical_wt = std::fs::canonicalize(&wt).unwrap();
@@ -33519,6 +34248,52 @@ mod tests {
         assert_eq!(row.status, "running");
     }
 
+    /// idlefix-T1 缺口①（round-trip）：`reserve_new_session_run` 占槽写 run_id=None 之后，
+    /// `start_lead_session` 现在会在拿到真实 run_id 后用同一个 `db::set_session_runtime` 回填
+    /// （lead 分支，仿 solo lib.rs:11058 的写法）——这里直接验证这条 UPSERT 序列本身：
+    /// None → Some(run_id) 生效，不会被 `run_id = excluded.run_id` 的 UPSERT 语义卡在 NULL。
+    #[test]
+    fn session_runtime_run_id_backfill_after_reserve_overwrites_null() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
+
+        reserve_new_session_run(
+            &conn,
+            &running,
+            &team_running,
+            "s-runtime-lead-backfill",
+            Locale::Zh,
+        )
+        .unwrap();
+        assert_eq!(
+            db::get_session_runtime(&conn, "s-runtime-lead-backfill")
+                .unwrap()
+                .unwrap()
+                .run_id,
+            None,
+            "reserve 当时 run_id 还没现场生成，应先落 None"
+        );
+
+        db::set_session_runtime(
+            &conn,
+            "s-runtime-lead-backfill",
+            db::SESSION_RUNTIME_RUNNING,
+            Some("run-lead-42"),
+        )
+        .unwrap();
+
+        let row = db::get_session_runtime(&conn, "s-runtime-lead-backfill")
+            .unwrap()
+            .expect("行必须存在");
+        assert_eq!(
+            row.run_id.as_deref(),
+            Some("run-lead-42"),
+            "lead 起跑回填后 run_id 不该再是 NULL——否则手机端 runId===null 守卫会丢光这条会话的 live delta"
+        );
+    }
+
     /// 占槽失败（team 仍活跃）不得写 running——否则远端会看到一个从没真正跑起来的会话。
     #[test]
     fn reserve_new_session_run_does_not_write_session_runtime_on_rejection() {
@@ -33728,7 +34503,7 @@ mod tests {
             .split("fn reserve_lead_start_after_globalstop(")
             .nth(1)
             .unwrap()
-            .split("\nfn try_autofeed_lead(")
+            .split("\n#[derive(Default)]\nstruct ResumeState {")
             .next()
             .unwrap();
 
@@ -33763,12 +34538,18 @@ mod tests {
         let lock_idx = closure_body.find("db.0.lock()").unwrap_or_else(|| {
             panic!("{label}: 闭包体里没找到 db.0.lock()，测试的切片标记可能已经过期")
         });
-        let spawn_idx = closure_body.find("cmd.spawn(").unwrap_or_else(|| {
-            panic!("{label}: 闭包体里没找到 cmd.spawn(，测试的切片标记可能已经过期")
-        });
+        // D5 续刀：prompt 改走 stdin 后，直接 `cmd.spawn(` 换成了统一口
+        // `agent::spawn_with_stdin_prompt(&mut cmd, ..)`——搜索标记同步更新。
+        let spawn_idx = closure_body
+            .find("spawn_with_stdin_prompt(")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: 闭包体里没找到 spawn_with_stdin_prompt(，测试的切片标记可能已经过期"
+                )
+            });
         assert!(
             spawn_idx > lock_idx,
-            "{label}: cmd.spawn( 出现在 db.0.lock() 之前，切片范围不对"
+            "{label}: spawn_with_stdin_prompt( 出现在 db.0.lock() 之前，切片范围不对"
         );
         fn leading_spaces_of_line_at(text: &str, byte_idx: usize) -> usize {
             let line_start = text[..byte_idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
@@ -33778,7 +34559,7 @@ mod tests {
         let spawn_indent = leading_spaces_of_line_at(closure_body, spawn_idx);
         assert!(
             lock_indent > spawn_indent,
-            "{label}: db.0.lock() 所在行缩进（{lock_indent} 格）应严格深于 cmd.spawn( 所在行缩进\
+            "{label}: db.0.lock() 所在行缩进（{lock_indent} 格）应严格深于 spawn_with_stdin_prompt( 所在行缩进\
              （{spawn_indent} 格）——db.0.lock() 应该在专门收 conn 的内层 block 里，build 完这个\
              内层 block 就结束、guard 随之释放，spawn 在外层、更浅的缩进上执行。缩进相等或更浅\
              说明 guard 被挪出了内层 block、活到了跟 spawn 同层或更外层（H1/A1 要修的正是这个）"
@@ -34402,6 +35183,26 @@ mod tests {
             ".with_refresh(",
             "db.0.lock()",
             label,
+        );
+    }
+
+    /// idlefix-T1 缺口①：`reserve_lead_start_after_globalstop`（经 `reserve_new_session_run`，
+    /// lib.rs:2390）把 session_runtime 写成 running(run_id=None)（占槽当时 run_id 还没现场生
+    /// 成）；solo 路径在 lib.rs:11058 有回填，lead 起跑路径此前没有——这条测试钉住
+    /// `start_lead_session` 函数体必须仿 solo 写法回填 run_id，否则手机端 appRuntimeCore.ts 的
+    /// `runId===null` 守卫会把这个会话之后所有 live delta 全部丢弃。
+    #[test]
+    fn start_lead_session_backfills_session_runtime_run_id() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let stripped = strip_comments_and_strings(production);
+        let label = "start_lead_session";
+        let body = extract_fn_body(&stripped, "\nfn start_lead_session(", label);
+        assert!(
+            body.contains("db::set_session_runtime(") && body.contains("Some(&run_id)"),
+            "{label}: 必须仿 solo 路径（lib.rs:11058）用 `db::set_session_runtime(..., \
+             db::SESSION_RUNTIME_RUNNING, Some(&run_id))` 回填 session_runtime.run_id——否则 \
+             reserve_new_session_run 写下的 NULL 永远补不上（liveDroppedNoRun 全丢）"
         );
     }
 
@@ -35761,14 +36562,13 @@ mod tests {
 
     #[test]
     fn agent_argv_and_clean_env() {
-        let a = claude_agent_argv("hi");
+        let a = claude_agent_argv();
         assert!(a.iter().any(|s| s == "bypassPermissions"), "{a:?}");
         assert!(
             a.windows(2)
                 .any(|w| w[0] == "--setting-sources" && w[1] == "user,project,local"),
             "{a:?}"
         );
-        assert!(a.iter().any(|s| s == "hi"), "{a:?}");
         // apply_clean_env 在 get_envs() 把删掉的 key 体现为 (key, None)
         let mut c = std::process::Command::new("claude");
         apply_clean_env(&mut c);
@@ -35786,13 +36586,12 @@ mod tests {
 
     #[test]
     fn without_bypass_permissions_strips_the_pair() {
-        let argv = claude_agent_argv("hi");
+        let argv = claude_agent_argv();
         assert!(argv.iter().any(|s| s == "bypassPermissions"));
         let stripped = without_bypass_permissions(&argv);
         assert!(!stripped.iter().any(|s| s == "bypassPermissions"));
         assert!(!stripped.iter().any(|s| s == "--permission-mode"));
         // 其余参数保留
-        assert!(stripped.iter().any(|s| s == "hi"));
         assert!(stripped
             .windows(2)
             .any(|w| w[0] == "--setting-sources" && w[1] == "user,project,local"));
@@ -36878,7 +37677,7 @@ mod tests {
                 subtask: "edit one file".into(),
                 prompt: "edit one file".into(),
             };
-            let (command, _, _, cwd, _) = build_member_command(
+            let (command, _, _, cwd, _, _) = build_member_command(
                 &conn,
                 "s-team-inplace",
                 "run-team-inplace",
@@ -36937,6 +37736,7 @@ mod tests {
             monolithic_parse_fn,
             monolithic_wt,
             monolithic_gran,
+            monolithic_stdin_prompt,
         ) = build_member_command(&conn, "s-split", "run-split", &spec, Locale::En).unwrap();
 
         // 分阶段：先拿 profile（H1/A2 phase①），再拿 key（phase②之一，native 不走钥匙串），
@@ -36948,22 +37748,28 @@ mod tests {
         let wt = session_inplace_wt(&conn, "s-split")
             .unwrap()
             .expect("in-place 项目应直接给出路径，不必建 member worktree");
-        let (split_cmd, _split_parser, split_parse_fn, split_gran) = build_member_command_with(
-            &conn,
-            "s-split",
-            "run-split",
-            &spec,
-            &profile,
-            key,
-            HarnessSearchCreds::default(),
-            &wt,
-            Locale::En,
-        )
-        .unwrap();
+        let (split_cmd, _split_parser, split_parse_fn, split_gran, split_stdin_prompt) =
+            build_member_command_with(
+                &conn,
+                "s-split",
+                "run-split",
+                &spec,
+                &profile,
+                key,
+                HarnessSearchCreds::default(),
+                &wt,
+                Locale::En,
+            )
+            .unwrap();
 
         assert_eq!(wt, monolithic_wt, "分阶段算出的 wt 应与一次性调用逐位相同");
         assert_eq!(split_gran, monolithic_gran);
         assert_eq!(split_parse_fn, monolithic_parse_fn);
+        assert_eq!(
+            split_stdin_prompt.as_deref(),
+            monolithic_stdin_prompt.as_deref(),
+            "拆分后算出的 stdin prompt 应与一次性调用逐位相同"
+        );
         assert_eq!(split_cmd.get_program(), monolithic_cmd.get_program());
         assert_eq!(
             split_cmd.get_args().collect::<Vec<_>>(),
@@ -37002,9 +37808,22 @@ mod tests {
             "Worker 模式必须是 workspace-write 沙箱（不是 LeadDraft/LeadAction/Summarize 的 \
              read-only），实得 {split_args:?}"
         );
+        // D5 续刀：prompt 正文改走 stdin（超长 prompt 撞 ARG_MAX），argv 不该再含正文；
+        // codex 的位置参数应是 "-"（从 stdin 读），真正的正文在 split_stdin_prompt 里。
         assert!(
-            split_args.iter().any(|a| a.contains("do x")),
-            "拼出的 argv 里应该含队员的 prompt 原文，实得 {split_args:?}"
+            !split_args.iter().any(|a| a.contains("do x")),
+            "argv 不该再含队员的 prompt 正文，实得 {split_args:?}"
+        );
+        assert_eq!(
+            split_args.last().map(String::as_str),
+            Some("-"),
+            "codex 位置参数应是 \"-\"（从 stdin 读正文），实得 {split_args:?}"
+        );
+        assert!(
+            split_stdin_prompt
+                .as_deref()
+                .is_some_and(|p| p.contains("do x")),
+            "stdin_prompt 应该含队员的 prompt 原文，实得 {split_stdin_prompt:?}"
         );
     }
 
@@ -38098,9 +38917,12 @@ mod tests {
             contains_adjacent_pair(&args, "--output-format", "stream-json"),
             "Borrow backend 应复用 claude_sandboxed_cmd 的 stream-json argv：{args:?}"
         );
-        assert!(
-            args.iter().any(|arg| arg == "--disable-slash-commands"),
-            "Borrow backend 必须禁 slash commands / skills 注入：{args:?}"
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.as_str() == "--disable-slash-commands")
+                .count(),
+            1,
+            "Borrow backend 必须恰好带 1 条 --disable-slash-commands（禁 slash commands / skills 注入，不能重复）：{args:?}"
         );
         assert!(
             env_value(&cmd, "CLAUDE_CONFIG_DIR")
@@ -41707,7 +42529,7 @@ mod tests {
             let idx = lead
                 .find(anchor)
                 .unwrap_or_else(|| panic!("{label}: anchor not found: {anchor}"));
-            let mut window_end = (idx + 1400).min(lead.len());
+            let mut window_end = (idx + 1800).min(lead.len());
             while !lead.is_char_boundary(window_end) {
                 window_end -= 1;
             }
@@ -41736,7 +42558,763 @@ mod tests {
             "let (mut cmd, claude_bin) = match build_result {",
             "CommandBuild",
         );
-        assert_persist_before_emit("let mut child = match cmd", "ProcessStart");
+        assert_persist_before_emit(
+            "match agent::spawn_with_stdin_prompt_ack(&mut cmd, stdin_prompt.as_ref())",
+            "ProcessStart",
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // T5 I5：收尾序全支路——ack commit < slot release < drain。测试名带 `delivery_order` 子串。
+    // -----------------------------------------------------------------------------------------
+
+    /// ★ack commit < slot release 的核心证明：writer ack「晚到」时，`resolve_stdin_ack` 必须
+    /// 真的阻塞到 writer 发送结果才返回（不是提前臆测成功）；在它返回之前，报告台账仍是
+    /// pending、答案 id 仍未被摘除。ack 到达并提交之后，两者才真正落定。
+    #[test]
+    fn delivery_order_ack_commit_waits_for_late_writer_then_marks_delivered_and_acks_answers() {
+        let conn = crate::test_support::mem_db();
+        db::create_session(&conn, "s-delivery-order-ack", "t", "local-default", "local").unwrap();
+        conn.execute(
+            "INSERT INTO member_report_delivery (session_id, message_id, assignment_id) \
+             VALUES ('s-delivery-order-ack', 42, 'a1')",
+            [],
+        )
+        .unwrap();
+        register_pending_answer_id("s-delivery-order-ack", 7);
+
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
+        let ack_join = std::thread::spawn(move || resolve_stdin_ack(Some(rx)));
+
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(
+            !ack_join.is_finished(),
+            "writer ack 未到前，resolve_stdin_ack 不得提前判定收尾完成——recv 必须真的阻塞等待"
+        );
+        assert_eq!(
+            db::pending_member_report_message_ids(&conn, "s-delivery-order-ack").unwrap(),
+            vec![42],
+            "ack 未提交前报告必须仍是 pending"
+        );
+        assert!(
+            snapshot_pending_answer_ids("s-delivery-order-ack").contains(&7),
+            "ack 未提交前答案 id 必须仍未被摘除"
+        );
+
+        tx.send(Ok(())).unwrap();
+        let writer_ack = ack_join.join().unwrap();
+        assert_eq!(writer_ack, Ok(()));
+
+        // T8 P1-②：真相源改为 assembly.included_answer_ids（同线程直接捕获）——这里的裸
+        // `_with_conn`/`ack_pending_answers` 单测不经过完整 runner 线程，直接用一个本地字面量
+        // 表示「本轮组装实际纳入的答案 id」，不再靠全局侧信道 record/take。
+        let in_flight_ids = vec![7i64];
+        let commit_result = commit_lead_run_delivery_with_conn(
+            Some(&conn),
+            "s-delivery-order-ack",
+            writer_ack,
+            &[42],
+        );
+        assert_eq!(commit_result, Ok(()));
+        // 生产 wrapper `commit_lead_run_delivery` 只在 `_with_conn` 判 Ok 时才做这两步——这里
+        // 直接调用验证它们对齐同一份判断（同一份状态转移，不是重新发明）。
+        ack_pending_answers("s-delivery-order-ack", &in_flight_ids);
+        note_resume_success("s-delivery-order-ack");
+
+        assert!(
+            db::pending_member_report_message_ids(&conn, "s-delivery-order-ack")
+                .unwrap()
+                .is_empty(),
+            "ack 提交后报告必须置 delivered"
+        );
+        assert!(
+            snapshot_pending_answer_ids("s-delivery-order-ack").is_empty(),
+            "ack 提交后答案 id 必须从 pending 集合摘除"
+        );
+    }
+
+    /// writer 报告 I/O 失败 → 报告仍 pending、答案仍未确认；生产 wrapper 的 Err 分支随后会调
+    /// `note_resume_failure` 装退避。
+    #[test]
+    fn delivery_order_writer_err_leaves_report_pending_and_answers_unacked() {
+        let conn = crate::test_support::mem_db();
+        db::create_session(
+            &conn,
+            "s-delivery-order-writer-err",
+            "t",
+            "local-default",
+            "local",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO member_report_delivery (session_id, message_id, assignment_id) \
+             VALUES ('s-delivery-order-writer-err', 9, 'a1')",
+            [],
+        )
+        .unwrap();
+        register_pending_answer_id("s-delivery-order-writer-err", 3);
+
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
+        tx.send(Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "broken pipe",
+        )))
+        .unwrap();
+        let writer_ack = resolve_stdin_ack(Some(rx));
+        assert!(writer_ack.is_err(), "writer 报告 io::Err 必须转成失败 Result");
+
+        let result = commit_lead_run_delivery_with_conn(
+            Some(&conn),
+            "s-delivery-order-writer-err",
+            writer_ack,
+            &[9],
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            db::pending_member_report_message_ids(&conn, "s-delivery-order-writer-err").unwrap(),
+            vec![9],
+            "writer Err 时报告必须仍是 pending——绝不能提前标记已交付"
+        );
+        assert!(
+            snapshot_pending_answer_ids("s-delivery-order-writer-err").contains(&3),
+            "writer Err 时答案 id 不得被 ack 摘除"
+        );
+
+        assert!(resume_not_before_allows("s-delivery-order-writer-err"));
+        note_resume_failure("s-delivery-order-writer-err");
+        assert!(
+            !resume_not_before_allows("s-delivery-order-writer-err"),
+            "生产 wrapper commit_lead_run_delivery 的 Err 分支必须装退避（not_before 生效）"
+        );
+    }
+
+    /// T8-fix：`is_delivery_round_empty_but_pending` 的查询本身失败（DB 损坏/表缺失等）不能被
+    /// `.unwrap_or(false)` 悄悄吞成「查出来没有 pending」——那样会把「读失败」误判成「读到真没
+    /// 有」，进而把这一轮当成正常成功清零退避，真正卡住的 session 反而看起来风平浪静。查询 Err
+    /// 必须走 `decide_delivery_outcome` 的保守未交付分支（`UndeliveredPendingQueryError`）。
+    #[test]
+    fn delivery_order_pending_query_error_is_treated_as_undelivered() {
+        let conn = crate::test_support::mem_db();
+        db::create_session(&conn, "s-delivery-order-query-err", "t", "local-default", "local")
+            .unwrap();
+        // 故意打掉底层表，让 `pending_member_report_message_ids`（进而
+        // `is_delivery_round_empty_but_pending`）的查询报错，模拟“坏状态”而非正常空结果。
+        conn.execute("DROP TABLE member_report_delivery", []).unwrap();
+
+        let query_result =
+            is_delivery_round_empty_but_pending(&conn, "s-delivery-order-query-err", &[], &[]);
+        assert!(query_result.is_err(), "表缺失时查询必须报错，不能悄悄返回 Ok");
+
+        let outcome = decide_delivery_outcome(&Ok(()), Some(query_result));
+        assert!(
+            matches!(outcome, DeliveryOutcome::UndeliveredPendingQueryError(_)),
+            "pending 查询报错必须判为未交付（保守），不能被 unwrap_or(false) 吞成成功"
+        );
+
+        // 生产 wrapper commit_lead_run_delivery 命中这个判定时走 note_resume_failure，不清零退避
+        // ——同 `delivery_order_ack_db_unavailable_is_treated_as_ack_failure` 的验证姿势。
+        assert!(resume_not_before_allows("s-delivery-order-query-err"));
+        note_resume_failure("s-delivery-order-query-err");
+        assert!(
+            !resume_not_before_allows("s-delivery-order-query-err"),
+            "pending 查询失败必须装退避，不能被误判成功清零"
+        );
+    }
+
+    /// ack 本身的 DB 访问失败（这里用 `conn = None` 模拟「拿不到 DB 锁」）必须算失败，不能
+    /// 悄悄当成功放行——顺序上先装退避、调用方随后才可能走到槽释放，天然满足 I5。
+    #[test]
+    fn delivery_order_ack_db_unavailable_is_treated_as_ack_failure() {
+        let result = commit_lead_run_delivery_with_conn(
+            None,
+            "s-delivery-order-db-err",
+            Ok(()),
+            &[1],
+        );
+        assert!(
+            result.is_err(),
+            "conn 不可用（DB 锁失败）必须算 ack 失败，不能悄悄当成功放行"
+        );
+        assert!(resume_not_before_allows("s-delivery-order-db-err"));
+        note_resume_failure("s-delivery-order-db-err");
+        assert!(
+            !resume_not_before_allows("s-delivery-order-db-err"),
+            "ack DB 错误必须先装退避"
+        );
+    }
+
+    /// T8 P1-①：本轮零纳入（既没交付新报告也没确认答案）但该 session 在 DB 里仍有 pending
+    /// 报告行——「run 发生了」但什么都没消化掉，必须判定为未交付（不能清零退避，否则真正卡住
+    /// 的 session 会被误判成已经交付、autofeed 再也不会重试）。
+    #[test]
+    fn delivery_order_empty_round_with_pending_reports_is_treated_as_undelivered() {
+        let conn = crate::test_support::mem_db();
+        db::create_session(&conn, "s-delivery-order-empty-pending", "t", "local-default", "local")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO member_report_delivery (session_id, message_id, assignment_id) \
+             VALUES ('s-delivery-order-empty-pending', 55, 'a1')",
+            [],
+        )
+        .unwrap();
+
+        let empty_but_pending = is_delivery_round_empty_but_pending(
+            &conn,
+            "s-delivery-order-empty-pending",
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            empty_but_pending,
+            "零纳入且该 session 仍有 pending 报告行时必须判定为未交付"
+        );
+
+        // 生产 wrapper commit_lead_run_delivery 命中这个判定时走 note_resume_failure，不清零退避
+        // ——这里直接调用同一份状态转移函数验证（同 `delivery_order_ack_db_unavailable_...` 的
+        // 验证姿势，不重新发明）。
+        assert!(resume_not_before_allows("s-delivery-order-empty-pending"));
+        note_resume_failure("s-delivery-order-empty-pending");
+        assert!(
+            !resume_not_before_allows("s-delivery-order-empty-pending"),
+            "零纳入但仍有 pending 时必须装退避——不能被当成正常成功清零"
+        );
+    }
+
+    /// 零纳入、且该 session 没有任何 pending 报告行（纯用户轮，没有 worker 报告需要交付）——
+    /// 这是正常情况，必须照常判定为成功，不能被 P1-① 的治标误伤。
+    #[test]
+    fn delivery_order_empty_round_without_pending_reports_is_normal_success() {
+        let conn = crate::test_support::mem_db();
+        db::create_session(&conn, "s-delivery-order-empty-clean", "t", "local-default", "local")
+            .unwrap();
+
+        let empty_but_pending = is_delivery_round_empty_but_pending(
+            &conn,
+            "s-delivery-order-empty-clean",
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            !empty_but_pending,
+            "纯用户轮（无 pending 报告）零纳入必须视为正常成功，不得误判未交付"
+        );
+
+        assert!(resume_not_before_allows("s-delivery-order-empty-clean"));
+        note_resume_success("s-delivery-order-empty-clean");
+        assert!(
+            resume_not_before_allows("s-delivery-order-empty-clean"),
+            "正常成功不应装退避"
+        );
+    }
+
+    /// 只要本轮纳入了报告或答案中的任意一项，即使该 session 之后仍有其它 pending 报告行，
+    /// 也不该被当成「本轮未交付」——那些是留给下一批的，不是本轮的责任。
+    #[test]
+    fn delivery_order_nonempty_round_is_never_treated_as_undelivered_even_with_other_pending() {
+        let conn = crate::test_support::mem_db();
+        db::create_session(&conn, "s-delivery-order-nonempty-pending", "t", "local-default", "local")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO member_report_delivery (session_id, message_id, assignment_id) \
+             VALUES ('s-delivery-order-nonempty-pending', 61, 'a1'), \
+                    ('s-delivery-order-nonempty-pending', 62, 'a2')",
+            [],
+        )
+        .unwrap();
+
+        // 本轮纳入了 61（report_message_ids 非空），62 留给下一批——不该被判未交付。
+        let empty_but_pending = is_delivery_round_empty_but_pending(
+            &conn,
+            "s-delivery-order-nonempty-pending",
+            &[61],
+            &[],
+        )
+        .unwrap();
+        assert!(!empty_but_pending, "只要本轮纳入非空，即使还有其它 pending 也不算未交付");
+
+        // 报告为空但答案非空同理——只要有一项非空就不算「零纳入」。
+        let empty_but_pending_answer_only = is_delivery_round_empty_but_pending(
+            &conn,
+            "s-delivery-order-nonempty-pending",
+            &[],
+            &[9],
+        )
+        .unwrap();
+        assert!(
+            !empty_but_pending_answer_only,
+            "答案非空（哪怕报告为空）也不算零纳入"
+        );
+    }
+
+    /// 生产 `commit_lead_run_delivery` 必须真的调用 `is_delivery_round_empty_but_pending` 做
+    /// 零纳入判定，且判定结果（`DeliveryOutcome::UndeliveredEmptyButPending`）分支必须调用
+    /// `note_resume_failure`、成功分支（`DeliveryOutcome::Success`）必须调用
+    /// `note_resume_success`——源码断言锁住这道分流，防止有人把判定写好了却忘记接进生产
+    /// wrapper（同 `delivery_order_prespawn_and_spawn_failures_...` 那种“逻辑对但没接线”回归）。
+    /// T8-fix：判定结果收进 `DeliveryOutcome` 枚举再 match——枚举分支互斥，不再是旧版 `if` guard
+    /// 那种需要判先后顺序的写法，这里改成分别核两条分支各自接对了动作。
+    #[test]
+    fn delivery_order_wrapper_wires_empty_but_pending_check_before_unconditional_success() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let stripped = strip_comments_and_strings(production);
+        let label = "commit_lead_run_delivery";
+        let body = extract_fn_body(&stripped, "\nfn commit_lead_run_delivery(", label);
+
+        assert!(
+            body.contains("is_delivery_round_empty_but_pending("),
+            "commit_lead_run_delivery 必须调用 is_delivery_round_empty_but_pending 做零纳入判定"
+        );
+
+        let empty_pending_arm_idx = body
+            .find("DeliveryOutcome::UndeliveredEmptyButPending => {")
+            .expect("必须有 DeliveryOutcome::UndeliveredEmptyButPending 分支");
+        let empty_pending_arm_end = body[empty_pending_arm_idx..]
+            .find("}\n")
+            .map(|offset| empty_pending_arm_idx + offset)
+            .expect("UndeliveredEmptyButPending 分支必须有收尾 `}`");
+        let empty_pending_arm_text = &body[empty_pending_arm_idx..empty_pending_arm_end];
+        assert!(
+            empty_pending_arm_text.contains("note_resume_failure(session_id);"),
+            "DeliveryOutcome::UndeliveredEmptyButPending 分支必须调用 note_resume_failure，不清零退避"
+        );
+
+        let success_arm_idx = body
+            .find("DeliveryOutcome::Success => {")
+            .expect("必须保留无条件成功分支 DeliveryOutcome::Success");
+        let success_arm_end = body[success_arm_idx..]
+            .find("}\n")
+            .map(|offset| success_arm_idx + offset)
+            .expect("Success 分支必须有收尾 `}`");
+        let success_arm_text = &body[success_arm_idx..success_arm_end];
+        assert!(
+            success_arm_text.contains("note_resume_success(session_id);"),
+            "DeliveryOutcome::Success 分支必须调用 note_resume_success"
+        );
+    }
+
+    /// 三个 lead spawn 前失败点（McpStart/CommandBuild/ProcessStart）都必须先
+    /// `note_resume_failure`（装退避）再 `emit_lead_error_and_release`（摘槽+terminal），再
+    /// `drain_after_run_release`——I5：状态先于槽释放、槽释放先于 drain。
+    #[test]
+    fn delivery_order_prespawn_and_spawn_failures_install_backoff_before_slot_release() {
+        let source = include_str!("lib.rs");
+        let lead = source
+            .split("fn start_lead_session(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]\nfn stop_session(").next())
+            .expect("start_lead_session source slice");
+
+        let assert_order = |anchor: &str, label: &str| {
+            let idx = lead
+                .find(anchor)
+                .unwrap_or_else(|| panic!("{label}: anchor not found: {anchor}"));
+            let mut window_end = (idx + 2200).min(lead.len());
+            while !lead.is_char_boundary(window_end) {
+                window_end -= 1;
+            }
+            let window = &lead[idx..window_end];
+            let note_idx = window
+                .find("note_resume_failure(")
+                .unwrap_or_else(|| panic!("{label}: note_resume_failure( missing near anchor"));
+            let emit_idx = window
+                .find("emit_lead_error_and_release(")
+                .unwrap_or_else(|| {
+                    panic!("{label}: emit_lead_error_and_release( missing near anchor")
+                });
+            let drain_idx = window
+                .find("drain_after_run_release(")
+                .unwrap_or_else(|| panic!("{label}: drain_after_run_release( missing near anchor"));
+            assert!(
+                note_idx < emit_idx,
+                "{label}: note_resume_failure 必须先于 emit_lead_error_and_release（I5：状态先于槽释放）"
+            );
+            assert!(
+                emit_idx < drain_idx,
+                "{label}: emit_lead_error_and_release（槽释放）必须先于 drain_after_run_release"
+            );
+        };
+
+        assert_order(
+            "let mcp_srv = match mcp_server::start_mcp_server(tools_arc) {",
+            "McpStart",
+        );
+        assert_order(
+            "let (mut cmd, claude_bin) = match build_result {",
+            "CommandBuild",
+        );
+        assert_order(
+            "match agent::spawn_with_stdin_prompt_ack(&mut cmd, stdin_prompt.as_ref())",
+            "ProcessStart",
+        );
+        // T8 P2-④：组装失败（Autofeed/LateAnswer 分流的 I2 中止分支）同样必须
+        // note_resume_failure < emit_lead_error_and_release < drain_after_run_release。
+        assert_order(
+            "let assembled_prompt: String = match assembly_outcome {",
+            "ContextAssembly",
+        );
+    }
+
+    /// T8 P2-④/I2：组装失败时，自动来源（Autofeed/LateAnswer）绝不能只喂兜底句起跑——那等于
+    /// 把「run 发生了」包装成「run 交付了」；必须中止本轮（不 spawn 后续 command/child）。
+    /// UserMessage 来源保留旧行为：兜底句 + 留日志，正常继续起跑（用户主动发的消息不能被吞）。
+    #[test]
+    fn autofeed_context_assembly_failure_aborts_without_fallback_prompt_for_autofeed_and_late_answer(
+    ) {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let block = production
+            .split("let assembled_prompt: String = match assembly_outcome {")
+            .nth(1)
+            .expect("组装结果分流代码块缺失")
+            .split("\n        let (mut cmd, claude_bin) = match build_result {")
+            .next()
+            .expect("找不到组装分流块与命令构建块的边界");
+
+        let autofeed_arm = block
+            .split("StartOrigin::Autofeed | StartOrigin::LateAnswer => {")
+            .nth(1)
+            .expect("Autofeed/LateAnswer 分支缺失")
+            .split("StartOrigin::UserMessage => {")
+            .next()
+            .expect("找不到与 UserMessage 分支的边界");
+        assert!(
+            !autofeed_arm.contains("message_or_fallback"),
+            "Autofeed/LateAnswer 组装失败绝不能只喂兜底句起跑（I2）"
+        );
+        let failure_idx = autofeed_arm
+            .find("note_resume_failure(&session_id_t);")
+            .expect("必须先装退避");
+        let emit_idx = autofeed_arm
+            .find("emit_lead_error_and_release(")
+            .expect("必须摘槽/terminal");
+        let drain_idx = autofeed_arm
+            .find("drain_after_run_release(")
+            .expect("必须触发 drain 让其余排空源不被卡住");
+        let return_idx = autofeed_arm
+            .find("return;")
+            .expect("必须中止本轮——不能继续往下 spawn command/child");
+        assert!(
+            failure_idx < emit_idx && emit_idx < drain_idx && drain_idx < return_idx,
+            "组装失败中止分支的收尾序必须是 note_resume_failure < emit_lead_error_and_release < \
+             drain_after_run_release < return"
+        );
+        // T8 P1-③：组装失败轮绝不能 ack 答案——`commit_lead_run_delivery`/`ack_pending_answers`
+        // 都必须完全没被调用到，答案仍留在 `pending_answer_ids` 里等下一轮重试。
+        assert!(
+            !autofeed_arm.contains("commit_lead_run_delivery(")
+                && !autofeed_arm.contains("ack_pending_answers("),
+            "组装失败中止分支绝不能提前 ack 答案——答案必须仍是 pending，留给下一轮重试"
+        );
+
+        let user_message_arm = block
+            .split("StartOrigin::UserMessage => {")
+            .nth(1)
+            .expect("UserMessage 分支缺失");
+        assert!(
+            user_message_arm.contains("message_or_fallback.clone()"),
+            "UserMessage 来源必须保留兜底句、正常起跑（用户消息不能被吞）"
+        );
+        assert!(
+            !user_message_arm.contains("note_resume_failure(&session_id_t)")
+                && !user_message_arm.contains("emit_lead_error_and_release(")
+                && !user_message_arm.contains("return;"),
+            "UserMessage 分支不该中止本轮——只应兜底句 + 留日志后继续起跑"
+        );
+    }
+
+    /// 正常收尾序：`commit_lead_run_delivery`（ack 提交）必须先于
+    /// `finish_run_without_git_writes`，后者必须先于 `emit_terminal_after_releasing_run_slot`
+    /// （槽释放），槽释放必须先于最后一次 `drain_after_run_release`——I5 全链路源码顺序证明。
+    #[test]
+    fn delivery_order_normal_completion_commits_ack_before_slot_release_and_drain() {
+        let source = include_str!("lib.rs");
+        let lead = source
+            .split("fn start_lead_session(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]\nfn stop_session(").next())
+            .expect("start_lead_session source slice");
+
+        let commit_idx = lead
+            .find("commit_lead_run_delivery(")
+            .expect("commit_lead_run_delivery( missing");
+        let finish_idx = lead
+            .find("finish_run_without_git_writes(&conn, &session_id_t, &lead_run_id, stopped)")
+            .expect("finish_run_without_git_writes( call missing");
+        let release_idx = lead
+            .rfind("emit_terminal_after_releasing_run_slot(")
+            .expect("emit_terminal_after_releasing_run_slot( missing");
+        let drain_idx = lead
+            .rfind("drain_after_run_release(")
+            .expect("drain_after_run_release( missing");
+
+        assert!(
+            commit_idx < finish_idx,
+            "I5: ack 提交（commit_lead_run_delivery）必须先于 finish_run_without_git_writes"
+        );
+        assert!(
+            finish_idx < release_idx,
+            "finish_run_without_git_writes 必须先于槽释放（emit_terminal_after_releasing_run_slot）"
+        );
+        assert!(
+            release_idx < drain_idx,
+            "I5: 槽释放必须先于 drain（drain_after_run_release 是本次收尾的最后一次调用）"
+        );
+    }
+
+    /// runner OS 线程创建失败（`std::thread::Builder::spawn` 返回 `Err`）的统一收尾函数
+    /// `handle_lead_runner_thread_spawn_failure` 内部顺序：先装退避，再落库可见错误，再统一
+    /// 摘槽+terminal，再 drain——同 I5。这条路径需要真实 AppHandle 才能端到端触发（本仓测试
+    /// 约定对需要 AppHandle 的路径一律走源码顺序断言，见 `resume_pending_after_answer_records_
+    /// success_and_failure_via_shared_state_machine` 等既有先例），调用点（`start_lead_session`
+    /// 里 `match spawn_result` 的 `Err` 分支）本身经 `cargo build`/`cargo test --no-run` 编译期
+    /// 类型检查验证过接线正确。
+    #[test]
+    fn delivery_order_runner_thread_spawn_failure_installs_backoff_before_release_and_drain() {
+        let source = include_str!("lib.rs");
+        let body = source
+            .split("\nfn handle_lead_runner_thread_spawn_failure(")
+            .nth(1)
+            .and_then(|tail| tail.split("\nfn reconcile_running_dispatch_cards(").next())
+            .expect("handle_lead_runner_thread_spawn_failure source slice");
+
+        let note_idx = body
+            .find("note_resume_failure(session_id)")
+            .expect("note_resume_failure( missing");
+        let persist_idx = body
+            .find("persist_lead_prespawn_failure(")
+            .expect("persist_lead_prespawn_failure( missing");
+        let emit_idx = body
+            .find("emit_lead_error_and_release(")
+            .expect("emit_lead_error_and_release( missing");
+        let drain_idx = body
+            .find("drain_after_run_release(")
+            .expect("drain_after_run_release( missing");
+
+        assert!(
+            note_idx < persist_idx,
+            "装退避必须先于落库可见错误（I5：状态先于其余收尾步骤）"
+        );
+        assert!(
+            persist_idx < emit_idx,
+            "落库必须先于统一摘槽（emit_lead_error_and_release）"
+        );
+        assert!(
+            emit_idx < drain_idx,
+            "槽释放必须先于 drain（I5）"
+        );
+    }
+
+    /// `start_lead_session` 里 `std::thread::Builder::spawn` 的 `Ok`/`Err` 两分支：只有 `Ok`
+    /// 才直接 `guard.disarm()`；`Err` 必须先调用 `handle_lead_runner_thread_spawn_failure`
+    /// 完成收尾，再 `disarm()`（避免 guard 的 Drop 对已经手动摘掉的槽做二次摘槽/二次
+    /// refresh）——防将来有人在这两个分支里改错顺序。
+    #[test]
+    fn delivery_order_runner_thread_builder_spawn_err_handles_before_disarm() {
+        let source = include_str!("lib.rs");
+        // 注意：不能用 `.matches(...).count() == 1` 断言唯一——本测试自身的源码字符串字面量
+        // 也含有这段文本（`include_str!` 把整份文件含本测试自己都读进来了），计数天然 > 1；
+        // `.find()` 只取第一次出现，而生产里的真实 `match spawn_result {` 就在
+        // `start_lead_session` 函数体内、远早于本测试模块，第一次命中即是它。
+        let idx = source
+            .find("match spawn_result {")
+            .expect("match spawn_result { missing");
+        let mut window_end = (idx + 1600).min(source.len());
+        while !source.is_char_boundary(window_end) {
+            window_end -= 1;
+        }
+        let window = &source[idx..window_end];
+        let err_arm_idx = window.find("Err(e) => {").expect("Err(e) => { missing");
+        let err_arm = &window[err_arm_idx..];
+        let handle_idx = err_arm
+            .find("handle_lead_runner_thread_spawn_failure(")
+            .expect("handle_lead_runner_thread_spawn_failure( missing in Err arm");
+        let disarm_idx = err_arm
+            .find("guard.disarm();")
+            .expect("guard.disarm(); missing in Err arm");
+        assert!(
+            handle_idx < disarm_idx,
+            "Err 分支必须先调用 handle_lead_runner_thread_spawn_failure 完成收尾，再 disarm guard"
+        );
+    }
+
+    /// T5-fix B：runner OS 线程创建失败（`std::thread::Builder::spawn` 返回 `Err`）之后，
+    /// `match spawn_result { ... }` 必须是 `start_lead_session` 的尾表达式、且 `Err` 分支必须
+    /// 真正产出 `Err(...)`——旧 bug 的形状是这个 match 只是一条语句，两个分支都收口于共享的
+    /// `Ok(())`（写在 match 之后），于是调用方（`try_resume_pending_with_gate`）看到的永远是
+    /// `Ok(())`，把「runner 线程创建失败」误判成起跑成功，进而误登记 in-flight 答案 id、误当
+    /// 成功清零退避。这里既检查 Err 分支里有 `Err(format!(` 产出真错误，又检查 match 自身的
+    /// 收尾 `}` 后面（去掉尾随空白）只剩函数自己的收尾 `}`——不允许再有别的语句（尤其是共享的
+    /// `Ok(())`）挂在后面。
+    #[test]
+    fn delivery_order_runner_thread_builder_spawn_err_returns_err_not_shared_ok() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let stripped = strip_comments_and_strings(production);
+        let label = "start_lead_session";
+        let fn_body = extract_fn_body(&stripped, "\nfn start_lead_session(", label);
+
+        let after_match_kw = fn_body
+            .split("match spawn_result {")
+            .nth(1)
+            .expect("match spawn_result { missing in start_lead_session body");
+        // 深度计数找到这个 match 语句自己的收尾 `}`（`split` 已经吃掉了它自己的开括号，起始
+        // 深度记 1）。
+        let mut depth: i32 = 1;
+        let mut close_rel = None;
+        for (i, c) in after_match_kw.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_rel = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close_rel =
+            close_rel.expect("match spawn_result { ... } 没有找到匹配的收尾 `}`");
+        let match_block = &after_match_kw[..close_rel];
+        let after_match_block = &after_match_kw[close_rel + 1..];
+
+        assert!(
+            match_block.contains("Err(format!("),
+            "Err 分支必须真正产出 Err(...)，不能吞成 ()（旧 bug：两分支共享外面的 Ok(())）"
+        );
+        assert_eq!(
+            after_match_block.trim(),
+            "}",
+            "match spawn_result {{...}} 必须是 start_lead_session 的尾表达式——后面不得再挂\
+             共享的 Ok(())，否则 Err 分支的错误会被统一吞成成功"
+        );
+    }
+
+    /// Stopped 分支不装退避（global-stop 已表达用户明确意图）；Abort 分支（槽状态不是本次
+    /// Launching 的竞态）必须先 `note_resume_failure` 再摘槽——真实调用 `transition_lead_spawn_
+    /// handoff`（不是结构断言），直接验证 in-memory 退避状态与槽的最终结果。
+    #[test]
+    fn delivery_order_stopped_handoff_skips_backoff_but_abort_handoff_installs_it() {
+        let running = Running::default();
+        let team_running = member_runner::TeamRunning::default();
+        try_reserve(&running, "s-delivery-order-stopped").unwrap();
+        request_stop(&running, "s-delivery-order-stopped", |_| {}, |_| {}).unwrap();
+        let terminated = AtomicBool::new(false);
+        assert!(resume_not_before_allows("s-delivery-order-stopped"));
+        let proceed = transition_lead_spawn_handoff(
+            &running,
+            &team_running,
+            None,
+            &terminated,
+            "s-delivery-order-stopped",
+            9001,
+            "run-delivery-order-stopped",
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+        assert!(!proceed);
+        assert!(
+            resume_not_before_allows("s-delivery-order-stopped"),
+            "Stopped 分支不得装退避——global-stop 已经是用户明确意图"
+        );
+
+        let running2 = Running::default();
+        running2
+            .0
+            .lock()
+            .unwrap()
+            .insert("s-delivery-order-abort".to_string(), RunSlot::Running(9002));
+        let terminated2 = AtomicBool::new(false);
+        assert!(resume_not_before_allows("s-delivery-order-abort"));
+        let proceed2 = transition_lead_spawn_handoff(
+            &running2,
+            &team_running,
+            None,
+            &terminated2,
+            "s-delivery-order-abort",
+            9003,
+            "run-delivery-order-abort",
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+        assert!(!proceed2);
+        assert!(
+            !resume_not_before_allows("s-delivery-order-abort"),
+            "Abort 分支必须先 note_resume_failure 装退避再摘槽"
+        );
+        assert!(
+            running2
+                .0
+                .lock()
+                .unwrap()
+                .get("s-delivery-order-abort")
+                .is_none(),
+            "Abort 分支必须真摘槽"
+        );
+    }
+
+    /// T5-fix D：`running.0` 锁 poisoned 时，旧实现 `map_err(...)?` 提前 return——从未拿到
+    /// guard，也就从未 `slots.remove`，外层调用方（:14554 附近）却仍会在 `Err(_)` 分支照样
+    /// `drain_after_run_release`，违反「slot release < drain」顺序不变量。修复后 poisoned
+    /// 分支必须借 `PoisonError::into_inner` 拿回 guard，按 Abort 同款真摘槽 + 装退避，再把
+    /// 错误透传出去——用真实 poisoned mutex（另一线程持锁 panic）驱动，不是结构断言。
+    #[test]
+    fn delivery_order_poisoned_handoff_removes_slot_and_installs_backoff_before_drain() {
+        let session_id = "s-delivery-order-poisoned";
+        let running = Running::default();
+        running
+            .0
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), RunSlot::Running(9100));
+        let inner = running.0.clone();
+        let poison_result = std::thread::spawn(move || {
+            let _guard = inner.lock().unwrap();
+            panic!("deliberately poison the mutex for T5-fix D test");
+        })
+        .join();
+        assert!(poison_result.is_err(), "子线程应已 panic");
+        assert!(running.0.is_poisoned(), "mutex 应已进入 poisoned 状态");
+
+        let team_running = member_runner::TeamRunning::default();
+        let terminated = AtomicBool::new(false);
+        assert!(resume_not_before_allows(session_id));
+
+        let result = transition_lead_spawn_handoff(
+            &running,
+            &team_running,
+            None,
+            &terminated,
+            session_id,
+            9101,
+            "run-delivery-order-poisoned",
+            |_| {},
+            |_| {},
+        );
+        assert!(result.is_err(), "poisoned 分支必须仍把错误透传给调用方");
+        assert!(
+            terminated.load(Ordering::SeqCst),
+            "poisoned 分支必须置位 terminated"
+        );
+        assert!(
+            !resume_not_before_allows(session_id),
+            "poisoned 分支必须先 note_resume_failure 装退避——不是无声吞掉"
+        );
+        assert!(
+            running
+                .0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(session_id)
+                .is_none(),
+            "poisoned 分支必须真摘槽——外层 drain 才不会踩着一个仍占着的槽走"
+        );
     }
 
     /// Bug B 回归钉子（验收 b）：lead 见到 NeedsDecision 终态事件（myagent 退出码 4 的正常
@@ -42990,7 +44568,20 @@ mod tests {
             None,
         )
         .unwrap();
-        conn.last_insert_rowid()
+        let message_id = conn.last_insert_rowid();
+        if text.starts_with("[Worker report]") {
+            let assignment_id = text
+                .lines()
+                .find_map(|line| line.strip_prefix("assignment_id: "));
+            conn.execute(
+                "INSERT INTO member_report_delivery
+                    (session_id, message_id, assignment_id, delivered_at)
+                 VALUES (?1, ?2, ?3, NULL)",
+                rusqlite::params![session_id, message_id, assignment_id],
+            )
+            .unwrap();
+        }
+        message_id
     }
 
     fn lead_compact_wiring_transcript_nonce(prompt: &str) -> &str {
@@ -43043,22 +44634,26 @@ mod tests {
         )
         .unwrap();
 
-        let first = build_lead_context_prompt_and_record_autofeed_baseline(
+        let first = build_lead_context_prompt_for_session(
             &conn,
             session_id,
             &[],
             Locale::Zh,
             LeadEngine::Harness,
+            &[],
         )
-        .unwrap();
-        let second = build_lead_context_prompt_and_record_autofeed_baseline(
+        .unwrap()
+        .prompt;
+        let second = build_lead_context_prompt_for_session(
             &conn,
             session_id,
             &[],
             Locale::Zh,
             LeadEngine::Harness,
+            &[],
         )
-        .unwrap();
+        .unwrap()
+        .prompt;
 
         let first_nonce = lead_compact_wiring_transcript_nonce(&first);
         let second_nonce = lead_compact_wiring_transcript_nonce(&second);
@@ -43111,14 +44706,16 @@ mod tests {
         )
         .unwrap();
 
-        let prompt = build_lead_context_prompt_and_record_autofeed_baseline(
+        let prompt = build_lead_context_prompt_for_session(
             &conn,
             session_id,
             &[],
             Locale::Zh,
             LeadEngine::NativeClaude,
+            &[],
         )
-        .unwrap();
+        .unwrap()
+        .prompt;
 
         assert!(prompt.contains("legacy unmarked message"));
         assert!(!prompt.contains("AGENTLOOM-MSG"));
@@ -43167,7 +44764,7 @@ mod tests {
         let conn = autofeed_test_conn(false, session_id);
         append_autofeed_message(&conn, session_id, "[Worker report]\nsolo report");
 
-        assert_eq!(autofeed_decision(&conn, session_id), None);
+        assert_eq!(autofeed_decision(&conn, session_id).unwrap(), None);
     }
 
     #[test]
@@ -43177,7 +44774,10 @@ mod tests {
         append_autofeed_message(&conn, session_id, "lead dispatched work");
         let report_id = append_autofeed_message(&conn, session_id, "[Worker report]\ndone");
 
-        assert_eq!(autofeed_decision(&conn, session_id), Some(report_id));
+        assert_eq!(
+            autofeed_decision(&conn, session_id).unwrap(),
+            Some(report_id)
+        );
     }
 
     #[test]
@@ -43192,7 +44792,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(session_id.to_string(), report_id);
 
-        assert_eq!(autofeed_decision(&conn, session_id), None);
+        assert_eq!(autofeed_decision(&conn, session_id).unwrap(), None);
 
         db::append_message(
             &conn,
@@ -43207,7 +44807,10 @@ mod tests {
         )
         .unwrap();
         assert!(conn.last_insert_rowid() > report_id);
-        assert_eq!(autofeed_decision(&conn, session_id), Some(report_id));
+        assert_eq!(
+            autofeed_decision(&conn, session_id).unwrap(),
+            Some(report_id)
+        );
         assert!(!AUTOFEED_GLOBAL_STOP
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
@@ -43224,7 +44827,7 @@ mod tests {
         let assistant_id = append_autofeed_message(&conn, session_id, "late assistant update");
         assert!(assistant_id > report_id);
 
-        assert_eq!(autofeed_decision(&conn, session_id), None);
+        assert_eq!(autofeed_decision(&conn, session_id).unwrap(), None);
         assert_eq!(
             AUTOFEED_GLOBAL_STOP
                 .get_or_init(|| Mutex::new(HashMap::new()))
@@ -43242,11 +44845,14 @@ mod tests {
         let session_id = "s-autofeed-recheck-race";
         let conn = autofeed_test_conn(true, session_id);
         let report_id = append_autofeed_message(&conn, session_id, "[Worker report]\ndone");
-        assert_eq!(autofeed_decision(&conn, session_id), Some(report_id));
+        assert_eq!(
+            autofeed_decision(&conn, session_id).unwrap(),
+            Some(report_id)
+        );
 
         record_autofeed_global_stop(session_id, report_id);
         let starts = std::cell::Cell::new(0);
-        if autofeed_recheck_before_start(&conn, session_id) {
+        if autofeed_recheck_before_start(&conn, session_id).unwrap() {
             starts.set(starts.get() + 1);
         }
         assert_eq!(starts.get(), 0);
@@ -43278,8 +44884,8 @@ mod tests {
         team_running.mark_session_stopped(session_id);
         record_autofeed_global_stop(session_id, 17);
 
-        // resume_lead_session 与 try_autofeed_lead 都只委托 start_lead_session(message=None)，
-        // 因而共同落到这个占槽后门；不需分别复制命令层测试。
+        // try_resume_pending 只委托 start_lead_session(message=None)，
+        // 因而落到这个占槽后门；不需分别复制命令层测试。
         let error = match reserve_lead_start_after_globalstop(
             &conn,
             &running,
@@ -43407,212 +45013,132 @@ mod tests {
     }
 
     #[test]
-    fn autofeed_consumed_report_returns_none() {
-        let session_id = "s-autofeed-consumed";
+    fn autofeed_pending_report_survives_later_lead_message() {
+        let session_id = "s-autofeed-pending-after-lead";
         let conn = autofeed_test_conn(true, session_id);
-        append_autofeed_message(&conn, session_id, "[Worker report]\ndone");
+        let report_id = append_autofeed_message(
+            &conn,
+            session_id,
+            "[Worker report]\nassignment_id: assignment-pending\nstatus: done",
+        );
         append_autofeed_message(&conn, session_id, "lead consumed report");
 
-        assert_eq!(autofeed_decision(&conn, session_id), None);
-    }
-
-    #[test]
-    fn autofeed_report_without_lead_message_returns_report_id() {
-        let session_id = "s-autofeed-report-only";
-        let conn = autofeed_test_conn(true, session_id);
-        let report_id = append_autofeed_message(&conn, session_id, "[Worker report]\ndone");
-
-        assert_eq!(autofeed_decision(&conn, session_id), Some(report_id));
-    }
-
-    #[test]
-    fn autofeed_prompt_baseline_detects_report_before_later_lead_message() {
-        let session_id = "s-autofeed-reversed";
-        let conn = autofeed_test_conn(true, session_id);
-        for turn in 1..=8 {
-            assert_eq!(
-                append_autofeed_message(&conn, session_id, &format!("lead turn {turn}")),
-                turn
-            );
-        }
-        record_autofeed_prompt_baseline(session_id, 8);
-        let report_id = append_autofeed_message(&conn, session_id, "[Worker report]\ndone");
-        let lead_id = append_autofeed_message(&conn, session_id, "lead finished current turn");
-
-        assert_eq!(report_id, 9);
-        assert_eq!(lead_id, 10);
-        assert_eq!(autofeed_decision(&conn, session_id), Some(report_id));
+        assert_eq!(
+            autofeed_decision(&conn, session_id).unwrap(),
+            Some(report_id)
+        );
     }
 
     #[test]
     fn autofeed_wait_delivered_report_is_not_fed_again() {
         let session_id = "s-autofeed-wait-delivered";
         let conn = autofeed_test_conn(true, session_id);
-        for turn in 1..=8 {
-            append_autofeed_message(&conn, session_id, &format!("lead turn {turn}"));
-        }
-        record_autofeed_prompt_baseline(session_id, 8);
-        let report_id = append_autofeed_message(
+        append_autofeed_message(
             &conn,
             session_id,
             "[Worker report]\nassignment_id: assignment-wait\nstatus: done",
         );
-        append_autofeed_message(&conn, session_id, "lead finished current turn");
 
         assert_eq!(
-            record_autofeed_result_delivered(&conn, session_id, "assignment-wait"),
-            Some(report_id)
+            ack_autofeed_result_delivery(&conn, session_id, "assignment-wait"),
+            Ok(true)
         );
-        assert_eq!(autofeed_decision(&conn, session_id), None);
+        assert_eq!(autofeed_decision(&conn, session_id).unwrap(), None);
     }
 
     #[test]
     fn autofeed_timeout_unmarked_report_is_fed() {
         let session_id = "s-autofeed-timeout-unmarked";
         let conn = autofeed_test_conn(true, session_id);
-        for turn in 1..=8 {
-            append_autofeed_message(&conn, session_id, &format!("lead turn {turn}"));
-        }
-        record_autofeed_prompt_baseline(session_id, 8);
         let report_id = append_autofeed_message(
             &conn,
             session_id,
             "[Worker report]\nassignment_id: assignment-timeout\nstatus: done",
         );
-        append_autofeed_message(&conn, session_id, "lead finished current turn");
-
-        assert_eq!(autofeed_decision(&conn, session_id), Some(report_id));
+        assert_eq!(
+            autofeed_decision(&conn, session_id).unwrap(),
+            Some(report_id)
+        );
     }
 
     #[test]
-    fn autofeed_delivered_baseline_takes_max_and_never_regresses() {
-        let session_id = "s-autofeed-delivered-max";
+    fn autofeed_ledger_older_pending_report_survives_newer_ack() {
+        let session_id = "s-autofeed-older-pending";
         let conn = autofeed_test_conn(true, session_id);
-        for turn in 1..=6 {
-            append_autofeed_message(&conn, session_id, &format!("lead turn {turn}"));
-        }
         let older_report_id = append_autofeed_message(
             &conn,
             session_id,
             "[Worker report]\nassignment_id: assignment-old\nstatus: done",
         );
-        append_autofeed_message(&conn, session_id, "lead turn 8");
-        let newer_report_id = append_autofeed_message(
+        append_autofeed_message(
             &conn,
             session_id,
             "[Worker report]\nassignment_id: assignment-new\nstatus: done",
         );
 
-        assert_eq!(older_report_id, 7);
-        assert_eq!(newer_report_id, 9);
         assert_eq!(
-            record_autofeed_result_delivered(&conn, session_id, "assignment-new"),
-            Some(9)
+            ack_autofeed_result_delivery(&conn, session_id, "assignment-new"),
+            Ok(true)
         );
         assert_eq!(
-            record_autofeed_result_delivered(&conn, session_id, "assignment-old"),
-            Some(7)
+            autofeed_decision(&conn, session_id).unwrap(),
+            Some(older_report_id)
         );
-        assert_eq!(autofeed_prompt_baseline(session_id), Some(9));
     }
 
     #[test]
-    fn autofeed_prompt_baseline_consumed_report_returns_none() {
-        let session_id = "s-autofeed-baseline-consumed";
+    fn autofeed_all_acked_reports_return_none() {
+        let session_id = "s-autofeed-all-acked";
         let conn = autofeed_test_conn(true, session_id);
-        for turn in 1..=8 {
-            append_autofeed_message(&conn, session_id, &format!("lead turn {turn}"));
+        for assignment_id in ["assignment-a", "assignment-b"] {
+            append_autofeed_message(
+                &conn,
+                session_id,
+                &format!("[Worker report]\nassignment_id: {assignment_id}\nstatus: done"),
+            );
+            assert_eq!(
+                ack_autofeed_result_delivery(&conn, session_id, assignment_id),
+                Ok(true)
+            );
         }
-        let report_id = append_autofeed_message(&conn, session_id, "[Worker report]\ndone");
-        append_autofeed_message(&conn, session_id, "lead turn 10");
-        let prompt_baseline = append_autofeed_message(&conn, session_id, "lead turn 11");
-        record_autofeed_prompt_baseline(session_id, prompt_baseline);
 
-        assert_eq!(report_id, 9);
-        assert_eq!(prompt_baseline, 11);
-        assert_eq!(autofeed_decision(&conn, session_id), None);
+        assert_eq!(autofeed_decision(&conn, session_id).unwrap(), None);
     }
 
     #[test]
-    fn autofeed_without_prompt_baseline_falls_back_to_latest_lead_message() {
-        let session_id = "s-autofeed-no-baseline";
+    fn autofeed_decision_is_idempotent_until_assignment_ack() {
+        let session_id = "s-autofeed-idempotent-pending";
         let conn = autofeed_test_conn(true, session_id);
-        let report_id = append_autofeed_message(&conn, session_id, "[Worker report]\ndone");
-        let lead_id = append_autofeed_message(&conn, session_id, "lead consumed report");
-
-        assert_eq!(report_id, 1);
-        assert_eq!(lead_id, 2);
-        assert_eq!(autofeed_prompt_baseline(session_id), None);
-        assert_eq!(autofeed_decision(&conn, session_id), None);
-    }
-
-    #[test]
-    fn autofeed_prompt_baseline_advances_each_lead_turn() {
-        let session_id = "s-autofeed-baseline-advances";
-        let conn = autofeed_test_conn(true, session_id);
-        for turn in 1..=8 {
-            append_autofeed_message(&conn, session_id, &format!("lead turn {turn}"));
-        }
-        build_lead_context_prompt_and_record_autofeed_baseline(
+        let report_id = append_autofeed_message(
             &conn,
             session_id,
-            &[],
-            Locale::Zh,
-            LeadEngine::NativeClaude,
-        )
-        .unwrap();
-        assert_eq!(autofeed_prompt_baseline(session_id), Some(8));
+            "[Worker report]\nassignment_id: assignment-idempotent\nstatus: done",
+        );
 
-        for turn in 9..=11 {
-            append_autofeed_message(&conn, session_id, &format!("lead turn {turn}"));
-        }
-        build_lead_context_prompt_and_record_autofeed_baseline(
-            &conn,
-            session_id,
-            &[],
-            Locale::Zh,
-            LeadEngine::NativeClaude,
-        )
-        .unwrap();
-        assert_eq!(autofeed_prompt_baseline(session_id), Some(11));
+        assert_eq!(
+            autofeed_decision(&conn, session_id).unwrap(),
+            Some(report_id)
+        );
+        assert_eq!(
+            autofeed_decision(&conn, session_id).unwrap(),
+            Some(report_id)
+        );
+        assert_eq!(
+            ack_autofeed_result_delivery(&conn, session_id, "assignment-idempotent"),
+            Ok(true)
+        );
+        assert_eq!(autofeed_decision(&conn, session_id).unwrap(), None);
     }
 
     #[test]
-    fn autofeed_claim_is_atomic_and_blocks_duplicate_report() {
-        let mut started = HashMap::new();
-        assert_eq!(autofeed_claim_report(&mut started, "s", 7), Some(None));
-        assert_eq!(started.get("s"), Some(&7));
-        assert_eq!(autofeed_claim_report(&mut started, "s", 7), None);
-        assert_eq!(autofeed_claim_report(&mut started, "s", 6), None);
-        assert_eq!(autofeed_claim_report(&mut started, "s", 8), Some(Some(7)));
-        assert_eq!(started.get("s"), Some(&8));
-    }
+    fn autofeed_decision_returns_db_error() {
+        let session_id = "s-autofeed-db-error";
+        let conn = autofeed_test_conn(true, session_id);
+        conn.execute("DROP TABLE member_report_delivery", [])
+            .unwrap();
 
-    #[test]
-    fn autofeed_failed_start_rolls_back_claim_and_allows_retry() {
-        let mut started = HashMap::from([("s".to_string(), 5)]);
-        let previous = autofeed_claim_report(&mut started, "s", 7).unwrap();
-        assert_eq!(previous, Some(5));
-        assert_eq!(started.get("s"), Some(&7));
-
-        autofeed_rollback_claim(&mut started, "s", 7, previous);
-        assert_eq!(started.get("s"), Some(&5));
-        assert_eq!(autofeed_claim_report(&mut started, "s", 7), Some(Some(5)));
-
-        let previous_without_old_value =
-            autofeed_claim_report(&mut started, "new-session", 11).unwrap();
-        autofeed_rollback_claim(&mut started, "new-session", 11, previous_without_old_value);
-        assert!(!started.contains_key("new-session"));
-    }
-
-    #[test]
-    fn autofeed_claim_rollback_preserves_newer_report() {
-        let mut started = HashMap::from([("s".to_string(), 5)]);
-        let previous = autofeed_claim_report(&mut started, "s", 7).unwrap();
-        started.insert("s".to_string(), 8);
-
-        autofeed_rollback_claim(&mut started, "s", 7, previous);
-        assert_eq!(started.get("s"), Some(&8));
+        let error = autofeed_decision(&conn, session_id).unwrap_err();
+        assert!(error.to_string().contains("member_report_delivery"));
     }
 
     #[test]
@@ -43956,6 +45482,137 @@ mod tests {
     }
 
     #[test]
+    fn answer_question_inner_late_path_registers_resume_pending_answer_id_for_team_session_only()
+     {
+        // S-2：Late 路径落库成功后经 register_pending_answer_id_if_team 登记——Team 会话
+        // （session_agent_configs 有 lead_agent_id）必须登记进 RESUME_STATE，供
+        // try_resume_pending_with_gate 的快照纳入「含答案」触发原因；Solo 会话（无该行）绝不能
+        // 登记，否则 RESUME_STATE 里这个 session 的集合只会随每次补答只增不减——Solo 永远不会
+        // 触发续跑、也就永远不会调用 ack_pending_answers 摘除，是进程内内存泄漏。
+        let db = test_db();
+        {
+            let conn = db.0.lock().unwrap();
+            seed_pending_decision_card(
+                &conn,
+                "s-resume-pending-late-team",
+                "d-resume-pending-late-team",
+                "要不要重试？",
+            );
+            db::seed_builtin_agents(&conn).unwrap();
+            db::set_session_agent_config(
+                &conn,
+                "s-resume-pending-late-team",
+                Some("claude".to_string()),
+                vec![],
+            )
+            .unwrap();
+
+            seed_pending_decision_card(
+                &conn,
+                "s-resume-pending-late-solo",
+                "d-resume-pending-late-solo",
+                "要不要重试？",
+            );
+            // Solo：故意不写 session_agent_configs 行。
+        }
+        let q = LeadQuestions::default();
+        q.0.lock().unwrap().insert(
+            "d-resume-pending-late-team".into(),
+            LeadQuestionSlot::TimedOut,
+        );
+        q.0.lock().unwrap().insert(
+            "d-resume-pending-late-solo".into(),
+            LeadQuestionSlot::TimedOut,
+        );
+
+        let team_result = answer_question_inner(
+            &q,
+            &db,
+            "s-resume-pending-late-team",
+            "d-resume-pending-late-team",
+            "继续".into(),
+            Locale::Zh,
+        )
+        .expect("team late path should succeed");
+        let solo_result = answer_question_inner(
+            &q,
+            &db,
+            "s-resume-pending-late-solo",
+            "d-resume-pending-late-solo",
+            "继续".into(),
+            Locale::Zh,
+        )
+        .expect("solo late path should succeed");
+
+        let team_message_id = team_result
+            .appended
+            .expect("team late answer should append a message")
+            .id;
+        assert!(
+            solo_result.appended.is_some(),
+            "solo 落库仍应成功——只是不该登记进 RESUME_STATE"
+        );
+
+        assert_eq!(
+            snapshot_pending_answer_ids("s-resume-pending-late-team"),
+            vec![team_message_id],
+            "team 会话的迟到答案必须被登记，供续跑快照纳入"
+        );
+        assert!(
+            snapshot_pending_answer_ids("s-resume-pending-late-solo").is_empty(),
+            "solo 会话不该登记进 RESUME_STATE，否则永不会被 ack、进程内只增不减"
+        );
+    }
+
+    #[test]
+    fn answer_question_inner_missing_slot_pending_card_registers_resume_pending_answer_id_for_team_session()
+     {
+        // 覆盖 Missing 路由（内存 map 里没有这个槽位、DB 卡仍 pending，等同迟到答案）——落库
+        // 与登记复用的是同一段代码路径（同一个 register_pending_answer_id_if_team 助手），Solo
+        // 侧「不登记」的判断已经在上面 late 路径的测试里覆盖过，这里只需确认 Team 会话在
+        // Missing 路由下也确实登记成功。
+        let db = test_db();
+        {
+            let conn = db.0.lock().unwrap();
+            seed_pending_decision_card(
+                &conn,
+                "s-resume-pending-missing-team",
+                "d-resume-pending-missing-team",
+                "还继续吗？",
+            );
+            db::seed_builtin_agents(&conn).unwrap();
+            db::set_session_agent_config(
+                &conn,
+                "s-resume-pending-missing-team",
+                Some("claude".to_string()),
+                vec![],
+            )
+            .unwrap();
+        }
+        let q = LeadQuestions::default(); // 槽位压根没插入 => Missing 路由
+
+        let result = answer_question_inner(
+            &q,
+            &db,
+            "s-resume-pending-missing-team",
+            "d-resume-pending-missing-team",
+            "继续".into(),
+            Locale::Zh,
+        )
+        .expect("missing route with pending card should succeed");
+        let message_id = result
+            .appended
+            .expect("missing+pending path should append a late answer message")
+            .id;
+
+        assert_eq!(
+            snapshot_pending_answer_ids("s-resume-pending-missing-team"),
+            vec![message_id],
+            "Missing 路由（卡仍 pending）也要走同一个 register_pending_answer_id_if_team 助手登记"
+        );
+    }
+
+    #[test]
     fn commit_late_answer_uses_zh_shell_copy() {
         let db = test_db();
         let conn = db.0.lock().unwrap();
@@ -44227,20 +45884,19 @@ mod tests {
     }
 
     #[test]
-    fn try_resume_after_answer_releases_db_lock_before_starting_lead_session() {
+    fn try_resume_pending_with_gate_releases_db_lock_before_starting_lead_session() {
         // M1-T1 死锁血案同款红线：std::sync::Mutex 不可重入，绝不能带着 db 锁进入
         // start_lead_session（它自己也会 db.0.lock()，同线程二次加锁直接死锁）。
         // 用源码缩进断言判门读锁的内层 block 在 start_lead_session( 调用之前就已经收口
         // （同仓先例：lead_step_spawn_closure_releases_db_lock_before_spawning_child）。
-        // 变异自证：把 `let candidate = { ... };` 的花括号去掉、让 conn 活到
-        // start_lead_session 调用处，这条测试会变红。
+        // 变异自证：把判门块的花括号去掉、让 conn 活到 start_lead_session 调用处，这条测试会变红。
         let source = include_str!("lib.rs");
         let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
         let body = production
-            .split("fn try_resume_after_answer(")
+            .split("fn try_resume_pending_with_gate(")
             .nth(1)
             .unwrap()
-            .split("\nfn resume_after_answer_candidate(")
+            .split("\nfn try_resume_pending(")
             .next()
             .unwrap();
 
@@ -44271,38 +45927,10 @@ mod tests {
     }
 
     #[test]
-    fn try_resume_after_answer_returns_outcome_and_classifies_resume_errors() {
-        // busy（占槽被抢=会话已在跑）静默收敛；非 busy 才保留错误原文并打非致命日志。
-        // 两者都作为 outcome 返回，不把 start_lead_session 的 Err 冒泡成 command 失败。
-        let source = include_str!("lib.rs");
-        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-        let after_fn = production
-            .split("fn try_resume_after_answer(")
-            .nth(1)
-            .unwrap();
-        let header_end = after_fn.find('{').expect("函数体应有花括号");
-        let header = &after_fn[..header_end];
-        assert!(
-            header.trim_end().ends_with("-> AnswerLeadQuestionOutcome"),
-            "签名必须返回可携带三元信息的 outcome: {header:?}"
-        );
-
-        let body = after_fn
-            .split("\nfn resume_after_answer_candidate(")
-            .next()
-            .unwrap();
-        assert!(body.contains("finish_resume_after_answer(session_id, lead_agent_id, result)"));
-        assert!(
-            body.contains("if !autofeed_busy_error(&e)"),
-            "busy/非 busy 分流必须复用 autofeed_busy_error"
-        );
-        assert!(
-            body.contains("eprintln!(\"resume after late answer failed (non-fatal): {e}\")"),
-            "非 busy 失败必须保留非致命日志"
-        );
-
-        let busy = finish_resume_after_answer(
-            "s-finish-resume-busy",
+    fn resume_pending_classify_attempt_outcome_busy_non_busy_and_success() {
+        // busy（占槽被抢=会话已在跑）静默收敛；非 busy 才保留错误原文；成功携带 saved lead。
+        // 纯函数，不需要 AppHandle。
+        let busy = classify_resume_attempt_outcome(
             "claude".to_string(),
             Err("SESSION_ALREADY_RUNNING: s-team".to_string()),
         );
@@ -44310,168 +45938,606 @@ mod tests {
         assert_eq!(busy.resume_error, None, "busy 错误必须静默");
 
         let non_busy_error = "provider unavailable".to_string();
-        let failed = finish_resume_after_answer(
-            "s-finish-resume-nonbusy",
-            "claude".to_string(),
-            Err(non_busy_error.clone()),
-        );
+        let failed =
+            classify_resume_attempt_outcome("claude".to_string(), Err(non_busy_error.clone()));
         assert!(!failed.resumed);
         assert_eq!(failed.lead_agent_id, None);
         assert_eq!(failed.resume_error, Some(non_busy_error));
 
-        let resumed =
-            finish_resume_after_answer("s-finish-resume-ok", "saved-lead".to_string(), Ok(()));
+        let resumed = classify_resume_attempt_outcome("saved-lead".to_string(), Ok(()));
         assert!(resumed.resumed);
         assert_eq!(resumed.lead_agent_id.as_deref(), Some("saved-lead"));
         assert_eq!(resumed.resume_error, None);
     }
 
     #[test]
-    fn finish_resume_after_answer_registers_pending_only_on_busy() {
-        let busy_sid = "s-pending-answer-resume-busy";
-        let nonbusy_sid = "s-pending-answer-resume-nonbusy";
-        let ok_sid = "s-pending-answer-resume-ok";
-
-        let busy = finish_resume_after_answer(
-            busy_sid,
-            "lead-x".to_string(),
-            Err("SESSION_ALREADY_RUNNING: s".to_string()),
-        );
-        assert_eq!(busy, AnswerLeadQuestionOutcome::quietly_not_resumed());
-        assert!(
-            take_pending_answer_resume(busy_sid),
-            "busy 失败必须登记进 PENDING_ANSWER_RESUME"
-        );
-        assert!(
-            !take_pending_answer_resume(busy_sid),
-            "take 是一次性摘除，第二次应已清空"
-        );
-
-        let non_busy = finish_resume_after_answer(
-            nonbusy_sid,
-            "lead-x".to_string(),
-            Err("provider unavailable".to_string()),
-        );
-        assert!(!non_busy.resumed);
-        assert!(
-            !take_pending_answer_resume(nonbusy_sid),
-            "非 busy 失败不该登记"
-        );
-
-        let ok = finish_resume_after_answer(ok_sid, "lead-x".to_string(), Ok(()));
-        assert!(ok.resumed);
-        assert!(!take_pending_answer_resume(ok_sid), "成功续跑不该登记");
-    }
-
-    #[test]
-    fn try_resume_after_answer_busy_recheck_is_immediate_and_bounded_to_once() {
-        // F6 正例 + 反向源码形状：finish 先完成 busy 登记，随后才立即 take 并 continue；布尔闸
-        // 在 continue 前关闭，所以第二轮再 busy 只能由 finish 重新挂账并返回，绝不会第三轮。
-        // 变异自证：删掉整个二次探测分支，或把初始闸改成 false，这条测试都会变红。
+    fn resume_pending_after_answer_records_failure_but_never_clears_on_bare_start_success() {
+        // T5-fix A 源码形状：非 busy 分支必须调 record_resume_failure（计入共享退避）；
+        // 起跑成功（`resume_error` 为 None）绝不能在这里调 note_resume_success 清零——
+        // 「runner 线程创建成功、run 移交」不等于真正交付 ack，过早清零会把仍在排队的连续
+        // 失败在下一轮真失败前抹掉、退避永远卡在最短档（真正的清零只发生在
+        // `commit_lead_run_delivery` 的 Ok 分支，T5 M3/I5）。busy 两者都不该调，留给下一次
+        // drain 的 try_resume_pending 自然重试（答案 id 已在起跑前登记，不会丢）。
         let source = include_str!("lib.rs");
         let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
         let body = production
-            .split("fn try_resume_after_answer(")
+            .split("\nfn try_resume_after_answer(")
             .nth(1)
             .unwrap()
-            .split("\n/// T-4b（remote control M0 §3/§4b）挂账①收口")
+            .split("\n/// `try_resume_pending_with_gate` 的判门可测纯内核")
             .next()
             .unwrap();
-
-        assert_eq!(body.matches("start_lead_session(").count(), 1);
-        assert_eq!(body.matches("finish_resume_after_answer(").count(), 1);
-        assert_eq!(body.matches("take_pending_answer_resume(").count(), 1);
-        assert_eq!(body.matches("continue;").count(), 1);
-        assert!(body.contains("let mut recheck_after_busy = true;"));
-        assert!(body.contains("if was_busy && recheck_after_busy {"));
-
-        let finish_idx = body
-            .find("let outcome = finish_resume_after_answer(")
-            .expect("busy 分类必须先经 finish 完成登记");
-        let close_gate_idx = body
-            .find("recheck_after_busy = false;")
-            .expect("二次探测前必须永久关闭本次调用的重试闸");
-        let take_idx = body
-            .find("if take_pending_answer_resume(session_id) {")
-            .expect("登记后必须立即做一次 take 探测");
-        let continue_idx = body.find("continue;").expect("take 命中必须重跑完整流程");
-        let return_idx = body
-            .rfind("return outcome;")
-            .expect("不重试或第二轮结束后必须返回");
+        assert!(body.contains("record_resume_failure(app, session_id, error)"));
         assert!(
-            finish_idx < close_gate_idx
-                && close_gate_idx < take_idx
-                && take_idx < continue_idx
-                && continue_idx < return_idx,
-            "必须是 finish 登记 → 关闸 → take → 至多一次 continue → return"
+            !body.contains("note_resume_success(session_id)"),
+            "起跑成功不得在 try_resume_after_answer 里清零退避——真 ack 才能清零"
         );
+        assert!(body.contains("if !was_busy {"));
     }
 
     #[test]
-    fn pending_answer_recheck_stops_when_competing_drain_already_took_registration() {
-        // 模拟 F6 窗口的另一种交错：finish 登记后，并发的释放 drain 抢先摘走；紧随其后的
-        // 二次探测应看到 false，不再重复启动。这里只测 check-and-remove 的可观察内核语义，
-        // 与上一条源码形状测试共同钉住它在真实调用链里的位置。
-        let session_id = "s-pending-answer-recheck-competing-drain";
-        let outcome = finish_resume_after_answer(
-            session_id,
-            "lead-x".to_string(),
-            Err("SESSION_ALREADY_RUNNING: s".to_string()),
-        );
-        assert_eq!(outcome, AnswerLeadQuestionOutcome::quietly_not_resumed());
-        assert!(
-            take_pending_answer_resume(session_id),
-            "模拟并发释放 drain 应先摘到登记"
-        );
-        assert!(
-            !take_pending_answer_resume(session_id),
-            "当前调用的立即二次探测应看到登记已被消费，不再重复续跑"
-        );
-    }
-
-    #[test]
-    fn start_lead_session_success_clears_pending_before_spawn_outside_locks() {
-        // G3 启发式源码断言：清理必须在 reserve 成功、guard disarm 之后且在 spawn 之前，并保持
-        // 函数顶层作用域，不得挪进锁块或 spawn 闭包；更绕的同级跨锁控制流仍需人工 review。
-        // 变异自证：若把清理挪回 spawn 之后模拟旧 ABA 窗口，这条测试会变红。
+    fn try_resume_pending_never_clears_backoff_on_bare_start_success() {
+        // T5-fix A 的镜像覆盖：`try_resume_pending`（C2 自动路径）同样不得在 `Ok(())` 分支
+        // 清零——同上，理由见 `resume_pending_after_answer_records_failure_but_never_clears_
+        // on_bare_start_success`。
         let source = include_str!("lib.rs");
         let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
         let body = production
-            .split("fn start_lead_session(")
+            .split("\nfn try_resume_pending(app: &AppHandle, session_id: &str) {")
             .nth(1)
             .unwrap()
-            .split("\n#[cfg(unix)]\nfn background_process_stop_notice(")
+            .split("\n/// T4：run 槽释放后的统一排空咽喉")
             .next()
             .unwrap();
+        assert!(
+            !body.contains("note_resume_success"),
+            "try_resume_pending 的 Ok(()) 分支不得清零退避——真 ack 才能清零"
+        );
+        assert!(body.contains("record_resume_failure(app, session_id, &e)"));
+    }
 
-        let spawn_idx = body
-            .find("std::thread::spawn(move || {")
-            .expect("start_lead_session 应发出 lead runner 线程");
-        let cleanup_idx = body
-            .find("let _ = take_pending_answer_resume(&session_id);")
-            .expect("成功启动路径必须清除旧 pending 续跑账");
-        let disarm_idx = body
-            .find("guard.disarm();")
-            .expect("reserve 成功后必须 disarm reservation guard");
-        let ok_idx = body
-            .rfind("\n    Ok(())")
-            .expect("函数应以 Ok(()) 成功返回");
+    /// T8 P1-②：答案 ack 的真相源已改为组装阶段（`build_lead_context_prompt_for_session`）
+    /// 直接返回的 `assembly.included_answer_ids`——在 `start_lead_session` 自己 spawn 出的
+    /// runner 线程内、同一线程就地捕获进 `in_flight_answer_ids_t`，收尾 ack
+    /// （`commit_lead_run_delivery`）直接消费这个变量。原「调用方登记 + EOF 处跨线程 take」
+    /// 的全局侧信道（`record_in_flight_answer_ids`/`take_in_flight_answer_ids`/
+    /// `ResumeState.in_flight_answer_ids`）已整套删除——同线程 happens-before 天然消灭了
+    /// 「登记晚于取用」的竞态窗口，不需要再靠跨线程状态传递。
+    ///
+    /// T8-fix（可杀变异加固）：原断言只验证「捕获行早于 ack 调用行」——两个 `find` 各自成立、
+    /// 顺序也成立，但如果把 EOF 处 ack 的真实实参悄悄换回全局 `take_in_flight_answer_ids(...)`
+    /// （捕获行留在原地变成死代码），旧断言测不出来。补两条：① 直接抠出
+    /// `commit_lead_run_delivery(` 调用的实参文本，断言答案位置的实参就是
+    /// `&in_flight_answer_ids_t` 本身；② 对生产代码（非注释/非测试）做符号级源码守卫，三个旧
+    /// 全局侧信道符号一个都不许再出现——真要开历史倒车也得先让这条测试失败。
+    #[test]
+    fn resume_pending_start_lead_session_captures_assembly_answer_ids_before_ack() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let stripped = strip_comments_and_strings(production);
+        let label = "start_lead_session";
+        let body = extract_fn_body(&stripped, "\nfn start_lead_session(", label);
+        let capture_idx = body
+            .find("in_flight_answer_ids_t = assembly.included_answer_ids;")
+            .expect("组装阶段必须把 assembly.included_answer_ids 捕获进 in_flight_answer_ids_t");
+        let ack_idx = body
+            .find("commit_lead_run_delivery(")
+            .expect("收尾必须调用 commit_lead_run_delivery");
+        assert!(
+            capture_idx < ack_idx,
+            "assembly.included_answer_ids 的捕获必须先于收尾 ack 调用"
+        );
+
+        // ①：答案实参必须是 assembly 派生变量本身，不能悄悄换回全局 take_*() 侧信道调用。
+        let call_end = body[ack_idx..]
+            .find(");")
+            .map(|offset| ack_idx + offset + 2)
+            .expect("commit_lead_run_delivery 调用必须有匹配的结束括号");
+        let call_text = &body[ack_idx..call_end];
+        assert!(
+            call_text.contains("&in_flight_answer_ids_t"),
+            "commit_lead_run_delivery 调用处的答案实参必须是 &in_flight_answer_ids_t（assembly \
+             派生的同线程局部变量）——不能悄悄换回全局 take_*() 侧信道"
+        );
+
+        // ②：三个旧全局侧信道符号在全部生产代码（非注释/非测试）里必须零出现。
+        for banned in [
+            "record_in_flight_answer_ids",
+            "take_in_flight_answer_ids",
+            "in_flight_answer_ids:",
+        ] {
+            assert!(
+                !stripped.contains(banned),
+                "生产代码不得再出现全局侧信道符号 `{banned}`——真相源已改为 \
+                 assembly.included_answer_ids 同线程直接捕获，别开历史倒车"
+            );
+        }
+    }
+
+    /// T5-fix C 的调用方侧镜像：`try_resume_pending_with_gate` 把联合快照读到的 `answer_ids`
+    /// 随 `start_lead_session(...)` 调用一起移交（`Some(answer_ids)`），由被调用方在自己的
+    /// runner 线程内、组装阶段就地消费——不需要调用方自己另外登记任何跨线程状态。
+    #[test]
+    fn resume_pending_with_gate_carries_answer_ids_into_start_lead_session_not_after() {
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn try_resume_pending_with_gate(")
+            .nth(1)
+            .unwrap()
+            .split("\nfn try_resume_pending(")
+            .next()
+            .unwrap();
+        assert!(
+            body.contains("Some(answer_ids)"),
+            "answer_ids 必须作为参数随 start_lead_session 调用一起传入，供被调用方在组装阶段\
+             就地消费"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // T4：统一自动恢复状态机 try_resume_pending —— F1-F7。
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn resume_pending_origin_for_both_reasons_present_picks_single_late_answer_origin() {
+        // F1：两原因并存（报告 pending + 未确认答案 id）只产出一个 origin（LateAnswer），不是
+        // 两个独立触发；配合下面 `try_resume_pending_with_gate_starts_lead_session_at_most_once`
+        // 断言只调用一次 start_lead_session，共同钉住「快照原子性 → 只起一轮」。
         assert_eq!(
-            body.matches("take_pending_answer_resume(&session_id)")
-                .count(),
+            resume_origin_for(true, &[42, 43]),
+            Some(StartOrigin::LateAnswer)
+        );
+    }
+
+    #[test]
+    fn resume_origin_for_reports_only_is_autofeed() {
+        assert_eq!(resume_origin_for(true, &[]), Some(StartOrigin::Autofeed));
+    }
+
+    #[test]
+    fn resume_pending_origin_for_answers_only_is_late_answer() {
+        assert_eq!(
+            resume_origin_for(false, &[7]),
+            Some(StartOrigin::LateAnswer)
+        );
+    }
+
+    #[test]
+    fn resume_pending_origin_for_neither_reason_is_none() {
+        assert_eq!(resume_origin_for(false, &[]), None);
+    }
+
+    #[test]
+    fn try_resume_pending_with_gate_starts_lead_session_at_most_once() {
+        // F1：两原因并存时源码上只有一处 start_lead_session 调用——不可能分叉成两轮。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn try_resume_pending_with_gate(")
+            .nth(1)
+            .unwrap()
+            .split("\nfn try_resume_pending(")
+            .next()
+            .unwrap();
+        assert_eq!(
+            body.matches("start_lead_session(").count(),
             1,
-            "成功路径 pending 清理应恰好一次"
+            "两原因并存时也只能起一轮——快照后只允许一次 start_lead_session 调用"
         );
-        assert!(disarm_idx < cleanup_idx && cleanup_idx < spawn_idx);
+    }
 
-        let line_indent = |idx: usize| {
-            let line_start = body[..idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
-            body[line_start..].chars().take_while(|c| *c == ' ').count()
-        };
+    #[test]
+    fn resume_pending_backoff_sequence_caps_at_300s_and_success_resets() {
+        // F2：退避序列 2/10/60/300 封顶；成功交付后清零。纯状态转移，不需要真的等待。
+        let session_id = "s-resume-backoff-sequence";
+
+        let f1 = note_resume_failure(session_id);
+        assert_eq!(f1.delay, std::time::Duration::from_secs(2));
+        assert!(f1.first_failure, "第一次失败必须标 first_failure");
+        assert!(!f1.entered_cap);
+
+        let f2 = note_resume_failure(session_id);
+        assert_eq!(f2.delay, std::time::Duration::from_secs(10));
+        assert!(!f2.first_failure);
+        assert!(!f2.entered_cap);
+
+        let f3 = note_resume_failure(session_id);
+        assert_eq!(f3.delay, std::time::Duration::from_secs(60));
+        assert!(!f3.entered_cap);
+
+        let f4 = note_resume_failure(session_id);
+        assert_eq!(f4.delay, std::time::Duration::from_secs(300));
+        assert!(f4.entered_cap, "第四次失败必须首次进入封顶低频");
+
+        let f5 = note_resume_failure(session_id);
         assert_eq!(
-            line_indent(cleanup_idx),
-            line_indent(ok_idx + 1),
-            "pending 清理必须与函数最外层 Ok(()) 同级，不能藏在锁块或 spawn 闭包里"
+            f5.delay,
+            std::time::Duration::from_secs(300),
+            "封顶后维持低频不再升高"
+        );
+        assert!(!f5.entered_cap, "已经通知过封顶，后续持续失败不再重复通知");
+
+        note_resume_success(session_id);
+        assert!(
+            resume_not_before_allows(session_id),
+            "成功交付 ack 后 not_before 门必须立即重新放行"
+        );
+
+        let after_reset = note_resume_failure(session_id);
+        assert_eq!(
+            after_reset.delay,
+            std::time::Duration::from_secs(2),
+            "成功清零后下一次失败必须从头计（2s）"
+        );
+        assert!(
+            after_reset.first_failure,
+            "清零后的下一次失败必须重新算作 first_failure"
+        );
+    }
+
+    #[test]
+    fn resume_pending_gates_not_before_until_elapsed() {
+        // F3（前半）：not_before 未到期时门必须挡住；到期后放行。
+        let session_id = "s-resume-not-before-gate";
+        note_resume_failure(session_id);
+        assert!(
+            !resume_not_before_allows(session_id),
+            "刚记一次失败，not_before 应在未来，门必须挡住"
+        );
+    }
+
+    #[test]
+    fn resume_pending_timer_fires_only_when_generation_still_current() {
+        // F3：旧 generation 的 timer 到点不触发；新武装的 timer 到点能触发回调；用极短 delay
+        // （毫秒级）避免真实长 sleep，纯回调不依赖 AppHandle。
+        let session_id = "s-resume-timer-generation".to_string();
+        let stale_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stale_fired_cb = stale_fired.clone();
+        // 武装一个较长 delay 的“旧一代” timer。
+        arm_resume_timer_with(
+            session_id.clone(),
+            std::time::Duration::from_millis(40),
+            move || stale_fired_cb.store(true, std::sync::atomic::Ordering::SeqCst),
+        );
+        // 立即武装新一代（bump generation），旧一代到点应放弃触发。
+        let fresh_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fresh_fired_cb = fresh_fired.clone();
+        arm_resume_timer_with(
+            session_id.clone(),
+            std::time::Duration::from_millis(10),
+            move || fresh_fired_cb.store(true, std::sync::atomic::Ordering::SeqCst),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        assert!(
+            fresh_fired.load(std::sync::atomic::Ordering::SeqCst),
+            "无其他边沿时，新武装的 timer 到点必须触发回调"
+        );
+        assert!(
+            !stale_fired.load(std::sync::atomic::Ordering::SeqCst),
+            "旧 generation 的 timer 到点不应触发——已被更晚一次武装取代"
+        );
+    }
+
+    #[test]
+    fn resume_pending_timer_armed_when_missing_and_skips_when_already_armed() {
+        // F3（后半）：命中 not_before 门时必须确认已有武装 timer，没有就补武装；已武装则不重复。
+        let session_id = "s-resume-ensure-timer-armed";
+        {
+            let mut guard = resume_state_map().lock().unwrap_or_else(|p| p.into_inner());
+            let state = guard.entry(session_id.to_string()).or_default();
+            state.not_before = Some(Instant::now() + std::time::Duration::from_secs(5));
+            // 故意不设 timer_armed=true，模拟“not_before 已设但没人武装过 timer”的边缘状态。
+        }
+        assert!(
+            resume_needs_timer_rearm(session_id).is_some(),
+            "not_before 已设但 timer 未武装时必须判定需要补武装"
+        );
+
+        {
+            let mut guard = resume_state_map().lock().unwrap_or_else(|p| p.into_inner());
+            guard.get_mut(session_id).unwrap().timer_armed = true;
+        }
+        assert!(
+            resume_needs_timer_rearm(session_id).is_none(),
+            "已武装的 timer 不需要重复武装"
+        );
+    }
+
+    #[test]
+    fn resume_pending_answer_ids_register_and_ack_round_trip() {
+        // F4（T8 P1-②更新）：register 之后未 ack 前 id 一直可见（不在 spawn 前被消费）；ack
+        // 精确摘除指定 id，未 ack 的留下。原「in_flight 快照 take」全局侧信道已删——答案 ack
+        // 的真相源改为 lead runner 线程内组装阶段直接捕获的 `assembly.included_answer_ids`，
+        // 不再需要跨线程登记/取用这一步。
+        let session_id = "s-resume-answer-ids-round-trip";
+        register_pending_answer_id(session_id, 101);
+        register_pending_answer_id(session_id, 102);
+        let mut ids = snapshot_pending_answer_ids(session_id);
+        ids.sort_unstable();
+        assert_eq!(ids, vec![101, 102], "登记后未 ack 前两个 id 都应可见");
+
+        ack_pending_answers(session_id, &[101]);
+        assert_eq!(
+            snapshot_pending_answer_ids(session_id),
+            vec![102],
+            "只 ack 指定的 id，未 ack 的必须留下——不能在 spawn/起跑前被提前消费"
+        );
+    }
+
+    #[test]
+    fn try_resume_pending_with_gate_bypass_ignores_not_before_but_normal_gates() {
+        // F5：新鲜点击（Bypass）绕过 not_before 立即尝试一次；自动路径（Normal）仍受门限制。
+        // 只测门本身的纯判定：Normal 在 not_before 未到期时必须被挡（同
+        // `note_resume_failure_gates_not_before_until_elapsed`），Bypass 不查 not_before——
+        // 源码断言其判门只在 `gate == ResumeGate::Normal` 分支里出现。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn try_resume_pending_with_gate(")
+            .nth(1)
+            .unwrap()
+            .split("\nfn try_resume_pending(")
+            .next()
+            .unwrap();
+        assert!(
+            body.contains(
+                "if gate == ResumeGate::Normal && !resume_not_before_allows(session_id) {"
+            ),
+            "not_before 门必须只在 gate==Normal 时生效，Bypass 必须绕过"
+        );
+    }
+
+    #[test]
+    fn try_resume_pending_busy_does_not_count_as_failure() {
+        // F7：busy 不计入失败——源码断言 try_resume_pending/try_resume_after_answer 的 busy 分支
+        // 都不调 record_resume_failure/note_resume_failure。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn try_resume_pending(app: &AppHandle, session_id: &str) {")
+            .nth(1)
+            .unwrap()
+            .split("\n/// T4：run 槽释放后的统一排空咽喉")
+            .next()
+            .unwrap();
+        let busy_branch = body
+            .split("Some((_, Err(e))) if autofeed_busy_error(&e) => {}")
+            .nth(1)
+            .expect("必须有显式的空 busy 分支");
+        // busy 分支本身是空 `{}`（上面 split 已经切到它之后），确认它不是靠副作用触发记账：
+        // 整个函数体里 record_resume_failure 只应该出现在非 busy 分支那一次。
+        assert_eq!(
+            body.matches("record_resume_failure(").count(),
+            1,
+            "record_resume_failure 只应在非 busy 分支出现一次"
+        );
+        let _ = busy_branch;
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // T4-fix：skeptic 抓的两个 T4 真洞——A（DB 错误/timer 线程失败永等）、B（联合原子快照 +
+    // in-flight 覆盖）。
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn try_resume_pending_with_gate_snapshot_db_error_records_no_failure_recheck_still_does() {
+        // S-1：快照块（联合查询本身读不出来，锁失败/查询失败共用一个 `Err(message)` 出口）此时
+        // 还没跑到 `snapshot_resume_candidate` 内部判 team-ness 的那一步，判不出这是不是 team
+        // 会话——不能调用 `record_resume_failure`，否则会给一个可能压根没有 lead 的 Solo 会话
+        // 挂上文不对题的续喂失败消息 + 一个永不会被清零的重试 timer。
+        // recheck 块（快照已经确认过 team-ness 且过门之后）仍然必须调用 `record_resume_failure`
+        // ——两个调用方结构上只看得到笼统的 `None`，若不在这里记账、之后又没有新的自然 drain
+        // 边沿，pending 报告/答案就会永远悬空。
+        // 用 `let candidate = candidate?;` 把函数体切成「快照段」与「其余段（含 recheck）」两半，
+        // 分别断言：快照段里一次 record_resume_failure 都不能有；其余段里必须恰好一次。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn try_resume_pending_with_gate(")
+            .nth(1)
+            .unwrap()
+            .split("\nfn try_resume_pending(")
+            .next()
+            .unwrap();
+        let (snapshot_segment, rest) = body
+            .split_once("let candidate = candidate?;")
+            .expect("必须能找到快照段与 recheck 段的分界点");
+
+        assert!(
+            !snapshot_segment.contains("record_resume_failure("),
+            "快照失败判不出 team-ness，绝不能调用 record_resume_failure（不能记账/不能装\
+             timer/不能发用户可见消息）——本测试要能杀死『把 record_resume_failure 加回快照\
+             Err 分支』这种变异"
+        );
+        assert_eq!(
+            rest.matches("record_resume_failure(app, session_id,").count(),
+            1,
+            "recheck 失败仍必须唯一一次调用 record_resume_failure——本测试要能杀死『把\
+             recheck 分支的 record_resume_failure 删掉』这种变异"
+        );
+        // 双重确认：快照段的两个 Err 消息（锁失败/查询失败）确实还在（只是不再触发记账），
+        // recheck 段的两个 Err 消息也确实还在、且共用那唯一一次记账出口。
+        assert!(
+            snapshot_segment
+                .contains("resume_pending snapshot DB lock failed for {session_id}: {error}"),
+            "快照锁失败的日志消息必须保留"
+        );
+        assert!(
+            snapshot_segment
+                .contains("resume_pending snapshot DB failed for {session_id}: {error}"),
+            "快照查询失败的日志消息必须保留"
+        );
+        assert!(
+            rest.contains("resume_pending recheck DB lock failed for {session_id}: {error}"),
+            "recheck 锁失败必须走同一个记账出口"
+        );
+        assert!(
+            rest.contains("resume_pending recheck DB failed for {session_id}: {error}"),
+            "recheck 查询失败必须走同一个记账出口"
+        );
+    }
+
+    #[test]
+    fn try_resume_pending_with_gate_arms_timer_when_not_before_gate_blocks() {
+        // C：命中 not_before 门时必须确认/补武装 timer——防唤醒丢失。删掉 gate 内那次
+        // `ensure_resume_timer_armed` 调用要能让本测试变红（skeptic 点名的可杀变异测试）。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn try_resume_pending_with_gate(")
+            .nth(1)
+            .unwrap()
+            .split("\nfn try_resume_pending(")
+            .next()
+            .unwrap();
+        let gate_idx = body
+            .find("if gate == ResumeGate::Normal && !resume_not_before_allows(session_id) {")
+            .expect("必须能找到 not_before 门判断");
+        let return_idx = body[gate_idx..]
+            .find("return None;")
+            .map(|i| gate_idx + i)
+            .expect("门挡下分支必须以 return None 结束");
+        let gate_block = &body[gate_idx..return_idx];
+        assert!(
+            gate_block.contains("ensure_resume_timer_armed(app, session_id);"),
+            "命中 not_before 门时必须调用 ensure_resume_timer_armed 补武装——删掉这行会让唤醒\
+             丢失，且这条测试必须变红"
+        );
+    }
+
+    #[test]
+    fn try_resume_pending_with_gate_answer_ids_snapshotted_while_conn_lock_held() {
+        // B（联合原子快照）：`answer_ids` 的读取必须嵌在仍持有 conn 锁的 `Ok(conn) =>` 分支
+        // 内部完成，而不是等 conn 锁释放之后（`let (candidate, answer_ids) = match snapshot`
+        // 之后）再单独另取一次全局 map——否则两次读取之间会给答案点击/report ack 留出穿插
+        // 空当，「两原因原子快照」就只是名义上的。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn try_resume_pending_with_gate(")
+            .nth(1)
+            .unwrap()
+            .split("\nfn try_resume_pending(")
+            .next()
+            .unwrap();
+
+        let conn_arm_idx = body
+            .find("Ok(conn) => match snapshot_resume_candidate(&conn, session_id) {")
+            .expect("必须能找到持锁读 has_reports 的分支");
+        let answer_ids_idx = body
+            .find("let answer_ids = snapshot_pending_answer_ids(session_id);")
+            .expect("必须能找到答案 id 快照读取");
+        let unlocked_merge_idx = body
+            .find("let (candidate, answer_ids) = match snapshot {")
+            .expect("必须能找到解出快照结果的位置（conn 锁在此之前已释放）");
+
+        assert!(
+            answer_ids_idx > conn_arm_idx,
+            "答案 id 快照必须在进入持锁分支之后读取"
+        );
+        assert!(
+            answer_ids_idx < unlocked_merge_idx,
+            "答案 id 快照必须在 conn 锁释放之前、同一临界区内完成——不能等锁放开后再另取，\
+             否则不是「两原因单锁域联合快照」"
+        );
+    }
+
+    #[test]
+    fn resume_pending_with_gate_answer_ids_carried_as_start_lead_session_call_argument() {
+        // B（in-flight 覆盖洞，T4-fix B 原始动机）：答案 id 快照必须随 `start_lead_session(...)`
+        // 这一次调用整体移交，由被调用方在自己的 runner 线程内、组装阶段就地消费——不能等
+        // 调用返回之后、被 `result.is_ok()` 收窄才在这里另起炉灶处理（busy/prespawn 早退路径
+        // 天然到不了那种「事后处理」代码，「busy 不覆盖既有集合」的语义靠这一点自然保留）。
+        // T8 P1-②：真相源已改为组装阶段直接返回的 `assembly.included_answer_ids`（同线程
+        // 捕获），调用方这一侧不需要也不该再自己维护任何跨调用的答案 id 状态。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn try_resume_pending_with_gate(")
+            .nth(1)
+            .unwrap()
+            .split("\nfn try_resume_pending(")
+            .next()
+            .unwrap();
+
+        let start_idx = body
+            .find("start_lead_session(")
+            .expect("必须有 start_lead_session 调用");
+        // 只在调用点之后找「实参」——`body` 里调用前的注释也会提到 `Some(answer_ids)`
+        // 字样（T8-fix 重写注释引入），若从整个 body 头部找会误配到注释而非真实调用参数。
+        let carry_idx = body[start_idx..]
+            .find("Some(answer_ids)")
+            .map(|idx| idx + start_idx)
+            .expect("必须把 answer_ids 随 start_lead_session 调用一起移交");
+        assert!(
+            carry_idx > start_idx,
+            "answer_ids 应作为 start_lead_session 调用的参数之一整体移交"
+        );
+    }
+
+    #[test]
+    fn resume_pending_timer_spawn_failure_resets_armed_when_generation_still_current() {
+        // A（timer 线程创建失败兜底）：`arm_resume_timer_with` 把 `timer_armed` 乐观置 true
+        // 之后，如果线程创建本身失败，必须把它复原为 false——否则账面会一直显示「已武装」，
+        // 下一次 `ensure_resume_timer_armed`/`resume_needs_timer_rearm` 会误判「不需要补武装」，
+        // 造成同类永等洞。
+        let session_id = "s-resume-timer-spawn-failure-current";
+        let generation = {
+            let mut guard = resume_state_map().lock().unwrap_or_else(|p| p.into_inner());
+            let state = guard.entry(session_id.to_string()).or_default();
+            state.timer_generation += 1;
+            state.timer_armed = true;
+            state.timer_generation
+        };
+        note_resume_timer_spawn_failed(session_id, generation);
+        assert!(
+            resume_needs_timer_rearm(session_id).is_some(),
+            "线程创建失败必须复原 armed=false，否则下一次 ensure_resume_timer_armed 会误判\
+             「已有武装」永远不补武装"
+        );
+    }
+
+    #[test]
+    fn resume_pending_timer_spawn_failure_leaves_superseded_generation_alone() {
+        // 若在线程创建失败被发现之前，session 已经被更晚一次真正武装（generation 前进），
+        // 兜底复原不能反过来把那次真正武装的状态踩掉。
+        let session_id = "s-resume-timer-spawn-failure-stale";
+        let stale_generation = {
+            let mut guard = resume_state_map().lock().unwrap_or_else(|p| p.into_inner());
+            let state = guard.entry(session_id.to_string()).or_default();
+            state.timer_generation += 1;
+            state.timer_generation
+        };
+        {
+            let mut guard = resume_state_map().lock().unwrap_or_else(|p| p.into_inner());
+            let state = guard.get_mut(session_id).unwrap();
+            state.timer_generation += 1;
+            state.timer_armed = true;
+        }
+        note_resume_timer_spawn_failed(session_id, stale_generation);
+        assert!(
+            resume_needs_timer_rearm(session_id).is_none(),
+            "旧 generation 的失败兜底不能碰更晚一次真正武装的 armed 状态"
+        );
+    }
+
+    #[test]
+    fn arm_resume_timer_with_spawn_failure_calls_reset_helper() {
+        // 生产调用点断言：线程创建失败分支必须调用 note_resume_timer_spawn_failed 兜底复原，
+        // 光有上面两条纯状态测试挡不住「生产代码压根没接这个 helper」的回归。
+        let source = include_str!("lib.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = production
+            .split("fn arm_resume_timer_with<F>(")
+            .nth(1)
+            .unwrap()
+            .split("\nfn arm_resume_timer(")
+            .next()
+            .unwrap();
+        assert!(
+            body.contains("note_resume_timer_spawn_failed("),
+            "线程创建失败分支必须调用兜底复原 helper"
         );
     }
 
@@ -44559,6 +46625,94 @@ mod tests {
         drain_with_dirty_replay(session_id, || rounds += 1);
 
         assert_eq!(rounds, 1, "无脏位时不应额外重放");
+    }
+
+    // T7：worker 报告落账（M1 台账 pending 行）与 lead run 槽释放各自触发同一 session 的
+    // `drain_after_run_release`——两个触发谁先谁后都可能发生（worker settled 回调与 lead
+    // 收尾释放槽是两条并发路径）。这两条测试用 `try_begin_draining` + `drain_with_dirty_replay`
+    // 这套既有排空引擎（同 `drain_with_dirty_replay_replays_notification_merged_during_first_round`
+    // 手法）分别模拟「谁先取得排空资格」的两种顺序，断言：无论哪一种，晚到的那次触发都只能
+    // 合并为脏位、换来恰好一次原地重放（不是零次——不丢唤醒；也不是多次——不空转），而它携带的
+    // 报告最终被消费恰好一次（`consumed == 1`），不丢也不重复起跑。
+
+    #[test]
+    fn worker_settled_race_settled_trigger_wins_first_lead_release_merges_as_dirty() {
+        let session_id = "s-worker-settled-race-settled-first";
+        // `report_pending` 模拟 member_report_delivery 台账里这条报告的 pending 状态；
+        // `consumed` 记录它被一次完整续跑轮次真实消费（ack）的次数。
+        let mut report_pending = false;
+        let mut consumed = 0;
+        let mut rounds = 0;
+
+        // worker 报告刚落账 ack、`on_worker_settled` 抢先取得本 session 的排空资格。
+        let _settled_guard = try_begin_draining(session_id).expect("settled 触发应先取得排空资格");
+
+        drain_with_dirty_replay(session_id, || {
+            rounds += 1;
+            // 模拟 `try_resume_pending` 的原子快照：只认本轮开始那一刻已经落账的状态。
+            let snapshot = report_pending;
+            if rounds == 1 {
+                // lead 收尾释放槽之后也调用 `drain_after_run_release`——本轮快照已经拍过，
+                // 这条报告要等到下一轮才可能被看到；同时这次触发撞上正在跑的 settled 排空，
+                // 必须被拒绝、只能合并为脏位（不丢：脏位会换来一次原地重放）。
+                report_pending = true;
+                assert!(
+                    try_begin_draining(session_id).is_none(),
+                    "lead 收尾释放触发撞上进行中的 settled 排空必须被拒绝、合并为脏位"
+                );
+            }
+            if snapshot {
+                report_pending = false;
+                consumed += 1;
+            }
+        });
+
+        assert_eq!(rounds, 2, "晚到的释放触发必须换来恰好一次原地重放，不多不少");
+        assert_eq!(
+            consumed, 1,
+            "报告必须被消费恰好一次：round 1 快照拍早了消费不到，脏位重放的 round 2 补上，不丢唤醒"
+        );
+        let after = try_begin_draining(session_id)
+            .expect("重放完成后排空互斥登记应已摘除，可正常重新取得资格");
+        drop(after);
+    }
+
+    #[test]
+    fn worker_settled_race_lead_release_trigger_wins_first_settled_merges_as_dirty() {
+        let session_id = "s-worker-settled-race-release-first";
+        let mut report_pending = false;
+        let mut consumed = 0;
+        let mut rounds = 0;
+
+        // lead 收尾释放槽抢先取得本 session 的排空资格（此刻 worker 报告尚未落账 ack）。
+        let _release_guard = try_begin_draining(session_id).expect("释放触发应先取得排空资格");
+
+        drain_with_dirty_replay(session_id, || {
+            rounds += 1;
+            let snapshot = report_pending;
+            if rounds == 1 {
+                // worker 报告随后落账 ack、`on_worker_settled` 也调用 `drain_after_run_release`——
+                // 撞上正在跑的释放排空，必须被拒绝、只能合并为脏位。
+                report_pending = true;
+                assert!(
+                    try_begin_draining(session_id).is_none(),
+                    "worker settled 触发撞上进行中的释放排空必须被拒绝、合并为脏位"
+                );
+            }
+            if snapshot {
+                report_pending = false;
+                consumed += 1;
+            }
+        });
+
+        assert_eq!(rounds, 2, "晚到的 settled 触发必须换来恰好一次原地重放，不多不少");
+        assert_eq!(
+            consumed, 1,
+            "报告必须被消费恰好一次：round 1 快照拍早了消费不到，脏位重放的 round 2 补上，不丢唤醒"
+        );
+        let after = try_begin_draining(session_id)
+            .expect("重放完成后排空互斥登记应已摘除，可正常重新取得资格");
+        drop(after);
     }
 
     #[test]
@@ -44677,11 +46831,12 @@ mod tests {
     }
 
     #[test]
-    fn drain_after_run_release_runs_autofeed_before_pending_answer_before_inbox() {
-        // 排空序固定：a) autofeed → b) 迟到答案挂账续跑 → c) remote_inbox。
-        // 变异自证：把 inbox 段挪到 autofeed 之前，这条测试会变红（验证方式见 T-4b 交付报告）。
-        // 启发式源码断言：只挡把某一段整体挪到另一段前面的粗糙回归；不验证调用是否藏在
-        // if/else 分支里，也不证明运行时真的按此顺序执行，更绕的控制流改法仍需人工 review。
+    fn drain_owned_runs_resume_pending_before_remote_inbox_and_inbox_not_gated() {
+        // T4 C2：旧「autofeed → 迟到答案挂账 → inbox」三段顺序已合并为「try_resume_pending →
+        // remote_inbox」两段；排空序仍固定，且 inbox 段不能被包进依赖 try_resume_pending 返回值
+        // 的条件分支——remote inbox 不受自动恢复的 not_before 门影响（F.6）。
+        // 启发式源码断言：只挡把 inbox 段整体挪到 try_resume_pending 之前、或把它塞进条件分支
+        // 这类粗糙回归；不验证调用是否藏在更绕的控制流里，也不证明运行时真的按此顺序执行。
         let source = include_str!("lib.rs");
         let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
         let body = production
@@ -44691,49 +46846,20 @@ mod tests {
             .split("\n/// 纯循环内核")
             .next()
             .unwrap();
-        let autofeed_idx = body
-            .find("try_autofeed_lead(")
-            .expect("必须调用 try_autofeed_lead");
-        let pending_idx = body
-            .find("take_pending_answer_resume(")
-            .expect("必须调用 take_pending_answer_resume");
+        let resume_idx = body
+            .find("try_resume_pending(")
+            .expect("必须调用 try_resume_pending");
         let inbox_idx = body
             .find("drain_remote_inbox(")
             .expect("必须调用 drain_remote_inbox");
         assert!(
-            autofeed_idx < pending_idx,
-            "autofeed 必须先于迟到答案挂账段"
+            resume_idx < inbox_idx,
+            "try_resume_pending 必须先于 remote_inbox 排空段"
         );
         assert!(
-            pending_idx < inbox_idx,
-            "迟到答案挂账段必须先于 remote_inbox 排空段"
-        );
-    }
-
-    #[test]
-    fn drain_after_run_release_pending_answer_stage_takes_before_resuming() {
-        // 摘除必须先于重试调用——否则"又撞 busy"时会被 finish_resume_after_answer 的登记分支
-        // 立刻覆盖成"没摘除过"，而不是"摘除后又登记回去"的正确语义。
-        // 启发式源码断言：只挡把两个调用文本整体调换的粗糙回归；不验证调用是否藏在 if/else
-        // 分支里，也不证明运行时真的按此顺序执行，更绕的控制流改法仍需人工 review。
-        let source = include_str!("lib.rs");
-        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-        let body = production
-            .split("fn drain_owned(")
-            .nth(1)
-            .unwrap()
-            .split("\n/// 纯循环内核")
-            .next()
-            .unwrap();
-        let take_idx = body
-            .find("take_pending_answer_resume(")
-            .expect("必须调用 take_pending_answer_resume");
-        let resume_idx = body
-            .find("try_resume_after_answer(")
-            .expect("必须调用 try_resume_after_answer");
-        assert!(
-            take_idx < resume_idx,
-            "必须先摘除再重试——重新登记交给 finish_resume_after_answer 的既有 busy 分支"
+            !body.contains("if try_resume_pending("),
+            "remote inbox 不能被包进依赖 try_resume_pending 返回值的条件分支——它不受自动恢复\
+             的 not_before 门影响"
         );
     }
 
@@ -45349,10 +47475,12 @@ mod tests {
         );
         assert!(
             team_branch.contains(
-                "member_agent_ids,\n            None,\n            Some(display_reduce::remote_input_key(command_id)),\n        );"
+                "member_agent_ids,\n            None,\n            Some(StartOrigin::UserMessage),\n            Some(display_reduce::remote_input_key(command_id)),\n            // T5-fix C：这是一条全新用户消息投递，不携带待续答的答案 id 快照。\n            None,\n        );"
             ),
-            "member_agent_ids 后的 reasoning_tier 必须传 None，再后必须把 command_id 派生的\
-             user_dedup_key 传给 start_lead_session（P0-c command_id 穿线）"
+            "member_agent_ids 后的 reasoning_tier 必须传 None，再传 Some(StartOrigin::UserMessage)\
+             （T3 StartOrigin 穿线），再后必须把 command_id 派生的 user_dedup_key 传给\
+             start_lead_session（P0-c command_id 穿线），末尾 resume_answer_ids 必须传 None\
+             （T5-fix C：全新用户消息投递不携带待续答的答案 id 快照）"
         );
     }
 

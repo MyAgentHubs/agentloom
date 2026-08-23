@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import Markdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -6,6 +6,7 @@ import { CodeBlock } from "./CodeBlock";
 import { MermaidBlock } from "./MermaidBlock";
 import { useI18n } from "../i18n";
 import {
+  localImageBareParagraphComponent,
   localImageMarkdownComponent,
   makeImgOnlyUrlTransform,
   PreviewablePath,
@@ -59,6 +60,25 @@ export const MarkdownBody = React.memo(function MarkdownBody({
   const [attachmentOpenError, setAttachmentOpenError] = useState<string | null>(
     null,
   );
+  const bareParagraphOptsRef = useRef({
+    sessionId,
+    onOpenPreview,
+    onOpenLightbox,
+    streaming,
+  });
+  bareParagraphOptsRef.current = {
+    sessionId,
+    onOpenPreview,
+    onOpenLightbox,
+    streaming,
+  };
+  const bareParagraphComponent = useRef(
+    localImageBareParagraphComponent(bareParagraphOptsRef),
+  ).current;
+
+  const imgOptsRef = useRef({ sessionId, onOpenPreview, onOpenLightbox });
+  imgOptsRef.current = { sessionId, onOpenPreview, onOpenLightbox };
+  const imgComponent = useRef(localImageMarkdownComponent(imgOptsRef)).current;
 
   useEffect(() => {
     if (!attachmentOpenError) return;
@@ -114,11 +134,8 @@ export const MarkdownBody = React.memo(function MarkdownBody({
           </code>
         );
       },
-      img: localImageMarkdownComponent({
-        sessionId,
-        onOpenPreview,
-        onOpenLightbox,
-      }),
+      img: imgComponent,
+      p: bareParagraphComponent,
       table({ children }: React.ComponentProps<"table">) {
         return (
           <div className="mm-table-wrap">
@@ -141,7 +158,15 @@ export const MarkdownBody = React.memo(function MarkdownBody({
         );
       },
     }),
-    [attachmentPort, onOpenLightbox, onOpenPreview, sessionId, streaming, t],
+    [
+      attachmentPort,
+      bareParagraphComponent,
+      imgComponent,
+      onOpenPreview,
+      sessionId,
+      streaming,
+      t,
+    ],
   );
 
   return (

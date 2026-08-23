@@ -615,7 +615,10 @@ fn dispatch_worker_inner(
                 "sub": sub,
             }))
         }
-        Ok(Err(e)) => Err(e),
+        Ok(Err(e)) => {
+            (ctx.on_result_delivered)(&assignment_id);
+            Err(e)
+        }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(serde_json::json!({
             "status": "running_in_background",
             "assignment_id": assignment_id,
@@ -1579,6 +1582,47 @@ mod tests {
         assert_eq!(
             *delivered_assignment.lock().unwrap(),
             vec!["dispatch-agent-1-run-autofeed-wait-0"]
+        );
+    }
+
+    #[test]
+    fn dispatch_worker_autofeed_wait_error_also_acks_assignment() {
+        let delivered_assignment = Arc::new(Mutex::new(Vec::new()));
+        let delivered_assignment_t = delivered_assignment.clone();
+        let ctx = LeadCtx {
+            on_result_delivered: Arc::new(move |assignment_id| {
+                delivered_assignment_t
+                    .lock()
+                    .unwrap()
+                    .push(assignment_id.to_string());
+            }),
+            on_worker_settled: noop_worker_settled(),
+            run_worker: Arc::new(|_input: MemberInput| Err("worker failed".to_string())),
+            is_session_running: Arc::new(|| false),
+            begin_dispatch_intent: always_ok_intent(),
+            member_pool: vec![pool_member("agent-1")],
+            done: Arc::new(AtomicBool::new(false)),
+            terminated: Arc::new(AtomicBool::new(false)),
+            dispatch_seq: std::sync::atomic::AtomicUsize::new(0),
+            lead_run_id: "run-autofeed-error".to_string(),
+            dispatch_ledger: empty_ledger(),
+        };
+
+        assert_eq!(
+            dispatch_worker_inner(
+                &ctx,
+                DispatchArgs {
+                    task: "do work".to_string(),
+                    agent_hint: None,
+                    goal_title: None,
+                },
+                std::time::Duration::from_secs(1),
+            ),
+            Err("worker failed".to_string())
+        );
+        assert_eq!(
+            *delivered_assignment.lock().unwrap(),
+            vec!["dispatch-agent-1-run-autofeed-error-0"]
         );
     }
 

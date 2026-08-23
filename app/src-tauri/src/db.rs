@@ -1042,6 +1042,13 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_messages_history
             ON messages(session_id, id DESC)
             WHERE role IN ('user','assistant');
+        CREATE TABLE IF NOT EXISTS member_report_delivery (
+            session_id TEXT NOT NULL,
+            message_id INTEGER NOT NULL,
+            assignment_id TEXT,
+            delivered_at INTEGER,
+            PRIMARY KEY (session_id, message_id)
+        );
         CREATE TABLE IF NOT EXISTS attachments (
             id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL,
@@ -3951,6 +3958,119 @@ pub fn append_message_dedup_and_publish(
     Ok(inserted)
 }
 
+/// 原子落库 worker report 与待交付台账；只在事务 commit 成功后发布消息里程碑。
+/// 无台账行是 grandfather 的“已交付”语义，因此命中 dedup 时不为旧消息补行。
+#[allow(clippy::too_many_arguments)]
+pub fn persist_member_report_atomic(
+    conn: &Connection,
+    session_id: &str,
+    content: &[Block],
+    agent_id: Option<&str>,
+    agent_name_snapshot: Option<&str>,
+    dedup_key: &str,
+    assignment_id: Option<&str>,
+    dispatch_terminal: Option<(&str, &str)>,
+) -> rusqlite::Result<bool> {
+    persist_member_report_atomic_with_publish(
+        conn,
+        session_id,
+        content,
+        agent_id,
+        agent_name_snapshot,
+        dedup_key,
+        assignment_id,
+        dispatch_terminal,
+        MsgCompletedMilestone::publish,
+    )
+}
+
+/// 与公开 helper 共用完整事务路径；额外参数只让测试能在 publish 的精确时刻从独立连接
+/// 观察已提交状态，生产调用始终传 `MsgCompletedMilestone::publish`。
+#[allow(clippy::too_many_arguments)]
+fn persist_member_report_atomic_with_publish<F>(
+    conn: &Connection,
+    session_id: &str,
+    content: &[Block],
+    agent_id: Option<&str>,
+    agent_name_snapshot: Option<&str>,
+    dedup_key: &str,
+    assignment_id: Option<&str>,
+    dispatch_terminal: Option<(&str, &str)>,
+    publish: F,
+) -> rusqlite::Result<bool>
+where
+    F: FnOnce(MsgCompletedMilestone),
+{
+    let tx = conn.unchecked_transaction()?;
+    let milestone = append_message_dedup(
+        &tx,
+        session_id,
+        "assistant",
+        content,
+        Some("agent-team"),
+        agent_id,
+        agent_name_snapshot,
+        dedup_key,
+    )?;
+    if let Some(milestone) = milestone.as_ref() {
+        tx.execute(
+            "INSERT INTO member_report_delivery
+                (session_id, message_id, assignment_id, delivered_at)
+             VALUES (?1, ?2, ?3, NULL)",
+            (session_id, milestone.message_id, assignment_id),
+        )?;
+    }
+    if let (Some(assignment_id), Some((status, report_text))) = (assignment_id, dispatch_terminal) {
+        update_dispatch_card_terminal(&tx, session_id, assignment_id, status, report_text)?;
+    }
+    let inserted = milestone.is_some();
+    tx.commit()?;
+    if let Some(milestone) = milestone {
+        publish(milestone);
+    }
+    Ok(inserted)
+}
+
+/// 只有显式台账行且 `delivered_at IS NULL` 才是 pending；无行的存量消息视为已交付。
+pub fn pending_member_report_message_ids(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT message_id
+           FROM member_report_delivery
+          WHERE session_id = ?1 AND delivered_at IS NULL
+          ORDER BY message_id ASC",
+    )?;
+    let rows = stmt.query_map([session_id], |row| row.get(0))?;
+    rows.collect()
+}
+
+/// T5 M3：真正 I/O ack 之后，把本轮纳入 prompt 台账段的报告 message_id 逐条置
+/// `delivered_at`——短事务，任一条 `UPDATE` 失败整体回滚（不留「部分已交付」的幽灵态）。
+/// `message_ids` 为空是 no-op（T6 尚未接线「本轮纳入」选择逻辑前，调用方恒传空集合）。
+/// 只更新仍是 `delivered_at IS NULL` 的行——已交付的行不重复打时间戳。
+pub fn mark_member_reports_delivered(
+    conn: &Connection,
+    session_id: &str,
+    message_ids: &[i64],
+) -> rusqlite::Result<()> {
+    if message_ids.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    for message_id in message_ids {
+        tx.execute(
+            "UPDATE member_report_delivery
+                SET delivered_at = strftime('%s','now')
+              WHERE session_id = ?1 AND message_id = ?2 AND delivered_at IS NULL",
+            (session_id, message_id),
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// 把已落库 lead 消息中的 running DispatchCard 原地收敛到 worker 终态。
 /// SQL LIKE 只做候选预筛，assignment_id 与块类型均以 JSON 字段精确匹配为准。
 pub fn update_dispatch_card_terminal(
@@ -4205,6 +4325,10 @@ pub fn delete_session(conn: &Connection, id: &str) -> rusqlite::Result<()> {
         )?;
     }
     // Step 3: delete session-scoped rows
+    tx.execute(
+        "DELETE FROM member_report_delivery WHERE session_id = ?1",
+        [id],
+    )?;
     tx.execute("DELETE FROM messages WHERE session_id = ?1", [id])?;
     tx.execute("DELETE FROM attachments WHERE session_id = ?1", [id])?;
     tx.execute("DELETE FROM memory_blocks WHERE session_id = ?1", [id])?;
@@ -6256,6 +6380,47 @@ pub fn list_recent_milestone_replay_rows(
         .collect();
     rows.reverse();
     Ok(rows)
+}
+
+/// idlefix-T1 缺口②：连接后补发批用——`run.status` 现状帧的真相源。手机顶栏唯一数据源就是
+/// `run.status` 里程碑（remote-web `streamSource.ts`），但它只在状态变化时 publish 一次、
+/// gate 关闭即丢不重投；连接后补发批此前只重建 msg.completed/card.*，没有它——中途接入/错过
+/// 一帧就会让顶栏卡在上一次看到的状态上（同 `session.index` 行 status 走的会话列表绿点脱节）。
+/// 这里把 `session_runtime` 全表现状（排除软删会话，同 `list_session_index_snapshot_rows` 口径）
+/// 交给调用方逐行重建 `run.status` 帧重发；status 恒非 NULL（CHECK 约束），run_id 可空。
+///
+/// idlefix-T1 补针 D：会话数一大就有丢帧风险——`enqueue_milestone_with_generation` 落在有界
+/// channel 上，补发批一次性塞太多条目会把 channel 挤满、连本该优先送达的 running 现状帧也一起
+/// 被挤丢。这里补两条护栏，口径对齐 msg/card 那半补发（`list_recent_milestone_replay_rows` +
+/// `RECENT_MILESTONE_REPLAY_LIMIT`，见上）：① `ORDER BY` 让 running 行排在最前——channel 真被
+/// 挤满时，最先入队、最该被保住的是"正在跑"的会话，不是随手哪条 idle；② `LIMIT` 复用同一个
+/// 200 上限常量封顶，防会话表无限增长时这一批把 channel 全占满，挤丢别的种类的补发帧。
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionRuntimeReplayRow {
+    pub session_id: String,
+    pub status: String,
+    pub run_id: Option<String>,
+}
+
+pub fn list_session_runtime_replay_rows(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<SessionRuntimeReplayRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT sr.session_id, sr.status, sr.run_id \
+         FROM session_runtime sr \
+         JOIN sessions s ON s.id = sr.session_id \
+         WHERE s.deleted_at IS NULL \
+         ORDER BY CASE WHEN sr.status = 'running' THEN 0 ELSE 1 END \
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([RECENT_MILESTONE_REPLAY_LIMIT], |r| {
+        Ok(SessionRuntimeReplayRow {
+            session_id: r.get(0)?,
+            status: r.get(1)?,
+            run_id: r.get(2)?,
+        })
+    })?;
+    rows.collect()
 }
 
 #[cfg(test)]
@@ -9095,6 +9260,44 @@ mod tests {
         assert!(rows[0].message_id < rows[1].message_id);
     }
 
+    /// idlefix-T1 补针 D：running 行必须排在 LIMIT 截断线之前——造出比
+    /// `RECENT_MILESTONE_REPLAY_LIMIT` 更多的 idle 会话（挤占空间的"陪跑"），再插入少量
+    /// running 会话，断言：① 总行数被封顶在同一个常量；② 全部 running 行都活下来、且排在
+    /// 结果最前面，不会被单纯"先来后到"顺序挤出这批补发帧。
+    #[test]
+    fn list_session_runtime_replay_rows_orders_running_first_and_caps_at_shared_limit() {
+        let c = mem();
+        let running_count = 3_i64;
+        let idle_count = RECENT_MILESTONE_REPLAY_LIMIT + 5;
+        for i in 0..idle_count {
+            let id = format!("idle-{i}");
+            create_session(&c, &id, &id, "local-default", "local").unwrap();
+            set_session_runtime(&c, &id, "idle", None).unwrap();
+        }
+        for i in 0..running_count {
+            let id = format!("running-{i}");
+            create_session(&c, &id, &id, "local-default", "local").unwrap();
+            set_session_runtime(&c, &id, "running", Some(&format!("run-{i}"))).unwrap();
+        }
+
+        let rows = list_session_runtime_replay_rows(&c).unwrap();
+
+        assert_eq!(
+            rows.len() as i64,
+            RECENT_MILESTONE_REPLAY_LIMIT,
+            "LIMIT 必须封顶在与 msg/card 补发同一个常量，不能让 session_runtime 全表无界涌入"
+        );
+        let running_rows: Vec<_> = rows.iter().filter(|r| r.status == "running").collect();
+        assert_eq!(
+            running_rows.len() as i64,
+            running_count,
+            "running 行不该被挤丢——ORDER BY 必须把它们排到截断线之前"
+        );
+        for row in rows.iter().take(running_count as usize) {
+            assert_eq!(row.status, "running", "running 行必须排在结果最前面");
+        }
+    }
+
     #[test]
     fn history_db_before_null_returns_latest_rows_and_cursor_is_exclusive() {
         let c = mem();
@@ -9347,7 +9550,7 @@ mod tests {
     #[test]
     fn purge_session_cascades_all_session_scoped_rows() {
         // 🔴 I3 不变量锁(最高风险·漏表=永久孤儿行·codex+opus 双审 I2):delete_session 必须级联清掉
-        //    该 session 的全部 16 张 session-scoped 表 + 3 张 artifact-scoped 表。每张各插一行·
+        //    该 session 的全部 18 张 session-scoped 表 + 3 张 artifact-scoped 表。每张各插一行·
         //    purge 后逐张断言归零——未来误删任一 DELETE 行→此测试立刻 FAIL(防回归命根)。
         //    （2026-08-11 M1 修复轮 P2-2：session_runtime 补第 15 张——M1-T1 新增独立运行态镜像表，
         //    同样按 session_id 键，此前漏了级联删。T-4b 再补 remote_inbox 第 16 张。）
@@ -9357,12 +9560,19 @@ mod tests {
             [],
         )
         .unwrap();
-        // --- 14 张 session-scoped(键 session_id) ---
+        // --- 18 张 session-scoped(键 session_id) ---
         c.execute("INSERT INTO messages (session_id,role,content,created_at) VALUES ('s-p','user','[]',1)", []).unwrap();
+        let message_id = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO member_report_delivery (session_id,message_id,assignment_id) VALUES ('s-p',?1,'a1')",
+            [message_id],
+        )
+        .unwrap();
         c.execute("INSERT INTO attachments (id,session_id,kind,sha256,rel_path,created_at) VALUES ('att-p','s-p','image','sha','p/a.png',1)", []).unwrap();
         c.execute("INSERT INTO memory_blocks (session_id,slot,text,updated_at) VALUES ('s-p','persona','t',1)", []).unwrap();
         c.execute("INSERT INTO memory_entries (session_id,category,text,created_at) VALUES ('s-p','decision','t',1)", []).unwrap();
         c.execute("INSERT INTO run_commits (session_id,run_id,engine,pre_head,state,created_at) VALUES ('s-p','r1','claude','abc123','running',1)", []).unwrap();
+        c.execute("INSERT INTO run_commit_intents (session_id,run_id,expected_head,previous_state,created_at) VALUES ('s-p','r1','abc123','running',1)", []).unwrap();
         c.execute("INSERT INTO checkpoint_entries (session_id,run_id,file_path,existed,created_at) VALUES ('s-p','r1','/tmp/file.txt',0,1)", []).unwrap();
         c.execute("INSERT INTO team_run_pending (session_id,run_id,started_at,created_at) VALUES ('s-p','r1',1,1)", []).unwrap();
         c.execute(
@@ -9417,6 +9627,10 @@ mod tests {
                 "SELECT COUNT(*) FROM messages WHERE session_id='s-p'",
             ),
             (
+                "member_report_delivery",
+                "SELECT COUNT(*) FROM member_report_delivery WHERE session_id='s-p'",
+            ),
+            (
                 "attachments",
                 "SELECT COUNT(*) FROM attachments WHERE session_id='s-p'",
             ),
@@ -9431,6 +9645,10 @@ mod tests {
             (
                 "run_commits",
                 "SELECT COUNT(*) FROM run_commits WHERE session_id='s-p'",
+            ),
+            (
+                "run_commit_intents",
+                "SELECT COUNT(*) FROM run_commit_intents WHERE session_id='s-p'",
             ),
             (
                 "checkpoint_entries",
@@ -12169,6 +12387,29 @@ mod agents {
         c
     }
 
+    fn member_report_delivery_running_card(assignment_id: &str) -> Block {
+        Block::DispatchCard {
+            run_id: format!("worker-run-{assignment_id}"),
+            member: MemberSnapshot {
+                participant_id: "worker-1".into(),
+                assignment_id: assignment_id.into(),
+                task_id: "task-1".into(),
+                name: "Worker".into(),
+                started_at: Some(1),
+                status: "running".into(),
+                sub: "test report rollback".into(),
+                steps_total: 1,
+                steps_done: 0,
+                cost_usd: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                failed: false,
+                blocks: vec![],
+                result: None,
+            },
+        }
+    }
+
     fn agent(id: &str, sort_order: i64, is_builtin: bool) -> AgentProfile {
         AgentProfile {
             id: id.into(),
@@ -13266,6 +13507,243 @@ mod agents {
             vec!["msg.completed"],
             "commit 成功之后调用 publish() 才应该真正发布"
         );
+    }
+
+    #[test]
+    fn member_report_delivery_atomic_helper_commits_message_pending_then_publishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("member-report-publish-order.db");
+        let c = Connection::open(&db_path).unwrap();
+        init_schema(&c).unwrap();
+        c.execute(
+            "INSERT OR IGNORE INTO namespaces
+                (id, kind, name, is_builtin, added_at)
+             VALUES ('local', 'local', 'Local', 1, 0)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT OR IGNORE INTO repos
+                (id, namespace_id, source, name, path, status, added_at)
+             VALUES ('local-default', 'local', 'local', 'Local', '/tmp', 'active', 0)",
+            [],
+        )
+        .unwrap();
+        create_session(&c, "delivery-success", "x", "local-default", "local").unwrap();
+        let observer = Connection::open(&db_path).unwrap();
+        let rows_visible_at_publish = std::cell::Cell::new(false);
+
+        crate::remote_gateway::test_take_publish_log();
+        assert!(persist_member_report_atomic_with_publish(
+            &c,
+            "delivery-success",
+            &[Block::Text {
+                text: "[Worker report]\nstatus: done".into(),
+            }],
+            Some("worker-agent"),
+            Some("Worker"),
+            "member_result:run-1:assignment-1",
+            Some("assignment-1"),
+            None,
+            |milestone| {
+                let visible: (i64, i64) = observer
+                    .query_row(
+                        "SELECT
+                            (SELECT count(*) FROM messages
+                              WHERE session_id = 'delivery-success'
+                                AND dedup_key = 'member_result:run-1:assignment-1'),
+                            (SELECT count(*) FROM member_report_delivery
+                              WHERE session_id = 'delivery-success'
+                                AND delivered_at IS NULL)",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                rows_visible_at_publish.set(visible == (1, 1));
+                milestone.publish();
+            },
+        )
+        .unwrap());
+        assert!(
+            rows_visible_at_publish.get(),
+            "publish 回调触发时，独立连接必须已能看见 message 与 pending 台账；否则 publish 早于 commit"
+        );
+
+        let message_id: i64 = c
+            .query_row(
+                "SELECT id FROM messages WHERE session_id = 'delivery-success'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let pending: (i64, String, Option<i64>) = c
+            .query_row(
+                "SELECT message_id, assignment_id, delivered_at
+                   FROM member_report_delivery
+                  WHERE session_id = 'delivery-success'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(pending, (message_id, "assignment-1".into(), None));
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["msg.completed"],
+            "helper 只能在消息与 pending 台账同时 commit 后 publish"
+        );
+    }
+
+    #[test]
+    fn member_report_delivery_atomic_helper_rolls_back_without_ghost_publish() {
+        let c = crate::test_support::mem_db();
+        create_session(&c, "delivery-rollback", "x", "local-default", "local").unwrap();
+        for _ in 0..2 {
+            append_message(
+                &c,
+                "delivery-rollback",
+                "assistant",
+                &[member_report_delivery_running_card("assignment-1")],
+                Some("agent-team"),
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        let before = get_messages(&c, "delivery-rollback").unwrap();
+        let second_card_id = before[1].id;
+        c.execute_batch(&format!(
+            "CREATE TRIGGER fail_second_dispatch_card_update
+             BEFORE UPDATE OF content ON messages
+             WHEN OLD.id = {second_card_id}
+             BEGIN
+               SELECT RAISE(FAIL, 'forced second DispatchCard update failure');
+             END;"
+        ))
+        .unwrap();
+
+        crate::remote_gateway::test_take_publish_log();
+        let error = persist_member_report_atomic(
+            &c,
+            "delivery-rollback",
+            &[Block::Text {
+                text: "[Worker report]\nstatus: failed".into(),
+            }],
+            Some("worker-agent"),
+            Some("Worker"),
+            "member_result:run-rollback:assignment-1",
+            Some("assignment-1"),
+            Some(("failed", "[Worker report]\nstatus: failed")),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("forced second DispatchCard update failure"));
+
+        assert_eq!(
+            get_messages(&c, "delivery-rollback").unwrap(),
+            before,
+            "第二张卡更新失败后，第一张 DispatchCard 也必须回滚到 running，且不得留下 report 消息"
+        );
+        let delivery_count: i64 = c
+            .query_row(
+                "SELECT count(*) FROM member_report_delivery
+                  WHERE session_id = 'delivery-rollback'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(delivery_count, 0, "rollback 后不得留 pending 台账幽灵行");
+        assert!(
+            crate::remote_gateway::test_take_publish_log().is_empty(),
+            "rollback 路径不得发布 msg.completed 幽灵事件"
+        );
+    }
+
+    #[test]
+    fn member_report_delivery_grandfather_message_without_row_is_not_pending() {
+        let c = crate::test_support::mem_db();
+        create_session(&c, "delivery-grandfather", "x", "local-default", "local").unwrap();
+        append_message(
+            &c,
+            "delivery-grandfather",
+            "assistant",
+            &[Block::Text {
+                text: "[Worker report]\nlegacy".into(),
+            }],
+            Some("agent-team"),
+            Some("worker-agent"),
+            Some("Worker"),
+        )
+        .unwrap();
+
+        assert!(
+            pending_member_report_message_ids(&c, "delivery-grandfather")
+                .unwrap()
+                .is_empty(),
+            "无台账行的存量消息必须视为已交付"
+        );
+    }
+
+    #[test]
+    fn member_report_delivery_delivered_row_is_not_pending() {
+        let c = crate::test_support::mem_db();
+        create_session(&c, "delivery-complete", "x", "local-default", "local").unwrap();
+        persist_member_report_atomic(
+            &c,
+            "delivery-complete",
+            &[Block::Text {
+                text: "[Worker report]\nstatus: done".into(),
+            }],
+            Some("worker-agent"),
+            Some("Worker"),
+            "member_result:run-complete:assignment-1",
+            Some("assignment-1"),
+            None,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE member_report_delivery
+                SET delivered_at = 1
+              WHERE session_id = 'delivery-complete'",
+            [],
+        )
+        .unwrap();
+
+        assert!(
+            pending_member_report_message_ids(&c, "delivery-complete")
+                .unwrap()
+                .is_empty(),
+            "delivered_at 非 NULL 的台账行不得再算 pending"
+        );
+    }
+
+    #[test]
+    fn member_report_delivery_delete_session_purges_rows() {
+        let c = crate::test_support::mem_db();
+        create_session(&c, "delivery-purge", "x", "local-default", "local").unwrap();
+        persist_member_report_atomic(
+            &c,
+            "delivery-purge",
+            &[Block::Text {
+                text: "[Worker report]\nstatus: done".into(),
+            }],
+            Some("worker-agent"),
+            Some("Worker"),
+            "member_result:run-purge:assignment-1",
+            Some("assignment-1"),
+            None,
+        )
+        .unwrap();
+
+        delete_session(&c, "delivery-purge").unwrap();
+        let count: i64 = c
+            .query_row(
+                "SELECT count(*) FROM member_report_delivery WHERE session_id = 'delivery-purge'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

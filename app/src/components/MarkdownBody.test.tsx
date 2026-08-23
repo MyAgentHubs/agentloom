@@ -303,8 +303,55 @@ describe("MarkdownBody images", () => {
   it.each([
     ["![x](</Users/a/my pic.png>)", "/Users/a/my pic.png"],
     ["![x](/Users/a/pic%20x.png)", "/Users/a/pic x.png"],
+    ["![](</path/with space.png>)", "/path/with space.png"],
   ])(
     "decodes a local image path before reading it: %s",
+    async (markdown, path) => {
+      invokeMock.mockResolvedValueOnce({
+        kind: "image",
+        imageBase64: "iVBORw0KGgo=",
+        mediaType: "image/png",
+      });
+
+      render(<MarkdownBody streaming={false}>{markdown}</MarkdownBody>);
+
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+          path,
+          sessionId: null,
+        });
+      });
+    },
+  );
+
+  it("loads a file:// image path through read_attachment (scheme stripped)", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "ZmlsZQ==",
+      mediaType: "image/png",
+    });
+
+    render(
+      <MarkdownBody streaming={false} sessionId="session-file">
+        {"![chart](file:///Users/a/chart.png)"}
+      </MarkdownBody>,
+    );
+
+    expect(await screen.findByRole("img", { name: "chart" })).toHaveAttribute(
+      "src",
+      "data:image/png;base64,ZmlsZQ==",
+    );
+    expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+      path: "/Users/a/chart.png",
+      sessionId: "session-file",
+    });
+  });
+
+  it.each([
+    ["![x](file:///Users/a/my%20pic.png)", "/Users/a/my pic.png"],
+    ["![x](file:///Users/a/%E4%B8%AD%E6%96%87.png)", "/Users/a/中文.png"],
+  ])(
+    "decodes percent-encoding in a file:// image path before reading it: %s",
     async (markdown, path) => {
       invokeMock.mockResolvedValueOnce({
         kind: "image",
@@ -357,6 +404,248 @@ describe("MarkdownBody images", () => {
 
     expect(screen.getByRole("img", { name: "x" })).not.toHaveAttribute("src");
     expect(invokeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("MarkdownBody bare image paths", () => {
+  it("renders a standalone absolute image path through read_attachment", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "YmFyZS1hYnNvbHV0ZQ==",
+      mediaType: "image/png",
+    });
+
+    const { container } = render(
+      <MarkdownBody streaming={false} sessionId="session-bare-absolute">
+        {"\n\n/abs/path/chart.png\n\n"}
+      </MarkdownBody>,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector("img")).toHaveAttribute(
+        "src",
+        "data:image/png;base64,YmFyZS1hYnNvbHV0ZQ==",
+      );
+    });
+    expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+      path: "/abs/path/chart.png",
+      sessionId: "session-bare-absolute",
+    });
+  });
+
+  it("strips file:// from a standalone image path before reading it", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "YmFyZS1maWxl",
+      mediaType: "image/svg+xml",
+    });
+
+    const { container } = render(
+      <MarkdownBody streaming={false} sessionId="session-bare-file">
+        {"\n\nfile:///abs/x.svg\n\n"}
+      </MarkdownBody>,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector("img")).toHaveAttribute(
+        "src",
+        "data:image/svg+xml;base64,YmFyZS1maWxl",
+      );
+    });
+    expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+      path: "/abs/x.svg",
+      sessionId: "session-bare-file",
+    });
+  });
+
+  it("keeps mixed paragraph text unchanged", () => {
+    render(
+      <MarkdownBody streaming={false}>
+        {"\n\n结果在 /a/b.png 里\n\n"}
+      </MarkdownBody>,
+    );
+
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(screen.getByText(/结果在 \/a\/b\.png 里/)).toBeInTheDocument();
+  });
+
+  it("does not render an inline-code image path as an image", () => {
+    render(
+      <MarkdownBody streaming={false}>{"\n\n`/a/b.png`\n\n"}</MarkdownBody>,
+    );
+
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    // <code> 原样文本仍在——不是被吞了，只是没被判成裸路径图。
+    const code = screen.getByText("/a/b.png");
+    expect(code.tagName).toBe("CODE");
+  });
+
+  it("keeps a standalone non-image path as text", () => {
+    render(<MarkdownBody streaming={false}>{"\n\n/a/b.txt\n\n"}</MarkdownBody>);
+
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(screen.getByText("/a/b.txt")).toBeInTheDocument();
+  });
+
+  it("keeps a standalone relative image path as text", () => {
+    render(<MarkdownBody streaming={false}>{"\n\n./a.png\n\n"}</MarkdownBody>);
+
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(screen.getByText("./a.png")).toBeInTheDocument();
+  });
+
+  it("falls back to the path text when a bare image fails to load", async () => {
+    invokeMock.mockRejectedValueOnce(new Error("boom"));
+
+    render(
+      <MarkdownBody streaming={false}>{"\n\n/a/fail.png\n\n"}</MarkdownBody>,
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    });
+    expect(screen.getByText("/a/fail.png")).toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
+
+  it("does not inline a protocol-relative bare path (//host/a.png)", () => {
+    render(
+      <MarkdownBody streaming={false}>{"\n\n//host/a.png\n\n"}</MarkdownBody>,
+    );
+
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(screen.getByText("//host/a.png")).toBeInTheDocument();
+  });
+
+  it("does not inline a bare path with trailing punctuation (/a/b.png。)", () => {
+    render(
+      <MarkdownBody streaming={false}>{"\n\n/a/b.png。\n\n"}</MarkdownBody>,
+    );
+
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(screen.getByText("/a/b.png。")).toBeInTheDocument();
+  });
+
+  it("does not inline a bare path with a query string (/a/b.png?x=1)", () => {
+    render(
+      <MarkdownBody streaming={false}>{"\n\n/a/b.png?x=1\n\n"}</MarkdownBody>,
+    );
+
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(screen.getByText("/a/b.png?x=1")).toBeInTheDocument();
+  });
+
+  it("inlines a bare path with an uppercase .SVG extension", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "dXBwZXJjYXNl",
+      mediaType: "image/svg+xml",
+    });
+
+    const { container } = render(
+      <MarkdownBody streaming={false} sessionId="session-svg-upper">
+        {"\n\n/a/b.SVG\n\n"}
+      </MarkdownBody>,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector("img")).toHaveAttribute(
+        "src",
+        "data:image/svg+xml;base64,dXBwZXJjYXNl",
+      );
+    });
+    expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+      path: "/a/b.SVG",
+      sessionId: "session-svg-upper",
+    });
+  });
+
+  it("keeps a bare path mixed with bold text unchanged (**粗体** /a/b.png)", () => {
+    render(
+      <MarkdownBody streaming={false}>
+        {"\n\n**粗体** /a/b.png\n\n"}
+      </MarkdownBody>,
+    );
+
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(screen.getByText("粗体")).toBeInTheDocument();
+    expect(screen.getByText(/\/a\/b\.png/)).toBeInTheDocument();
+  });
+
+  it("does not inline a file:// URL with a non-empty host", () => {
+    render(
+      <MarkdownBody streaming={false}>
+        {"\n\nfile://host/a.png\n\n"}
+      </MarkdownBody>,
+    );
+
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(screen.getByText("file://host/a.png")).toBeInTheDocument();
+  });
+
+  it("splits one text line and one bare-path line into text + inlined image (按行切分)", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "bGluZTE=",
+      mediaType: "image/png",
+    });
+
+    const { container } = render(
+      <MarkdownBody streaming={false} sessionId="session-line-split">
+        {"\n\n一句话\n/a/b.png\n\n"}
+      </MarkdownBody>,
+    );
+
+    expect(screen.getByText("一句话")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(container.querySelectorAll("img")).toHaveLength(1);
+    });
+    expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+      path: "/a/b.png",
+      sessionId: "session-line-split",
+    });
+  });
+
+  it("inlines two bare-path lines with no separating text into two images (按行切分)", async () => {
+    invokeMock.mockResolvedValue({
+      kind: "image",
+      imageBase64: "dHdvbGluZXM=",
+      mediaType: "image/png",
+    });
+
+    const { container } = render(
+      <MarkdownBody streaming={false} sessionId="session-two-lines">
+        {"\n\n/a/one.png\n/a/two.png\n\n"}
+      </MarkdownBody>,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelectorAll("img")).toHaveLength(2);
+    });
+    expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+      path: "/a/one.png",
+      sessionId: "session-two-lines",
+    });
+    expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+      path: "/a/two.png",
+      sessionId: "session-two-lines",
+    });
+  });
+
+  it("disables bare-path auto-inlining while streaming but keeps ![]() working", () => {
+    render(
+      <MarkdownBody streaming={true} sessionId="session-streaming">
+        {"\n\n/a/b.png\n\n![x](https://example.com/x.png)"}
+      </MarkdownBody>,
+    );
+
+    // 裸路径不自动内联：streaming 中途仍原样是文本，不闪图。
+    expect(screen.getByText("/a/b.png")).toBeInTheDocument();
+    // ![]() 语法照常渲图，不受这个门控影响。
+    expect(screen.getByRole("img", { name: "x" })).toHaveAttribute(
+      "src",
+      "https://example.com/x.png",
+    );
   });
 });
 

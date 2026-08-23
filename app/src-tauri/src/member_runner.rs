@@ -17,6 +17,7 @@ type PreparedMember = (
     crate::agent::ParseFn,
     std::path::PathBuf,
     TextGranularity,
+    Option<crate::agent::StdinPrompt>,
 );
 
 type PreparedSingleMember = (
@@ -27,6 +28,7 @@ type PreparedSingleMember = (
     std::path::PathBuf,
     TextGranularity,
     Result<Stage1Snapshot, String>,
+    Option<crate::agent::StdinPrompt>,
 );
 
 fn finalize_team_run(
@@ -622,8 +624,8 @@ fn build_task_pack(
         }
     }
     pack.push_str(match locale {
-        crate::Locale::Zh => "\n\n## 工程纪律\n- 只修改任务点名的文件；别顺手重构或改动任务范围外的代码。\n- 严禁全局格式化（如 `cargo fmt` 不带参数、`prettier --write .`）——只格式化你亲手改的文件。\n- 严禁用 `git stash` / `git restore` / `git checkout --` 回滚不是你本次创建的改动——工作区里可能有前序 worker 的成果。\n- 如果你产出/生成了希望用户在聊天里直接看到的图片文件（截图、图表等），汇报时用 Markdown 内联图片语法 `![](图片绝对路径)` 引用；只写裸路径不会内联显示。\n- 本会话可能跑在 AgentLoom 外层 macOS 沙箱内（系统禁止嵌套沙箱）：如需派 codex 子进程，勿用 `--sandbox workspace-write`（会以 sandbox_apply: Operation not permitted / exit 71 失败），改用 `--dangerously-bypass-approvals-and-sandbox`——该子进程与你安全地位相同，须遵守与你相同的工作区纪律；外层沙箱仍会阻止写入 AgentLoom 自身状态目录。",
-        crate::Locale::En => "\n\n## Engineering Discipline\n- Only touch the files this task names; don't drive-by refactor or edit code outside its scope.\n- No global formatting (e.g. bare `cargo fmt`, `prettier --write .`) — only format the files you personally changed.\n- Never use `git stash` / `git restore` / `git checkout --` to roll back changes you didn't create this run — the workspace may hold prior workers' work.\n- If you produce or generate an image file (such as a screenshot or chart) that you want the user to see directly in chat, reference it in your report with the Markdown inline image syntax `![](absolute image path)`; a bare path will not display inline.\n- This session may be running inside AgentLoom's outer macOS sandbox (nested sandboxes are disallowed): if you spawn a codex subprocess, don't use `--sandbox workspace-write` (fails with sandbox_apply: Operation not permitted / exit 71) — use `--dangerously-bypass-approvals-and-sandbox` instead. That child has the same security standing as you and must follow the same workspace discipline; the outer sandbox still blocks writes to AgentLoom's own state directories.",
+        crate::Locale::Zh => "\n\n## 工程纪律\n- 只修改任务点名的文件；别顺手重构或改动任务范围外的代码。\n- 严禁全局格式化（如 `cargo fmt` 不带参数、`prettier --write .`）——只格式化你亲手改的文件。\n- 严禁用 `git stash` / `git restore` / `git checkout --` 回滚不是你本次创建的改动——工作区里可能有前序 worker 的成果。\n- 如果你产出/生成了希望用户在聊天里直接看到的图片文件（截图、图表等），汇报时用 Markdown 内联图片语法 `![](图片绝对路径)` 引用；只写裸路径不会内联显示。路径含空格时须用尖括号包裹：`![](</path/with space.png>)`。\n- 本会话可能跑在 AgentLoom 外层 macOS 沙箱内（系统禁止嵌套沙箱）：如需派 codex 子进程，勿用 `--sandbox workspace-write`（会以 sandbox_apply: Operation not permitted / exit 71 失败），改用 `--dangerously-bypass-approvals-and-sandbox`——该子进程与你安全地位相同，须遵守与你相同的工作区纪律；外层沙箱仍会阻止写入 AgentLoom 自身状态目录。",
+        crate::Locale::En => "\n\n## Engineering Discipline\n- Only touch the files this task names; don't drive-by refactor or edit code outside its scope.\n- No global formatting (e.g. bare `cargo fmt`, `prettier --write .`) — only format the files you personally changed.\n- Never use `git stash` / `git restore` / `git checkout --` to roll back changes you didn't create this run — the workspace may hold prior workers' work.\n- If you produce or generate an image file (such as a screenshot or chart) that you want the user to see directly in chat, reference it in your report with the Markdown inline image syntax `![](absolute image path)`; a bare path will not display inline. If the path contains spaces, wrap it in angle brackets: `![](</path/with space.png>)`.\n- This session may be running inside AgentLoom's outer macOS sandbox (nested sandboxes are disallowed): if you spawn a codex subprocess, don't use `--sandbox workspace-write` (fails with sandbox_apply: Operation not permitted / exit 71) — use `--dangerously-bypass-approvals-and-sandbox` instead. That child has the same security standing as you and must follow the same workspace discipline; the outer sandbox still blocks writes to AgentLoom's own state directories.",
     });
     pack.push_str(if goal.is_empty() {
         match locale {
@@ -814,10 +816,19 @@ fn prepare_team_members(
     {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         for (spec, profile, key, search, wt) in member_ready {
-            let (command, parser, parse_fn, granularity) = crate::build_member_command_with(
-                &conn, session_id, run_id, &spec, &profile, key, search, &wt, locale,
-            )?;
-            prepared.push((spec, command, parser, parse_fn, wt, granularity));
+            let (command, parser, parse_fn, granularity, stdin_prompt) =
+                crate::build_member_command_with(
+                    &conn, session_id, run_id, &spec, &profile, key, search, &wt, locale,
+                )?;
+            prepared.push((
+                spec,
+                command,
+                parser,
+                parse_fn,
+                wt,
+                granularity,
+                stdin_prompt,
+            ));
         }
     }
     Ok(prepared)
@@ -940,7 +951,7 @@ pub fn start_team_run(
     // 全失败分支 / spawn_member 后台 reader 线程），guard 不再需要兜底，disarm 防止函数返回时
     // Drop 把仍在跑的槽提前释放掉。
     slot_guard.disarm();
-    for (spec, command, parser, parse_fn, wt, granularity) in prepared {
+    for (spec, command, parser, parse_fn, wt, granularity, stdin_prompt) in prepared {
         if let Err(e) = spawn_member(
             app.clone(),
             team_running.inner().clone(),
@@ -950,6 +961,7 @@ pub fn start_team_run(
             spec.clone(),
             wt,
             command,
+            stdin_prompt,
             parser,
             parse_fn,
             granularity,
@@ -1448,26 +1460,18 @@ pub(crate) fn persist_member_result_message(
     result: &MemberResult,
 ) -> rusqlite::Result<bool> {
     let report = render_member_result_report(agent_name, result);
-    let inserted = crate::db::append_message_dedup_and_publish(
+    crate::db::persist_member_report_atomic(
         conn,
         session_id,
-        "assistant",
         &[crate::db::Block::Text {
             text: report.clone(),
         }],
-        Some("agent-team"),
         Some(agent_id),
         Some(agent_name),
         &member_result_dedup_key(run_id, &result.assignment_id),
-    )?;
-    crate::db::update_dispatch_card_terminal(
-        conn,
-        session_id,
-        &result.assignment_id,
-        &result.status,
-        &report,
-    )?;
-    Ok(inserted)
+        Some(&result.assignment_id),
+        Some((&result.status, &report)),
+    )
 }
 
 fn persist_member_failure_message(
@@ -1486,26 +1490,18 @@ fn persist_member_failure_message(
         None,
         &[],
     );
-    let inserted = crate::db::append_message_dedup_and_publish(
+    crate::db::persist_member_report_atomic(
         conn,
         session_id,
-        "assistant",
         &[crate::db::Block::Text {
             text: report.clone(),
         }],
-        Some("agent-team"),
         Some(&spec.agent_id),
         Some(&spec.agent_name),
         &member_result_dedup_key(run_id, &spec.assignment_id),
-    )?;
-    crate::db::update_dispatch_card_terminal(
-        conn,
-        session_id,
-        &spec.assignment_id,
-        "failed",
-        &report,
-    )?;
-    Ok(inserted)
+        Some(&spec.assignment_id),
+        Some(("failed", &report)),
+    )
 }
 
 fn persist_member_setup_failure_message(
@@ -1524,26 +1520,18 @@ fn persist_member_setup_failure_message(
         None,
         &[],
     );
-    let inserted = crate::db::append_message_dedup_and_publish(
+    crate::db::persist_member_report_atomic(
         conn,
         session_id,
-        "assistant",
         &[crate::db::Block::Text {
             text: report.clone(),
         }],
-        Some("agent-team"),
         Some(&spec.agent_id),
         Some(&spec.agent_name),
         &member_result_setup_failed_dedup_key(run_id, &spec.assignment_id),
-    )?;
-    crate::db::update_dispatch_card_terminal(
-        conn,
-        session_id,
-        &spec.assignment_id,
-        "failed",
-        &report,
-    )?;
-    Ok(inserted)
+        Some(&spec.assignment_id),
+        Some(("failed", &report)),
+    )
 }
 
 fn log_member_run_side_effect_failure(
@@ -2308,6 +2296,7 @@ fn run_member_reader_for_locale(
     run_member_reader_for_locale_with_watchdog(
         child,
         None,
+        None,
         hook_guard,
         tr,
         key,
@@ -2329,6 +2318,7 @@ fn run_member_reader_for_locale(
 fn run_member_reader_for_locale_with_watchdog(
     mut child: Child,
     mut retry_command: Option<&mut Command>,
+    retry_stdin_prompt: Option<&crate::agent::StdinPrompt>,
     hook_guard: Option<crate::checkpoint_hook::HookRunGuard>,
     tr: &TeamRunning,
     key: &MemberKey,
@@ -2387,7 +2377,7 @@ fn run_member_reader_for_locale_with_watchdog(
             350 * u64::from(retry_count),
         ));
         attempt_watchdog = MemberFirstEventWatchdog::for_command(parse_fn, command, spec);
-        match command.spawn() {
+        match crate::agent::spawn_with_stdin_prompt(command, retry_stdin_prompt) {
             Ok(mut retry_child) => {
                 let retry_pid = retry_child.id();
                 if tr.register_auth_retry(key, current_pid, retry_pid) {
@@ -2752,6 +2742,7 @@ pub(crate) fn run_single_worker_inner(
         run_id,
         spec,
         command,
+        None,
         parser,
         None,
         crate::Locale::Zh,
@@ -2770,6 +2761,7 @@ fn run_single_worker_inner_for_locale(
     run_id: &str,
     spec: MemberSpec,
     mut command: std::process::Command,
+    stdin_prompt: Option<crate::agent::StdinPrompt>,
     parser: fn(&str) -> Vec<AgentEvent>,
     parse_fn: Option<crate::agent::ParseFn>,
     locale: crate::Locale,
@@ -2782,15 +2774,13 @@ fn run_single_worker_inner_for_locale(
     let hook_guard = crate::checkpoint_hook::guard_for_command(&command);
     command.stderr(Stdio::piped());
     command.stdout(Stdio::piped());
-    command.stdin(Stdio::null());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
     let first_event_watchdog = MemberFirstEventWatchdog::for_command(parse_fn, &command, &spec);
-    let child = command
-        .spawn()
+    let child = crate::agent::spawn_with_stdin_prompt(&mut command, stdin_prompt.as_ref())
         .map_err(|e| crate::ui_msg::al_err("member.spawnFailed", &[("detail", e.to_string())]))?;
     let pid = child.id();
     let key = MemberKey::new(session_id, run_id, &spec.assignment_id);
@@ -2812,6 +2802,7 @@ fn run_single_worker_inner_for_locale(
         run_member_reader_for_locale_with_watchdog(
             child,
             Some(&mut command),
+            stdin_prompt.as_ref(),
             hook_guard,
             tr,
             &key,
@@ -3041,7 +3032,7 @@ fn prepare_single_worker(
     let stage1_snapshot =
         stage1_phase1.and_then(|phase1| stage1_snapshot_phase2(phase1, session_id));
 
-    let (command, parser, parse_fn, granularity) = {
+    let (command, parser, parse_fn, granularity, stdin_prompt) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         crate::build_member_command_with(
             &conn, session_id, run_id, &spec, &profile, key, search, &wt, locale,
@@ -3055,6 +3046,7 @@ fn prepare_single_worker(
         wt,
         granularity,
         stage1_snapshot,
+        stdin_prompt,
     ))
 }
 
@@ -3090,42 +3082,43 @@ pub fn run_single_worker(
         prompt: task_pack,
     };
     let prepared = prepare_single_worker(db, session_id, run_id, member, &fallback_spec, locale);
-    let (spec, command, parser, parse_fn, wt, granularity, stage1_snapshot) = match prepared {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            if emit_events {
-                emit_single_worker_setup_failure_best_effort(
-                    session_id,
-                    run_id,
-                    &fallback_spec,
-                    TextGranularity::Token,
-                    &error,
-                );
-            }
-            return Err(finish_single_worker_setup_failure(
-                session_id,
-                run_id,
-                &fallback_spec,
-                error,
-                |reason| {
-                    let conn = db.0.lock().map_err(|e| e.to_string())?;
-                    persist_member_failure_message(
-                        &conn,
+    let (spec, command, parser, parse_fn, wt, granularity, stage1_snapshot, stdin_prompt) =
+        match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if emit_events {
+                    emit_single_worker_setup_failure_best_effort(
                         session_id,
                         run_id,
                         &fallback_spec,
-                        reason,
-                    )
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-                },
-                || {
-                    let conn = db.0.lock().map_err(|e| e.to_string())?;
-                    finalize_team_run(&conn, session_id, run_id).map_err(|e| e.to_string())
-                },
-            ));
-        }
-    };
+                        TextGranularity::Token,
+                        &error,
+                    );
+                }
+                return Err(finish_single_worker_setup_failure(
+                    session_id,
+                    run_id,
+                    &fallback_spec,
+                    error,
+                    |reason| {
+                        let conn = db.0.lock().map_err(|e| e.to_string())?;
+                        persist_member_failure_message(
+                            &conn,
+                            session_id,
+                            run_id,
+                            &fallback_spec,
+                            reason,
+                        )
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                    },
+                    || {
+                        let conn = db.0.lock().map_err(|e| e.to_string())?;
+                        finalize_team_run(&conn, session_id, run_id).map_err(|e| e.to_string())
+                    },
+                ));
+            }
+        };
 
     let stage1_snapshot = match stage1_snapshot {
         Ok(stage1_snapshot) => stage1_snapshot,
@@ -3215,6 +3208,7 @@ pub fn run_single_worker(
                 run_id,
                 spec.clone(),
                 command,
+                stdin_prompt,
                 parser,
                 Some(parse_fn),
                 crate::current_locale(app),
@@ -3294,6 +3288,7 @@ pub fn spawn_member(
     spec: MemberSpec,
     wt: std::path::PathBuf,
     mut command: Command,
+    stdin_prompt: Option<crate::agent::StdinPrompt>,
     parser: fn(&str) -> Vec<AgentEvent>,
     parse_fn: crate::agent::ParseFn,
     granularity: TextGranularity,
@@ -3311,7 +3306,8 @@ pub fn spawn_member(
     }
     let first_event_watchdog =
         MemberFirstEventWatchdog::for_command(Some(parse_fn), &command, &spec);
-    let child = match command.stdin(Stdio::null()).stdout(Stdio::piped()).spawn() {
+    command.stdout(Stdio::piped());
+    let child = match crate::agent::spawn_with_stdin_prompt(&mut command, stdin_prompt.as_ref()) {
         Ok(child) => child,
         Err(error) => {
             let (open_meta, open_event) = member_open_event(&run_id, &spec);
@@ -3351,6 +3347,7 @@ pub fn spawn_member(
         let run_done = run_member_reader_for_locale_with_watchdog(
             child,
             Some(&mut command),
+            stdin_prompt.as_ref(),
             hook_guard,
             &tr,
             &key,
@@ -3457,6 +3454,30 @@ mod tests {
             }
         }
         panic!("{label}: {fn_needle:?} 的函数体没扫到匹配的收尾 `}}`，测试的切片标记可能已经过期");
+    }
+
+    fn extract_call<'a>(text: &'a str, call_needle: &str, label: &str) -> &'a str {
+        let start = text.find(call_needle).unwrap_or_else(|| {
+            panic!("{label}: 源码里没找到调用 {call_needle:?}，测试的切片标记可能已经过期")
+        });
+        let from_call = &text[start..];
+        let open_rel = from_call
+            .find('(')
+            .unwrap_or_else(|| panic!("{label}: {call_needle:?} 后面没找到调用参数开头"));
+        let mut depth: i32 = 0;
+        for (i, c) in from_call[open_rel..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &from_call[..open_rel + i + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{label}: {call_needle:?} 的调用没扫到匹配的收尾 `)`，测试的切片标记可能已经过期");
     }
 
     fn assert_lock_scope_closed_before_marker(
@@ -4329,7 +4350,7 @@ fi"#,
         .unwrap();
 
         assert_eq!(prepared.len(), 2);
-        for (spec, command, _parser, _parse_fn, wt, _granularity) in &prepared {
+        for (spec, command, _parser, _parse_fn, wt, _granularity, _stdin_prompt) in &prepared {
             assert_eq!(
                 wt, &project,
                 "in-place 会话下所有 member 应共用同一项目路径"
@@ -4396,7 +4417,9 @@ fi"#,
         .unwrap();
 
         assert_eq!(prepared.len(), 3);
-        for (idx, (spec, _cmd, _parser, _parse_fn, _wt, _gran)) in prepared.iter().enumerate() {
+        for (idx, (spec, _cmd, _parser, _parse_fn, _wt, _gran, _stdin_prompt)) in
+            prepared.iter().enumerate()
+        {
             assert_eq!(spec.agent_id, format!("m-{}", idx + 1));
             assert_eq!(spec.agent_name, format!("member-name-{idx}"));
         }
@@ -4497,7 +4520,7 @@ fi"#,
             prompt: "任意占位".into(),
         };
 
-        let (spec, command, _parser, _parse_fn, wt, _granularity, stage1_snapshot) =
+        let (spec, command, _parser, _parse_fn, wt, _granularity, stage1_snapshot, _stdin_prompt) =
             prepare_single_worker(
                 &db,
                 "s-single",
@@ -4657,14 +4680,14 @@ fi"#,
     #[test]
     fn task_pack_non_empty_goal_is_byte_identical_zh() {
         let pack = build_task_pack("总目标", "子任务", &[], &[], crate::Locale::Zh);
-        let expected = "## 总目标\n总目标\n\n## 你的子任务\n子任务\n\n## 文件范围（≤3 文件为默认非硬规则）\n- （未指定·按子任务自行判断）\n\n## 验收\n- （本子任务无显式验收条目）\n\n\n## 工程纪律\n- 只修改任务点名的文件；别顺手重构或改动任务范围外的代码。\n- 严禁全局格式化（如 `cargo fmt` 不带参数、`prettier --write .`）——只格式化你亲手改的文件。\n- 严禁用 `git stash` / `git restore` / `git checkout --` 回滚不是你本次创建的改动——工作区里可能有前序 worker 的成果。\n- 如果你产出/生成了希望用户在聊天里直接看到的图片文件（截图、图表等），汇报时用 Markdown 内联图片语法 `![](图片绝对路径)` 引用；只写裸路径不会内联显示。\n- 本会话可能跑在 AgentLoom 外层 macOS 沙箱内（系统禁止嵌套沙箱）：如需派 codex 子进程，勿用 `--sandbox workspace-write`（会以 sandbox_apply: Operation not permitted / exit 71 失败），改用 `--dangerously-bypass-approvals-and-sandbox`——该子进程与你安全地位相同，须遵守与你相同的工作区纪律；外层沙箱仍会阻止写入 AgentLoom 自身状态目录。\n\n产出与汇报的语言跟随上面「总目标」的自然语言：总目标中文则中文、英文则英文；代码、命令、文件名、路径保持原样。";
+        let expected = "## 总目标\n总目标\n\n## 你的子任务\n子任务\n\n## 文件范围（≤3 文件为默认非硬规则）\n- （未指定·按子任务自行判断）\n\n## 验收\n- （本子任务无显式验收条目）\n\n\n## 工程纪律\n- 只修改任务点名的文件；别顺手重构或改动任务范围外的代码。\n- 严禁全局格式化（如 `cargo fmt` 不带参数、`prettier --write .`）——只格式化你亲手改的文件。\n- 严禁用 `git stash` / `git restore` / `git checkout --` 回滚不是你本次创建的改动——工作区里可能有前序 worker 的成果。\n- 如果你产出/生成了希望用户在聊天里直接看到的图片文件（截图、图表等），汇报时用 Markdown 内联图片语法 `![](图片绝对路径)` 引用；只写裸路径不会内联显示。路径含空格时须用尖括号包裹：`![](</path/with space.png>)`。\n- 本会话可能跑在 AgentLoom 外层 macOS 沙箱内（系统禁止嵌套沙箱）：如需派 codex 子进程，勿用 `--sandbox workspace-write`（会以 sandbox_apply: Operation not permitted / exit 71 失败），改用 `--dangerously-bypass-approvals-and-sandbox`——该子进程与你安全地位相同，须遵守与你相同的工作区纪律；外层沙箱仍会阻止写入 AgentLoom 自身状态目录。\n\n产出与汇报的语言跟随上面「总目标」的自然语言：总目标中文则中文、英文则英文；代码、命令、文件名、路径保持原样。";
         assert_eq!(pack, expected);
     }
 
     #[test]
     fn task_pack_non_empty_goal_is_byte_identical_en() {
         let pack = build_task_pack("goal", "subtask", &[], &[], crate::Locale::En);
-        let expected = "## Goal\ngoal\n\n## Your Subtask\nsubtask\n\n## File Scope (≤3 files, a default not a hard rule)\n- (Not specified; determine based on the subtask)\n\n## Acceptance\n- (No explicit acceptance criteria for this subtask)\n\n\n## Engineering Discipline\n- Only touch the files this task names; don't drive-by refactor or edit code outside its scope.\n- No global formatting (e.g. bare `cargo fmt`, `prettier --write .`) — only format the files you personally changed.\n- Never use `git stash` / `git restore` / `git checkout --` to roll back changes you didn't create this run — the workspace may hold prior workers' work.\n- If you produce or generate an image file (such as a screenshot or chart) that you want the user to see directly in chat, reference it in your report with the Markdown inline image syntax `![](absolute image path)`; a bare path will not display inline.\n- This session may be running inside AgentLoom's outer macOS sandbox (nested sandboxes are disallowed): if you spawn a codex subprocess, don't use `--sandbox workspace-write` (fails with sandbox_apply: Operation not permitted / exit 71) — use `--dangerously-bypass-approvals-and-sandbox` instead. That child has the same security standing as you and must follow the same workspace discipline; the outer sandbox still blocks writes to AgentLoom's own state directories.\n\nWrite your output and report in the language of the goal above: a Chinese goal gets Chinese, an English goal gets English; keep code, commands, file names, and paths as-is.";
+        let expected = "## Goal\ngoal\n\n## Your Subtask\nsubtask\n\n## File Scope (≤3 files, a default not a hard rule)\n- (Not specified; determine based on the subtask)\n\n## Acceptance\n- (No explicit acceptance criteria for this subtask)\n\n\n## Engineering Discipline\n- Only touch the files this task names; don't drive-by refactor or edit code outside its scope.\n- No global formatting (e.g. bare `cargo fmt`, `prettier --write .`) — only format the files you personally changed.\n- Never use `git stash` / `git restore` / `git checkout --` to roll back changes you didn't create this run — the workspace may hold prior workers' work.\n- If you produce or generate an image file (such as a screenshot or chart) that you want the user to see directly in chat, reference it in your report with the Markdown inline image syntax `![](absolute image path)`; a bare path will not display inline. If the path contains spaces, wrap it in angle brackets: `![](</path/with space.png>)`.\n- This session may be running inside AgentLoom's outer macOS sandbox (nested sandboxes are disallowed): if you spawn a codex subprocess, don't use `--sandbox workspace-write` (fails with sandbox_apply: Operation not permitted / exit 71) — use `--dangerously-bypass-approvals-and-sandbox` instead. That child has the same security standing as you and must follow the same workspace discipline; the outer sandbox still blocks writes to AgentLoom's own state directories.\n\nWrite your output and report in the language of the goal above: a Chinese goal gets Chinese, an English goal gets English; keep code, commands, file names, and paths as-is.";
         assert_eq!(pack, expected);
     }
 
@@ -5868,6 +5891,290 @@ fi"#,
         }
     }
 
+    fn assert_member_report_delivery_pending(
+        conn: &Connection,
+        session_id: &str,
+        assignment_id: &str,
+    ) {
+        let pending: (String, Option<i64>) = conn
+            .query_row(
+                "SELECT assignment_id, delivered_at
+                   FROM member_report_delivery
+                  WHERE session_id = ?1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pending, (assignment_id.to_string(), None));
+    }
+
+    #[test]
+    fn member_report_delivery_normal_result_branch_creates_pending_row() {
+        let conn = crate::test_support::mem_db();
+        let mut branch_spec = spec();
+        branch_spec.assignment_id = "assignment-normal".into();
+        let mut result = ledger_result("done", "normal result");
+        result.assignment_id = branch_spec.assignment_id.clone();
+
+        run_single_worker_lifecycle(
+            &TeamRunning::default(),
+            "member-report-delivery-normal",
+            "run-normal",
+            &branch_spec,
+            || Ok(()),
+            |()| Ok(result),
+            |result| {
+                persist_member_result_message(
+                    &conn,
+                    "member-report-delivery-normal",
+                    "run-normal",
+                    &branch_spec.agent_id,
+                    &branch_spec.agent_name,
+                    result,
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            },
+            |_: &str| Ok(()),
+            |_: &str| Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_member_report_delivery_pending(
+            &conn,
+            "member-report-delivery-normal",
+            &branch_spec.assignment_id,
+        );
+    }
+
+    #[test]
+    fn member_report_delivery_lifecycle_failure_branch_creates_pending_row() {
+        let conn = crate::test_support::mem_db();
+        let mut branch_spec = spec();
+        branch_spec.assignment_id = "assignment-lifecycle-failure".into();
+
+        run_single_worker_lifecycle(
+            &TeamRunning::default(),
+            "member-report-delivery-lifecycle-failure",
+            "run-lifecycle-failure",
+            &branch_spec,
+            || Ok(()),
+            |()| Err("worker lifecycle failure".to_string()),
+            |_: &MemberResult| Ok(()),
+            |_: &str| Ok(()),
+            |reason| {
+                persist_member_failure_message(
+                    &conn,
+                    "member-report-delivery-lifecycle-failure",
+                    "run-lifecycle-failure",
+                    &branch_spec,
+                    reason,
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        assert_member_report_delivery_pending(
+            &conn,
+            "member-report-delivery-lifecycle-failure",
+            &branch_spec.assignment_id,
+        );
+    }
+
+    #[test]
+    fn member_report_delivery_setup_failure_branch_creates_pending_row() {
+        let conn = crate::test_support::mem_db();
+        let mut branch_spec = spec();
+        branch_spec.assignment_id = "assignment-setup-failure".into();
+
+        run_single_worker_lifecycle(
+            &TeamRunning::default(),
+            "member-report-delivery-setup-failure",
+            "run-setup-failure",
+            &branch_spec,
+            || Err::<(), _>("setup failure".to_string()),
+            |()| unreachable!("setup failure must not run the worker"),
+            |_: &MemberResult| Ok(()),
+            |reason| {
+                persist_member_setup_failure_message(
+                    &conn,
+                    "member-report-delivery-setup-failure",
+                    "run-setup-failure",
+                    &branch_spec,
+                    reason,
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            },
+            |_: &str| Ok(()),
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        assert_member_report_delivery_pending(
+            &conn,
+            "member-report-delivery-setup-failure",
+            &branch_spec.assignment_id,
+        );
+    }
+
+    #[test]
+    fn member_report_delivery_pre_setup_prepare_failure_branch_creates_pending_row() {
+        let conn = crate::test_support::mem_db();
+        let mut branch_spec = spec();
+        branch_spec.assignment_id = "assignment-pre-setup-prepare".into();
+
+        let error = finish_single_worker_setup_failure(
+            "member-report-delivery-pre-setup-prepare",
+            "run-pre-setup-prepare",
+            &branch_spec,
+            "prepare_single_worker failure".to_string(),
+            |reason| {
+                persist_member_failure_message(
+                    &conn,
+                    "member-report-delivery-pre-setup-prepare",
+                    "run-pre-setup-prepare",
+                    &branch_spec,
+                    reason,
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            },
+            || Ok(()),
+        );
+        assert_eq!(error, "prepare_single_worker failure");
+        assert_member_report_delivery_pending(
+            &conn,
+            "member-report-delivery-pre-setup-prepare",
+            &branch_spec.assignment_id,
+        );
+    }
+
+    #[test]
+    fn member_report_delivery_pre_setup_snapshot_failure_branch_creates_pending_row() {
+        let conn = crate::test_support::mem_db();
+        let mut branch_spec = spec();
+        branch_spec.assignment_id = "assignment-pre-setup-snapshot".into();
+
+        let error = finish_single_worker_setup_failure(
+            "member-report-delivery-pre-setup-snapshot",
+            "run-pre-setup-snapshot",
+            &branch_spec,
+            "stage1 snapshot failure".to_string(),
+            |reason| {
+                persist_member_failure_message(
+                    &conn,
+                    "member-report-delivery-pre-setup-snapshot",
+                    "run-pre-setup-snapshot",
+                    &branch_spec,
+                    reason,
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            },
+            || Ok(()),
+        );
+        assert_eq!(error, "stage1 snapshot failure");
+        assert_member_report_delivery_pending(
+            &conn,
+            "member-report-delivery-pre-setup-snapshot",
+            &branch_spec.assignment_id,
+        );
+    }
+
+    #[test]
+    fn member_report_delivery_production_wiring_uses_atomic_family_for_all_five_branches() {
+        let source = include_str!("member_runner.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production source slice");
+        let stripped = strip_comments_and_strings(production);
+        let run_body = extract_fn_body(
+            &stripped,
+            "pub fn run_single_worker(",
+            "run_single_worker member report wiring",
+        );
+
+        let lifecycle_call = extract_call(
+            run_body,
+            "run_single_worker_lifecycle(",
+            "run_single_worker lifecycle wiring",
+        );
+        for (helper, label) in [
+            ("persist_member_result_message(", "正常结果"),
+            (
+                "persist_member_setup_failure_message(",
+                "普通 setup failure",
+            ),
+            ("persist_member_failure_message(", "普通 lifecycle failure"),
+        ] {
+            assert_eq!(
+                lifecycle_call.matches(helper).count(),
+                1,
+                "{label} 生产闭包必须恰好接到 {helper}"
+            );
+        }
+
+        let finish_needle = "finish_single_worker_setup_failure(";
+        let mut finish_cursor = 0;
+        let mut finish_call_count = 0;
+        while let Some(rel) = run_body[finish_cursor..].find(finish_needle) {
+            let start = finish_cursor + rel;
+            let call = extract_call(
+                &run_body[start..],
+                finish_needle,
+                "pre-setup failure production wiring",
+            );
+            assert_eq!(
+                call.matches("persist_member_failure_message(").count(),
+                1,
+                "每条 pre-setup 真实调用点都必须把落账闭包接到 persist_member_failure_message"
+            );
+            finish_call_count += 1;
+            finish_cursor = start + call.len();
+        }
+        assert_eq!(
+            finish_call_count, 2,
+            "prepare_single_worker 与 stage1 snapshot 两条 pre-setup 早退必须各保留一个真实调用点"
+        );
+
+        for (fn_needle, label) in [
+            (
+                "pub(crate) fn persist_member_result_message(",
+                "persist_member_result_message",
+            ),
+            (
+                "fn persist_member_failure_message(",
+                "persist_member_failure_message",
+            ),
+            (
+                "fn persist_member_setup_failure_message(",
+                "persist_member_setup_failure_message",
+            ),
+        ] {
+            let body = extract_fn_body(&stripped, fn_needle, label);
+            assert_eq!(
+                body.matches("crate::db::persist_member_report_atomic(")
+                    .count(),
+                1,
+                "{label} 必须恰好一次落到原子 report helper"
+            );
+            assert!(
+                !body.contains("append_message_dedup_and_publish("),
+                "{label} 不得退回旧的非原子 publish 路径"
+            );
+        }
+        assert!(
+            !run_body.contains("append_message_dedup_and_publish("),
+            "run_single_worker 的 [Worker report] 生产接线不得直接调用旧 helper"
+        );
+    }
+
     #[test]
     fn member_result_ledger_deduplicates_same_dispatch() {
         let conn = crate::test_support::mem_db();
@@ -6443,6 +6750,7 @@ fi"#,
             child,
             None,
             None,
+            None,
             &tr,
             &key,
             "run1",
@@ -6485,6 +6793,7 @@ fi"#,
             child,
             None,
             None,
+            None,
             &tr,
             &key,
             "run1",
@@ -6522,6 +6831,7 @@ fi"#,
         let mut emitted = Vec::new();
         run_member_reader_for_locale_with_watchdog(
             child,
+            None,
             None,
             None,
             &tr,
@@ -9127,6 +9437,99 @@ fi"#,
             result.changed_files
         );
         assert_eq!(result.status, "done");
+    }
+
+    /// stdin 刀 P1-2 接缝覆盖：`run_single_worker_inner`（测试壳）硬写 `stdin_prompt = None`，
+    /// build 端（argv 断言）与帮手端（`spawn_with_stdin_prompt_writes_full_payload_without_deadlock`
+    /// 用 `cat` 直调帮手）两头都有测试，唯独中间这段真实 wiring——`run_single_worker_inner_for_locale`
+    /// 把调用方传入的 `stdin_prompt: Some(payload)` 原样送到 `spawn_with_stdin_prompt`、payload
+    /// 逐字节送达子进程 stdin——从未被跑过。这里直接调用生产函数
+    /// `run_single_worker_inner_for_locale`（本文件私有 fn，非测试专属分支），走真实调用路径而非
+    /// 降档到只读 `stdin_prompt` 字段：用假 CLI（`cat`）把收到的 stdin 原样写进一个临时文件，跑完后
+    /// 比对文件内容与送入的 payload 是否逐字节相同。
+    #[test]
+    fn run_single_worker_inner_for_locale_delivers_stdin_prompt_payload_to_child_stdin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(tmp.path())
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(tmp.path().join("a.txt"), "base\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-qm", "base"]);
+
+        let received_stdin = tmp.path().join("received-stdin.txt");
+        let payload_text = format!(
+            "超长 prompt 正文占位·换行\n第二行·unicode 校验 ✅\n{}",
+            "z".repeat(4096)
+        );
+        let payload = crate::agent::StdinPrompt::from(payload_text.as_str());
+
+        // 用 `cat > "$1"` 把整段 stdin 原样落盘，再 printf 一行给 parser 当 Completed 事件的触发信号
+        // ——`$1` 而非把路径拼进脚本字符串字面量，避免临时目录路径需要 shell 转义。
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "cat > \"$1\"; printf 'x\\n'",
+            "_",
+            received_stdin.to_str().unwrap(),
+        ]);
+
+        fn parser(_: &str) -> Vec<AgentEvent> {
+            vec![AgentEvent::Completed {
+                cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                final_text: Some("worker done".into()),
+                result: None,
+                run_id: None,
+                commit_sha: None,
+                files_changed: None,
+                insertions: None,
+                deletions: None,
+                interrupted: None,
+            }]
+        }
+
+        let tr = TeamRunning::default();
+        tr.init_run("run1", 1);
+        let mut emitted: Vec<(DispatchMeta, AgentEvent)> = Vec::new();
+
+        let base_sha = crate::worktree::rev_parse_head(tmp.path()).unwrap_or_default();
+        let result = run_single_worker_inner_for_locale(
+            &tr,
+            "s1",
+            "run1",
+            spec(),
+            cmd,
+            Some(payload.clone()),
+            parser,
+            None,
+            crate::Locale::Zh,
+            TextGranularity::Line,
+            tmp.path().to_path_buf(),
+            base_sha,
+            &mut |d, e| emitted.push((d, e)),
+            None,
+        )
+        .expect("run_single_worker_inner_for_locale 应成功");
+        assert_eq!(result.status, "done");
+
+        let received = std::fs::read_to_string(&received_stdin)
+            .expect("子进程应已把收到的 stdin 落盘到 received_stdin");
+        assert_eq!(
+            received, payload_text,
+            "子进程 stdin 收到的正文必须与 spawn 前送入 spawn_with_stdin_prompt 的 payload 逐字节相同\
+             ——这条断言若红说明 wiring 链路（build 端 payload → run_single_worker_inner_for_locale →\
+             spawn_with_stdin_prompt）某处丢字节/截断/没送到"
+        );
     }
 
     #[test]

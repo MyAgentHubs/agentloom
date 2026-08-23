@@ -1010,6 +1010,194 @@ describe("SettingsRemoteControl", () => {
       expect(deviceListCalls).toBe(2);
     });
   });
+
+  it("A1：常显当前伺服项目名，不依赖下拉框选中态", async () => {
+    render(<SettingsRemoteControl currentRepoId="repo-1" />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("remote-control-current-serving-value"),
+      ).toHaveTextContent("Repo One"),
+    );
+  });
+
+  it("A2：伺服项目与 app 当前项目不一致时展示提示，点击一键切换调用 remote_set_active_project", async () => {
+    let activeRepoIdOnBackend: string | null = "repo-1";
+    invokeMock.mockImplementation(async (cmd: string, args?: any) => {
+      if (cmd === "remote_control_get_settings") {
+        return {
+          enabled: true,
+          relay_url: "wss://relay.example.com",
+          active_repo_id: activeRepoIdOnBackend,
+        };
+      }
+      if (cmd === "list_repos") return [repoOne, repoTwo];
+      if (cmd === "remote_devices_list") return [activeDevice];
+      if (cmd === "remote_gateway_status") return gatewayStatus;
+      if (cmd === "remote_set_active_project") {
+        activeRepoIdOnBackend = (args?.repoId as string | null) ?? null;
+        return undefined;
+      }
+      return undefined;
+    });
+
+    render(<SettingsRemoteControl currentRepoId="repo-2" />);
+
+    expect(
+      await screen.findByText(
+        "远程控制正在伺服「Repo One」，你当前在「Repo Two」。",
+      ),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "切换为当前项目" }));
+
+    expect(invokeMock).toHaveBeenCalledWith("remote_set_active_project", {
+      repoId: "repo-2",
+    });
+    await waitFor(() =>
+      expect(
+        screen.queryByText(
+          "远程控制正在伺服「Repo One」，你当前在「Repo Two」。",
+        ),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("A2：伺服项目与当前项目一致时不展示不一致提示", async () => {
+    render(<SettingsRemoteControl currentRepoId="repo-1" />);
+
+    await screen.findByTestId("remote-control-current-serving-value");
+    expect(
+      screen.queryByRole("button", { name: "切换为当前项目" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("A2：未传 currentRepoId（如默认 session 无关联项目）时不展示不一致提示", async () => {
+    render(<SettingsRemoteControl currentRepoId={null} />);
+
+    await screen.findByTestId("remote-control-current-serving-value");
+    expect(
+      screen.queryByRole("button", { name: "切换为当前项目" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("B1：开启远程控制时若伺服项目未设置，自动默认为 app 当前活跃项目", async () => {
+    let activeRepoIdOnBackend: string | null = null;
+    invokeMock.mockImplementation(async (cmd: string, args?: any) => {
+      if (cmd === "remote_control_get_settings") {
+        return {
+          enabled: false,
+          relay_url: "wss://relay.example.com",
+          active_repo_id: activeRepoIdOnBackend,
+        };
+      }
+      if (cmd === "list_repos") return [repoOne, repoTwo];
+      if (cmd === "remote_devices_list") return [activeDevice];
+      if (cmd === "remote_gateway_status") return gatewayStatus;
+      if (cmd === "remote_control_set_settings") return undefined;
+      if (cmd === "remote_set_active_project") {
+        activeRepoIdOnBackend = (args?.repoId as string | null) ?? null;
+        return undefined;
+      }
+      return undefined;
+    });
+
+    render(<SettingsRemoteControl currentRepoId="repo-2" />);
+
+    const toggle = await screen.findByRole("switch", {
+      name: "允许手机远程控制",
+    });
+    await waitFor(() =>
+      expect(toggle).toHaveAttribute("aria-checked", "false"),
+    );
+
+    fireEvent.click(toggle);
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("remote_set_active_project", {
+        repoId: "repo-2",
+      }),
+    );
+    // B2 的反例：从「未设置」首次带出项目没有旧房间可断，不该弹出重新扫码提示。
+    expect(
+      screen.queryByText(
+        "伺服项目已切换，房间也随之变了——手机端需要重新扫码才能连接。",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("B1：开启远程控制时若伺服项目已设置（哪怕与当前项目不同），不自动改写", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_control_get_settings") {
+        return {
+          enabled: false,
+          relay_url: "wss://relay.example.com",
+          active_repo_id: "repo-1",
+        };
+      }
+      if (cmd === "list_repos") return [repoOne, repoTwo];
+      if (cmd === "remote_devices_list") return [activeDevice];
+      if (cmd === "remote_gateway_status") return gatewayStatus;
+      if (cmd === "remote_control_set_settings") return undefined;
+      return undefined;
+    });
+
+    render(<SettingsRemoteControl currentRepoId="repo-2" />);
+
+    const toggle = await screen.findByRole("switch", {
+      name: "允许手机远程控制",
+    });
+    await waitFor(() =>
+      expect(toggle).toHaveAttribute("aria-checked", "false"),
+    );
+
+    fireEvent.click(toggle);
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("remote_control_set_settings", {
+        enabled: true,
+        relayUrl: "wss://relay.example.com",
+      }),
+    );
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "remote_set_active_project",
+      expect.anything(),
+    );
+    expect(
+      await screen.findByText(
+        "远程控制正在伺服「Repo One」，你当前在「Repo Two」。",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("B2：切换伺服项目成功后常显重新扫码提示，可关闭", async () => {
+    // beforeEach 默认 mock：active_repo_id 已是 "repo-1"——切到 repo-2 属于「已设置项目间切换」。
+    render(<SettingsRemoteControl currentRepoId="repo-2" />);
+    const select = await screen.findByLabelText("活跃项目");
+    await waitFor(() => expect(select).toHaveValue("repo-1"));
+
+    expect(
+      screen.queryByText(
+        "伺服项目已切换，房间也随之变了——手机端需要重新扫码才能连接。",
+      ),
+    ).not.toBeInTheDocument();
+
+    fireEvent.change(select, { target: { value: "repo-2" } });
+
+    expect(
+      await screen.findByText(
+        "伺服项目已切换，房间也随之变了——手机端需要重新扫码才能连接。",
+      ),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "知道了" }));
+
+    expect(
+      screen.queryByText(
+        "伺服项目已切换，房间也随之变了——手机端需要重新扫码才能连接。",
+      ),
+    ).not.toBeInTheDocument();
+  });
 });
 
 // P0-a1：QR 出码纯函数——独立于组件渲染直接测，覆盖 spec 钉死的形状/派生/校验/上限规则。

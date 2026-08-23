@@ -7,10 +7,15 @@ import {
   type ReactNode,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { UrlTransform } from "react-markdown";
 import { useI18n } from "../i18n";
 import { renderBackendError } from "../lib/backendMsg";
 import { useMarkdownLib } from "../lib/useMarkdown";
 import { CodeBlock } from "./CodeBlock";
+import {
+  localImageMarkdownComponent,
+  makeImgOnlyUrlTransform,
+} from "./localMarkdownImage";
 
 type ProjectFileEntry = {
   path: string;
@@ -66,6 +71,35 @@ function preferredFile(entries: ProjectFileEntry[]): string | null {
 
 function pathParts(repoName: string, path: string | null): string[] {
   return [repoName, ...(path ? path.split("/") : [])].filter(Boolean);
+}
+
+const IMG_SRC_SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
+
+// react-markdown 里 `![](src)` 的 src 是相对于「被预览文件所在目录」的（markdown 语义），
+// 但 LocalMarkdownImage / read_attachment 期望的相对路径基准是「会话（或 repo）根目录」——
+// file.path（read_project_file 的返回值）本身就是根相对路径，把 dirname(file.path) 拼到
+// src 前面即可得到根相对路径，不需要文件系统绝对路径。带 scheme（http/https/data/file 等）
+// 与已经是根相对（`/` 开头）的 src 原样放行，交给下游（makeImgOnlyUrlTransform /
+// localImageMarkdownComponent）按既有逻辑处理。
+export function resolvePreviewImageSrc(
+  filePath: string | null,
+  src: string,
+): string {
+  if (!filePath || !src) return src;
+  if (IMG_SRC_SCHEME_RE.test(src) || src.startsWith("/")) return src;
+  const slashIndex = filePath.lastIndexOf("/");
+  const dir = slashIndex === -1 ? "" : filePath.slice(0, slashIndex);
+  const joined = dir ? `${dir}/${src}` : src;
+  const normalized: string[] = [];
+  for (const segment of joined.split("/")) {
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") {
+      normalized.pop();
+      continue;
+    }
+    normalized.push(segment);
+  }
+  return normalized.join("/");
 }
 
 function escapeRegExp(s: string): string {
@@ -190,6 +224,36 @@ export function FilesPanel({ sessionId, repoId = null, repoName }: Props) {
     () => new Set(),
   );
   const findActiveRef = useRef<HTMLElement | null>(null);
+
+  // 预览面板内不需要点开预览/灯箱（本身就在预览面板里），onOpenPreview /
+  // onOpenLightbox 不接，维持 undefined。
+  const previewImgOptsRef = useRef<{ sessionId: string | null }>({
+    sessionId,
+  });
+  previewImgOptsRef.current = { sessionId };
+  const previewImgComponent = useRef(
+    localImageMarkdownComponent(previewImgOptsRef),
+  ).current;
+
+  const filePathRef = useRef<string | null>(null);
+  filePathRef.current = file?.path ?? null;
+
+  const previewUrlTransform = useMemo<UrlTransform | undefined>(() => {
+    if (!markdownLib) return undefined;
+    const withDefault = makeImgOnlyUrlTransform(
+      markdownLib.defaultUrlTransform,
+    );
+    return (url, key, node) => {
+      if (key === "src" && node?.tagName === "img") {
+        return withDefault(
+          resolvePreviewImageSrc(filePathRef.current, url),
+          key,
+          node,
+        );
+      }
+      return withDefault(url, key, node);
+    };
+  }, [markdownLib]);
 
   const source = useMemo(() => {
     if (sessionId) {
@@ -463,7 +527,11 @@ export function FilesPanel({ sessionId, repoId = null, repoName }: Props) {
             ) : showMarkdown ? (
               <div className="files-md">
                 {markdownLib ? (
-                  <markdownLib.Markdown remarkPlugins={[markdownLib.remarkGfm]}>
+                  <markdownLib.Markdown
+                    remarkPlugins={[markdownLib.remarkGfm]}
+                    urlTransform={previewUrlTransform}
+                    components={{ img: previewImgComponent }}
+                  >
                     {file.content}
                   </markdownLib.Markdown>
                 ) : (

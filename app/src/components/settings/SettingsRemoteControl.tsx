@@ -2,10 +2,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import QRCode from "qrcode";
 import type { CSSProperties } from "react";
-import { useI18n } from "../../i18n";
+import { localProjectDisplayName, useI18n } from "../../i18n";
 import { renderBackendError } from "../../lib/backendMsg";
 import { ConfirmDialog } from "../ConfirmDialog";
 import type { RepoMeta } from "../../types/agent";
+
+type SettingsRemoteControlProps = {
+  /** app 当前活跃项目 id（项目切换器同一数据源，App.tsx 的 `activeRepoId`）——
+   *  用于跟 `remote_active_repo_id`（本组件下方伺服哪个项目）比对，检测不一致。
+   *  未传时（如既有测试）视为 null，不展示不一致提示，行为与改动前一致。 */
+  currentRepoId?: string | null;
+};
 
 type RemoteControlSettings = {
   enabled: boolean;
@@ -165,6 +172,54 @@ const styles = {
     color: "var(--ink-3)",
     fontSize: 10.5,
     lineHeight: 1.45,
+  },
+  currentServingRow: {
+    alignItems: "baseline",
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 6,
+  },
+  currentServingLabel: {
+    color: "var(--ink-2)",
+    fontSize: 11,
+    fontWeight: 600,
+  },
+  currentServingValue: {
+    color: "var(--ink)",
+    fontSize: 12.5,
+    fontWeight: 650,
+  },
+  mismatchBanner: {
+    alignItems: "center",
+    border: "1px solid var(--amber)",
+    borderRadius: 7,
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 10,
+    padding: "9px 12px",
+  },
+  mismatchText: {
+    color: "var(--amber-ink)",
+    flex: 1,
+    fontSize: 11.5,
+    lineHeight: 1.5,
+    minWidth: 200,
+  },
+  switchNotice: {
+    alignItems: "center",
+    border: "1px solid var(--amber)",
+    borderRadius: 7,
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 10,
+    padding: "9px 12px",
+  },
+  switchNoticeText: {
+    color: "var(--amber-ink)",
+    flex: 1,
+    fontSize: 11.5,
+    lineHeight: 1.5,
+    minWidth: 200,
   },
   error: {
     color: "var(--red)",
@@ -385,7 +440,9 @@ export function buildPairingQrUrl(
   return url;
 }
 
-export function SettingsRemoteControl() {
+export function SettingsRemoteControl({
+  currentRepoId = null,
+}: SettingsRemoteControlProps = {}) {
   const { locale, t } = useI18n();
   const [enabled, setEnabled] = useState(false);
   const [relayUrl, setRelayUrl] = useState("");
@@ -416,6 +473,9 @@ export function SettingsRemoteControl() {
   const [activeProjectError, setActiveProjectError] = useState<string | null>(
     null,
   );
+  // B2：切换伺服项目成功后常显的「需要重新扫码」提示——本地 state 天然满足「关闭或重新
+  // 进入该页面即消失」（组件卸载重挂载会重置回 false），不需要额外的定时器/持久化。
+  const [switchNotice, setSwitchNotice] = useState(false);
 
   const [pairingStatus, setPairingStatus] =
     useState<RemotePairingStatus | null>(null);
@@ -583,6 +643,11 @@ export function SettingsRemoteControl() {
       });
       if (nextEnabled) {
         startPolling();
+        // B1：开启时若还没设过伺服哪个项目，直接默认带出 app 当前活跃项目——已设置过
+        // （哪怕跟当前项目不一致）不动它，靠下方 A2 的不一致提示引导用户手动切换。
+        if (activeRepoId === null && currentRepoId !== null) {
+          await changeActiveProject(currentRepoId);
+        }
       } else {
         stopPolling();
         setGatewayStoppedReason(null);
@@ -640,6 +705,11 @@ export function SettingsRemoteControl() {
         "remote_control_get_settings",
       );
       setActiveRepoId(settings.active_repo_id ?? null);
+      // B2：只有「从一个已设置的项目切到另一个」才算真正的切换、需要提醒重新扫码——
+      // 从「未设置」首次带出项目（含 B1 开关自动默认）没有旧房间可断，不展示这条提示。
+      if (previousActiveRepoId !== null) {
+        setSwitchNotice(true);
+      }
       await refreshRemoteStatus();
       // DEVLIST 返工·项 2：切活跃项目成功后必须重拉设备列表——后端 remote_devices_list 按
       // active 房过滤（见 lib.rs remote_devices_list_in_conn），不重拉的话旧房的设备行会一直
@@ -796,6 +866,18 @@ export function SettingsRemoteControl() {
   const formatTime = (milliseconds: number) =>
     new Date(milliseconds).toLocaleString(dateLocale);
 
+  // A1/A2：把项目 id 解析成人类可读名——查不到（如设备端尚未拉到 repos）就原样显示 id 兜底。
+  function repoDisplayName(repoId: string | null): string {
+    if (repoId === null) return t("settings.remoteControl.activeProjectUnset");
+    const repo = repos.find((candidate) => candidate.id === repoId);
+    return repo ? localProjectDisplayName(repo, t) : repoId;
+  }
+  const servingProjectName = repoDisplayName(activeRepoId);
+  // A2：只在 app 当前项目「有确定值」时才比对——currentRepoId 为 null（如默认 session
+  // 没关联项目）没有可切换的目标，不展示不一致提示。
+  const hasProjectMismatch =
+    currentRepoId !== null && currentRepoId !== activeRepoId;
+
   return (
     <div style={styles.root}>
       <div className="ob-disc-h" style={styles.header}>
@@ -853,6 +935,40 @@ export function SettingsRemoteControl() {
         </div>
       ) : null}
 
+      <div style={styles.currentServingRow}>
+        <span style={styles.currentServingLabel}>
+          {t("settings.remoteControl.currentServingLabel")}
+        </span>
+        <span
+          data-testid="remote-control-current-serving-value"
+          style={styles.currentServingValue}
+        >
+          {servingProjectName}
+        </span>
+      </div>
+
+      {hasProjectMismatch ? (
+        <div role="status" style={styles.mismatchBanner}>
+          <span style={styles.mismatchText}>
+            {t("settings.remoteControl.projectMismatch", {
+              serving: servingProjectName,
+              current: repoDisplayName(currentRepoId),
+            })}
+          </span>
+          <button
+            type="button"
+            className="ob-btn"
+            disabled={activeProjectSaving}
+            onClick={() => {
+              if (currentRepoId !== null)
+                void changeActiveProject(currentRepoId);
+            }}
+          >
+            {t("settings.remoteControl.projectMismatchSwitch")}
+          </button>
+        </div>
+      ) : null}
+
       <div style={styles.field}>
         <label htmlFor="remote-control-active-project" style={styles.label}>
           {t("settings.remoteControl.activeProjectLabel")}
@@ -892,6 +1008,21 @@ export function SettingsRemoteControl() {
           </span>
         ) : null}
       </div>
+
+      {switchNotice ? (
+        <div role="status" style={styles.switchNotice}>
+          <span style={styles.switchNoticeText}>
+            {t("settings.remoteControl.switchNotice")}
+          </span>
+          <button
+            type="button"
+            className="ob-btn"
+            onClick={() => setSwitchNotice(false)}
+          >
+            {t("settings.remoteControl.switchNoticeClose")}
+          </button>
+        </div>
+      ) : null}
 
       <div style={styles.field}>
         <label htmlFor="remote-control-relay-url" style={styles.label}>

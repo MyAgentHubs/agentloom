@@ -803,4 +803,40 @@ describe("LeadSummaryBlock", () => {
     );
     expect(invokeMock).not.toHaveBeenCalled();
   });
+
+  // G4 item②：裸路径自动内联接线到 LeadSummaryBlock 自己的 p 渲染点，行为要跟
+  // MarkdownBody 一致——不是只有 ![]() 语法才能触发。
+  test("also auto-inlines a standalone bare image path in section body (G4 P1-2)", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "bGVhZC1iYXJl",
+      mediaType: "image/png",
+    });
+    const { container } = render(
+      <LeadSummaryBlock
+        block={lsb({
+          sections: [
+            {
+              heading: "",
+              body_richtext: "/abs/lead-bare.png",
+              findings: [],
+              attribution: ["a1"],
+              trace_ref: { run_id: "r1", assignment_ids: ["a1"] },
+            },
+          ],
+        })}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector("img")).toHaveAttribute(
+        "src",
+        "data:image/png;base64,bGVhZC1iYXJl",
+      );
+    });
+    expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+      path: "/abs/lead-bare.png",
+      sessionId: null,
+    });
+  });
 });

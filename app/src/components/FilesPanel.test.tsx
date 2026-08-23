@@ -1,7 +1,11 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { FilesPanel, highlightMatches } from "./FilesPanel";
+import {
+  FilesPanel,
+  highlightMatches,
+  resolvePreviewImageSrc,
+} from "./FilesPanel";
 
 // 渲染 highlightMatches 返回的 ReactNode[]，取出 <mark> 命中的文本内容做断言。
 function renderedHighlights(content: string, query: string): string[] {
@@ -271,6 +275,139 @@ describe("FilesPanel", () => {
   it("shows an empty session hint outside a session", () => {
     render(<FilesPanel sessionId={null} repoId={null} repoName={null} />);
     expect(screen.getByText("进入会话后浏览项目文件")).toBeInTheDocument();
+  });
+
+  describe("markdown 预览：本地图片路径按被预览文件目录解析", () => {
+    const mdEntries = [
+      {
+        path: "docs/article.md",
+        name: "article.md",
+        isDir: false,
+        depth: 1,
+        size: 40,
+      },
+    ];
+
+    function mockPreview(content: string) {
+      invokeMock.mockImplementation((cmd: string) => {
+        if (cmd === "list_session_files")
+          return Promise.resolve({ entries: mdEntries, truncated: false });
+        if (cmd === "read_session_file") {
+          return Promise.resolve({
+            path: "docs/article.md",
+            name: "article.md",
+            content,
+            size: content.length,
+            language: "md",
+            isMarkdown: true,
+          });
+        }
+        if (cmd === "read_attachment") {
+          return Promise.resolve({
+            kind: "image",
+            imageBase64: "aW1n",
+            mediaType: "image/svg+xml",
+          });
+        }
+        throw new Error(cmd);
+      });
+    }
+
+    it("resolves a same-directory relative image path against the previewed file's directory", async () => {
+      mockPreview("![](assets-01-engines.svg)");
+      render(<FilesPanel sessionId="s1" repoName="demo" />);
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+          path: "docs/assets-01-engines.svg",
+          sessionId: "s1",
+        });
+      });
+    });
+
+    it("normalizes ./ and ../ segments in relative image paths", async () => {
+      mockPreview("![a](./sub/a.png)\n\n![b](../up.png)");
+      render(<FilesPanel sessionId="s1" repoName="demo" />);
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+          path: "docs/sub/a.png",
+          sessionId: "s1",
+        });
+        expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+          path: "up.png",
+          sessionId: "s1",
+        });
+      });
+    });
+
+    it("passes an absolute image path through unchanged", async () => {
+      mockPreview("![](/abs/other.png)");
+      render(<FilesPanel sessionId="s1" repoName="demo" />);
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+          path: "/abs/other.png",
+          sessionId: "s1",
+        });
+      });
+    });
+
+    it("renders an external image link untouched (no read_attachment call)", async () => {
+      mockPreview("![ext](https://x.com/a.png)");
+      render(<FilesPanel sessionId="s1" repoName="demo" />);
+      const img = await screen.findByRole("img", { name: "ext" });
+      expect(img).toHaveAttribute("src", "https://x.com/a.png");
+      expect(invokeMock).not.toHaveBeenCalledWith(
+        "read_attachment",
+        expect.anything(),
+      );
+    });
+
+    it("resolves a relative image path containing spaces", async () => {
+      mockPreview("![](<sub dir/img with space.png>)");
+      render(<FilesPanel sessionId="s1" repoName="demo" />);
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+          path: "docs/sub dir/img with space.png",
+          sessionId: "s1",
+        });
+      });
+    });
+  });
+});
+
+describe("resolvePreviewImageSrc", () => {
+  it("joins a bare relative src to the previewed file's directory", () => {
+    expect(resolvePreviewImageSrc("docs/article.md", "a.svg")).toBe(
+      "docs/a.svg",
+    );
+  });
+
+  it("normalizes ./ and ../ segments", () => {
+    expect(resolvePreviewImageSrc("docs/article.md", "./sub/a.png")).toBe(
+      "docs/sub/a.png",
+    );
+    expect(resolvePreviewImageSrc("docs/article.md", "../up.png")).toBe(
+      "up.png",
+    );
+  });
+
+  it("leaves a root-level file's relative src untouched by any directory prefix", () => {
+    expect(resolvePreviewImageSrc("article.md", "a.svg")).toBe("a.svg");
+  });
+
+  it("passes absolute and scheme-prefixed src through unchanged", () => {
+    expect(resolvePreviewImageSrc("docs/article.md", "/abs/a.png")).toBe(
+      "/abs/a.png",
+    );
+    expect(
+      resolvePreviewImageSrc("docs/article.md", "https://x.com/a.png"),
+    ).toBe("https://x.com/a.png");
+    expect(resolvePreviewImageSrc("docs/article.md", "file:///a/b.png")).toBe(
+      "file:///a/b.png",
+    );
+  });
+
+  it("passes src through unchanged when there is no previewed file path", () => {
+    expect(resolvePreviewImageSrc(null, "a.svg")).toBe("a.svg");
   });
 });
 

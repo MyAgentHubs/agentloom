@@ -12,6 +12,7 @@ const base = {
   reposContent: <div>REPOS_CONTENT</div>,
   archivedProjectsContent: <div>ARCHIVED_PROJECTS_CONTENT</div>,
   languageContent: <div>LANGUAGE_CONTENT</div>,
+  currentRepoId: null,
 };
 
 describe("SettingsSheet", () => {

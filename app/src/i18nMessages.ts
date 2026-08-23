@@ -64,6 +64,13 @@ export const messages = {
       "配对与设备都归属当前活跃项目的房间，请先选择一个项目再开始配对。",
     "settings.remoteControl.activeProjectSwitchHint":
       "切换活跃项目会让已配对的手机断开连接；切回原项目时，原有配对通常仍然有效——如果连不上，再在下方重新生成二维码扫码配对。",
+    "settings.remoteControl.currentServingLabel": "当前伺服项目",
+    "settings.remoteControl.projectMismatch":
+      "远程控制正在伺服「{serving}」，你当前在「{current}」。",
+    "settings.remoteControl.projectMismatchSwitch": "切换为当前项目",
+    "settings.remoteControl.switchNotice":
+      "伺服项目已切换，房间也随之变了——手机端需要重新扫码才能连接。",
+    "settings.remoteControl.switchNoticeClose": "知道了",
     "settings.remoteControl.pairingTitle": "手机配对",
     "settings.remoteControl.pairingIntro":
       "用手机扫描二维码，与这台电脑建立配对。",
@@ -1588,6 +1595,13 @@ export const messages = {
       "Pairing and devices belong to the room of the current active project. Choose a project before you start pairing.",
     "settings.remoteControl.activeProjectSwitchHint":
       "Switching the active project disconnects any already-paired phones. If you switch back to the original project, the existing pairing usually still works — only generate a new QR code below and re-pair if it doesn't reconnect.",
+    "settings.remoteControl.currentServingLabel": "Currently serving",
+    "settings.remoteControl.projectMismatch":
+      "Remote control is serving “{serving}”, but you're currently in “{current}”.",
+    "settings.remoteControl.projectMismatchSwitch": "Switch to current project",
+    "settings.remoteControl.switchNotice":
+      "The served project changed, so the room changed too — your phone needs to scan a new QR code to reconnect.",
+    "settings.remoteControl.switchNoticeClose": "Got it",
     "settings.remoteControl.pairingTitle": "Pair a phone",
     "settings.remoteControl.pairingIntro":
       "Scan the QR code with your phone to pair it with this computer.",

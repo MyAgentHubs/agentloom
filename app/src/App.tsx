@@ -411,23 +411,6 @@ const LOCAL_DISPATCH_PREFIX = "local-dispatch";
 // MCP 队长决策卡（ask_user / propose_verifier）的 source_run_id 前缀（须与后端
 // lead_tools::MCP_LEAD_DECISION_PREFIX 一致）。据此按卡身份路由·MCP 卡绝不回退 legacy lead_step。
 const MCP_LEAD_PREFIX = "mcp-lead";
-// worker 完成自动唤醒 lead 续跑：同一 session 连续自动续喂上限（防「lead 反复小额派单低效
-// 空转」的兜底，不是防死循环——同 session 单 worker 硬闸已保证不会爆炸）。用户手动发消息即重置。
-const AUTO_RESUME_MAX_STREAK = 10;
-// 自动续喂竞速重试：reader 摘 member（src-tauri/src/member_runner.rs:2272）早于
-// dispatch intent guard 释放（要等 run_single_worker 整体返回，含 persist/finalize/Stage①
-// 收尾），前端若抢在 guard drop 前 invoke 会撞 AL_ERR:run.teamMembersActive 被拒。这是
-// 暂时性竞态、不是真失败——短延迟后重试一次即可，不必长等（guard 通常很快释放）。
-const AUTO_RESUME_RACE_RETRY_DELAY_MS = 800;
-
-/** 用户手动发消息 = 明确接管，清零该 session 的自动续喂连续计数（纯函数，便于单测）。 */
-export function resetAutoResumeStreak(
-  streakRef: { current: Map<string, number> },
-  sid: string,
-): void {
-  streakRef.current.delete(sid);
-}
-
 export function pickDisplayGoal(
   teamGoal: GoalContract | null,
   sessionGoal: SessionGoal | null,
@@ -637,17 +620,6 @@ function AppContent() {
     new Map(),
   );
   const goalTitleFetchedRef = useRef<Set<string>>(new Set());
-  // worker 完成自动唤醒 lead 续跑：按 `${sid}:${assignment_id}` 去重（防事件重放/重复批次
-  // 导致多次 invoke），只在 resume_lead_session **成功**后才永久记入——即便当时 lead 在跑而未
-  // 触发也不补触发（不排队，见 AUTO_RESUME_MAX_STREAK 旁注）。失败（含竞速重试后仍失败）不烧
-  // 这个键：不是「这单自动续喂被永久放弃」，是留给后续真实事件重放/重触发条件自然补上。
-  const autoResumeTriggeredRef = useRef<Set<string>>(new Set());
-  // 同步「进行中」守卫：防同一 dedupKey 在单个事件批次内被重放触发并发 invoke（例如
-  // applyAgentEvent 在同一 tick 内收到重复事件）。成功后随 autoResumeTriggeredRef 一起留住；
-  // 失败（含重试耗尽）后摘除，让真实的事件重放有机会重新尝试。
-  const autoResumeInFlightRef = useRef<Set<string>>(new Set());
-  // 连续自动续喂计数（per-session）；用户手动发消息（onSend）时清零。
-  const autoResumeStreakRef = useRef<Map<string, number>>(new Map());
   const [codingBlocksByRun, setCodingBlocksByRun] = useState<
     Map<string, CodingTaskBlock>
   >(new Map());
@@ -3216,83 +3188,9 @@ function AppContent() {
               })
               .catch(() => {});
           }
-          // 自动唤醒刀：worker 终态到达且 lead 已空闲 → 替用户按「继续」（同形先例
-          // App.tsx:5261-5288·G3 停摆修复 T3）。终态判定复用本 effect 下方既有 isTerminalEvent
-          // （3507 行左右）——worker 自己的 run 无论 done/failed/stopped 都统一走
-          // kind==="completed"（member_terminal_event 恒发 AgentEvent::Completed，
-          // status_transition 才区分成败，见 src-tauri/src/member_runner.rs:1514-1557），
-          // isTerminalEvent 的 kind 判据天然适用、不需要另判 status_transition。
-          {
-            const aid = ev.dispatch?.assignment_id;
-            if (aid && isTerminalEvent(ev)) {
-              const dedupKey = `${sid}:${aid}`;
-              // 按 assignment 去重：防事件重放/重复批次导致多次 invoke。
-              if (
-                !autoResumeTriggeredRef.current.has(dedupKey) &&
-                !autoResumeInFlightRef.current.has(dedupKey)
-              ) {
-                // lead 空闲才触发（与 App.tsx:5257 先例同判据）；lead 在跑就什么都不做——
-                // 跟 streak 达上限一样，是「跳过」而非「失败」：立即永久记入、不补触发
-                // （不排队，lead 自己下轮能看到 report）。
-                if (!runningSessionsRef.current.has(sid)) {
-                  const streak = autoResumeStreakRef.current.get(sid) ?? 0;
-                  if (streak < AUTO_RESUME_MAX_STREAK) {
-                    autoResumeStreakRef.current.set(sid, streak + 1);
-                    // 同步占位：只挡 invoke 结果落定前的同 tick 重放（下面成功/终态失败都会摘掉）——
-                    // 不是永久记入，失败（含竞速重试后仍失败）时特意不转成 autoResumeTriggeredRef，
-                    // 好让这单自动续喂不被永久放弃（真实事件重放/重触发条件到来还有机会）。
-                    autoResumeInFlightRef.current.add(dedupKey);
-                    const runtime = resolveRuntimeTeamConfigRef.current(sid);
-                    // 中性原则：只是替用户按「继续」，不往对话注入任何指令文本——worker
-                    // report 已在会话史里，lead 自己会看到。
-                    const attemptResume = (isRetry: boolean) => {
-                      invoke("resume_lead_session", {
-                        sessionId: sid,
-                        leadAgentId: runtime.effectiveLeadId,
-                        memberIds: runtime.memberPoolIds,
-                      })
-                        .then(() => {
-                          autoResumeInFlightRef.current.delete(dedupKey);
-                          autoResumeTriggeredRef.current.add(dedupKey);
-                        })
-                        .catch((e) => {
-                          const envelope = parseBackendError(String(e));
-                          const isIntentRaceRejection =
-                            envelope?.code === "run.teamMembersActive";
-                          if (!isRetry && isIntentRaceRejection) {
-                            // 竞速：reader 摘 member（member_runner.rs:2272）早于 dispatch
-                            // intent guard 释放（要等 run_single_worker 整体返回，含
-                            // persist/finalize/Stage① 收尾）——前端可能抢在 guard drop 前
-                            // invoke、撞 AL_ERR:run.teamMembersActive 被拒。暂时性竞态，
-                            // 不是真失败：短延迟后重试一次，仍失败才罢休。
-                            window.setTimeout(
-                              () => attemptResume(true),
-                              AUTO_RESUME_RACE_RETRY_DELAY_MS,
-                            );
-                            return;
-                          }
-                          // 占槽被抢（如另一路径同时唤醒）或竞速重试仍失败 = 正常收敛，
-                          // 不扰民；不烧 triggered 键，只摘掉 inFlight——留给后续真实事件
-                          // 重放/重触发条件自然补上，不是永久放弃。
-                          autoResumeInFlightRef.current.delete(dedupKey);
-                          console.debug(
-                            "[auto-resume] resume_lead_session skipped",
-                            e,
-                          );
-                        });
-                    };
-                    attemptResume(false);
-                  } else {
-                    // 达连续上限：静默停，把控制权还给用户；用户发消息（onSend）时清零。
-                    autoResumeTriggeredRef.current.add(dedupKey);
-                  }
-                } else {
-                  // lead 在跑：跳过，不补触发（同原语义永久记入）。
-                  autoResumeTriggeredRef.current.add(dedupKey);
-                }
-              }
-            }
-          }
+          // worker 终态唤醒 lead 续跑已统一由后端 on_worker_settled 负责（报告落账之后才
+          // 触发，见 member_report_delivery 台账 + T7 设计），前端不再自行 invoke
+          // resume_lead_session——避免「报告可能还没落库就抢跑空轮」的双真相源。
           return;
         }
         const rid = ev.dispatch!.run_id!;
@@ -4947,8 +4845,6 @@ function AppContent() {
     if (loadingSessionsRef.current.has(sid)) return;
     if (runningSessionsRef.current.has(sid)) return;
     if (getSessionReadonlyReason(sid)) return;
-    // 用户手动发消息 = 明确接管，清零自动续喂连续计数（见 autoResumeStreakRef 旁注）。
-    resetAutoResumeStreak(autoResumeStreakRef, sid);
     if (mode === "team") {
       if (teamConfigBlocked) return;
       startLeadSessionForComposer(sid, text, config);
@@ -5691,9 +5587,10 @@ function AppContent() {
       try {
         // T3（remote control M0 §4a）：续跑权收归后端——commit_late_answer 落库成功后
         // answer_lead_question 已经自己 try_resume_after_answer 触发续跑（覆盖远程控制
-        // 场景：手机答卡走同一条 IPC，背后没有前端替它 invoke resume_lead_session）。这里
-        // 只按后端回的 resumed 做乐观绘制，绝不再自己 invoke resume_lead_session——否则本机
-        // 路径会双触发：后端先占槽、前端随后 resume 撞 busy，给用户弹假错误。
+        // 场景：手机答卡走同一条 IPC，背后没有前端替它自触发续跑）。这里
+        // 只按后端回的 resumed 做乐观绘制，绝不再自己 invoke 任何续跑命令——否则本机
+        // 路径会双触发：后端先占槽、前端随后 resume 撞 busy，给用户弹假错误（T7 起前端
+        // 已无任何自触发续跑的 IPC 入口）。
         const closeoutSeqBeforeAnswer = closeoutSeqRef.current.get(sid) ?? 0;
         const result = await invoke<{
           resumed: boolean;
@@ -6643,6 +6540,7 @@ function AppContent() {
         page={settingsPage}
         onPageChange={setSettingsPage}
         onClose={() => setSettingsOpen(false)}
+        currentRepoId={activeRepoId}
         agentsContent={
           <SettingsAgents
             onAgentsChanged={refetchAgents}

@@ -69,7 +69,6 @@ import App, {
   suppressBlockBShells,
   runIdForActiveCodingSession,
   pruneNavHistory,
-  resetAutoResumeStreak,
 } from "./App";
 import type { CodingState } from "./lib/codingLoop";
 import * as codingLoopDriver from "./lib/codingLoopDriver";
@@ -13035,40 +13034,12 @@ describe("App", () => {
       sessionId,
     );
 
-  function mockResumeLeadSession() {
-    const baseInvoke = invokeMock.getMockImplementation();
-    invokeMock.mockImplementation((cmd: string, args?: any) => {
-      if (cmd === "resume_lead_session") return Promise.resolve();
-      return baseInvoke?.(cmd, args);
-    });
-  }
-
-  function resumeLeadSessionCallCount() {
-    return invokeMock.mock.calls.filter(
-      ([cmd]) => cmd === "resume_lead_session",
-    ).length;
-  }
-
-  // 竞速重试用例：`resume_lead_session` 调用按次序走不同结果（第 1 次 reject/第 2 次
-  // resolve 等），别的 invoke 走既有 baseInvoke。
-  function mockResumeLeadSessionSequence(
-    handlers: Array<() => Promise<unknown>>,
-  ) {
-    const baseInvoke = invokeMock.getMockImplementation();
-    let callIndex = 0;
-    invokeMock.mockImplementation((cmd: string, args?: any) => {
-      if (cmd === "resume_lead_session") {
-        const handler = handlers[Math.min(callIndex, handlers.length - 1)];
-        callIndex += 1;
-        return handler();
-      }
-      return baseInvoke?.(cmd, args);
-    });
-  }
-
-  it("worker 完成自动唤醒 lead：orchestrated worker 终态事件 + lead 空闲 → resume_lead_session 恰好被 invoke 一次(参数正确)", async () => {
+  // T7：worker 唤醒 lead 续跑已统一收归后端 on_worker_settled（报告落账之后才触发，见
+  // member_report_delivery 台账设计），前端不再自行 invoke resume_lead_session——即便
+  // orchestrated worker 终态事件到达且 lead 空闲，也绝不产生这个 invoke（不再有「抢跑」
+  // 空轮的风险）。
+  it("worker 完成不再由前端唤醒 lead：orchestrated worker 终态事件 + lead 空闲 → 不 invoke resume_lead_session（唤醒权收归后端 on_worker_settled）", async () => {
     mockBasicApp(agentProfiles, { messages: orchestratedTeamMessages() });
-    mockResumeLeadSession();
 
     render(<App />);
     await screen.findByRole("button", { name: "选择 agent：Claude Code" });
@@ -13078,18 +13049,15 @@ describe("App", () => {
       cb(workerTerminalEvent("wrun-a", "wa-a"));
     });
 
-    await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith(
-        "resume_lead_session",
-        expect.objectContaining({ sessionId: "s1", leadAgentId: "claude" }),
-      ),
+    // 事件已处理（dispatch card 更新等），但绝不产生 resume_lead_session 这个 invoke。
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "resume_lead_session",
+      expect.anything(),
     );
-    expect(resumeLeadSessionCallCount()).toBe(1);
   });
 
-  it("worker 完成自动唤醒 lead：同一 worker 终态事件重放 → 不重复 invoke", async () => {
+  it("worker 完成不再由前端唤醒 lead：同一 worker 终态事件重放多次 → 始终不 invoke resume_lead_session", async () => {
     mockBasicApp(agentProfiles, { messages: orchestratedTeamMessages() });
-    mockResumeLeadSession();
 
     render(<App />);
     await screen.findByRole("button", { name: "选择 agent：Claude Code" });
@@ -13101,120 +13069,10 @@ describe("App", () => {
       cb(ev);
     });
 
-    await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith(
-        "resume_lead_session",
-        expect.anything(),
-      ),
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "resume_lead_session",
+      expect.anything(),
     );
-    expect(resumeLeadSessionCallCount()).toBe(1);
-  });
-
-  it("worker 完成自动唤醒 lead：lead 正在跑 → 不 invoke（不排队，lead 自己下轮能看到 report）", async () => {
-    // configureTeamLead 要点「设为队长」——hasLeadCapability 只认
-    // provider==="claude"&&access==="native"（与 cap_lead 无关），默认 agentProfiles
-    // fixture 是 provider:"anthropic"/access:"api"，故此处照 G3 先例custom 一份。
-    mockBasicApp([
-      agentProfile({ provider: "claude", access: "native" }),
-      agentProfile({
-        id: "deepseek",
-        name: "DeepSeek",
-        provider: "deepseek",
-        sort_order: 1,
-      }),
-    ]);
-    mockResumeLeadSession();
-
-    render(<App />);
-    await screen.findByText("Claude Code");
-    await configureTeamLead();
-
-    fireEvent.change(screen.getByPlaceholderText(/输入消息/), {
-      target: { value: "先跑起来" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "发送" }));
-    await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith(
-        "start_lead_session",
-        expect.objectContaining({ sessionId: "s1" }),
-      ),
-    );
-
-    const cb = agentEventCb();
-    await act(async () => {
-      cb(workerTerminalEvent("wrun-c", "wa-c"));
-    });
-
-    expect(resumeLeadSessionCallCount()).toBe(0);
-  });
-
-  it("worker 完成自动唤醒 lead：连续 10 次自动续喂后第 11 个终态不再 invoke（cap=10）", async () => {
-    mockBasicApp(agentProfiles, { messages: orchestratedTeamMessages() });
-    mockResumeLeadSession();
-
-    render(<App />);
-    await screen.findByRole("button", { name: "选择 agent：Claude Code" });
-    const cb = agentEventCb();
-
-    for (let i = 0; i < 11; i++) {
-      await act(async () => {
-        cb(workerTerminalEvent(`wrun-cap-${i}`, `wa-cap-${i}`));
-      });
-    }
-
-    await waitFor(() => expect(resumeLeadSessionCallCount()).toBe(10));
-  });
-
-  it("worker 完成自动唤醒 lead：首次撞 dispatch intent 竞速拒绝(AL_ERR:run.teamMembersActive) → 短延迟后重试一次并成功(恰好 invoke 两次)", async () => {
-    mockBasicApp(agentProfiles, { messages: orchestratedTeamMessages() });
-    mockResumeLeadSessionSequence([
-      // Tauri invoke 对 `Result<_, String>` 命令的 reject 值是裸字符串（不是 JS Error 实例）
-      // ——与 src-tauri/src/lib.rs::reserve_new_session_run 的真实返回形态一致
-      // （`ui_msg::al_err("run.teamMembersActive", ...)` 产出 `AL_ERR:run.teamMembersActive:{...}`）。
-      () =>
-        Promise.reject(
-          'AL_ERR:run.teamMembersActive:{"detail":"队员仍在执行上一轮派单"}',
-        ),
-      () => Promise.resolve(),
-    ]);
-
-    render(<App />);
-    await screen.findByRole("button", { name: "选择 agent：Claude Code" });
-    const cb = agentEventCb();
-
-    await act(async () => {
-      cb(workerTerminalEvent("wrun-race", "wa-race"));
-    });
-
-    // 首次拒绝已发生·此刻应恰好 1 次（重试还没到点）。
-    await waitFor(() => expect(resumeLeadSessionCallCount()).toBe(1));
-
-    // 竞速重试延迟窗口过后应补上第二次 invoke（成功）。
-    await waitFor(() => expect(resumeLeadSessionCallCount()).toBe(2), {
-      timeout: 2000,
-    });
-  });
-
-  it("worker 完成自动唤醒 lead：拒因非 run.teamMembersActive → 不重试(保守)", async () => {
-    mockBasicApp(agentProfiles, { messages: orchestratedTeamMessages() });
-    mockResumeLeadSessionSequence([
-      () => Promise.reject("boom: 别的原因"),
-      () => Promise.resolve(),
-    ]);
-
-    render(<App />);
-    await screen.findByRole("button", { name: "选择 agent：Claude Code" });
-    const cb = agentEventCb();
-
-    await act(async () => {
-      cb(workerTerminalEvent("wrun-noretry", "wa-noretry"));
-    });
-
-    await waitFor(() => expect(resumeLeadSessionCallCount()).toBe(1));
-
-    // 给足竞速重试延迟窗口，确认确实没有第二次 invoke。
-    await new Promise((resolve) => setTimeout(resolve, 900));
-    expect(resumeLeadSessionCallCount()).toBe(1);
   });
 
   it("onDecisionChoose: MCP ask_user 卡 → 调 answer_lead_question·不调 choose_decision_card/lead_step", async () => {
@@ -14980,22 +14838,3 @@ describe("pruneNavHistory", () => {
   });
 });
 
-describe("resetAutoResumeStreak", () => {
-  it("清零指定 session 的连续续喂计数·不动其他 session", () => {
-    const ref = {
-      current: new Map([
-        ["s1", 5],
-        ["s2", 3],
-      ]),
-    };
-    resetAutoResumeStreak(ref, "s1");
-    expect(ref.current.has("s1")).toBe(false);
-    expect(ref.current.get("s2")).toBe(3);
-  });
-
-  it("对未记过账的 session 调用是安全 no-op", () => {
-    const ref = { current: new Map<string, number>() };
-    expect(() => resetAutoResumeStreak(ref, "s-unknown")).not.toThrow();
-    expect(ref.current.size).toBe(0);
-  });
-});

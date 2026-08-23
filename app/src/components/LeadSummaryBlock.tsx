@@ -1,9 +1,10 @@
-import { useMemo } from "react";
+import { useMemo, useRef } from "react";
 import type { Components } from "react-markdown";
 import type { LeadSummaryBlock as LSB, Finding } from "../types/agent";
 import { useI18n } from "../i18n";
 import { useMarkdownLib } from "../lib/useMarkdown";
 import {
+  localImageBareParagraphComponent,
   localImageMarkdownComponent,
   makeImgOnlyUrlTransform,
 } from "./localMarkdownImage";
@@ -251,16 +252,30 @@ export function LeadSummaryBlock({
 }: Props) {
   const { t } = useI18n();
   const markdownLib = useMarkdownLib();
+
+  const imgOptsRef = useRef({ sessionId, onOpenPreview, onOpenLightbox });
+  imgOptsRef.current = { sessionId, onOpenPreview, onOpenLightbox };
+  const imgComponent = useRef(localImageMarkdownComponent(imgOptsRef)).current;
+
+  // lead 汇报是整块落地渲染、没有逐字流式的中间态（跟 MarkdownBody 的
+  // streaming prop 不对应），裸路径自动内联默认启用。
+  const bareParagraphOptsRef = useRef({
+    sessionId,
+    onOpenPreview,
+    onOpenLightbox,
+  });
+  bareParagraphOptsRef.current = { sessionId, onOpenPreview, onOpenLightbox };
+  const bareParagraphComponent = useRef(
+    localImageBareParagraphComponent(bareParagraphOptsRef),
+  ).current;
+
   const components = useMemo(
     () => ({
       ...leadMarkdownComponents,
-      img: localImageMarkdownComponent({
-        sessionId,
-        onOpenPreview,
-        onOpenLightbox,
-      }),
+      img: imgComponent,
+      p: bareParagraphComponent,
     }),
-    [onOpenLightbox, onOpenPreview, sessionId],
+    [bareParagraphComponent, imgComponent],
   );
 
   if (block.summary_source === "pending") {

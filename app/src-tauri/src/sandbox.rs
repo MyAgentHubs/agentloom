@@ -369,18 +369,6 @@ pub(crate) fn resolve_claude_bin_for_spawn() -> Result<String, String> {
     .map(|path| path.unwrap_or_else(|| "claude".to_string()))
 }
 
-fn resolve_claude_bin_with_override_from(
-    override_path: Option<&str>,
-    windows: bool,
-    path_is_file: impl FnMut(&Path) -> bool,
-    mut automatic_path: impl FnMut() -> String,
-) -> Result<String, String> {
-    crate::detect::resolve_cli_path_with_override_from(override_path, windows, path_is_file, || {
-        Some(automatic_path())
-    })
-    .map(|path| path.unwrap_or_else(|| "claude".to_string()))
-}
-
 fn resolve_claude_bin_with_env(
     detected: Option<String>,
     home: Option<&OsStr>,
@@ -698,69 +686,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_claude_bin_override_short_circuits_automatic_resolution() {
-        let automatic_calls = std::cell::Cell::new(0);
-        let resolved = resolve_claude_bin_with_override_from(
-            Some("/custom/bin/claude"),
-            false,
-            |path| path == Path::new("/custom/bin/claude"),
-            || {
-                automatic_calls.set(automatic_calls.get() + 1);
-                "/automatic/bin/claude".to_string()
-            },
-        )
-        .unwrap();
-
-        assert_eq!(resolved, "/custom/bin/claude");
-        assert_eq!(automatic_calls.get(), 0);
-    }
-
-    #[test]
-    fn resolve_claude_bin_invalid_override_fails_closed_without_automatic_resolution() {
-        let automatic_calls = std::cell::Cell::new(0);
-        let error = resolve_claude_bin_with_override_from(
-            Some("/missing/bin/claude"),
-            false,
-            |_| false,
-            || {
-                automatic_calls.set(automatic_calls.get() + 1);
-                "/automatic/bin/claude".to_string()
-            },
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            error,
-            r#"AL_ERR:cliPath.invalidPath:{"path":"/missing/bin/claude"}"#
-        );
-        assert_eq!(automatic_calls.get(), 0);
-    }
-
-    #[test]
     fn resolve_claude_bin_compatibility_wrapper_keeps_an_invalid_pinned_path() {
         let _guard = crate::detect::CliPathOverrideTestGuard::new();
         let missing = std::env::temp_dir().join("agentloom-missing-pinned-claude");
         crate::detect::set_cached_cli_path("claude", missing.to_str()).unwrap();
 
         assert_eq!(resolve_claude_bin(), missing.to_string_lossy());
-    }
-
-    #[test]
-    fn resolve_claude_bin_without_override_keeps_automatic_resolution_unchanged() {
-        let automatic_calls = std::cell::Cell::new(0);
-        let resolved = resolve_claude_bin_with_override_from(
-            None,
-            false,
-            |_| panic!("override validation must not run"),
-            || {
-                automatic_calls.set(automatic_calls.get() + 1);
-                "/automatic/bin/claude".to_string()
-            },
-        )
-        .unwrap();
-
-        assert_eq!(resolved, "/automatic/bin/claude");
-        assert_eq!(automatic_calls.get(), 1);
     }
 
     // ── resolve_git_bin：Xcode 转发壳检测 + 穿透（2026-07-25 dogfood 定罪修复） ──

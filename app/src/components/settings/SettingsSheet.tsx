@@ -14,6 +14,8 @@ type Props = {
   reposContent: ReactNode;
   archivedProjectsContent: ReactNode;
   languageContent: ReactNode;
+  /** app 当前活跃项目 id——透传给远程控制页做「伺服项目 vs 当前项目」不一致检测。 */
+  currentRepoId: string | null;
 };
 
 /**
@@ -74,7 +76,7 @@ export function SettingsSheet(props: Props) {
             ) : props.page === "language" ? (
               props.languageContent
             ) : props.page === "remoteControl" ? (
-              <SettingsRemoteControl />
+              <SettingsRemoteControl currentRepoId={props.currentRepoId} />
             ) : props.page === "archivedProjects" ? (
               props.archivedProjectsContent
             ) : props.page === "about" ? (
