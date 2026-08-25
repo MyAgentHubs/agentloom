@@ -63,6 +63,7 @@ type Props = {
   // 阶段1 Task1.3：全高列 chrome
   onToggleSidebar?: () => void;
   onHome?: () => void; // 总览入口（删 TopBar 后归位·不能 backlog·既有 App.test 断言「总览」）
+  onSearch?: () => void;
 };
 
 const emptyRunningSessionIds = new Set<string>();
@@ -183,6 +184,7 @@ export const Sidebar = React.memo(function Sidebar({
   onForward,
   onToggleSidebar,
   onHome,
+  onSearch,
 }: Props) {
   const { t } = useI18n();
   const [archOpen, setArchOpen] = useState(false);
@@ -390,7 +392,7 @@ export const Sidebar = React.memo(function Sidebar({
           className="iconbtn"
           aria-label={t("sidebar.search")}
           title={t("sidebar.searchTitle")}
-          disabled
+          onClick={onSearch}
         >
           <svg {...ic}>
             <circle cx="11" cy="11" r="7" />

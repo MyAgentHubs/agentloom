@@ -15,6 +15,7 @@ import { SessionMain } from "./components/SessionMain";
 import type { ContinuationDraftState } from "./components/ContinuationBriefPanel";
 import { OverviewHome } from "./components/OverviewHome";
 import { Sidebar } from "./components/Sidebar";
+import { GlobalSearch } from "./components/GlobalSearch";
 import { RightPanel } from "./components/RightPanel";
 import type { RightPanelTab } from "./components/RightPanelTabs";
 import { GoalCriteriaPanel } from "./components/GoalCriteriaPanel";
@@ -742,6 +743,7 @@ function AppContent() {
     runId: string;
   } | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [rightPanelOpen, setRightPanelOpen] = useState(false);
   const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab | null>(
@@ -6260,6 +6262,14 @@ function AppContent() {
     [],
   );
   const handleHome = useCallback(() => setView("overview"), []);
+  const handleOpenGlobalSearch = useCallback(
+    () => setGlobalSearchOpen(true),
+    [],
+  );
+  const handleCloseGlobalSearch = useCallback(
+    () => setGlobalSearchOpen(false),
+    [],
+  );
   // msgfix2 Q1：composer 上方 chip 的三个交互 + recoverableMemberBlock 入队，
   // 都是「resolve currentIdRef.current 再调 sid 显式核心函数」的薄壳——sid 只在
   // 这一层解析一次，核心函数（enqueueComposerMessage/editQueuedMessage/...）
@@ -6562,6 +6572,13 @@ function AppContent() {
           editingRepo !== null
         }
       >
+        <GlobalSearch
+          open={globalSearchOpen}
+          currentId={currentId}
+          onOpen={handleOpenGlobalSearch}
+          onClose={handleCloseGlobalSearch}
+          onSelect={handleSidebarSelect}
+        />
         {sidebarOpen && (
           <Sidebar
             sessions={sessions}
@@ -6610,6 +6627,7 @@ function AppContent() {
             onForward={handleForward}
             onToggleSidebar={handleToggleSidebar}
             onHome={handleHome}
+            onSearch={handleOpenGlobalSearch}
           />
         )}
         <div

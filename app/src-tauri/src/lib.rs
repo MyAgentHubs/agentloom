@@ -10987,6 +10987,204 @@ fn get_messages(db: State<Db>, session_id: String) -> Result<Vec<db::Message>, S
     db::get_messages(&conn, &session_id).map_err(|e| e.to_string())
 }
 
+#[derive(Serialize, Clone, Debug, PartialEq)]
+struct GlobalSearchResult {
+    session_id: String,
+    message_id: Option<i64>,
+    title: String,
+    project: String,
+    snippet: String,
+    archived: bool,
+    updated_at: i64,
+}
+
+#[derive(Clone)]
+struct RankedGlobalSearchResult {
+    result: GlobalSearchResult,
+    score: i64,
+}
+
+fn truncate_search_snippet(text: &str) -> String {
+    const LIMIT: usize = 240;
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= LIMIT {
+        return trimmed.to_string();
+    }
+    let mut snippet: String = trimmed.chars().take(LIMIT).collect();
+    snippet.push('…');
+    snippet
+}
+
+fn escape_like_pattern(term: &str) -> String {
+    term.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn search_sessions_inner(
+    conn: &rusqlite::Connection,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<GlobalSearchResult>, String> {
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .filter(|term| !term.is_empty())
+        .collect();
+    let project_sql =
+        "COALESCE(CASE WHEN r.owner IS NOT NULL THEN r.owner || '/' || r.name ELSE r.name END, s.repo_id, 'Local')";
+    if terms.is_empty() {
+        let sql = format!(
+            "WITH text_messages AS ( \
+                SELECT m.session_id, m.id, \
+                       CAST(json_extract(block.value, '$.text') AS TEXT) AS text, \
+                       m.created_at, \
+                       ROW_NUMBER() OVER (PARTITION BY m.session_id ORDER BY m.id DESC) AS row_no \
+                FROM messages m \
+                JOIN json_each(m.content) block \
+                  ON json_extract(block.value, '$.type') = 'text' \
+                WHERE m.role IN ('user', 'assistant') \
+                  AND (m.dedup_key IS NULL OR m.dedup_key NOT LIKE 'activity_summary:%') \
+                  AND COALESCE(m.engine, '') != 'verifier-result' \
+             ) \
+             SELECT s.id, s.title, {project_sql}, s.archived, \
+                    tm.id, COALESCE(tm.text, ''), COALESCE(tm.created_at, s.created_at) \
+             FROM sessions s \
+             LEFT JOIN repos r ON r.id = s.repo_id \
+             LEFT JOIN text_messages tm ON tm.session_id = s.id AND tm.row_no = 1 \
+             WHERE s.deleted_at IS NULL \
+             ORDER BY COALESCE(tm.created_at, s.created_at) DESC, s.id ASC \
+             LIMIT ?1",
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([limit.clamp(1, 50) as i64], |row| {
+                Ok(GlobalSearchResult {
+                    session_id: row.get(0)?,
+                    title: row.get(1)?,
+                    project: row.get(2)?,
+                    archived: row.get(3)?,
+                    message_id: row.get(4)?,
+                    snippet: truncate_search_snippet(&row.get::<_, String>(5)?),
+                    updated_at: row.get(6)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        return rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| e.to_string());
+    }
+
+    let coarse = format!("%{}%", escape_like_pattern(&terms[0]));
+    let sql = format!(
+        "SELECT s.id, s.title, {project_sql}, s.archived, m.id, \
+                CAST(json_extract(block.value, '$.text') AS TEXT), \
+                COALESCE(m.created_at, s.created_at) \
+         FROM sessions s \
+         LEFT JOIN repos r ON r.id = s.repo_id \
+         LEFT JOIN messages m ON m.session_id = s.id \
+            AND m.role IN ('user', 'assistant') \
+            AND (m.dedup_key IS NULL OR m.dedup_key NOT LIKE 'activity_summary:%') \
+            AND COALESCE(m.engine, '') != 'verifier-result' \
+         LEFT JOIN json_each(m.content) block \
+            ON json_extract(block.value, '$.type') = 'text' \
+         WHERE s.deleted_at IS NULL AND ( \
+            lower(s.title) LIKE ?1 ESCAPE '\\' OR \
+            lower({project_sql}) LIKE ?1 ESCAPE '\\' OR \
+            lower(COALESCE(CAST(json_extract(block.value, '$.text') AS TEXT), '')) LIKE ?1 ESCAPE '\\' \
+         )",
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([coarse], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                row.get::<_, i64>(6)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut best_by_session: HashMap<String, RankedGlobalSearchResult> = HashMap::new();
+    for row in rows {
+        let (session_id, title, project, archived, message_id, text, updated_at) =
+            row.map_err(|e| e.to_string())?;
+        let title_lower = title.to_lowercase();
+        let project_lower = project.to_lowercase();
+        let text_lower = text.to_lowercase();
+        let combined = format!("{title_lower} {project_lower} {text_lower}");
+        if !terms.iter().all(|term| combined.contains(term)) {
+            continue;
+        }
+
+        let mut score = 0_i64;
+        for term in &terms {
+            if title_lower == *term {
+                score += 1_000;
+            } else if title_lower.contains(term) {
+                score += 500;
+            }
+            if project_lower.contains(term) {
+                score += 100;
+            }
+            if text_lower.contains(term) {
+                score += 20;
+            }
+        }
+        let text_matches = terms.iter().any(|term| text_lower.contains(term));
+        let candidate = RankedGlobalSearchResult {
+            result: GlobalSearchResult {
+                session_id: session_id.clone(),
+                message_id: text_matches.then_some(message_id).flatten(),
+                title,
+                project,
+                snippet: truncate_search_snippet(&text),
+                archived,
+                updated_at,
+            },
+            score,
+        };
+        let replace = match best_by_session.get(&session_id) {
+            None => true,
+            Some(current) => {
+                candidate.score > current.score
+                    || (candidate.score == current.score
+                        && candidate.result.updated_at > current.result.updated_at)
+            }
+        };
+        if replace {
+            best_by_session.insert(session_id, candidate);
+        }
+    }
+
+    let mut ranked: Vec<_> = best_by_session.into_values().collect();
+    ranked.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| b.result.updated_at.cmp(&a.result.updated_at))
+            .then_with(|| a.result.title.cmp(&b.result.title))
+    });
+    Ok(ranked
+        .into_iter()
+        .take(limit.clamp(1, 50))
+        .map(|item| item.result)
+        .collect())
+}
+
+#[tauri::command]
+fn search_sessions(
+    db: State<Db>,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<GlobalSearchResult>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    search_sessions_inner(&conn, &query, limit.unwrap_or(20))
+}
+
 /// P0-c 记档：前端三处非 reply 动作（非通过 send_message/start_lead_session 的用户消息落库
 /// 路径，如手工插入的旁路场景）走的是这条 IPC，仍调非 dedup 版 `db::append_message`——本刀
 /// 不动：这条旁路落的 user 行仍无 dedup_key、不会产生 msg.completed 里程碑，远端补发批看
@@ -18706,6 +18904,7 @@ pub fn run() {
             delete_group,
             move_session_to_group,
             get_messages,
+            search_sessions,
             append_message,
             choose_decision_card,
             // cluster L 新增（Task 6）
@@ -39508,6 +39707,95 @@ mod tests {
         assert_eq!(s.group_id, Some("g-list".into()));
         assert_eq!(s.parent_session_id, Some("parent".into()));
         assert_eq!(s.continued_to_session_id, Some("child".into()));
+    }
+
+    #[test]
+    fn global_search_ranks_titles_and_only_indexes_visible_text_blocks() {
+        let c = crate::test_support::mem_db();
+        for (id, title) in [
+            ("s-title", "Rust"),
+            ("s-body", "前后端关系"),
+            ("s-archived", "历史会话"),
+            ("s-hidden", "隐藏内容"),
+            ("s-deleted", "Rust 已删除"),
+        ] {
+            db::create_session(&c, id, title, "local-default", "local").unwrap();
+        }
+        c.execute(
+            "UPDATE sessions SET archived = 1 WHERE id = 's-archived'",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE sessions SET deleted_at = 100 WHERE id = 's-deleted'",
+            [],
+        )
+        .unwrap();
+
+        let insert = |session_id: &str, role: &str, content: &str, created_at: i64| {
+            c.execute(
+                "INSERT INTO messages (session_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![session_id, role, content, created_at],
+            )
+            .unwrap()
+        };
+        insert(
+            "s-title",
+            "assistant",
+            r#"[{"type":"text","text":"这是标题命中的会话"}]"#,
+            10,
+        );
+        insert(
+            "s-body",
+            "user",
+            r#"[{"type":"text","text":"React 前端会请求 Rust 后端"}]"#,
+            20,
+        );
+        insert(
+            "s-body",
+            "assistant",
+            r#"[{"type":"text","text":"Rust 与 React 通过 Tauri 通信"}]"#,
+            30,
+        );
+        insert(
+            "s-archived",
+            "assistant",
+            r#"[{"type":"text","text":"归档中的 Rust 笔记"}]"#,
+            40,
+        );
+        insert(
+            "s-hidden",
+            "assistant",
+            r#"[{"type":"thinking","text":"needle-thinking"},{"type":"tool","id":"t","tool":"exec","summary":"x","card":"compact","status":"ok","exit_code":0,"output":"needle-tool"}]"#,
+            50,
+        );
+        insert(
+            "s-deleted",
+            "user",
+            r#"[{"type":"text","text":"Rust React"}]"#,
+            60,
+        );
+
+        let rust = search_sessions_inner(&c, "rust", 20).unwrap();
+        assert_eq!(rust[0].session_id, "s-title", "标题精确命中应排第一");
+        assert!(rust.iter().any(|row| row.session_id == "s-archived"));
+        assert!(!rust.iter().any(|row| row.session_id == "s-deleted"));
+        assert_eq!(
+            rust.iter().filter(|row| row.session_id == "s-body").count(),
+            1,
+            "同一会话多个匹配消息只返回最佳一条"
+        );
+
+        let multi = search_sessions_inner(&c, "rust react", 20).unwrap();
+        assert_eq!(multi.len(), 1);
+        assert_eq!(multi[0].session_id, "s-body");
+        assert!(multi[0].message_id.is_some());
+        assert!(search_sessions_inner(&c, "needle-thinking", 20)
+            .unwrap()
+            .is_empty());
+        assert!(search_sessions_inner(&c, "needle-tool", 20)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -389,6 +389,7 @@ const MessageTurn = React.memo(function MessageTurn({
       className={`turn turn--${message.role}${
         hovered ? " turn--hovered" : ""
       }${runBlock ? " turn--runbar" : ""}`}
+      data-message-id={messageId(message) ?? undefined}
       onMouseEnter={() => onHoverChange(turnKey, true)}
       onMouseLeave={() => onHoverChange(turnKey, false)}
     >

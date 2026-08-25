@@ -632,9 +632,13 @@ describe("Sidebar · 全高列 sb-top + footer selector（阶段1 Task1.3）", (
     expect(onHome).toHaveBeenCalledOnce();
   });
 
-  it("搜索功能未实现时按钮置灰且不可点击", () => {
-    renderSidebar();
-    expect(screen.getByRole("button", { name: "搜索" })).toBeDisabled();
+  it("搜索按钮可用并触发全局搜索", () => {
+    const onSearch = vi.fn();
+    renderSidebar({ onSearch });
+    const search = screen.getByRole("button", { name: "搜索" });
+    expect(search).toBeEnabled();
+    fireEvent.click(search);
+    expect(onSearch).toHaveBeenCalledOnce();
   });
 
   it(".sb-foot 保留项目切换器和设置齿轮（设置齿轮仍触发 onMenuAgents）", () => {
