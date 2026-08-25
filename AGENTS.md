@@ -6,14 +6,20 @@ same rules in a form you can hand to a tool.
 
 ## Before you write any code
 
-**A pull request requires an issue that a maintainer has labeled `accepted`.**
-If no such issue exists, stop. Do not open the pull request. Report back to the
-person who asked you, and offer to draft an issue instead.
+What you may do without an issue depends on the size of the change:
 
-This is a hard gate. Pull requests without a linked `accepted` issue are closed
-unread.
-
-Exceptions: typo fixes, broken links, and factual corrections in `docs/`.
+- **Small bug fixes may go straight to a pull request.** Small means: three
+  files or fewer, no new dependencies, no behavior change beyond the fix, and
+  the PR includes a test that fails before the fix and passes after. Describe
+  the bug and how to reproduce it in the PR body.
+- **Typo fixes, broken links, and factual corrections in `docs/`** may also go
+  straight to a pull request.
+- **Everything else — new features, behavior changes, refactors, anything
+  touching protocol, security, or dependencies — requires an issue first.**
+  Open an issue describing the problem and your proposed approach, and wait
+  for a maintainer to label it `accepted` before writing code. If no such
+  issue exists, stop and offer to draft one instead. Feature pull requests
+  without a linked `accepted` issue are closed unread.
 
 ## Scope rules
 

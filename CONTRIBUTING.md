@@ -13,17 +13,23 @@ approach fits a roadmap you can't see.
 
 So we've inverted the usual order:
 
-1. Open an issue describing the problem.
+For **small bug fixes** — three files or fewer, no new dependencies, no
+behavior change beyond the fix, with a test that fails before and passes
+after — just send the pull request and describe the bug in it.
+
+For **features, behavior changes, and refactors**:
+
+1. Open an issue describing the problem and your proposed approach.
 2. Wait for a maintainer to label it `accepted`.
 3. Then send the pull request, linking that issue.
 
-**Pull requests that don't reference an `accepted` issue will be closed** —
-usually quickly, and sometimes without a detailed explanation. That is not a
-judgment on your code. It means we haven't agreed on the problem yet, and
-agreeing on the problem is the cheap part.
+**Feature pull requests that don't reference an `accepted` issue will be
+closed** — usually quickly, and sometimes without a detailed explanation. That
+is not a judgment on your code. It means we haven't agreed on the problem yet,
+and agreeing on the problem is the cheap part.
 
-Two things never need an issue: fixing a typo or a broken link, and correcting
-a factual error in the docs. Just send those.
+Besides small bug fixes, two things never need an issue: fixing a typo or a
+broken link, and correcting a factual error in the docs. Just send those.
 
 ## What to expect from us
 
