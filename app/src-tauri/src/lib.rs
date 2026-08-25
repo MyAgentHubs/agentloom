@@ -578,10 +578,83 @@ fn remote_gateway_session_history_provider(
                     message_id: row.message_id,
                     role: row.role,
                     content_json,
+                    // msgfix1 T3（M0 §10.6）：content_ref 的 sha256/total_bytes 必须对原始
+                    // DB content 字节计算，保留 row.content 而不是仅传重新序列化过的 Value。
+                    content_raw: row.content,
+                    revision: row.revision,
                 })
             })
             .collect()
     })
+}
+
+/// msgfix1 T4（M0 §10.9 联合授权闸）：`msg.fetch` 校验链第①步 provider——与
+/// `remote_gateway_session_repo_provider`/`remote_gateway_session_history_provider` 同形：命令
+/// 处理线程上只持短 DB 锁，不碰钥匙串/网络/子进程；查询失败显式回传，由命令臂 fail-closed。
+/// 把 `db::MessageForFetch` 映射成 `remote_gateway::MessageForFetchResult`——两个类型故意分开定义
+/// （同 `SessionHistoryRow` 既有惯例），`remote_gateway.rs` 的测试不依赖 db.rs 也能构造任意三态。
+fn remote_gateway_message_fetch_provider(app: &AppHandle) -> remote_gateway::MessageFetchProvider {
+    let app = app.clone();
+    Box::new(move |session_id: &str, message_id: i64| {
+        let db = app
+            .try_state::<Db>()
+            .ok_or_else(|| "Db state unavailable".to_owned())?;
+        let lock_result = db.inner().0.lock();
+        let conn = lock_result.map_err(|_| "Db lock poisoned".to_owned())?;
+        let result = db::get_message_for_fetch(&conn, session_id, message_id)
+            .map_err(|error| error.to_string())?;
+        Ok(match result {
+            db::MessageForFetch::Found {
+                content,
+                revision,
+                session_deleted,
+            } => remote_gateway::MessageForFetchResult::Found {
+                content_raw: content,
+                revision,
+                session_deleted,
+            },
+            db::MessageForFetch::WrongSession => {
+                remote_gateway::MessageForFetchResult::WrongSession
+            }
+            db::MessageForFetch::NotFound => remote_gateway::MessageForFetchResult::NotFound,
+        })
+    })
+}
+
+/// msgfix2 U1b：L1 活动摘要聚合器的生产落库 provider——签名镜像
+/// `db::upsert_activity_summary_and_publish`（见 `remote_gateway::ActivitySummaryWriter` 文档），
+/// 与 `remote_gateway_message_fetch_provider` 同一惯例：只在独立写线程（`run_activity_summary_
+/// worker`，不是 Tauri 主线程）上执行，短锁拿 `Db` state，不碰钥匙串/网络/子进程。
+fn remote_gateway_activity_summary_writer(
+    app: &AppHandle,
+) -> remote_gateway::ActivitySummaryWriter {
+    let app = app.clone();
+    Box::new(
+        move |session_id: &str,
+              run_id: &str,
+              tool_calls: i64,
+              failed: i64,
+              mcp_calls: i64,
+              permission_prompts: i64,
+              state: &str| {
+            let db = app
+                .try_state::<Db>()
+                .ok_or_else(|| "Db state unavailable".to_owned())?;
+            let lock_result = db.inner().0.lock();
+            let conn = lock_result.map_err(|_| "Db lock poisoned".to_owned())?;
+            db::upsert_activity_summary_and_publish(
+                &conn,
+                session_id,
+                run_id,
+                tool_calls,
+                failed,
+                mcp_calls,
+                permission_prompts,
+                state,
+            )
+            .map_err(|error| error.to_string())
+        },
+    )
 }
 
 /// T5c2（remote control M0 v1.7.5 §4d）：连接后重发批 provider——同 session-index 快照一样在独立的
@@ -2960,7 +3033,11 @@ fn commit_late_answer(
         .map_err(|e| e.to_string())?
         .map(|(q, _)| q)
         .unwrap_or_default();
-    let changed = db::update_decision_card_status(
+    // msgfix1 T5（缺口④）：改走 `update_decision_card_status_message_id`——除了原有的
+    // changed bool，还拿到被改写的 message_id，重读该消息、以新 revision 重发
+    // msg.completed（client_msg_id 带 revision → relay 视为新事件必广播）。重发失败不回滚
+    // 上面已经提交的 CAS 改写，静默跳过（best-effort，同缺口③/④其余落点）。
+    let cas_message_id = db::update_decision_card_status_message_id(
         conn,
         session_id,
         decision_id,
@@ -2969,6 +3046,12 @@ fn commit_late_answer(
         Some(answer),
     )
     .map_err(|e| e.to_string())?;
+    if let Some(message_id) = cas_message_id {
+        if let Ok(Some(republish)) = db::get_message_for_republish(conn, session_id, message_id) {
+            republish.publish();
+        }
+    }
+    let changed = cas_message_id.is_some();
     if !changed {
         return Ok(None);
     }
@@ -10942,7 +11025,10 @@ fn choose_decision_card(
     chosen_option: Option<String>,
 ) -> Result<bool, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    db::update_decision_card_status(
+    // msgfix1 T5（缺口④）：改走 `update_decision_card_status_message_id`——命中改写时重读
+    // 该消息、以新 revision 重发 msg.completed，让远端知道这张卡翻了状态（旧 API 只返回
+    // bool，够不到 message_id，做不了重发）。重发失败不回滚上面已经提交的 CAS 改写。
+    let cas_message_id = db::update_decision_card_status_message_id(
         &conn,
         &session_id,
         &decision_id,
@@ -10950,7 +11036,13 @@ fn choose_decision_card(
         &next_status,
         chosen_option.as_deref(),
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    if let Some(message_id) = cas_message_id {
+        if let Ok(Some(republish)) = db::get_message_for_republish(&conn, &session_id, message_id) {
+            republish.publish();
+        }
+    }
+    Ok(cas_message_id.is_some())
 }
 
 #[tauri::command]
@@ -18467,7 +18559,58 @@ pub fn run() {
                 remote_gateway_control_stop_handler(app.handle()),
                 remote_gateway_session_repo_provider(app.handle()),
                 remote_gateway_session_history_provider(app.handle()),
+                remote_gateway_message_fetch_provider(app.handle()),
             );
+            // msgfix2 U1b：L1 聚合器生产接线——真实 DB 写 provider（见
+            // `remote_gateway_activity_summary_writer` 文档），激活 `extract_tool_milestones`
+            // 的聚合器分支 + 启动独立写线程。
+            remote_gateway::install_activity_summary_writer(remote_gateway_activity_summary_writer(
+                app.handle(),
+            ));
+            // msgfix2 U1b（设计稿 v4.1 §4.1「revision 保留」重启恢复规则）：桌面异常重启前仍
+            // 停在 running 态的 L1 活动摘要，没有任何后续事件能把它翻转——启动时一次性对账
+            // 封 failed。active_run_ids 天然是空集（此刻还没有任何运行会话被拉起），也就是
+            // "当前没有任何逻辑 run 还活着"——这正是重启恢复要的语义：存量全部 running 摘要
+            // 一律封口，不是偶然传空。
+            //
+            // R4（msgfix2 整盘审 P1）：这次调用挪到 `remote_gateway::setup()` +
+            // `install_activity_summary_writer()` 之后——旧位置在两者之前（`Db` 还没
+            // `manage`、`GATEWAY` 单例也没建立），`reconcile_stale_running_activity_summaries`
+            // 内部对每条被封口的消息调 `republish.publish()`（`MsgCompletedMilestone::
+            // publish` → `remote_gateway::publish_msg_completed_milestone`），该函数第一步
+            // 就是 `GATEWAY.get()`，此刻恒 `None` → 直接静默 no-op：DB 里的 `state` 确实被
+            // 改写成了 `failed`，但一个当下已连接的客户端（如果凑巧在这一刻已经连上）永远收
+            // 不到这次改写的广播，要等下一次这条消息因为别的原因被重新读取/重发才会看到新
+            // 状态。挪到此处之后，`GATEWAY` 单例已经建立（`remote_gateway::setup` 已跑），
+            // `publish()` 才有意义。`conn` 此刻已经被上面 `app.manage(Db(...))` 移交给托管
+            // 状态、不再能直接借用，改经 `app.state::<Db>()` 拿回一次连接——与
+            // `remote_gateway_settings_reader` 等既有 provider 闭包同一惯例
+            // （`db.inner().0.lock()`）。
+            match app.try_state::<Db>() {
+                Some(db) => match db.inner().0.lock() {
+                    Ok(conn) => {
+                        match db::reconcile_stale_running_activity_summaries(
+                            &conn,
+                            &std::collections::HashSet::new(),
+                        ) {
+                            Ok(n) if n > 0 => {
+                                eprintln!("reconcile_stale_running_activity_summaries: 启动封口 {n} 条孤儿 running 活动摘要")
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("reconcile_stale_running_activity_summaries 失败（忽略·不阻塞启动）：{e}")
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("reconcile_stale_running_activity_summaries 拿不到 db 锁（忽略·不阻塞启动）：{e}")
+                    }
+                },
+                None => {
+                    eprintln!("reconcile_stale_running_activity_summaries 拿不到 Db state（忽略·不阻塞启动）")
+                }
+            }
+            tick!("reconcile stale activity summaries");
             remote_gateway::install_event_sink(event_transport());
             // 白屏修复兜底：窗口以 visible:false 创建（tauri.conf.json）·正常路径 =
             // 前端 main.tsx 起始处 show；前端加载失败/卡死时 3 秒后强制显示，
@@ -32826,6 +32969,7 @@ mod tests {
             engine: engine.map(|e| e.to_string()),
             agent_id: None,
             agent_name_snapshot: None,
+            revision: 1,
         }
     }
 
@@ -32846,6 +32990,7 @@ mod tests {
             engine: engine.map(|e| e.to_string()),
             agent_id: agent_id.map(|id| id.to_string()),
             agent_name_snapshot: agent_name_snapshot.map(|name| name.to_string()),
+            revision: 1,
         }
     }
 
@@ -33027,6 +33172,7 @@ mod tests {
                 engine: None,
                 agent_id: None,
                 agent_name_snapshot: None,
+                revision: 1,
             },
             db::Message {
                 id: 0,
@@ -33038,6 +33184,7 @@ mod tests {
                 engine: None,
                 agent_id: None,
                 agent_name_snapshot: None,
+                revision: 1,
             },
         ];
         let got = build_prompt(&history, "继续", Locale::Zh, None, None);
@@ -33060,6 +33207,7 @@ mod tests {
             engine: None,
             agent_id: None,
             agent_name_snapshot: None,
+            revision: 1,
         }
     }
 
@@ -33336,6 +33484,7 @@ mod tests {
                 engine: None,
                 agent_id: None,
                 agent_name_snapshot: None,
+                revision: 1,
             },
             db::Message {
                 id: 0,
@@ -33347,6 +33496,7 @@ mod tests {
                 engine: None,
                 agent_id: None,
                 agent_name_snapshot: None,
+                revision: 1,
             },
         ];
         let got = build_prompt(&history, "Continue", Locale::En, None, None);

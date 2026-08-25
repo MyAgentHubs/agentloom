@@ -584,6 +584,9 @@ export const messages = {
     "messageContent.imageMenu.pathCopied": "路径已复制",
     "messageContent.imageMenu.copyFailed": "复制失败",
     "messageContent.html.openExternal": "在浏览器打开 {name}",
+    // msgfix2 F2 S1：未知块类型守卫（M0 §10.11「不识别的块类型不崩溃」）——block.text 为
+    // undefined 时不再 fall-through 到 `block.text.length` 崩溃，降级渲染这行提示。
+    "messageContent.unknownBlock": "[未知内容块]",
     "lightbox.label": "图片放大预览",
     "lightbox.close": "关闭图片预览",
     "lightbox.imageAlt": "放大的图片",
@@ -750,6 +753,11 @@ export const messages = {
     "composer.memberActiveHint":
       "成员任务仍在运行，等它完成或在卡片上停止后再发送",
     "composer.memberRecheckFailedHint": "无法确认成员任务状态，请稍后重试",
+    "composer.queued.count": "已排队 {count} 条",
+    "composer.queued.edit": "编辑",
+    "composer.queued.remove": "删除",
+    "composer.queued.send": "发送",
+    "composer.queued.pausedHint": "待手动发送",
     "composer.hint.send": "Enter 发送 · Shift+Enter 换行",
     "composer.agentSelector.loadingSuffix": "，加载中",
     "composer.agentSelector.trigger.team":
@@ -2156,6 +2164,7 @@ export const messages = {
     "messageContent.imageMenu.pathCopied": "Path copied",
     "messageContent.imageMenu.copyFailed": "Copy failed",
     "messageContent.html.openExternal": "Open {name} in browser",
+    "messageContent.unknownBlock": "[Unknown content block]",
     "lightbox.label": "Enlarged image preview",
     "lightbox.close": "Close image preview",
     "lightbox.imageAlt": "Enlarged image",
@@ -2334,6 +2343,11 @@ export const messages = {
       "A member task is still running. Wait for it to finish or stop it from its card before sending.",
     "composer.memberRecheckFailedHint":
       "Could not verify the member task status. Please try again.",
+    "composer.queued.count": "{count} message(s) queued",
+    "composer.queued.edit": "Edit",
+    "composer.queued.remove": "Remove",
+    "composer.queued.send": "Send",
+    "composer.queued.pausedHint": "waiting to be sent manually",
     "composer.hint.send": "Enter to send · Shift+Enter for a new line",
     "composer.agentSelector.loadingSuffix": ", loading",
     "composer.agentSelector.trigger.team":

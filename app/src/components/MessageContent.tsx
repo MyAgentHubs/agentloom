@@ -1066,6 +1066,19 @@ function MessageContentImpl({
         if (block.type === "decision_card") return null; // 决策卡经 lead-turn 路径渲·不走 raw block 循环
 
         const key = `b-${i}${streaming ? "-streaming" : ""}`;
+        // msgfix2 F2 S1（M0 §10.11「不识别的块类型不崩溃」）：走到这里的块理论上只剩 `text`——
+        // 但这个联合类型只是前端已知的形状，后端可能发出一个这里没有任何 `if` 分支认识的新块
+        // 类型（如未来新增的 `activity_summary_v99`），运行时它照样落到这里，`block.text` 实际是
+        // `undefined`，不是类型标注承诺的 `string`。原先直接 `block.text.length` 对 undefined
+        // 取 `.length` 会抛 TypeError，且 remote-web 当时没有任何 ErrorBoundary 兜底，会整页白屏。
+        // 这里加运行时守卫（类型层面看似恒假，但这就是防的正是"类型跟运行时对不上"这件事本身）：
+        // 不是字符串就降级渲染一行提示，不再往下访问 `.length`。
+        if (typeof block.text !== "string")
+          return (
+            <div key={key} className="turn__unknown-block">
+              {t("messageContent.unknownBlock")}
+            </div>
+          );
         if (block.text.length > HUGE_TEXT_BLOCK_CHARS)
           return <HugeTextBlock key={key} text={block.text} />;
         if (!MarkdownBody)

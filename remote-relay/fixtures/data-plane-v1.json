@@ -21,7 +21,15 @@
       "consumer_tests": [
         "data_plane_v1_msg_completed_matches_fixture_and_drives_builder"
       ],
-      "gap": "P0-c（本刀）已补：msg.completed 现覆盖 assistant 与 user 两种角色的落库咽喉（send_message / start_lead_session / commit_late_answer / 续会话种子四源统一走 dedup 落库 + command_id 穿线补发）；build_msg_completed_payload(message_id, role, blocks) 本就 role 无关，样张沿用既有 assistant 样张即可覆盖两路——不再需要专属 user 样张。显示当前 agent（MA1，本刀）已补：build_msg_completed_payload 加 optional agent 参数，Some 时插入样张的 \"agent\" 键（本样张即覆盖 Some 分支）；None（无 agent 归属）分支不单出样张，由 Rust 侧单元测试 builds_msg_completed_payload_agent_field_optional 覆盖『agent 键整个省略、不是 null』。已知子 gap：重连补发路径（publish_milestone_replay_batch_on_connect，消费 db::MilestoneReplayRow）暂不带 agent——MilestoneReplayRow 尚未携带 agent_name_snapshot，另立单跟进，不在本刀 scope。剩余 gap：本机旁路 IPC `append_message`（前端三处非 reply 动作）仍走非 dedup 版落库，无 dedup_key/里程碑，留后续刀。"
+      "gap": "P0-c（本刀）已补：msg.completed 现覆盖 assistant 与 user 两种角色的落库咽喉（send_message / start_lead_session / commit_late_answer / 续会话种子四源统一走 dedup 落库 + command_id 穿线补发）；build_msg_completed_payload(message_id, role, blocks) 本就 role 无关，样张沿用既有 assistant 样张即可覆盖两路——不再需要专属 user 样张。显示当前 agent（MA1，本刀）已补：build_msg_completed_payload 加 optional agent 参数，Some 时插入样张的 \"agent\" 键（本样张即覆盖 Some 分支）；None（无 agent 归属）分支不单出样张，由 Rust 侧单元测试 builds_msg_completed_payload_agent_field_optional 覆盖『agent 键整个省略、不是 null』。已知子 gap：重连补发路径（publish_milestone_replay_batch_on_connect，消费 db::MilestoneReplayRow）暂不带 agent——MilestoneReplayRow 尚未携带 agent_name_snapshot，另立单跟进，不在本刀 scope。剩余 gap：本机旁路 IPC `append_message`（前端三处非 reply 动作）仍走非 dedup 版落库，无 dedup_key/里程碑，留后续刀。msgfix2 U1（M0 §10.10）已补：本样张与 msg_completed_with_content_ref 均加顶层 revision 字段。"
+    },
+    {
+      "category": "L1 活动摘要 activity_summary（M0 §10.11·msgfix2 U1）",
+      "sample_count": 2,
+      "consumer_tests": [
+        "data_plane_v1_activity_summary_matches_fixture_and_drives_upsert（首发 revision=1 + 改写重发 revision=2 两态）"
+      ],
+      "gap": "聚合器内存计数→节流→串行写线程→db::upsert_activity_summary_and_publish 的完整链路在 remote_gateway.rs/db.rs 内自包含并有单元测试覆盖；lib.rs 侧两处接线均已落地（U1b 已接线，不再是待办）：① 生产 DB 写 provider 在启动序列里通过 remote_gateway::install_activity_summary_writer(remote_gateway_activity_summary_writer(...)) 接进写线程；② 重启恢复扫描 db::reconcile_stale_running_activity_summaries 在启动序列里调用，且（msgfix2 整盘审 R4）调用点已挪到 remote_gateway::setup()+install_activity_summary_writer() 之后——挪之前 GATEWAY 单例尚未建立，被封口消息的 republish 会因为 GATEWAY.get()==None 静默 no-op（DB 状态改了但没广播出去）；挪之后 publish 真正生效。剩余 gap：reconcile 传入的 active_run_ids 目前恒为空集（供给真实运行态集合留后续刀，属另一件事，不影响本条『已接线』的结论）。"
     },
     {
       "category": "event 其余里程碑：card.created / card.resolved / run.status / tool.completed",
@@ -95,6 +103,16 @@
       "sample_count": 1,
       "consumer_tests": [
         "relay desktopHello 在 registry_ready 激活后下发的首帧 replay.head 与 store 现状一致"
+      ],
+      "gap": null
+    },
+    {
+      "category": "消息完整性面（v1.9·msgfix1 T6 合入）：msg.fetch 请求 / msg.chunk 应答 / msg.fetch.error 两 code 分支 / 带 content_ref 的 msg.completed",
+      "sample_count": 5,
+      "consumer_tests": [
+        "remote-web parseFrame() accepts every valid: true data-plane-v1 case and reproduces it field-for-field（msg_fetch_request/msg_chunk/msg_fetch_error_stale_revision/msg_fetch_error_not_found/msg_completed_with_content_ref）",
+        "remote-web msgFetch.ts::MsgChunkReassembler（重组状态机·消费 msg_chunk 样张的字段形状）",
+        "remote-web milestoneProjection.ts::applyMsgCompleted revision 高者胜（消费 msg_completed_with_content_ref 的 content_ref.revision）"
       ],
       "gap": null
     }
@@ -270,12 +288,13 @@
     },
     {
       "name": "msg_completed",
-      "desc": "msg.completed——build_msg_completed_payload(message_id, role, blocks, agent)；blocks 逐字段抄自 db::Block 的真实 Serialize 输出（Text + Tool 两类块，tag=\"type\"/snake_case）。显示当前 agent（MA1）：agent = 落库时的 agent_name_snapshot，Some 时插入本样张的 \"agent\" 键；user 消息 / 无 agent 归属时该键整个省略（不是 null）——另有消费测试单独覆盖 None 分支，未各出一张样张。",
+      "desc": "msg.completed——build_msg_completed_payload(message_id, role, blocks, agent, revision)；blocks 逐字段抄自 db::Block 的真实 Serialize 输出（Text + Tool 两类块，tag=\"type\"/snake_case）。显示当前 agent（MA1）：agent = 落库时的 agent_name_snapshot，Some 时插入本样张的 \"agent\" 键；user 消息 / 无 agent 归属时该键整个省略（不是 null）——另有消费测试单独覆盖 None 分支，未各出一张样张。msgfix2 U1（M0 §10.10）：顶层 revision 字段——桌面三处 msg.completed 产出点（live 首发/重连补发批/history 分页）恒带该消息当前 messages.revision。",
       "frame": {
         "t": "msg.completed",
         "message_id": 101,
         "role": "assistant",
         "agent": "Claude",
+        "revision": 1,
         "blocks": [
           {
             "type": "text",
@@ -623,6 +642,151 @@
       "valid": true,
       "consumers": [
         "relay desktopHello 在 registry_ready 激活后下发的首帧 replay.head 与 store 现状一致"
+      ]
+    },
+    {
+      "name": "msg_fetch_request",
+      "desc": "msg.fetch——手机经 control 通道发起全文拉取请求；session/message_id/revision/offset 四字段（M0 §10.4）。command_id 走信封顶层（既有 control 契约），不在密文体里重复。",
+      "frame": {
+        "t": "msg.fetch",
+        "session": "sess-1",
+        "message_id": 4821,
+        "revision": 1,
+        "offset": 0
+      },
+      "valid": true,
+      "consumers": [
+        "remote-web parseFrame() accepts every valid: true data-plane-v1 case（msg_fetch_request）",
+        "remote-web buildMsgFetchRequest() round-trips through parseFrame()"
+      ]
+    },
+    {
+      "name": "msg_chunk",
+      "desc": "msg.chunk——桌面经 reply 通道回的正常分片（M0 §10.5）。content_sha256/total_bytes 描述整条消息；offset/chunk_len 描述本分片在整体中的位置；bytes_b64 是本分片裸内容的 base64（样张用短占位串，真实分片大小上限由 T4 生成式测量钉死，见 M0 §10.8）。",
+      "frame": {
+        "t": "msg.chunk",
+        "message_id": 4821,
+        "revision": 2,
+        "content_sha256": "fa04bb56749d53fe6e872af4ee833c6df85b1ae71a68c957daf7efd499d15bf4",
+        "total_bytes": 205510,
+        "offset": 0,
+        "chunk_len": 31,
+        "bytes_b64": "Y2h1bmsgY29udGVudCBzYW1wbGUgYnl0ZXMgMC0xOQ=="
+      },
+      "valid": true,
+      "consumers": [
+        "remote-web parseFrame() accepts every valid: true data-plane-v1 case（msg_chunk）",
+        "remote-web msgFetch.ts::MsgChunkReassembler"
+      ]
+    },
+    {
+      "name": "msg_fetch_error_stale_revision",
+      "desc": "msg.fetch.error（code=stale_revision）——请求的 revision 已不是最新，current_ref 引导按新 revision 重拉（M0 §10.5：这是唯一必带 current_ref 的 code）。",
+      "frame": {
+        "t": "msg.fetch.error",
+        "code": "stale_revision",
+        "current_ref": {
+          "message_id": 4821,
+          "revision": 3,
+          "content_sha256": "b13a840083cf20c571809df508a7cd78fac970fd964fc6d46fcca6f832c789dd",
+          "total_bytes": 206112
+        }
+      },
+      "valid": true,
+      "consumers": [
+        "remote-web parseFrame() accepts every valid: true data-plane-v1 case（msg_fetch_error_stale_revision）"
+      ]
+    },
+    {
+      "name": "msg_fetch_error_not_found",
+      "desc": "msg.fetch.error（code=not_found）——message_id 不存在；current_ref 字段整个省略（M0 §10.5：非 stale_revision 的 code 不带该字段，不是带 null）。",
+      "frame": {
+        "t": "msg.fetch.error",
+        "code": "not_found"
+      },
+      "valid": true,
+      "consumers": [
+        "remote-web parseFrame() accepts every valid: true data-plane-v1 case（msg_fetch_error_not_found）"
+      ]
+    },
+    {
+      "name": "msg_completed_with_content_ref",
+      "desc": "msg.completed 挂可选 content_ref（M0 §10.6）——超预算消息降级为预览 blocks，content_ref 指向可按需拉取的全文；旧客户端不识别 content_ref 键时必须照常渲染 message_id/role/blocks 其余字段（前向兼容硬约束）。total_bytes 口径 = 该消息 DB content JSON 的 UTF-8 字节数，与预览后 blocks 的字节数无关（预览小、全文大是常态）。msgfix2 U1（M0 §10.10）：顶层 revision 与 content_ref.revision 并存、同值——客户端读取优先顶层。",
+      "frame": {
+        "t": "msg.completed",
+        "message_id": 4821,
+        "role": "assistant",
+        "revision": 1,
+        "blocks": [
+          {
+            "type": "text",
+            "text": "Investigated the failing pipeline and produced a detailed report. 内容较长，已截断——点击加载全文查看完整报告。"
+          }
+        ],
+        "content_ref": {
+          "message_id": 4821,
+          "revision": 1,
+          "content_sha256": "8207faff11789eb4a8fa537167b88c24271089c948f4ecad6a132c328283e5fa",
+          "total_bytes": 205510
+        }
+      },
+      "valid": true,
+      "consumers": [
+        "remote-web parseFrame() accepts every valid: true data-plane-v1 case（msg_completed_with_content_ref）",
+        "remote-web milestoneProjection.ts::applyMsgCompleted revision 高者胜"
+      ]
+    },
+    {
+      "name": "activity_summary_first_send",
+      "desc": "msg.completed 承载 L1 活动摘要（M0 §10.11·设计稿 v4.1 §4.1）——不是新帧型，blocks 数组唯一元素是 type=\"activity_summary\" 块；dedup_key=\"activity_summary:\"+run_id（不下发·内部幂等细节）；首次发布 revision 恒为 1，state=\"running\"。",
+      "frame": {
+        "t": "msg.completed",
+        "message_id": 501,
+        "role": "assistant",
+        "revision": 1,
+        "blocks": [
+          {
+            "type": "activity_summary",
+            "run_id": "run-9",
+            "tool_calls": 3,
+            "failed": 0,
+            "mcp_calls": 1,
+            "permission_prompts": 0,
+            "state": "running"
+          }
+        ]
+      },
+      "valid": true,
+      "consumers": [
+        "remote-web parseFrame() accepts every valid: true data-plane-v1 case（activity_summary_first_send）",
+        "db::upsert_activity_summary_and_publish 首次 INSERT 分支（revision==1）"
+      ]
+    },
+    {
+      "name": "activity_summary_revision_update",
+      "desc": "同一 run 的 L1 活动摘要计数变化后原地改写重发（M0 §10.7 revision+1 派生规则原样适用）——同 message_id、revision 从 1 跳到 2，state 翻到终态 \"done\"。旧客户端按到达序覆盖（不更坏）。",
+      "frame": {
+        "t": "msg.completed",
+        "message_id": 501,
+        "role": "assistant",
+        "revision": 2,
+        "blocks": [
+          {
+            "type": "activity_summary",
+            "run_id": "run-9",
+            "tool_calls": 5,
+            "failed": 1,
+            "mcp_calls": 1,
+            "permission_prompts": 1,
+            "state": "done"
+          }
+        ]
+      },
+      "valid": true,
+      "consumers": [
+        "remote-web parseFrame() accepts every valid: true data-plane-v1 case（activity_summary_revision_update）",
+        "remote-web milestoneProjection.ts::applyMsgCompleted revision 高者胜（消费 activity_summary_revision_update 的顶层 revision）",
+        "db::upsert_activity_summary_and_publish 命中已存在 dedup_key 的 UPDATE 分支（revision+1）"
       ]
     }
   ]

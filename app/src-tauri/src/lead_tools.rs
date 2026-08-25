@@ -649,8 +649,47 @@ pub fn finish(ctx: &LeadCtx, _args: FinishArgs) -> Result<serde_json::Value, Str
 /// prompt_user 的结果：准点收到答案，还是有界等待窗口耗尽仍未收到（只有 `wait: Some(_)` 调用
 /// 才可能产生 Pending；`wait: None`——旧的无界等待——恒不返回 Pending，只会 Answered 或 Err）。
 enum PromptOutcome {
-    Answered(String),
+    /// (答案, decision_id)——decision_id 供 `ask_user_bounded` 的准点回显给
+    /// `decision_echo:<decision_id>` 拼稳定 dedup_key（msgfix1 T5·缺口③；msgfix1 T7 B4
+    /// 把分隔符从 `|` 改 `:`——见 `append_decision_card_message` doc）。
+    Answered(String, String),
     Pending,
+}
+
+/// msgfix1 T5（缺口③·决策卡承载）：`prompt_user` 落决策卡消息的纯 DB 内核（同
+/// `append_decision_echo_message`/`append_verifier_result_echo` 一样拆成纯 `&Connection`
+/// 函数，不依赖 `AppHandle`——本仓无 AppHandle 测试基础设施，拆出来才能单测）。
+/// 改走 append_message_dedup + 统一 publish 链路——旧版 `append_message` 从不发布
+/// msg.completed，这条承载决策卡的消息对相连的手机端完全不可见（只有 card.created 这个
+/// 轻量事件，没有可用 content_ref/revision 同步）。dedup_key = `decision_card:<decision_id>`：
+/// decision_id 在本次 prompt_user 调用内全程稳定（函数顶部生成一次、贯穿 CAS/echo），同一
+/// 决策事件重放得同一个 key；与另一决策事件（新 decision_id）天然不冲突。
+///
+/// msgfix1 T7 B4（opus 整盘审 P2-12）：分隔符用 `:` 不用 `|`——`derive_msg_completed_client_msg_id`
+/// 把这个 dedup_key 整段拼进 `msg.completed|{session_id}|{dedup_key}` 再派生 client_msg_id，
+/// `|` 本身就是那个外层拼接的字段分隔符；若 dedup_key 内部也含 `|`，理论上能构造出两个不同
+/// `(session_id, dedup_key)` 拼出同一个中间字符串（字段边界错位），派生出同一个 client_msg_id
+/// 造成误判重复。`:` 不是外层拼接使用的字符，不会有这层歧义。本批（msgfix1）尚未发布，
+/// 数据库里没有旧分隔符的存量行需要迁移。
+fn append_decision_card_message(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    decision_id: &str,
+    block: &crate::db::Block,
+    agent_id: Option<&str>,
+    agent_name: Option<&str>,
+) -> rusqlite::Result<Option<crate::db::MsgCompletedMilestone>> {
+    let dedup_key = format!("decision_card:{decision_id}");
+    crate::db::append_message_dedup(
+        conn,
+        session_id,
+        "assistant",
+        std::slice::from_ref(block),
+        Some("agent-team"),
+        agent_id,
+        agent_name,
+        &dedup_key,
+    )
 }
 
 /// MCP 工具：队长问用户一个问题。
@@ -682,7 +721,7 @@ fn prompt_user(
         rationale: rationale.clone().unwrap_or_default(),
     };
 
-    let card = {
+    let (card, card_milestone) = {
         let db_state = app.state::<crate::db::Db>();
         let conn = db_state.0.lock().map_err(|e| e.to_string())?;
         let now = crate::db::now_secs();
@@ -705,22 +744,26 @@ fn prompt_user(
         let card =
             crate::lead_step::build_decision_card_block(&decision_id, &source_run_id, &action, now);
 
+        let mut card_milestone = None;
         if let Some(b) = &card {
             // 决策打扰收敛刀 T4：决策卡带上 lead 身份快照——旧版落库 agent_id/name 恒 None，
             // 导致前端作者行显「Lead·Lead」（live）或重启后回退成内部 tag「agent-team」（persisted）。
-            crate::db::append_message(
+            card_milestone = append_decision_card_message(
                 &conn,
                 session_id,
-                "assistant",
-                std::slice::from_ref(b),
-                Some("agent-team"),
+                &decision_id,
+                b,
                 agent_id,
                 agent_name,
             )
             .map_err(|e| e.to_string())?;
         }
-        card
+        (card, card_milestone)
     }; // DB lock released here
+
+    if let Some(milestone) = card_milestone {
+        milestone.publish();
+    }
 
     if let Some(b) = &card {
         use tauri::Emitter;
@@ -752,24 +795,37 @@ fn prompt_user(
         wait,
     )? {
         crate::WaitOutcome::Answered(opt) => {
-            let changed = {
+            // msgfix1 T5（缺口④）：CAS 赢家分支改走 `update_decision_card_status_message_id`
+            // ——除了原有的 changed bool，还拿到被改写的 message_id，供下面重读该消息、以新
+            // revision 重发 msg.completed（旧 API 只返回 bool，够不到 message_id）。
+            let (changed, republish) = {
                 let db_state = app.state::<crate::db::Db>();
-                let cas_changed = match db_state.0.lock() {
-                    Ok(conn) => matches!(
-                        crate::db::update_decision_card_status(
+                let outcome = match db_state.0.lock() {
+                    Ok(conn) => {
+                        let cas_message_id = crate::db::update_decision_card_status_message_id(
                             &conn,
                             session_id,
                             &decision_id,
                             "pending",
                             "chosen",
                             Some(&opt),
-                        ),
-                        Ok(true)
-                    ),
-                    Err(_) => false,
+                        )
+                        .unwrap_or(None);
+                        let republish = cas_message_id.and_then(|message_id| {
+                            crate::db::get_message_for_republish(&conn, session_id, message_id)
+                                .ok()
+                                .flatten()
+                        });
+                        (cas_message_id.is_some(), republish)
+                    }
+                    Err(_) => (false, None),
                 };
-                cas_changed
+                outcome
             };
+            // 重发失败/无 dedup_key 均静默跳过（best-effort，不回滚上面已经提交的 CAS 改写）。
+            if let Some(milestone) = republish {
+                milestone.publish();
+            }
             if changed {
                 use tauri::Emitter;
                 let _ = app.emit(
@@ -782,7 +838,7 @@ fn prompt_user(
                     }),
                 );
             }
-            Ok(PromptOutcome::Answered(opt))
+            Ok(PromptOutcome::Answered(opt, decision_id.clone()))
         }
         crate::WaitOutcome::TimedOut => Ok(PromptOutcome::Pending),
     }
@@ -819,7 +875,7 @@ pub fn ask_user(
         agent_name,
         None,
     )? {
-        PromptOutcome::Answered(opt) => Ok(serde_json::json!({ "answer": opt })),
+        PromptOutcome::Answered(opt, _decision_id) => Ok(serde_json::json!({ "answer": opt })),
         PromptOutcome::Pending => Err(unbounded_prompt_never_pending()),
     }
 }
@@ -851,8 +907,16 @@ pub fn ask_user_bounded(
         agent_name,
         Some(DISPATCH_WORKER_WAIT),
     )? {
-        PromptOutcome::Answered(opt) => {
-            append_decision_echo(app, session_id, &question, &opt, agent_id, agent_name);
+        PromptOutcome::Answered(opt, decision_id) => {
+            append_decision_echo(
+                app,
+                session_id,
+                &decision_id,
+                &question,
+                &opt,
+                agent_id,
+                agent_name,
+            );
             Ok(serde_json::json!({ "answer": opt }))
         }
         PromptOutcome::Pending => Ok(serde_json::json!({
@@ -880,6 +944,7 @@ pub fn ask_user_bounded(
 fn append_decision_echo(
     app: &tauri::AppHandle,
     session_id: &str,
+    decision_id: &str,
     question: &str,
     answer: &str,
     agent_id: Option<&str>,
@@ -890,8 +955,15 @@ fn append_decision_echo(
     let Ok(conn) = db_state.0.lock() else {
         return;
     };
-    let message =
-        append_decision_echo_message(&conn, session_id, question, answer, agent_id, agent_name);
+    let message = append_decision_echo_message(
+        &conn,
+        session_id,
+        decision_id,
+        question,
+        answer,
+        agent_id,
+        agent_name,
+    );
     drop(conn);
     if let Some(message) = message {
         let _ = app.emit(
@@ -907,16 +979,23 @@ fn append_decision_echo(
 /// `append_decision_echo` 的纯 DB 内核：落一条回显消息，成功则读回刚插入的完整
 /// `db::Message`（供调用方 emit）。写失败（含读回失败）返回 `None`——best-effort 语义不变，
 /// 不影响已经成功的 ask_user 调用本身。
+/// msgfix1 T5（缺口③·决策回显）：改走 append_message_dedup + 统一 publish 链路——旧版
+/// append_message 从不发布 msg.completed，这条回显对手机端不可见。dedup_key =
+/// `decision_echo:<decision_id>`：decision_id 在本次 prompt_user 调用内全程稳定（函数顶部
+/// 生成一次），同一决策事件重放得同一个 key，不同决策事件天然不冲突。msgfix1 T7 B4：分隔符
+/// 用 `:` 不用 `|`——理由见 `append_decision_card_message` doc。
 fn append_decision_echo_message(
     conn: &rusqlite::Connection,
     session_id: &str,
+    decision_id: &str,
     question: &str,
     answer: &str,
     agent_id: Option<&str>,
     agent_name: Option<&str>,
 ) -> Option<crate::db::Message> {
     let text = format!("已选择「{answer}」（{}）", clip_chars(question, 160));
-    crate::db::append_message(
+    let dedup_key = format!("decision_echo:{decision_id}");
+    let milestone = crate::db::append_message_dedup(
         conn,
         session_id,
         "assistant",
@@ -924,9 +1003,11 @@ fn append_decision_echo_message(
         Some(DECISION_ECHO_ENGINE_TAG),
         agent_id,
         agent_name,
+        &dedup_key,
     )
-    .ok()?;
+    .ok()??;
     let id = conn.last_insert_rowid();
+    milestone.publish();
     crate::db::get_message_by_id(conn, id).ok().flatten()
 }
 
@@ -945,6 +1026,13 @@ fn clip_chars(s: &str, max: usize) -> String {
 /// 从 `Block::Text` 换成折叠默认的命令卡（`Block::Tool`，见 `verifier_result_block`），别再
 /// 把长命令原样平铺进正文。best-effort：写失败不影响已经成功跑完的验证结果本身（lead 已经
 /// 拿到 verdict）。
+/// msgfix1 T5（缺口③·验证回执）：改走 append_message_dedup + 统一 publish 链路——旧版
+/// append_message 从不发布 msg.completed，这条验证结果卡对手机端不可见。dedup_key 复用
+/// `verifier_result_block` 自己生成的块 id（`Block::Tool.id`，`format!("verifier-{}",
+/// crate::new_run_id())`）——同一次 propose_verifier 调用只构造这一个块、只落这一条消息，
+/// 块 id 与消息 dedup_key 一一对应；不像 decision_id/command_id 那样有天然的、跨越更大
+/// 生命周期的业务标识可复用（propose_verifier 没有 assignment_id/run_id 入参），沿用块自身
+/// 已经生成的一次性 id 是最小改动、且不会与其他 propose_verifier 调用碰撞。
 fn append_verifier_result_echo(
     app: &tauri::AppHandle,
     session_id: &str,
@@ -961,15 +1049,42 @@ fn append_verifier_result_echo(
         return;
     };
     let block = verifier_result_block(locale, cmd, verdict, exit_code);
-    let _ = crate::db::append_message(
-        &conn,
+    if let Ok(Some(milestone)) =
+        append_verifier_result_message(&conn, session_id, &block, agent_id, agent_name)
+    {
+        milestone.publish();
+    }
+}
+
+/// `append_verifier_result_echo` 的纯 DB 内核（同 `append_decision_card_message`/
+/// `append_decision_echo_message` 一样拆成纯 `&Connection` 函数，供单测直接调用，不依赖
+/// `AppHandle`）。dedup_key 复用 `verifier_result_block` 自己生成的块 id（`Block::Tool.id`，
+/// `format!("verifier-{}", crate::new_run_id())`）——同一次 propose_verifier 调用只构造这一个
+/// 块、只落这一条消息，块 id 与消息 dedup_key 一一对应；不像 decision_id/command_id 那样有
+/// 天然的、跨越更大生命周期的业务标识可复用（propose_verifier 没有 assignment_id/run_id
+/// 入参），沿用块自身已经生成的一次性 id 是最小改动、且不会与其他 propose_verifier 调用碰撞。
+/// msgfix1 T7 B4：分隔符用 `:` 不用 `|`——理由见 `append_decision_card_message` doc。
+fn append_verifier_result_message(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    block: &crate::db::Block,
+    agent_id: Option<&str>,
+    agent_name: Option<&str>,
+) -> rusqlite::Result<Option<crate::db::MsgCompletedMilestone>> {
+    let crate::db::Block::Tool { id: block_id, .. } = block else {
+        return Ok(None); // 理论不可达：verifier_result_block 恒构造 Block::Tool。
+    };
+    let dedup_key = format!("verifier_result:{block_id}");
+    crate::db::append_message_dedup(
+        conn,
         session_id,
         "assistant",
-        &[block],
+        std::slice::from_ref(block),
         Some(VERIFIER_RESULT_ENGINE_TAG),
         agent_id,
         agent_name,
-    );
+        &dedup_key,
+    )
 }
 
 /// 决策打扰收敛刀 T2：propose_verifier 去确认弹卡·改 Auto 直跑——这版本本来就是 Auto
@@ -1060,26 +1175,27 @@ mod tests {
             "Answered 分支应且仅应有一次翻卡 emit"
         );
         let update_idx = answered
-            .find("crate::db::update_decision_card_status(")
+            .find("crate::db::update_decision_card_status_message_id(")
             .expect("Answered 分支必须执行决策卡 CAS");
         let if_idx = answered
             .find("if changed {")
             .expect("Answered 分支必须以 changed 门控 emit");
         assert!(update_idx < if_idx, "必须先取得 CAS 结果，再判断是否 emit");
         let changed_source = answered
-            .split("let changed = {")
+            .split("let (changed, republish) = {")
             .nth(1)
-            .expect("必须捕获 CAS 是否成功")
+            .expect("必须捕获 CAS 是否成功（含 msgfix1 T5 缺口④重发用的 message_id）")
             .split("if changed {")
             .next()
             .unwrap();
         assert!(
-            changed_source.contains("matches!(") && changed_source.contains("Ok(true)"),
-            "只有 CAS 返回 Ok(true) 才能把 changed 置为 true"
+            changed_source.contains(".unwrap_or(None)")
+                && changed_source.contains("cas_message_id.is_some()"),
+            "只有 CAS 真的命中改写（message_id 非空）才能把 changed 置为 true"
         );
         assert!(
-            changed_source.contains("Err(_) => false"),
-            "DB 锁失败必须折叠为 changed=false，不得 emit"
+            changed_source.contains("Err(_) => (false, None)"),
+            "DB 锁失败必须折叠为 changed=false 且不产出重发目标，不得 emit/重发"
         );
 
         let open_idx = if_idx
@@ -1110,7 +1226,7 @@ mod tests {
             "decision-card-resolved emit 必须嵌套在 CAS changed=true 分支内"
         );
         let answer_return_idx = answered
-            .find("Ok(PromptOutcome::Answered(opt))")
+            .find("Ok(PromptOutcome::Answered(opt, decision_id.clone()))")
             .expect("无论是否 emit 都必须返回 Answered");
         assert!(
             close_idx < answer_return_idx,
@@ -2802,6 +2918,7 @@ mod tests {
         let message = append_decision_echo_message(
             &conn,
             "s-echo",
+            "d-echo",
             "要不要继续？",
             "继续",
             Some("lead-claude"),
@@ -2834,13 +2951,143 @@ mod tests {
         let conn = crate::test_support::mem_db();
         seed_session_for_echo(&conn, "s-echo-2");
 
-        let first = append_decision_echo_message(&conn, "s-echo-2", "Q1", "A1", None, None)
-            .expect("第一条应落库成功");
-        let second = append_decision_echo_message(&conn, "s-echo-2", "Q2", "A2", None, None)
-            .expect("第二条应落库成功");
+        let first =
+            append_decision_echo_message(&conn, "s-echo-2", "d-echo-2-a", "Q1", "A1", None, None)
+                .expect("第一条应落库成功");
+        let second =
+            append_decision_echo_message(&conn, "s-echo-2", "d-echo-2-b", "Q2", "A2", None, None)
+                .expect("第二条应落库成功");
 
         assert_ne!(first.id, second.id);
         let msgs = crate::db::get_messages(&conn, "s-echo-2").unwrap();
         assert_eq!(msgs.len(), 2);
+    }
+
+    // ---- msgfix1 T5 缺口③：三处「落库+publish 统一链路」调用点各自的 dedup_key 稳定性 +
+    // 确实经 publish 链路发出 msg.completed ----
+
+    #[test]
+    fn append_decision_card_message_publishes_msg_completed_with_stable_dedup_key() {
+        let conn = crate::test_support::mem_db();
+        seed_session_for_echo(&conn, "s-card");
+        crate::remote_gateway::test_take_publish_log(); // 清空可能的残留
+
+        let block = crate::db::Block::Text {
+            text: "决策卡".into(),
+        };
+        let milestone =
+            append_decision_card_message(&conn, "s-card", "d-card-1", &block, None, None)
+                .expect("落库不应报错")
+                .expect("首次落库应产出可发布的 milestone");
+        milestone.publish();
+
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["msg.completed"],
+            "决策卡承载消息必须经统一 publish 链路发出 msg.completed"
+        );
+
+        let dedup_key: String = conn
+            .query_row(
+                "SELECT dedup_key FROM messages WHERE session_id = 's-card'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dedup_key, "decision_card:d-card-1");
+
+        // 稳定性：同一 decision_id 重放（如队长重试同一次 ask_user）必须被 dedup_key 挡下，
+        // 不重复插入第二行。
+        let retry = append_decision_card_message(&conn, "s-card", "d-card-1", &block, None, None)
+            .expect("重放不应报错");
+        assert!(
+            retry.is_none(),
+            "同一 decision_id 重放必须被 dedup_key 去重"
+        );
+    }
+
+    #[test]
+    fn append_decision_echo_message_publishes_msg_completed_with_stable_dedup_key() {
+        let conn = crate::test_support::mem_db();
+        seed_session_for_echo(&conn, "s-echo-publish");
+        crate::remote_gateway::test_take_publish_log();
+
+        append_decision_echo_message(
+            &conn,
+            "s-echo-publish",
+            "d-echo-publish",
+            "要不要继续？",
+            "继续",
+            None,
+            None,
+        )
+        .expect("落库成功应回完整 Message");
+
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["msg.completed"],
+            "决策回显必须经统一 publish 链路发出 msg.completed"
+        );
+
+        let dedup_key: String = conn
+            .query_row(
+                "SELECT dedup_key FROM messages WHERE session_id = 's-echo-publish'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dedup_key, "decision_echo:d-echo-publish");
+
+        let retry = append_decision_echo_message(
+            &conn,
+            "s-echo-publish",
+            "d-echo-publish",
+            "要不要继续？",
+            "继续",
+            None,
+            None,
+        );
+        assert!(
+            retry.is_none(),
+            "同一 decision_id 重放必须被 decision_echo:<decision_id> dedup_key 去重"
+        );
+    }
+
+    #[test]
+    fn append_verifier_result_message_publishes_msg_completed_with_dedup_key_from_block_id() {
+        let conn = crate::test_support::mem_db();
+        seed_session_for_echo(&conn, "s-verifier");
+        crate::remote_gateway::test_take_publish_log();
+
+        let block = verifier_result_block(crate::Locale::Zh, "cargo test", "passed", Some(0));
+        let crate::db::Block::Tool { id: block_id, .. } = &block else {
+            panic!("verifier_result_block 应恒产出 Block::Tool");
+        };
+        let expected_dedup_key = format!("verifier_result:{block_id}");
+
+        let milestone = append_verifier_result_message(&conn, "s-verifier", &block, None, None)
+            .expect("落库不应报错")
+            .expect("首次落库应产出可发布的 milestone");
+        milestone.publish();
+
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["msg.completed"],
+            "验证回执必须经统一 publish 链路发出 msg.completed"
+        );
+
+        let dedup_key: String = conn
+            .query_row(
+                "SELECT dedup_key FROM messages WHERE session_id = 's-verifier'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dedup_key, expected_dedup_key, "dedup_key 必须复用块自身 id");
+
+        // 稳定性：同一个块（同一 dedup_key）重放必须被去重。
+        let retry = append_verifier_result_message(&conn, "s-verifier", &block, None, None)
+            .expect("重放不应报错");
+        assert!(retry.is_none(), "同一块 id 重放必须被 dedup_key 去重");
     }
 }

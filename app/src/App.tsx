@@ -102,6 +102,15 @@ import {
 } from "./lib/dispatchCards";
 import { startMemberIdlePoll } from "./lib/memberIdlePoll";
 import {
+  clear as clearQueued,
+  emptyQueueState,
+  enqueue as enqueueQueued,
+  listQueue,
+  remove as removeQueued,
+  type QueuedMessage,
+  type QueueState as ComposerQueueState,
+} from "./lib/composerQueue";
+import {
   isLandingBlockedError,
   nextCodingAction,
   selectCodingVerifier,
@@ -652,6 +661,19 @@ function AppContent() {
     Map<string, SessionDotStatus>
   >(new Map());
   const sessionStatusRef = useRef<Map<string, SessionDotStatus>>(new Map());
+  // msgfix2 Q1：运行中 composer 消息排队——per-session FIFO + 显式停止后的暂停态 +
+  // 投递 in-flight 标志（防两条触发沿撞出双发）。纯前端态，不落库、不进 app 数据目录。
+  const [queueBySession, setQueueBySession] = useState<ComposerQueueState>(() =>
+    emptyQueueState(),
+  );
+  const queueBySessionRef = useRef<ComposerQueueState>(queueBySession);
+  queueBySessionRef.current = queueBySession;
+  const [queuePausedSessions, setQueuePausedSessions] = useState<Set<string>>(
+    new Set(),
+  );
+  const queuePausedSessionsRef = useRef<Set<string>>(queuePausedSessions);
+  queuePausedSessionsRef.current = queuePausedSessions;
+  const queueDeliveryInFlightRef = useRef<Set<string>>(new Set());
   const [agents, setAgents] = useState<AgentProfile[]>([]);
   const [agentsReady, setAgentsReady] = useState(false);
   const [agentId, setAgentId] = useState(() => loadLastAgentId() ?? "claude");
@@ -1328,6 +1350,11 @@ function AppContent() {
     memberRunning,
   });
   const currentRun = currentId ? runningSessions.get(currentId) : undefined;
+  // msgfix2 Q1：当前会话的排队列表 + 暂停态（"" 恒不命中，稳定复用 listQueue 的空数组常量）。
+  const currentQueuedMessages = listQueue(queueBySession, currentId ?? "");
+  const currentQueuePaused = currentId
+    ? queuePausedSessions.has(currentId)
+    : false;
   // 是否 in-place 由后端按会话真实绑定透出，不再用 namespace.kind 猜。
   const currentSession = currentId
     ? (sessions.find((s) => s.id === currentId) ?? null)
@@ -1430,15 +1457,205 @@ function AppContent() {
     [],
   );
 
+  // ---- msgfix2 Q1：composer 消息排队——入队/出队/投递 ----------------------
+
+  function maybeClearQueuePause(
+    sid: string,
+    nextQueueState: ComposerQueueState,
+  ) {
+    if (nextQueueState.has(sid)) return;
+    if (!queuePausedSessionsRef.current.has(sid)) return;
+    const next = new Set(queuePausedSessionsRef.current);
+    next.delete(sid);
+    queuePausedSessionsRef.current = next;
+    setQueuePausedSessions(next);
+  }
+
+  /** F3 T2：无条件清掉某 sid 的 paused 门——用户主动发起新 run（无论直发还是递送）都
+   * 视为「停止意图结束」。补空队列停止那条漏洞：onStop 只在队列非空时才置 paused，
+   * 但万一 paused 因别的路径残留，这里兜底清掉，不让它无限期挡住之后的自动递送。 */
+  function clearQueuePauseForSid(sid: string) {
+    if (!queuePausedSessionsRef.current.has(sid)) return;
+    const next = new Set(queuePausedSessionsRef.current);
+    next.delete(sid);
+    queuePausedSessionsRef.current = next;
+    setQueuePausedSessions(next);
+  }
+
+  /** F3 T5：会话删除/归档时清掉排队 + paused 残留——不接的话切走的死会话队列永远挂着。 */
+  function clearSessionQueueState(sid: string) {
+    const nextQueue = clearQueued(queueBySessionRef.current, sid);
+    if (nextQueue !== queueBySessionRef.current) {
+      queueBySessionRef.current = nextQueue;
+      setQueueBySession(nextQueue);
+    }
+    clearQueuePauseForSid(sid);
+  }
+
+  function enqueueComposerMessage(
+    sid: string,
+    text: string,
+    qmode: Mode,
+    soloAgentId: string | null,
+    config?: ComposerRuntimeConfig,
+  ) {
+    const next = enqueueQueued(queueBySessionRef.current, sid, {
+      text,
+      mode: qmode,
+      agentId: soloAgentId,
+      config,
+    });
+    queueBySessionRef.current = next;
+    setQueueBySession(next);
+  }
+
+  function removeQueuedMessage(sid: string, id: string) {
+    const next = removeQueued(queueBySessionRef.current, sid, id);
+    if (next === queueBySessionRef.current) return;
+    queueBySessionRef.current = next;
+    setQueueBySession(next);
+    maybeClearQueuePause(sid, next);
+  }
+
+  /** chip「编辑」：把条目移出队列，把文本吐回去给 InputArea 回填 textarea。 */
+  function editQueuedMessage(sid: string, id: string): string | null {
+    const list = listQueue(queueBySessionRef.current, sid);
+    const found = list.find((m) => m.id === id) ?? null;
+    if (!found) return null;
+    removeQueuedMessage(sid, id);
+    return found.text;
+  }
+
+  /** 出队+实际发起一个 run；调用前的一切「能不能发」复核都在这一个函数里做完再出队，
+   * 复核不过就原样留队（不丢消息），等下一次触发沿或用户手动点「发送」重试。 */
+  async function deliverQueuedTarget(sid: string, target: QueuedMessage) {
+    if (runningSessionsRef.current.has(sid)) return;
+    const stillRunning = await invoke<boolean>("is_team_session_running", {
+      sessionId: sid,
+    }).catch(() => false);
+    if (stillRunning) return;
+    if (getSessionReadonlyReason(sid)) return;
+    if (target.mode === "team" && teamConfigBlocked) return;
+    // F3 T4：solo 递送前复核 agent 是否仍可用——出队后再在 sendSoloForSession 内部
+    // 静默 return 会把已出队的消息凭空丢掉，复核必须在出队前做完。
+    if (target.mode !== "team") {
+      const agentStillAvailable =
+        !!target.agentId &&
+        availableAgents.some((a) => a.id === target.agentId);
+      if (!agentStillAvailable) return;
+    }
+
+    // F3 T1：await 复核期间用户可能已经在 chip 上把这条撤回/编辑走了（两条都直接改
+    // queueBySessionRef，不等这个 await）。removeQueued 若没找到目标，原样返回传入的
+    // 引用——引用相等即视为「条目已被用户拿走」，放弃递送，绝不能照发/双发。
+    const before = queueBySessionRef.current;
+    const next = removeQueued(before, sid, target.id);
+    if (next === before) return;
+    queueBySessionRef.current = next;
+    setQueueBySession(next);
+    maybeClearQueuePause(sid, next);
+    // 手动/自然递送都视为「用户认可继续」——递送这一条时把 paused 门一并放开，
+    // 后续条目跟着走自动递送（而不是每条都要用户再点一次）。
+    if (queuePausedSessionsRef.current.has(sid)) {
+      const nextPaused = new Set(queuePausedSessionsRef.current);
+      nextPaused.delete(sid);
+      queuePausedSessionsRef.current = nextPaused;
+      setQueuePausedSessions(nextPaused);
+    }
+
+    // F3 T4：条目已出队，若发起本身被后端占槽竞争拒绝（SESSION_ALREADY_RUNNING /
+    // SESSION_BUSY），必须把它塞回队首——出队不等于发起成功，绝不能让消息凭空消失。
+    const requeueOnConflict = () => {
+      const current = queueBySessionRef.current;
+      const list = listQueue(current, sid);
+      const restored = new Map(current);
+      restored.set(sid, [target, ...list]);
+      queueBySessionRef.current = restored;
+      setQueueBySession(restored);
+    };
+
+    if (target.mode === "team") {
+      startLeadSessionForComposer(
+        sid,
+        target.text,
+        target.config,
+        requeueOnConflict,
+      );
+    } else {
+      sendSoloForSession(
+        sid,
+        target.text,
+        target.agentId ?? null,
+        target.config,
+        requeueOnConflict,
+      );
+    }
+  }
+
+  /** 自动递送沿共用入口：memberRunning/busy true→false 的 effect + idle-poll 的 onIdle 都调这个。
+   * paused（显式停止过）态下不自动递送——等用户在 chip 上手动点「发送」。 */
+  async function tryDeliverQueued(sid: string | null) {
+    if (!sid) return;
+    if (queueDeliveryInFlightRef.current.has(sid)) return;
+    if (queuePausedSessionsRef.current.has(sid)) return;
+    const target = listQueue(queueBySessionRef.current, sid)[0];
+    if (!target) return;
+    queueDeliveryInFlightRef.current.add(sid);
+    try {
+      await deliverQueuedTarget(sid, target);
+    } finally {
+      queueDeliveryInFlightRef.current.delete(sid);
+    }
+  }
+
+  /** chip 上单条手动「发送」（queuePaused 态）：无视 paused 门，直接递送这一条。 */
+  async function sendQueuedMessageNow(sid: string | null, id: string) {
+    if (!sid) return;
+    if (queueDeliveryInFlightRef.current.has(sid)) return;
+    const target = listQueue(queueBySessionRef.current, sid).find(
+      (m) => m.id === id,
+    );
+    if (!target) return;
+    queueDeliveryInFlightRef.current.add(sid);
+    try {
+      await deliverQueuedTarget(sid, target);
+    } finally {
+      queueDeliveryInFlightRef.current.delete(sid);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+
   useEffect(() => {
     if (!memberRunning || busy || currentId === null) return;
     const sessionId = currentId;
     return startMemberIdlePoll({
       checkRunning: () =>
         invoke<boolean>("is_team_session_running", { sessionId }),
-      onIdle: () => clearStaleMemberCards(sessionId),
+      onIdle: () => {
+        clearStaleMemberCards(sessionId);
+        void tryDeliverQueued(sessionId);
+      },
     });
   }, [memberRunning, busy, currentId, clearStaleMemberCards]);
+
+  // F3 T3 触发沿①：全局 runningSessions（running）true→false 下降沿——按每个 sid
+  // 逐个判定，不再只认 currentId。旧实现只看当前视图的 busy：会话 A 排队后切到 B，
+  // A 跑完时没人在看它（sid !== currentId），这个沿从未打过，切回 A 也补不上
+  // （旧实现同 sid 才算沿，切走再切回中间那次跳变直接被吞）。
+  // memberRunning（team member 卡收尾后自动递送）仍走下面 startMemberIdlePoll——那条
+  // per-session 轮询本就绑定 currentId（messages 只装当前会话），不在本次全局化范围内。
+  const prevRunningSidsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const nowRunningSids = new Set(runningSessions.keys());
+    const prevRunningSids = prevRunningSidsRef.current;
+    for (const sid of prevRunningSids) {
+      if (!nowRunningSids.has(sid)) {
+        void tryDeliverQueued(sid);
+      }
+    }
+    prevRunningSidsRef.current = nowRunningSids;
+  }, [runningSessions]);
 
   const upsertCodingTaskBlock = (runId: string, blk: CodingTaskBlock) => {
     setCodingBlocksByRun((prev) => {
@@ -1997,7 +2214,12 @@ function AppContent() {
     sid: string,
     text: string,
     config?: ComposerRuntimeConfig,
+    // F3 T4：仅队列递送路径传入——发起撞后端占槽竞争（SESSION_ALREADY_RUNNING/
+    // SESSION_BUSY）时把条目塞回队首，别让已出队的消息凭空消失。
+    onQueueConflict?: () => void,
   ) {
+    // F3 T2：用户主动发起新 run = 停止意图结束，清掉可能残留的 paused 门。
+    clearQueuePauseForSid(sid);
     const arr = messagesRef.current.get(sid) ?? [];
     if (arr.length === 0) {
       const title = deriveSessionTitle(text) || t("app.session.new");
@@ -2040,7 +2262,18 @@ function AppContent() {
       ...(config?.reasoningTier ? { reasoningTier: config.reasoningTier } : {}),
     }).catch((e) => {
       setRun(sid, null);
-      showLeadError(sid, String(e));
+      const msg = String(e);
+      if (
+        onQueueConflict &&
+        (msg.startsWith("SESSION_ALREADY_RUNNING") ||
+          msg.startsWith("SESSION_BUSY"))
+      ) {
+        // 撤回本次乐观占位（user msg + 空 assistant 占位），条目回队，不留悬空气泡。
+        setSessionMessages(sid, arr);
+        onQueueConflict();
+        return;
+      }
+      showLeadError(sid, msg);
     });
   }
 
@@ -4124,6 +4357,9 @@ function AppContent() {
     ) {
       refreshReview(id);
     }
+    // F3 T3：切回一个可能在后台错过下降沿的会话——若它此刻已经不忙且队列非空就补投一次；
+    // deliverQueuedTarget 内部本就会先核 running/paused/agent 可用性，命中即投，未命中零副作用。
+    void tryDeliverQueued(id);
   }
 
   async function applyNamespaceRepoSwitch(nsId: string, repoId: string | null) {
@@ -4703,6 +4939,8 @@ function AppContent() {
     const i = activeScopedSorted(sessions).findIndex((s) => s.id === id);
     await invoke("delete_session", { id });
     setSessionDotStatus(id, null);
+    // F3 T5：会话删除是硬终点——排队条目 + paused 门跟着一起清，不留死会话的孤儿队列。
+    clearSessionQueueState(id);
     const list = await refreshSessions();
 
     // 剪枝导航历史：移除所有该会话的条目
@@ -4802,6 +5040,8 @@ function AppContent() {
       navHistoryRef.current = pruned.history;
       navIndexRef.current = pruned.index;
       syncNavState();
+      // F3 T5：归档同删除一样退出活跃视图——排队条目 + paused 门一起清。
+      clearSessionQueueState(id);
     }
 
     if (id === currentIdRef.current) {
@@ -4819,6 +5059,18 @@ function AppContent() {
   function onStop() {
     const sid = currentIdRef.current;
     if (!sid) return;
+    // msgfix2 Q1 停止语义：显式停止 → 暂停该会话队列的自动递送（条目保留，
+    // chip 转「待手动发送」态）；停止后 reserve_lead_start_after_globalstop 那条
+    // 全局停止清除逻辑只认「用户手敲了新消息」，绝不能被队列自动递送顶掉。
+    // F3 T2：只在该会话此刻确有排队条目时才置 paused——队列空时置了也没有任何
+    // 出队/移除动作能清掉它（maybeClearQueuePause 只在队列变空那一刻触发），会导致
+    // 该会话的自动递送被永久锁死（下一条排队消息也永远等不到自动送出）。
+    if (listQueue(queueBySessionRef.current, sid).length > 0) {
+      const pausedNext = new Set(queuePausedSessionsRef.current);
+      pausedNext.add(sid);
+      queuePausedSessionsRef.current = pausedNext;
+      setQueuePausedSessions(pausedNext);
+    }
     stopIssuedAtRef.current.set(sid, Date.now());
     invoke("stop_session", { sessionId: sid })
       .catch(() => {})
@@ -4843,13 +5095,58 @@ function AppContent() {
     const sid = currentIdRef.current;
     if (!sid) return;
     if (loadingSessionsRef.current.has(sid)) return;
-    if (runningSessionsRef.current.has(sid)) return;
+    // msgfix2 Q1：会话正忙（自己在跑，或 lead 已收尾但 member 卡还在跑）→ 不再拒发，
+    // 改投队列（完成后自动递送）。agentId/mode 在这一刻就钉死，交给 sid 显式的
+    // 投递函数原样消费，不依赖之后可能漂移的当前视图全局态。
+    if (runningSessionsRef.current.has(sid) || memberRunning) {
+      if (getSessionReadonlyReason(sid)) return;
+      if (mode === "team") {
+        if (teamConfigBlocked) return;
+        enqueueComposerMessage(sid, text, "team", null, config);
+        return;
+      }
+      if (!sendGate.effectiveAgentId) return;
+      enqueueComposerMessage(
+        sid,
+        text,
+        "normal",
+        sendGate.effectiveAgentId,
+        config,
+      );
+      return;
+    }
     if (getSessionReadonlyReason(sid)) return;
     if (mode === "team") {
       if (teamConfigBlocked) return;
       startLeadSessionForComposer(sid, text, config);
       return;
     }
+    if (!sendGate.effectiveAgentId) return;
+    sendSoloForSession(sid, text, sendGate.effectiveAgentId, config);
+  }
+
+  /** solo 发送的实际执行体：sid 显式——不读 currentIdRef、不走当前视图的 sendGate，
+   * agentId 由调用方在各自时刻 resolve 好后原样传入。供「当前视图直接发」（onSend）
+   * 和「队列递送」（tryDeliverQueued/sendQueuedMessageNow）两条路复用。 */
+  function sendSoloForSession(
+    sid: string,
+    text: string,
+    agentIdCandidate: string | null,
+    config?: ComposerRuntimeConfig,
+    // F3 T4：仅队列递送路径传入——发起撞后端占槽竞争（SESSION_ALREADY_RUNNING/
+    // SESSION_BUSY）时把条目塞回队首，别让已出队的消息凭空消失。
+    onQueueConflict?: () => void,
+  ) {
+    if (runningSessionsRef.current.has(sid)) return;
+    if (getSessionReadonlyReason(sid)) return;
+    const selectedAgentId =
+      agentIdCandidate && availableAgents.some((a) => a.id === agentIdCandidate)
+        ? agentIdCandidate
+        : null;
+    if (!selectedAgentId) return;
+    // F3 T2：用户主动发起新 run = 停止意图结束，清掉可能残留的 paused 门。
+    clearQueuePauseForSid(sid);
+
     const arr = messagesRef.current.get(sid) ?? [];
     // 首条消息自动命名：本会话还没有消息时，用消息截断作标题（替代恒为「新会话」）
     if (arr.length === 0) {
@@ -4859,8 +5156,6 @@ function AppContent() {
       );
     }
     setDone(null);
-    if (!sendGate.effectiveAgentId) return;
-    const selectedAgentId = sendGate.effectiveAgentId;
     const agentNameSnapshot = agentNameSnapshotFor(selectedAgentId);
     const selectedAgent = agents.find((agent) => agent.id === selectedAgentId);
     const missingNativeCredentials =
@@ -4929,6 +5224,14 @@ function AppContent() {
       sendMessagePayload(sid, selectedAgentId, text, config),
     ).catch((err) => {
       if (String(err).startsWith("SESSION_ALREADY_RUNNING:")) {
+        if (onQueueConflict) {
+          // F3 T4：队列递送路径撞后端占槽竞争——撤回本次乐观占位（user msg + 空
+          // assistant 占位），条目回队，不伪造「已在运行」提示、也不吞消息。
+          setRun(sid, null);
+          setSessionMessages(sid, arr);
+          onQueueConflict();
+          return;
+        }
         console.error("[send_message] backend session already running", err);
         const sessionReceivedEvent =
           (sessionEventEpochRef.current.get(sid) ?? 0) !==
@@ -5957,6 +6260,36 @@ function AppContent() {
     [],
   );
   const handleHome = useCallback(() => setView("overview"), []);
+  // msgfix2 Q1：composer 上方 chip 的三个交互 + recoverableMemberBlock 入队，
+  // 都是「resolve currentIdRef.current 再调 sid 显式核心函数」的薄壳——sid 只在
+  // 这一层解析一次，核心函数（enqueueComposerMessage/editQueuedMessage/...）
+  // 全程只认调用方传进来的 sid，不重复读全局当前视图态。
+  function onQueueMessageFromComposer(text: string, qmode: Mode) {
+    const sid = currentIdRef.current;
+    if (!sid) return;
+    if (qmode === "team") {
+      enqueueComposerMessage(sid, text, "team", null);
+      return;
+    }
+    if (!sendGate.effectiveAgentId) return;
+    enqueueComposerMessage(sid, text, "normal", sendGate.effectiveAgentId);
+  }
+  function onEditQueuedMessageForComposer(id: string): string | null {
+    const sid = currentIdRef.current;
+    if (!sid) return null;
+    return editQueuedMessage(sid, id);
+  }
+  function onRemoveQueuedMessageForComposer(id: string) {
+    const sid = currentIdRef.current;
+    if (!sid) return;
+    removeQueuedMessage(sid, id);
+  }
+  function onSendQueuedMessageForComposer(id: string) {
+    const sid = currentIdRef.current;
+    if (!sid) return;
+    void sendQueuedMessageNow(sid, id);
+  }
+
   const sessionMainHandlersRef = useRef({
     cancelContinuationDraft,
     dismissInterruptedRun,
@@ -5966,6 +6299,7 @@ function AppContent() {
     onCodingRetryVerify,
     onCodingShelve,
     onDecisionChoose,
+    onEditQueuedMessageForComposer,
     onGateAction,
     onGateBackToNormal,
     onGateFreeze,
@@ -5973,7 +6307,10 @@ function AppContent() {
     onGateRedraft,
     onGateRetry,
     onLeadChoose,
+    onQueueMessageFromComposer,
+    onRemoveQueuedMessageForComposer,
     onSend,
+    onSendQueuedMessageForComposer,
     onStartContinuation,
     onStop,
     onViewRun,
@@ -5991,6 +6328,7 @@ function AppContent() {
     onCodingRetryVerify,
     onCodingShelve,
     onDecisionChoose,
+    onEditQueuedMessageForComposer,
     onGateAction,
     onGateBackToNormal,
     onGateFreeze,
@@ -5998,7 +6336,10 @@ function AppContent() {
     onGateRedraft,
     onGateRetry,
     onLeadChoose,
+    onQueueMessageFromComposer,
+    onRemoveQueuedMessageForComposer,
     onSend,
+    onSendQueuedMessageForComposer,
     onStartContinuation,
     onStop,
     onViewRun,
@@ -6010,6 +6351,26 @@ function AppContent() {
   const handleSessionSend = useCallback(
     (text: string, nextMode: Mode, config?: ComposerRuntimeConfig) =>
       sessionMainHandlersRef.current.onSend(text, nextMode, config),
+    [],
+  );
+  const handleQueueMessage = useCallback(
+    (text: string, nextMode: Mode) =>
+      sessionMainHandlersRef.current.onQueueMessageFromComposer(text, nextMode),
+    [],
+  );
+  const handleEditQueuedMessage = useCallback(
+    (id: string) =>
+      sessionMainHandlersRef.current.onEditQueuedMessageForComposer(id),
+    [],
+  );
+  const handleRemoveQueuedMessage = useCallback(
+    (id: string) =>
+      sessionMainHandlersRef.current.onRemoveQueuedMessageForComposer(id),
+    [],
+  );
+  const handleSendQueuedMessage = useCallback(
+    (id: string) =>
+      sessionMainHandlersRef.current.onSendQueuedMessageForComposer(id),
     [],
   );
   const handleSessionStop = useCallback(
@@ -6380,6 +6741,12 @@ function AppContent() {
                   onSend={handleSessionSend}
                   onMemberIdle={clearStaleMemberCards}
                   onStop={handleSessionStop}
+                  queuedMessages={currentQueuedMessages}
+                  queuePaused={currentQueuePaused}
+                  onQueueMessage={handleQueueMessage}
+                  onEditQueuedMessage={handleEditQueuedMessage}
+                  onRemoveQueuedMessage={handleRemoveQueuedMessage}
+                  onSendQueuedMessage={handleSendQueuedMessage}
                   onViewRun={handleSessionViewRun}
                   onUndoRun={onUndoRun}
                   onOpenPreview={openPreview}

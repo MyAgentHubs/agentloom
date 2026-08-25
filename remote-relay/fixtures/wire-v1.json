@@ -391,6 +391,107 @@
     }
   },
   {
+    "name": "reply_with_command_id",
+    "envelope": {
+      "v": 1,
+      "room": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "epoch": 1,
+      "kind": "reply",
+      "session": "sess-1",
+      "command_id": "cmd-fetch-1",
+      "seq": null,
+      "ct": "aGVsbG8gY2lwaGVydGV4dA==",
+      "n": "BwcHBwcHBwcHBwcH",
+      "ts": 1765430400123
+    },
+    "expect": {
+      "valid": true,
+      "errors": [],
+      "aad": "1|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|1|reply|sess-1|cmd-fetch-1"
+    }
+  },
+  {
+    "name": "reply_missing_command_id",
+    "envelope": {
+      "v": 1,
+      "room": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "epoch": 1,
+      "kind": "reply",
+      "session": "sess-1",
+      "command_id": null,
+      "seq": null,
+      "ct": "aGVsbG8gY2lwaGVydGV4dA==",
+      "n": "BwcHBwcHBwcHBwcH",
+      "ts": 1765430400123
+    },
+    "expect": {
+      "valid": false,
+      "errors": ["command_id_required_for_kind"],
+      "aad": null
+    }
+  },
+  {
+    "name": "reply_with_client_msg_id_rejected",
+    "envelope": {
+      "v": 1,
+      "room": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "epoch": 1,
+      "kind": "reply",
+      "session": "sess-1",
+      "command_id": "cmd-fetch-2",
+      "seq": null,
+      "client_msg_id": "cmid-should-not-be-here",
+      "ct": "aGVsbG8gY2lwaGVydGV4dA==",
+      "n": "BwcHBwcHBwcHBwcH",
+      "ts": 1765430400123
+    },
+    "expect": {
+      "valid": false,
+      "errors": ["client_msg_id_not_allowed_for_kind"],
+      "aad": null
+    }
+  },
+  {
+    "name": "reply_with_seq_rejected",
+    "envelope": {
+      "v": 1,
+      "room": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "epoch": 1,
+      "kind": "reply",
+      "session": "sess-1",
+      "command_id": "cmd-fetch-3",
+      "seq": 7,
+      "ct": "aGVsbG8gY2lwaGVydGV4dA==",
+      "n": "BwcHBwcHBwcHBwcH",
+      "ts": 1765430400123
+    },
+    "expect": {
+      "valid": false,
+      "errors": ["seq_not_allowed_for_kind"],
+      "aad": null
+    }
+  },
+  {
+    "name": "reply_with_null_session",
+    "envelope": {
+      "v": 1,
+      "room": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "epoch": 1,
+      "kind": "reply",
+      "session": null,
+      "command_id": "cmd-fetch-4",
+      "seq": null,
+      "ct": "aGVsbG8gY2lwaGVydGV4dA==",
+      "n": "BwcHBwcHBwcHBwcH",
+      "ts": 1765430400123
+    },
+    "expect": {
+      "valid": true,
+      "errors": [],
+      "aad": "1|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|1|reply||cmd-fetch-4"
+    }
+  },
+  {
     "name": "token_put_current_g100_prev_g5_valid",
     "layer": "token-frame",
     "frame": {

@@ -111,7 +111,23 @@ const SNAPSHOT_SEND_BUDGET_BYTES: usize = 44 * 1024;
 const HISTORY_SEND_BUDGET_BYTES: usize = 44 * 1024;
 const HISTORY_PAGE_MAX_ROWS: usize = 50;
 /// 收敛丢块后插在 blocks 最前的截断提示——复用 `db::Block::Text` 既有形状，不加新字段。
+/// 缺口②：文案带被淘汰块数（"(N 块折叠)"），拼接见 `snapshot_truncated_notice_text`。
 const SNAPSHOT_TRUNCATED_NOTICE: &str = "（快照已截断，仅含最近内容）";
+/// msgfix1 T3（设计稿 §A）：超预算 `msg.completed`/history row 降级为 preview 时，text 块保留
+/// 的首段字节数——与 content_ref 的 `total_bytes` 同口径按 UTF-8 字节数量，不是字符数。
+const OVERSIZED_PREVIEW_TEXT_HEAD_BYTES: usize = 512;
+/// msgfix1 T3（设计稿 §A）：preview 截断提示，追加在保留的首段文本之后（与
+/// `remote-relay/fixtures/data-plane-v1.json` 里 `msg_completed_with_content_ref`
+/// 样张的 `blocks[0].text` 尾部逐字节一致——msgfix1 T7 B5：pending 版已随 T6 合入正式文件并
+/// 删除，改指正式文件）。
+const OVERSIZED_PREVIEW_TRUNCATION_NOTICE: &str = "内容较长，已截断——点击加载全文查看完整报告。";
+/// msgfix1 T3：`build_msg_completed_payload` 把预计算好的 content_ref 临时挂在这个私有键下；
+/// `enqueue_milestone_item` 在测量/发送前必须无条件 `remove` 掉——不管消息最终是否超预算，这
+/// 个键都绝不能流到 wire（非超预算消息本就不该带 `content_ref`，§10.6「可选字段」）。之所以
+/// 不直接把 content_ref 摆进 payload 顶层：`content_ref` 只有在真正降级为 preview 时才附加，
+/// 而 revision/原始 content 字节在构造 payload 的那一刻就已具备，这个私有键是两个时刻之间唯一
+/// 的搬运方式（`MilestoneItem` 是本文件内 33+ 处构造的通用结构体，不为这一种帧型单独加字段）。
+const MSG_COMPLETED_REF_SOURCE_KEY: &str = "__msgfix1_content_ref_source";
 const MAX_DRAIN_ITEMS_PER_ROUND: usize = 64;
 const DRAIN_ROUND_BUDGET: Duration = Duration::from_millis(250);
 // M0 v1.7.2 拍板：JSON safe integer 上界（2^53 - 1）。
@@ -130,6 +146,75 @@ const CONTROL_STOP_MAX_LIFETIME_MS: u64 = 30_000;
 const CONTROL_STOP_SKEW_MS: u64 = 120_000;
 const CLIENT_MSG_ID_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0xfe4e51ad_468c_4c11_85c2_f15f0c22f030);
+
+/// M0 §10.9：`msg.fetch` 目标消息 `total_bytes` 上限——超过直接回 `too_large`，不进入分片流程。
+const MSG_FETCH_TOTAL_BYTES_LIMIT: usize = 4 * 1024 * 1024;
+
+/// msgfix1 T4（M0 §10.8，机制钉死·数值由本刀生成式测量定）：`msg.chunk` 每片裸内容字节数
+/// （切片前的原始字节，不是 base64 后的长度）。
+///
+/// **测量方法**（见 `tests::msg_chunk_raw_bytes_worst_case_wire_frame_stays_under_relay_limit_
+/// with_margin`，真实走 `remote_crypto::seal` + `build_envelope_json`，不是手算）：构造整条
+/// wire 帧的最坏情形——`bytes_b64` 来自最坏转义原始字节（高位不可打印字节与 `"` 交替，排除
+/// "巧合被 base64 表友好对待"的侥幸）、`message_id`/`revision`/`epoch`/`ts` 取各自类型的最大值、
+/// `content_sha256` 固定 64 hex（sha256 的真实长度，不是"尽量长"）、`total_bytes`/`offset` 取
+/// 4MiB 上限（`MSG_FETCH_TOTAL_BYTES_LIMIT`，本类型字段在通过校验链后不可能再大）、
+/// `room`/`session`/`command_id` 取各自协议允许的最长值——序列化整条明文 payload、真实
+/// AES-256-GCM 加密（密文 = 明文 + 16B tag，不是估算）、base64、拼进完整 wire envelope JSON，
+/// 量出最终字节数。
+///
+/// 候选值实测（wire_len / margin，relay 64KiB=65536 硬闸，要求 margin ≥ 10%=6553）：
+/// 16384→29914(35622) / 20480→37194(28342) / **24576→44474(21062)** / 28672→51762(13774) /
+/// 30000→54118(11418) / 32768→59042(6494，margin 已低于 10% 门槛)。双重 base64
+/// （`bytes_b64` 一层 + AEAD 密文再 base64 成 `ct` 一层）实测膨胀系数 ≈1.778×，与设计稿 v3
+/// §B「40KiB 经双重 base64 ≈73KiB 必撞 64KiB」的量级判断吻合（1.778×40960≈72827）。
+///
+/// 选 **24576（24KiB）**——落在设计稿 v3 §B 与本任务书都预估的 "~20-24KiB" 区间正中，
+/// margin 21062B（占硬闸 32%，远超 10% 门槛的 6553B），给未来信封字段增长/密钥材料变化留足
+/// 冗余，同时 4MiB 消息只需约 171 片（4194304 / 24576 ≈ 170.7）——分片数与
+/// `REPLY_QUEUE_CAPACITY` 的关系见该常量文档。
+const CHUNK_RAW_BYTES: usize = 24 * 1024;
+
+/// msgfix1 T4：`reply` 独立有界队列容量（M0 §10.9「满→回 busy 终态、不静默」）。单飞行闸
+/// （`msg_fetch_inflight`，见 `GatewayInnerState` doc）保证同一时刻只有一个 session 的 chunk
+/// 序列在往这条队列里塞；一次满额 4MiB fetch 按 `CHUNK_RAW_BYTES`（24KiB）切片产生
+/// ⌈4194304/24576⌉=171 片。容量取 256——覆盖单次满额 fetch 的全部分片并留约 50% 冗余（应对
+/// "旧 fetch 超时释放单飞行槽位但其分片仍未排空、新 fetch 紧接着开始入队"这类双重饱和边缘
+/// 情形，见 `handle_msg_fetch` 里 chunk 入队失败后改发 `busy` 的兜底路径），不需要为多 session
+/// 并发预留更多（单飞行闸已经排除了并发）。
+const REPLY_QUEUE_CAPACITY: usize = 256;
+
+/// msgfix1 T4（M0 §10.9 单飞行 + 超时释放）：一次 `msg.fetch` 在途最长存活时间——超过后单飞行
+/// 闸判定该占用已释放，允许同 session 的新请求进来（"超时即终止该次拉取并释放占用"）。量级
+/// 推导：一次满额 4MiB fetch（171 片）按 `MAX_DRAIN_ITEMS_PER_ROUND`（64 片/轮）需要 ≥3 轮
+/// `drain_reply_queue`，每轮最迟卡在 `READ_TIMEOUT`（500ms，读循环没有新帧到达时的最长阻塞）
+/// 才会被驱动到——最坏情形（对端完全安静、只靠读超时推进）≈3×500ms=1.5s；30s 留了一个数量级
+/// 以上的余量给真实网络往返/relay 排队，同时不会让一个真正卡死的连接把单飞行槽位锁死太久。
+const MSG_FETCH_INFLIGHT_TIMEOUT_MS: u64 = 30_000;
+
+/// msgfix1 T4（M0 §10.9 滥用闸，桌面侧独立第二层）；msgfix1 T7 B1（opus 整盘审 P1-2
+/// 后半）改口径：**gateway 全局聚合**的 60 秒滑动窗口字节预算，不再按 session 分桶——relay
+/// 自己在 §9.8/§10.3 是 per-subject（单连接维度）字节计费，桌面若仍按 session 分桶，同一部
+/// 桌面下的多个 session 各自领一份 8MiB/60s，叠加起来能远超 relay 那边单连接 16MiB 的固定窗
+/// （`REPLY_BYTE_BUDGET_LIMIT_BYTES`，见 `remote-relay/src/room-do.js`），等于桌面这层闸形同
+/// 虚设。改成单连接总量记账后：8MiB/60s 上限 × 双重 base64 膨胀系数 ≈1.81×（同
+/// `CHUNK_RAW_BYTES` doc 量出的 wire 膨胀）≈14.5MiB，仍落在 relay 16MiB 桶之内，多 session
+/// 叠加不再越桶。量级对照单次 `msg.fetch` 上限 `MSG_FETCH_TOTAL_BYTES_LIMIT`（4MiB）：8MiB/60s
+/// 允许 60 秒内（跨全部 session 合计）接受两次满额拉取（含一次合理重试/续传），第三次起判
+/// `busy`。计量口径按**接受时刻的 `total_bytes`**（消息全量大小，不是实际切出的分片字节数）
+/// 计入预算——单飞行闸只保证单个 session 内同一时刻至多一个 fetch 在计费，多 session 之间仍可
+/// 并发接受，这正是本条要堵的叠加口子。
+const MSG_FETCH_BYTE_BUDGET_PER_WINDOW: u64 = 8 * 1024 * 1024;
+const MSG_FETCH_BYTE_BUDGET_WINDOW_MS: u64 = 60_000;
+
+/// msgfix1 T4 返修②（skeptic 补审）：`msg_fetch_command_ledger` 的容量——见
+/// `MsgFetchCommandLedger` doc。量级：单飞行闸决定同一 session 任意时刻至多 1 条在途 fetch，
+/// 一次典型会话在 `MSG_FETCH_INFLIGHT_TIMEOUT_MS`（30s）的时间尺度上不太可能提交远超几十个
+/// 不同 command_id 的 fetch 请求；512 覆盖全部当前活跃 session 的正常换页/重试流量并留出充足
+/// 冗余，同时对内存是可忽略的量（每条记录两个短字符串）。容量满时 FIFO 淘汰最老一条——这只是
+/// 让"很久以前用过的 command_id"重新变得可提交，不是安全边界（真正的安全边界是
+/// `MsgFetchInflightEntry.generation`，不依赖这张表的完整性）。
+const MSG_FETCH_COMMAND_LEDGER_CAPACITY: usize = 512;
 
 pub(crate) type SettingsReader = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
 pub(crate) type TokenProvider = Box<dyn Fn() -> Option<String> + Send + Sync>;
@@ -173,11 +258,42 @@ pub(crate) struct SessionHistoryRow {
     pub message_id: i64,
     pub role: String,
     pub content_json: Value,
+    /// msgfix1 T3（M0 §10.6）：`content_json` 之外原样保留的原始 DB `content` 字符串——
+    /// content_ref 的 sha256/total_bytes 必须对这份原文字节计算，不能用重新序列化过的
+    /// `content_json`（`Value` 内部 `Map` 默认按 key 排序，字节不保证与原文相同）。
+    pub content_raw: String,
+    /// msgfix1 T3（M0 §10.7）：该消息当前的 `messages.revision`。
+    pub revision: i64,
 }
 /// `control.history` 的短锁 DB provider：结果保持 `message_id DESC`，组页层负责预算收敛与
 /// wire 所需的升序反转。错误必须显式返回，让命令回 failed，不发送半页。
 pub(crate) type SessionHistoryProvider =
     Box<dyn Fn(&str, Option<i64>, i64) -> Result<Vec<SessionHistoryRow>, String> + Send + Sync>;
+
+/// msgfix1 T4（M0 §10.9 联合授权闸）：`msg.fetch` 校验链第①步的 DB provider——按精确
+/// `(session, message_id)` 查询单条消息用于全文拉取。三态镜像 `db::MessageForFetch`（生产实现
+/// 见 lib.rs `remote_gateway_message_fetch_provider` 包一层 `db::get_message_for_fetch`），这里
+/// 单独定义一份而不是直接引用 db.rs 的类型——同 `SessionHistoryRow`/`SessionRepoProvider` 既有
+/// 惯例，让 `remote_gateway.rs` 的测试不依赖 db.rs 也能构造任意三态。`Err` = 查询本身失败（DB
+/// 错误），调用方 fail-closed 处理（同 `SessionRepoProvider` 既有姿势）。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum MessageForFetchResult {
+    /// 消息确属该 session；`content_raw` 是原始 DB `content` 字符串（`content_ref.content_sha256`
+    /// /`msg.chunk` 切片必须按这份原文字节计算，不能用任何反序列化/重序列化后的值）；
+    /// `session_deleted` = 其所属 session 是否已软删。
+    Found {
+        content_raw: String,
+        revision: i64,
+        session_deleted: bool,
+    },
+    /// `message_id` 存在，但不属于调用方声称的 `session`（越权）。
+    WrongSession,
+    /// `message_id` 完全不存在。
+    NotFound,
+}
+
+pub(crate) type MessageFetchProvider =
+    Box<dyn Fn(&str, i64) -> Result<MessageForFetchResult, String> + Send + Sync>;
 pub(crate) type PairHelloHandler =
     Box<dyn Fn(PairHelloFrame) -> Option<PairAcceptFrame> + Send + Sync>;
 pub(crate) type PairDoneHandler = Box<dyn Fn(PairDoneFrame) -> PairDoneAction + Send + Sync>;
@@ -898,6 +1014,8 @@ struct Inner {
     /// `Some`），这个 provider 就会被调用。
     session_repo_provider: SessionRepoProvider,
     session_history_provider: SessionHistoryProvider,
+    /// msgfix1 T4：`msg.fetch` 校验链第①步用——见 `MessageFetchProvider` doc。
+    message_fetch_provider: MessageFetchProvider,
     state: GatewayInnerState,
     shutdown: AtomicBool,
     reload_requested: AtomicBool,
@@ -994,10 +1112,14 @@ struct GatewayInnerState {
     /// P0-b 返工·v1.8.12 ③ 发送侧兜底：`build_snapshot_payload` 收敛后仍超
     /// `SNAPSHOT_SEND_BUDGET_BYTES` 而被跳过发送的计数——只护 snapshot 这一条路径。
     snapshot_oversized_dropped: AtomicU64,
-    /// 工具 output 截断后，单条 history 消息仍超过发送预算而被跳过的条数。
+    /// msgfix1 T3：工具 output 截断后，单条 history 消息仍超过发送预算——**不再整条丢弃**，
+    /// 降级为块级 preview + content_ref（设计稿 §A）。该计数器语义随之从"丢弃条数"改为"降级
+    /// 为 preview 的条数"（极端兜底——连 preview+ref 单条页都装不下——仍如实丢弃，同样计入）。
     history_oversized_dropped: AtomicU64,
-    /// `msg.completed` 工具 output 截断后，完整明文帧仍超过发送预算而被跳过的条数。
-    /// 连接回放与 live 发布共用同一入队闸和同一计数。
+    /// msgfix1 T3：`msg.completed` 工具 output 截断后，完整明文帧仍超过发送预算——**不再
+    /// 静默丢弃**，降级为块级 preview + content_ref（设计稿 §A）。连接回放与 live 发布共用
+    /// 同一入队闸和同一计数；语义同上改为"降级为 preview 的条数"（无 content_ref 来源的防御性
+    /// 兜底分支仍保留旧的丢弃语义，同样计入本计数器）。
     replay_oversized_dropped: AtomicU64,
     /// idlefix-T1 补针 C（TOCTOU）：`publish_run_status_replay_rows`（连接后补发批读 DB + 逐行
     /// 入队 `run.status` 现状帧）与 `enqueue_run_status_milestone_with_gate`（真实运行时
@@ -1006,6 +1128,121 @@ struct GatewayInnerState {
     /// "读 DB + 入队"过程，期间任何真实状态翻转要么在读之前已落库（读到的就是新值，天然一致），
     /// 要么必须等补发批放锁后才能把新状态入队（必然排在补发帧之后，不会被陈旧帧倒灌覆盖）。
     run_status_replay_gate: Mutex<()>,
+    /// msgfix1 T4（M0 §10.9「reply 独立有界队列」）：`msg.chunk`/`msg.fetch.error` 出帧专属队列
+    /// ——与 event/live（`upstream_tx`/`milestone_tx`）完全独立，互不挤占容量。`drain_reply_
+    /// queue` 每轮连接主循环先于 milestone/live 排空这里（见 `drain_upstream_with_budget`）。
+    /// 之所以挂在 `GatewayInnerState`（一个 `Mutex<VecDeque<_>>`）而不是像 `upstream_tx`/
+    /// `milestone_tx` 那样另开一对 `mpsc::sync_channel` 挂在 `Inner` 上：`GatewayInnerState`
+    /// 全仓 60+ 处构造都走 `GatewayInnerState::default()`（只有 1 处 `Default` 实现），新增字段
+    /// 零改动这些调用点；而 `Inner` 的新增字段需要同步改 ~20 处结构体字面量 + 把新 `Receiver`
+    /// 一路穿 `connect_loop`/`connect_loop_with`/`attempt_once`/`run_connection_request` 的签名
+    /// 和它们各自的测试闭包——量级差一个数量级，选前者。
+    reply_queue: Mutex<VecDeque<ReplyQueueItem>>,
+    /// 诊断：`reply_queue` 已满且连兜底的 `msg.fetch.error{busy}` 本身也塞不进去时的丢弃计数
+    /// （双重饱和的极端情形，见 `handle_msg_fetch` 里 chunk 入队失败后的兜底分支）。
+    reply_queue_dropped: AtomicU64,
+    /// msgfix1 T4 返修③（skeptic 补审·对照 `upstream_stale_generation_dropped`）：出队时二次
+    /// 复核 `connection_generation` 不匹配（跨连接残留）而丢弃的 reply 条数——单开一对新计数器
+    /// 而不是复用 `upstream_stale_generation_dropped`/`upstream_repo_filtered`，避免混淆那两个
+    /// 计数器"上行里程碑 + live 事件"的既有文档语义（见 `drain_reply_queue` doc）。
+    reply_stale_connection_dropped: AtomicU64,
+    /// 返修③：出队时二次复核 session 不再属于 active repo（用户切换项目/重连后归属变化）而
+    /// 丢弃的 reply 条数。
+    reply_repo_filtered_dropped: AtomicU64,
+    /// 返修②（skeptic 补审）：单飞行槽位超时被新请求接管时，从 `reply_queue` 里整体清掉的
+    /// "上一个 generation 还没发出的残片"条数——见 `purge_stale_reply_queue_generation`。
+    reply_queue_stale_generation_purged: AtomicU64,
+    /// msgfix1 T4（M0 §10.9 单飞行闸）：session → 在途 fetch 记账。任务书 §3④明确按 **session**
+    /// 维度（比 §10.9 条文字面的 `(session, message_id)` 更严——同一 session 同时只服务一条
+    /// fetch，无论 message_id 是否相同），键为 session id。条目在 `drain_reply_queue` 真正送出
+    /// 该 fetch 最后一帧时清除，或被 `MSG_FETCH_INFLIGHT_TIMEOUT_MS` 超时后新请求接管。
+    /// 返修②（skeptic 补审）：**不再兼作"command_id 账本"**——`MsgFetchInflightEntry` 只保留
+    /// 当前占用者的身份判定所需信息（含 `generation`），command_id 的"近期已终态、拒绝复用"
+    /// 语义搬去独立的 `msg_fetch_command_ledger`（原设计里两者共用一张表，会在同 command_id
+    /// 复用时把"新占用者的身份"和"旧 command_id 是否用过"这两个不同问题绑在同一条记录上）。
+    msg_fetch_inflight: Mutex<HashMap<String, MsgFetchInflightEntry>>,
+    /// msgfix1 T4：桌面侧 60 秒滑动窗口字节预算——第二层防滥用闸（relay 已有 §9.8/§10.3 的
+    /// per-subject 字节计费；这层独立生效，不依赖 relay 是否正确执行）。msgfix1 T7 B1 改口径为
+    /// **gateway 全局聚合**（不再按 session 分桶）——见 `MSG_FETCH_BYTE_BUDGET_PER_WINDOW`
+    /// 定义处的量级推导。
+    msg_fetch_byte_budget: Mutex<VecDeque<(u64, usize)>>,
+    /// msgfix1 T4 返修②（skeptic 补审）：`msg.fetch` 每次被 `handle_msg_fetch_at` 接受处理
+    /// （无论最终成功还是走某个 error code）就从这里领一个全局单调递增的新值，写进
+    /// `MsgFetchInflightEntry.generation`/`ReplyQueueItem.generation`。见
+    /// `clear_msg_fetch_inflight_if_matches` doc——generation 保证"同一 session 先后两次接受
+    /// （哪怕 command_id 相同）绝不会被彼此的残片/终片误伤"，是 command_id 复用防线的结构性
+    /// 兜底（`msg_fetch_command_ledger` 是行为兜底，容量满了会被淘汰失效；generation 判定
+    /// 不依赖容量、恒正确）。
+    msg_fetch_generation_counter: AtomicU64,
+    /// msgfix1 T4 返修②（skeptic 补审）：`(session, command_id)` 终态账本——见
+    /// `msg_fetch_command_ledger_admit`。
+    msg_fetch_command_ledger: Mutex<MsgFetchCommandLedger>,
+    /// msgfix2 U1（设计稿 v4.1 §4.1）：L1 活动摘要聚合器的输入端——`extract_tool_milestones`
+    /// （sink 回调，禁止 DB I/O）把 delta `try_send` 进这里；独立串行写线程
+    /// （`run_activity_summary_worker`）在另一端消费、做节流/终态压制、调用注入的
+    /// `ActivitySummaryWriter` 落库。惰性配置：`None` 时 `extract_tool_milestones` 直接跳过
+    /// （功能整体禁用，不是丢弃——生产接线（真实 DB 写 provider）留后续刀，见
+    /// `configure_activity_summary_writer` 文档）。挂在 `GatewayInnerState` 而不是 `Inner`：
+    /// 同 `reply_queue` 既有理由（该字段文档已详述）——`GatewayInnerState::default()` 全仓
+    /// 60+ 处零改动，`Inner` 的新增字段则要同步改 ~20+ 处结构体字面量 + `setup()` 签名。
+    activity_summary_tx: OnceLock<SyncSender<ActivitySummaryDelta>>,
+    /// 惰性 spawn 单发保证，同 `snapshot_wake_tx`/`ensure_snapshot_worker` 惯例。
+    activity_summary_worker_spawn_count: AtomicU64,
+    /// 诊断：`activity_summary_tx` 已配置但 channel 满/断连时的 try_send 失败计数（不是"功能
+    /// 未启用"那种整体跳过——是"启用了但这一条具体丢了"）。
+    activity_summary_dropped: AtomicU64,
+}
+
+/// msgfix1 T4：`GatewayInnerState::msg_fetch_inflight` 单条记账。返修②（skeptic 补审）新增
+/// `generation`——`accepted_at_ms` 仍是超时判定唯一依据；`generation` 是"这个占用到底是不是
+/// 我这次接受的那个"唯一判据（`command_id` 不再可靠，见 `clear_msg_fetch_inflight_if_matches`
+/// doc：client 复用同一 command_id 时两次接受的 `command_id` 逐字节相同，只有 `generation`
+/// 能区分）。
+#[derive(Clone, Debug, PartialEq)]
+struct MsgFetchInflightEntry {
+    command_id: String,
+    accepted_at_ms: u64,
+    generation: u64,
+}
+
+/// msgfix1 T4（M0 §10.9）：`reply` 独立有界队列的一条待发条目——`drain_reply_queue` 逐条取出、
+/// seal 成 `reply` kind 信封发出。
+#[derive(Clone, Debug, PartialEq)]
+struct ReplyQueueItem {
+    session: Option<String>,
+    command_id: String,
+    payload: Value,
+    /// 这一帧是不是该 fetch 的最后一帧——`msg.fetch.error` 恒为 `true`（单帧终态）；
+    /// `msg.chunk` 序列只有最后一片为 `true`。`drain_reply_queue` 只在真正**发出**这一帧后才
+    /// 清除 `msg_fetch_inflight` 里对应 session 的占用（不是入队时就清）——保证"占用直到真正
+    /// 送达/终态"，而不是"一入队就当作已完成"，避免客户端在还有大量分片排队等发时就抢发新
+    /// 一轮 fetch 把队列灌爆。
+    final_frame: bool,
+    /// msgfix1 T4 返修②（skeptic 补审）：这条 reply 条目所属的那次 `msg.fetch` 接受的
+    /// generation——`final_frame` 帧真正发出时用它（不是 `command_id`）去匹配/清除
+    /// `msg_fetch_inflight`，见 `clear_msg_fetch_inflight_if_matches` doc。同时也是
+    /// `purge_stale_reply_queue_generation` 精确清除"被新请求接管前那次接受"残片的判据。
+    generation: u64,
+    /// msgfix1 T4 返修③（skeptic 补审）：入队那一刻的 `connection_generation`
+    /// （`GatewayInnerState::connection_generation_snapshot`）——`drain_reply_queue` 出队时
+    /// 与当前连接的 generation 比对，跨连接的残片（断线重连后仍在队列里的旧数据）判过期丢弃，
+    /// 对照 milestone/live 既有的 `(u64, Item)` generation 标记同一套机制。
+    connection_generation: u64,
+}
+
+/// msgfix1 T4 返修②（skeptic 补审·M0 §10.9「command_id 账本」）：`(session, command_id)`
+/// 终态账本——`handle_msg_fetch_at` 每接受一次请求（无论最终成功还是走某个 error code）就把
+/// 这次的 `(session, command_id)` 记进来；下次同一 `(session, command_id)` 再来一次
+/// `msg.fetch`，一律拒绝（回 `busy`，引导客户端换一个新 command_id）——从根上避免"同一
+/// command_id 对应两次不同的处理"这条会让 `msg_fetch_inflight`/`reply_queue` 记账产生歧义的
+/// 路径，而不是只靠 `generation` 号事后补救（见 `MsgFetchInflightEntry`/`ReplyQueueItem` doc）。
+/// `seen`/`order` 键集合恒一致，容量满时 FIFO 淘汰最老一条——同 `ToolCorrelationState` 既有
+/// 惯例（这份表本身仍是有界的，`generation` 判定不依赖它的完整性，容量淘汰不破坏正确性，只是
+/// 让极老的 command_id 重新变得"可提交"）。
+#[derive(Default)]
+struct MsgFetchCommandLedger {
+    seen: std::collections::HashSet<(String, String)>,
+    order: VecDeque<(String, String)>,
 }
 
 /// Tool-name correlation table between ToolStarted and ToolCompleted.
@@ -1068,6 +1305,18 @@ impl Default for GatewayInnerState {
             history_oversized_dropped: AtomicU64::new(0),
             replay_oversized_dropped: AtomicU64::new(0),
             run_status_replay_gate: Mutex::new(()),
+            reply_queue: Mutex::new(VecDeque::new()),
+            reply_queue_dropped: AtomicU64::new(0),
+            reply_stale_connection_dropped: AtomicU64::new(0),
+            reply_repo_filtered_dropped: AtomicU64::new(0),
+            reply_queue_stale_generation_purged: AtomicU64::new(0),
+            msg_fetch_inflight: Mutex::new(HashMap::new()),
+            msg_fetch_byte_budget: Mutex::new(VecDeque::new()),
+            msg_fetch_generation_counter: AtomicU64::new(0),
+            msg_fetch_command_ledger: Mutex::new(MsgFetchCommandLedger::default()),
+            activity_summary_tx: OnceLock::new(),
+            activity_summary_worker_spawn_count: AtomicU64::new(0),
+            activity_summary_dropped: AtomicU64::new(0),
         }
     }
 }
@@ -1283,6 +1532,7 @@ pub(crate) fn setup(
     control_stop_handler: ControlStopHandler,
     session_repo_provider: SessionRepoProvider,
     session_history_provider: SessionHistoryProvider,
+    message_fetch_provider: MessageFetchProvider,
 ) {
     if GATEWAY.get().is_some() {
         return;
@@ -1315,6 +1565,7 @@ pub(crate) fn setup(
         control_stop_handler,
         session_repo_provider,
         session_history_provider,
+        message_fetch_provider,
         upstream_tx,
         milestone_tx,
         state: GatewayInnerState::default(),
@@ -2189,13 +2440,20 @@ fn publish_msg_and_card_replay_rows(inner: &Inner, connection_generation: u64) {
         return;
     };
     for row in rows {
-        let client_msg_id = derive_msg_completed_client_msg_id(&row.session_id, &row.dedup_key);
+        let client_msg_id =
+            derive_msg_completed_client_msg_id(&row.session_id, &row.dedup_key, row.revision);
         // 显示当前 agent（MA1）已知 gap：`db::MilestoneReplayRow` 尚不携带
         // `agent_name_snapshot`（另立单），补发路径这里暂传 `None`——首发（live）
         // msg.completed 帧会带 agent，重连补发的同一条消息暂不带，与 fixture
         // coverage 里 msg.completed 条目的 gap 说明保持一致，不是遗漏。
-        let payload =
-            build_msg_completed_payload(row.message_id, &row.role, row.content_json.clone(), None);
+        let payload = build_msg_completed_payload(
+            row.message_id,
+            &row.role,
+            row.content_json.clone(),
+            None,
+            row.revision,
+            &row.content,
+        );
         enqueue_milestone_with_generation(
             &inner.state,
             &inner.milestone_tx,
@@ -3037,6 +3295,23 @@ fn drain_upstream_with_budget(
     let connection_generation = state.connection_generation_snapshot();
     let mut drained_items = 0;
 
+    // msgfix1 T4：`reply` 排在 milestone/live 之前——`msg.fetch` 是远端主动按需拉取，理应比
+    // 背景里程碑/live 广播更快送达；且 `reply_queue` 与另外两条队列完全独立（不同的
+    // `Mutex<VecDeque<_>>`），排在前面不会让 milestone/live 挨饿（各自预算互不借用）。
+    if drain_reply_queue(
+        socket,
+        state,
+        k_room,
+        room,
+        connection_generation,
+        deadline,
+        &mut drained_items,
+        session_repo_provider,
+        session_repo_cache,
+        session_repo_epoch_seen,
+    )? {
+        return Ok(());
+    }
     if drain_milestone_queue(
         socket,
         state,
@@ -3066,6 +3341,176 @@ fn drain_upstream_with_budget(
         session_repo_epoch_seen,
     )?;
     Ok(())
+}
+
+/// msgfix1 T4（M0 §10.9「reply 独立有界队列」）+ 返修③（skeptic 补审）：排空
+/// `state.reply_queue`，逐条 seal 成 `reply` kind 信封发出（见 `send_upstream_value`）。
+///
+/// **出队时二次归属复核**（返修③）：`reply_queue` 是持久队列，一条分片从入队到真正出队之间
+/// 可能跨越"断线重连"（`connection_generation` 变了）或"用户切换 active repo"（原来放行的
+/// session 现在不再属于 active repo）——入队时（`handle_msg_fetch_at` 步骤①）过的那次闸只
+/// 保证"入队那一刻合法"，不保证"出队那一刻仍然合法"。对照 `drain_milestone_queue`/
+/// `drain_live_queue` 既有的"入队时校验、出队时复核"两段式模式：这里同样复核
+/// `connection_generation` 未变 + `upstream_session_allowed`（session 仍属 active repo），
+/// 不过闸的残片直接丢弃（不发出、不触碰 socket），分别计入
+/// `reply_stale_connection_dropped`/`reply_repo_filtered_dropped`（不复用
+/// `upstream_stale_generation_dropped`/`upstream_repo_filtered`——那两个计数器的既有文档明确
+/// 只描述"上行里程碑 + live 事件"，为 reply 单开一对避免混淆诊断来源）。
+///
+/// 真正**发出**一帧 `final_frame == true` 的条目后才清 `msg_fetch_inflight` 对应 session 的
+/// 占用（见 `ReplyQueueItem::final_frame` doc）——这一步同时是"发帧"与"释放单飞行槽位"的唯一
+/// 入口。返修②：清除现在按 `generation`（而不是 `command_id`）匹配——见
+/// `clear_msg_fetch_inflight_if_matches` doc，防止 command_id 复用场景下旧终片误清新占用。
+/// 不管发送是否因 `k_room` 缺失、二次归属复核不过闸而被丢弃都会尝试释放（连接没有可用密钥/
+/// session 不再属于 active repo 时，继续占着单飞行槽位没有额外保护意义，同 `upstream_dropped`/
+/// `milestone_dropped` 在 `k_room` 缺失时的既有姿势）。
+#[allow(clippy::too_many_arguments)]
+fn drain_reply_queue(
+    socket: &mut tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
+    state: &GatewayInnerState,
+    k_room: Option<&Zeroizing<[u8; 32]>>,
+    room: &str,
+    connection_generation: u64,
+    deadline: Instant,
+    drained_items: &mut usize,
+    session_repo_provider: &SessionRepoProvider,
+    session_repo_cache: &mut HashMap<String, Option<String>>,
+    session_repo_epoch_seen: &mut u64,
+) -> Result<bool, String> {
+    while *drained_items < MAX_DRAIN_ITEMS_PER_ROUND {
+        let Some(item) = lock(&state.reply_queue).pop_front() else {
+            break;
+        };
+        *drained_items += 1;
+        let ReplyQueueItem {
+            session,
+            command_id,
+            payload,
+            final_frame,
+            generation,
+            connection_generation: enqueued_connection_generation,
+        } = item;
+        let session_for_inflight = session.clone();
+
+        let stale_connection = enqueued_connection_generation != connection_generation;
+        let repo_denied = !stale_connection
+            && session.as_deref().is_some_and(|session_id| {
+                !upstream_session_allowed(
+                    state,
+                    session_repo_provider,
+                    session_repo_cache,
+                    session_repo_epoch_seen,
+                    session_id,
+                )
+            });
+        if stale_connection {
+            state
+                .reply_stale_connection_dropped
+                .fetch_add(1, Ordering::Relaxed);
+        } else if repo_denied {
+            state
+                .reply_repo_filtered_dropped
+                .fetch_add(1, Ordering::Relaxed);
+        } else if let Some(k_room) = k_room {
+            send_upstream_value(
+                socket,
+                state,
+                k_room,
+                room,
+                "reply",
+                session,
+                payload,
+                None,
+                Some(&command_id),
+            )?;
+        } else {
+            state.reply_queue_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        if final_frame {
+            if let Some(session_id) = session_for_inflight {
+                clear_msg_fetch_inflight_if_matches(state, &session_id, generation);
+            }
+        }
+        if Instant::now() >= deadline {
+            state
+                .upstream_budget_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// msgfix1 T4 返修②（skeptic 补审）：只在该 session 当前的单飞行占用仍是**这次
+/// generation**（全局单调递增，`handle_msg_fetch_at` 每接受一次请求就领一个新值，见
+/// `GatewayInnerState::msg_fetch_generation_counter`）时才清除——此前按 `command_id` 匹配，
+/// 一旦客户端复用同一个 command_id（旧请求已超时被新请求接管，二者 command_id 相同），旧
+/// 请求残留在 `reply_queue` 里迟迟才被 drain 的终片会命中 `command_id` 相等、误清新请求刚占
+/// 上的槽位——`generation` 对每次接受都是全新值，天然不会跟任何更早或更晚的接受撞上，从根上
+/// 消除这条误清路径（配合 `msg_fetch_command_ledger_admit` 从源头拒绝 command_id 复用是双重
+/// 防线：账本可能因为容量淘汰而失效，generation 判定始终正确）。
+fn clear_msg_fetch_inflight_if_matches(state: &GatewayInnerState, session: &str, generation: u64) {
+    let mut inflight = lock(&state.msg_fetch_inflight);
+    if inflight
+        .get(session)
+        .is_some_and(|entry| entry.generation == generation)
+    {
+        inflight.remove(session);
+    }
+}
+
+/// msgfix1 T4（M0 §10.9「reply 独立有界队列」满→回 busy 终态）：尝试把一条 reply 条目塞进
+/// `state.reply_queue`——容量见 `REPLY_QUEUE_CAPACITY`。满时返回 `false`，调用方据此中止当前
+/// 分片序列并改发 `msg.fetch.error{busy}` 终态（`handle_msg_fetch_at` 的兜底路径），不静默
+/// 丢帧。用于**单帧**入队（`msg.fetch.error`、`busy` 兜底本身、以及各类正常单条 reply）——
+/// 多分片传输请用 `try_enqueue_reply_chunk`（少留 1 个坑位，保证兜底 error 总有地方放）。
+fn try_enqueue_reply(state: &GatewayInnerState, item: ReplyQueueItem) -> bool {
+    let mut queue = lock(&state.reply_queue);
+    if queue.len() >= REPLY_QUEUE_CAPACITY {
+        return false;
+    }
+    queue.push_back(item);
+    true
+}
+
+/// msgfix1 T4：多分片传输专用入队——比 `try_enqueue_reply` 严格预留 1 个坑位。一旦某片因为
+/// "满"而失败，调用方要紧接着回退发一条 `msg.fetch.error{busy}` 终态（M0 §10.9「满→回 busy
+/// 终态、不静默」），这条终态帧必须总有地方放——如果分片本身把队列写到刚好 100% 满才失败，
+/// 兜底 error 会紧接着在同一次饱和里也失败，退化成"满→连 busy 都发不出去"的双重饱和（这条
+/// 极窄的边仍在——见 `reply_queue_dropped` 与两条测试
+/// `handle_msg_fetch_reply_queue_full_aborts_transfer_and_appends_busy_terminal`/
+/// `handle_msg_fetch_double_saturation_drops_and_releases_inflight_when_even_the_busy_error_
+/// cannot_fit`——但只在队列已经被预先写到刚好等于容量时才会命中，正常的"分片途中撞满"必然
+/// 留得出这 1 个坑位）。
+fn try_enqueue_reply_chunk(state: &GatewayInnerState, item: ReplyQueueItem) -> bool {
+    let mut queue = lock(&state.reply_queue);
+    if queue.len() + 1 >= REPLY_QUEUE_CAPACITY {
+        return false;
+    }
+    queue.push_back(item);
+    true
+}
+
+/// msgfix1 T4 返修②（skeptic 补审）：单飞行槽位因超时被新请求接管时，把上一个 generation
+/// 还没发出的残片从 `reply_queue` 里整体清掉——这些分片属于一次客户端早已放弃等待（超过
+/// `MSG_FETCH_INFLIGHT_TIMEOUT_MS` 未见任何回应）的旧 fetch，继续让它们被正常 drain 发出只会
+/// 把跟当前请求毫不相干的旧数据推给客户端（旧 command_id 因为 `msg_fetch_command_ledger_admit`
+/// 已经不可能被重新提交，客户端此刻根本不会在等这个 command_id 的任何后续帧）。`generation`
+/// 判定保证只清这一个 session 里恰好属于被取代的那次接受的残片，不会误伤同 session 更早或
+/// 更晚的其它 generation（正常情况下同一时刻只有一个 generation 在队——这里按 generation 而
+/// 不是"清空整个 session 在队条目"过滤，是为了在理论上的极端时序下也保持精确）。
+fn purge_stale_reply_queue_generation(state: &GatewayInnerState, session: &str, generation: u64) {
+    let mut queue = lock(&state.reply_queue);
+    let before = queue.len();
+    queue.retain(|item| {
+        !(item.session.as_deref() == Some(session) && item.generation == generation)
+    });
+    let purged = before - queue.len();
+    if purged > 0 {
+        state
+            .reply_queue_stale_generation_purged
+            .fetch_add(purged as u64, Ordering::Relaxed);
+    }
 }
 
 fn drain_milestone_queue(
@@ -3127,6 +3572,7 @@ fn drain_milestone_queue(
                             session,
                             milestone_payload(&t, rewritten_payload),
                             Some(&client_msg_id),
+                            None,
                         )?;
                     }
                     None => {
@@ -3173,6 +3619,7 @@ fn drain_milestone_queue(
                         session,
                         milestone_payload(&t, payload),
                         Some(&client_msg_id),
+                        None,
                     )?;
                 }
             }
@@ -3258,6 +3705,7 @@ fn drain_live_queue(
                                     Some(batch.session_id.clone()),
                                     value,
                                     client_msg_id.as_deref(),
+                                    None,
                                 )?;
                             }
                         }
@@ -3288,6 +3736,7 @@ fn drain_live_queue(
                         Some(frame.session),
                         frame.payload,
                         Some(&frame.client_msg_id),
+                        None,
                     )?;
                 }
                 if Instant::now() >= deadline {
@@ -3363,6 +3812,10 @@ fn send_upstream_value(
     session: Option<String>,
     value: Value,
     client_msg_id: Option<&str>,
+    // msgfix1 T4：`reply`（M0 §10.1）是第一个真正需要非空 `command_id` 的出站 kind——
+    // 既有 event/live 调用点全部继续传 `None`，行为逐字节不变；`drain_reply_queue` 是
+    // 唯一会传 `Some(..)` 的调用方。
+    command_id: Option<&str>,
 ) -> Result<(), String> {
     let plaintext = match serde_json::to_vec(&value) {
         Ok(plaintext) => plaintext,
@@ -3377,7 +3830,7 @@ fn send_upstream_value(
         epoch: state.epoch.load(Ordering::Acquire),
         kind: kind.to_owned(),
         session,
-        command_id: None,
+        command_id: command_id.map(str::to_owned),
     };
     let (ct, n) = crate::remote_crypto::seal(k_room, &meta, &plaintext);
     let envelope = build_envelope_json(&meta, &ct, &n, now_unix_ms(), client_msg_id);
@@ -3724,13 +4177,24 @@ fn build_envelope_json(
     ts_ms: u64,
     client_msg_id: Option<&str>,
 ) -> serde_json::Value {
+    // msgfix1 T4：`command_id` 现在如实回显 `meta.command_id`——此前这里硬编码
+    // `Value::Null`，因为唯一的调用方 `send_upstream_value` 服务 event/live，两者的
+    // `EnvelopeMeta.command_id` 恒为 `None`。`reply`（M0 §10.1）是第一个真正需要非空
+    // `command_id` 的出站 kind——取值必须与 `crate::remote_crypto::seal` 用来算 AAD 的那份
+    // `meta.command_id` 逐字节一致（AAD 拼串含 `command_id`，见 `remote_crypto::build_aad`），
+    // 两处各写一份必然产生"JSON 里的 command_id"与"AAD 里签的 command_id"不同源的风险——
+    // 单一读点排除这种分裂。
+    let command_id = match meta.command_id.as_deref() {
+        Some(command_id) => Value::String(command_id.to_owned()),
+        None => Value::Null,
+    };
     let mut envelope = serde_json::json!({
         "v": meta.v,
         "room": meta.room,
         "epoch": meta.epoch,
         "kind": meta.kind,
         "session": meta.session,
-        "command_id": serde_json::Value::Null,
+        "command_id": command_id,
         "seq": serde_json::Value::Null,
         "ct": ct,
         "n": n,
@@ -3926,6 +4390,29 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> String {
     text[..end].to_owned()
 }
 
+/// msgfix1 T7 B2（opus 整盘审 P1-4 裁决=最小可见化）：工具输出被裁到 `OUTPUT_TRUNCATE_BYTES`
+/// 时，纯粹砍掉尾部字节会让远端读者以为内容天然到此为止、完全看不出发生过截断——这是一种
+/// "不可见的信息损失"：用户可能依据不完整的工具输出做判断而自己毫无察觉。这里只做最小可见化：
+/// 真正发生截断时在文本尾追加固定标记 `TOOL_OUTPUT_TRUNCATION_MARKER`；能整份取回被截掉尾部的
+/// 完整 ref 化留作 BACKLOG（M0 条文/设计稿本任务不动，见 HANDOFF 交接单），这里只解决
+/// "看不看得出被截断"，不解决"截断之后怎么找回全文"。
+///
+/// 标记必须**计入 `max_bytes` 预算之内**，不能先按 `max_bytes` 截完正文再往后拼标记——那样会把
+/// 总字节数顶到 `max_bytes` 之上，重新撞上调用方紧接着做的预算判定（`enqueue_milestone_item`
+/// 里 `milestone_frame_bytes(...) > SNAPSHOT_SEND_BUDGET_BYTES` 那道闸）。做法：先给正文腾出
+/// `max_bytes - marker.len()` 字节的截断空间，标记再拼上去，总字节数恒 ≤ max_bytes。
+const TOOL_OUTPUT_TRUNCATION_MARKER: &str = "…[输出已截断]";
+
+fn truncate_utf8_with_marker(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let body_budget = max_bytes.saturating_sub(TOOL_OUTPUT_TRUNCATION_MARKER.len());
+    let mut truncated = truncate_utf8(text, body_budget);
+    truncated.push_str(TOOL_OUTPUT_TRUNCATION_MARKER);
+    truncated
+}
+
 /// 在 sink 入队路径（enqueue 时，emitter 线程同步调用）识别 batch 中的
 /// ToolStarted/ToolCompleted 事件，维护 `(run_id, tool_id)` 名字关联，并把 ToolCompleted
 /// 转成里程碑优先级的 MilestoneItem 后 try_send 进 milestone_tx。它不再等待原始 batch
@@ -3940,6 +4427,16 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> String {
 ///
 /// 原始 batch（包括这两类事件）不做过滤，仍原样 try_send 到 upstream_tx。live drain 统一
 /// 交给 classify，而 classify 对 ToolStarted/ToolCompleted 返回 None，因此不会重复上行。
+///
+/// msgfix2 U1（设计稿 v4.1 §4.1）：本函数**同时**是 L1 活动摘要聚合器的 delta 提取点——不是
+/// 拆成独立函数重新扫一遍 batch，是刻意合并：`ToolCompleted` 分支已经调用
+/// `take_tool_name`（消费式查询，查到即从关联表摘除），活动摘要需要同一个工具名判断
+/// `mcp__` 前缀；若拆成两个各自独立遍历同一批事件的函数，无论谁先跑，`take_tool_name`
+/// 都会把关联表清空，另一个函数就再也拿不到工具名——所以两个关注点必须共享同一次
+/// `take_tool_name` 调用结果，只能同函数内完成。`extract_activity_summary_delta`
+/// 只在 `state.activity_summary_tx` 已配置（`configure_activity_summary_writer` 启用过
+/// 聚合器）时才真正 try_send；未配置时整个功能是 no-op，不计入任何丢弃计数（"未启用"≠
+/// "启用了但丢了"，见该字段文档）。
 fn extract_tool_milestones(
     state: &GatewayInnerState,
     milestone_tx: &SyncSender<(u64, MilestoneItem)>,
@@ -3947,7 +4444,44 @@ fn extract_tool_milestones(
 ) {
     use crate::agent_event::AgentEvent;
 
+    let Some(activity_summary_tx) = state.activity_summary_tx.get() else {
+        // 聚合器未配置——退化为原有纯 tool.completed 提取路径，零额外开销。
+        for batch in &payload.batches {
+            for sequenced in &batch.events {
+                match &sequenced.event {
+                    AgentEvent::ToolStarted { id, tool, .. } => {
+                        remember_tool_name(state, &batch.run_id, id, tool);
+                    }
+                    AgentEvent::ToolCompleted {
+                        id,
+                        status,
+                        exit_code,
+                        output,
+                    } => {
+                        let tool = take_tool_name(state, &batch.run_id, id);
+                        publish_tool_completed_milestone(
+                            state,
+                            milestone_tx,
+                            batch,
+                            id,
+                            &tool,
+                            status,
+                            *exit_code,
+                            output.as_deref(),
+                        );
+                    }
+                    AgentEvent::Completed { .. } | AgentEvent::RunCloseout { .. } => {
+                        purge_tool_correlation_for_run(state, &batch.run_id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        return;
+    };
+
     for batch in &payload.batches {
+        let logical_run_id = activity_summary_logical_run_id(batch);
         for sequenced in &batch.events {
             match &sequenced.event {
                 AgentEvent::ToolStarted { id, tool, .. } => {
@@ -3960,34 +4494,568 @@ fn extract_tool_milestones(
                     output,
                 } => {
                     let tool = take_tool_name(state, &batch.run_id, id);
-                    let client_msg_id =
-                        derive_client_msg_id(&format!("tool.completed|{}|{}", batch.run_id, id));
-                    enqueue_milestone_for_upstream(
+                    publish_tool_completed_milestone(
                         state,
                         milestone_tx,
-                        MilestoneItem {
-                            session: Some(batch.session_id.clone()),
-                            t: "tool.completed".to_owned(),
-                            payload: serde_json::json!({
-                                "id": id,
-                                "tool": tool,
-                                "status": tool_status_wire_str(status),
-                                "exit_code": exit_code,
-                                "output": output
-                                    .as_deref()
-                                    .map(|value| truncate_utf8(value, OUTPUT_TRUNCATE_BYTES)),
-                            }),
-                            client_msg_id,
+                        batch,
+                        id,
+                        &tool,
+                        status,
+                        *exit_code,
+                        output.as_deref(),
+                    );
+                    send_activity_summary_delta(
+                        state,
+                        activity_summary_tx,
+                        batch.session_id.clone(),
+                        logical_run_id.clone(),
+                        ActivitySummaryDeltaKind::ToolCompleted {
+                            mcp: tool.starts_with("mcp__"),
+                            failed: matches!(status, crate::agent_event::ToolStatus::Failed),
                         },
                     );
                 }
+                AgentEvent::ApprovalRequested { .. } => {
+                    // msgfix2 U1 修单三（G2·独立审查 P1）：真路由——approval 是否允许把内容
+                    // 原样并入 L1 由 `event_joins_l1_aggregation` 在运行时判定（release 构建
+                    // 同样生效，不再只是 debug_assert）。approval 是 actionable 类型，函数
+                    // 返回 false，这里因此只走受限路径：产生不带字段的 `PermissionPrompt`
+                    // 计数 delta；approval_id/command/summary/cwd 等原卡内容依旧绝不进入
+                    // activity_summary——`PermissionPrompt` 变体本身没有字段位置可以携带
+                    // 内容，编译期即锁死。
+                    if !event_joins_l1_aggregation("approval") {
+                        send_activity_summary_delta(
+                            state,
+                            activity_summary_tx,
+                            batch.session_id.clone(),
+                            logical_run_id.clone(),
+                            ActivitySummaryDeltaKind::PermissionPrompt,
+                        );
+                    } else {
+                        // 理论不可达：当前白名单恒把 approval 判为 actionable。若未来白名单
+                        // 漂移把它移出 actionable 集合，debug 构建在这里立即炸出来，而不是
+                        // release 环境悄悄改变路由行为却毫无信号——这正是 G2 要堵的漂移窗口。
+                        debug_assert!(
+                            false,
+                            "白名单漂移：approval 不再被判定为 actionable，L1 路由需要重新设计（本刀未实现）"
+                        );
+                    }
+                }
                 AgentEvent::Completed { .. } | AgentEvent::RunCloseout { .. } => {
                     purge_tool_correlation_for_run(state, &batch.run_id);
+                    // msgfix2 F1（spec §4.1「粒度=逻辑 run」）：member lane 自己的终态只代表
+                    // "这条 member lane 结束了"，不代表"整个逻辑（lead）run 结束了"——只有
+                    // lead/solo 自己的 batch（不带 dispatch，`activity_summary_logical_run_id`
+                    // 此时就是它自己）才允许封父 run。member lane 的非终态 delta（上面
+                    // ToolCompleted/PermissionPrompt 分支）不受此门槛限制，仍照常并入父 run 计数
+                    // ——否则 member1 先完成会把 lead run 提前 sealed，丢掉 member2/lead 之后的
+                    // 计数与终态。
+                    if batch.dispatch.is_none() {
+                        send_activity_summary_delta(
+                            state,
+                            activity_summary_tx,
+                            batch.session_id.clone(),
+                            logical_run_id.clone(),
+                            ActivitySummaryDeltaKind::Terminal { failed: false },
+                        );
+                    }
+                }
+                AgentEvent::Error { .. } => {
+                    // msgfix2 F1：同上——member lane 自己的异常终态同样不得封父 run。
+                    if batch.dispatch.is_none() {
+                        send_activity_summary_delta(
+                            state,
+                            activity_summary_tx,
+                            batch.session_id.clone(),
+                            logical_run_id.clone(),
+                            ActivitySummaryDeltaKind::Terminal { failed: true },
+                        );
+                    }
+                }
+                AgentEvent::NeedsDecision { .. } => {
+                    // msgfix2 U1 修单三（G2·独立审查 P1）+ msgfix2 U1b 尾单 B2：真路由——
+                    // scope_change 是否允许并入 L1 由 `event_joins_l1_aggregation` 在运行时
+                    // 判定；与 ApprovalRequested 分支同构成 if/else 两支，路由决策（调用单点
+                    // 函数）和"是否产生 delta"分离成显式两条路径——不让"跳过"靠 match arm 本身
+                    // 的沉默兜底（即便 scope_change 目前没有专属 delta kind、"非 actionable"
+                    // 分支恒是显式空跳过，这件事也要可见、可测，不是碰巧沉默）。它走
+                    // `db::Block::ScopeChange` 独立卡片路径（lib.rs 侧 lead 编排构造，不在本
+                    // 文件）。
+                    if !event_joins_l1_aggregation("scope_change") {
+                        // 正确路由结果（scope_change 是 actionable）：不产生任何 delta——
+                        // 没有专属 delta kind 可用，`PermissionPrompt` 语义上专属 approval，
+                        // 不能借用。
+                    } else {
+                        // 理论不可达：当前白名单恒把 scope_change 判为 actionable。若未来
+                        // 白名单漂移把它移出 actionable 集合，debug 构建立即炸出来——见
+                        // ApprovalRequested 分支同款注释。
+                        debug_assert!(
+                            false,
+                            "白名单漂移：scope_change 不再被判定为 actionable，L1 路由需要重新设计（本刀未实现）"
+                        );
+                    }
                 }
                 _ => {}
             }
         }
     }
+}
+
+/// `ToolCompleted` → `tool.completed` 里程碑的公共构造尾段——`extract_tool_milestones`
+/// 两条路径（聚合器配置/未配置）共用，避免两份重复的 `enqueue_milestone_for_upstream` 调用
+/// 各自维护一份字段列表而漂移。
+#[allow(clippy::too_many_arguments)]
+fn publish_tool_completed_milestone(
+    state: &GatewayInnerState,
+    milestone_tx: &SyncSender<(u64, MilestoneItem)>,
+    batch: &crate::event_transport::RunBatch,
+    id: &str,
+    tool: &str,
+    status: &crate::agent_event::ToolStatus,
+    exit_code: Option<i64>,
+    output: Option<&str>,
+) {
+    let client_msg_id = derive_client_msg_id(&format!("tool.completed|{}|{}", batch.run_id, id));
+    enqueue_milestone_for_upstream(
+        state,
+        milestone_tx,
+        MilestoneItem {
+            session: Some(batch.session_id.clone()),
+            t: "tool.completed".to_owned(),
+            payload: serde_json::json!({
+                "id": id,
+                "tool": tool,
+                "status": tool_status_wire_str(status),
+                "exit_code": exit_code,
+                "output": output.map(|value| truncate_utf8(value, OUTPUT_TRUNCATE_BYTES)),
+            }),
+            client_msg_id,
+        },
+    );
+}
+
+/// msgfix2 U1（设计稿 v4.1 §4.1）：一个 batch 的"逻辑 run"——team 会话按 lead run 聚合、member
+/// lane 计数并入父 run。`RunBatch.run_id` 对 member lane 是传输层复合 lane id
+/// （`member_transport_lane_id`："member:{lead_run_id}:{assignment_id}"），不是逻辑 run；真正
+/// 的 lead run id 在 `batch.dispatch.run_id`（member_runner.rs::member_dispatch_meta 注册时
+/// 填的就是 lead 传入的 run_id）。lead/solo 自己的 lane 不带 dispatch（`register_run(&run_id,
+/// ..., None, ...)`，见 lib.rs 咽喉），此时 `batch.run_id` 本身就是真实 run_id，直接回退即可。
+fn activity_summary_logical_run_id(batch: &crate::event_transport::RunBatch) -> String {
+    batch
+        .dispatch
+        .as_ref()
+        .and_then(|dispatch| dispatch.run_id.clone())
+        .unwrap_or_else(|| batch.run_id.clone())
+}
+
+fn send_activity_summary_delta(
+    state: &GatewayInnerState,
+    tx: &SyncSender<ActivitySummaryDelta>,
+    session_id: String,
+    run_id: String,
+    kind: ActivitySummaryDeltaKind,
+) {
+    if tx
+        .try_send(ActivitySummaryDelta {
+            session_id,
+            run_id,
+            kind,
+        })
+        .is_err()
+    {
+        state
+            .activity_summary_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// ============================================================================
+// msgfix2 U1（设计稿 v4.1 §4.1·M0 §10.11）：L1 活动摘要聚合器——独立串行写线程。
+//
+// 数据流：`extract_tool_milestones`（sink 回调，禁止 DB I/O）→ try_send 进
+// `ActivitySummaryDelta` 有界 channel → `run_activity_summary_worker`（独立 OS 线程，串行
+// 消费）在内存里累积计数，按节流/终态规则决定何时调用注入的 `ActivitySummaryWriter` 落库 +
+// republish（真正的 DB 写只发生在这个线程里，绝不在 sink 回调内）。
+// ============================================================================
+
+/// 一条运行时增量——由 `extract_tool_milestones` 产生。
+#[derive(Clone, Debug, PartialEq)]
+struct ActivitySummaryDelta {
+    session_id: String,
+    run_id: String,
+    kind: ActivitySummaryDeltaKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ActivitySummaryDeltaKind {
+    ToolCompleted {
+        mcp: bool,
+        failed: bool,
+    },
+    PermissionPrompt,
+    /// run 终态——`failed=true` 对应 `AgentEvent::Error`；`false` 对应
+    /// `Completed`/`RunCloseout`（`Blocked`/`NeedsDecision` 不是终态：run 仍可能继续，
+    /// 不封口）。
+    Terminal {
+        failed: bool,
+    },
+}
+
+/// 落库签名镜像 `db::upsert_activity_summary_and_publish`（少 `&Connection`——生产环境的注入
+/// 闭包在实际接线时捕获真实连接）：`(session_id, run_id, tool_calls, failed, mcp_calls,
+/// permission_prompts, state)`。生产接线（真实 DB 写 provider）留后续刀，见
+/// `configure_activity_summary_writer` 文档。
+pub(crate) type ActivitySummaryWriter =
+    Box<dyn Fn(&str, &str, i64, i64, i64, i64, &str) -> Result<(), String> + Send + Sync>;
+
+const ACTIVITY_SUMMARY_THROTTLE_MS: u64 = 2_000;
+const ACTIVITY_SUMMARY_CHANNEL_CAPACITY: usize = 2048;
+const ACTIVITY_SUMMARY_TICK_MS: u64 = 250;
+/// R6③（msgfix2 整盘审 P2 顺手）：连续写失败的退避窗口上限——`activity_summary_retry_due`
+/// 按 `ACTIVITY_SUMMARY_THROTTLE_MS * 2^consecutive_failures` 指数增长，封顶在这个值，不会
+/// 因为失败次数持续攀升就无限拉长下一次重试的等待时间。
+const ACTIVITY_SUMMARY_MAX_BACKOFF_MS: u64 = 30_000;
+
+#[derive(Clone, Debug, PartialEq, Default)]
+struct ActivityCounters {
+    tool_calls: i64,
+    failed: i64,
+    mcp_calls: i64,
+    permission_prompts: i64,
+}
+
+#[derive(Debug, PartialEq)]
+struct RunActivityEntry {
+    session_id: String,
+    counters: ActivityCounters,
+    state: &'static str,
+    /// 终态 delta **一到达**（不是"成功写库后"）即置 true——之后到达的任何非终态 delta 一律
+    /// 丢弃（设计稿「终态置位后到达的 running 更新丢弃」）；终态本身只应用一次
+    /// （`apply_activity_summary_delta` 对已 sealed 的 run 直接忽略后续 Terminal delta）。
+    /// **`sealed` 只代表"不再接受新的 running/终态 delta"，不代表"终态已经成功落库"**——
+    /// 那是 `terminal_pending` 的职责（msgfix2 U1 修单三·独立审查 G1：过去这两个语义挤在
+    /// 同一个位上，写库失败时无法区分"该挡迟到 delta 了"与"还需要重试落库"，导致终态永久
+    /// 卡在未落库状态，见 `terminal_pending` 文档）。tombstone（sealed 条目）本身不会从
+    /// `state.runs` 移除，有界生命周期淘汰策略留 BACKLOG（本刀不实现淘汰）。
+    sealed: bool,
+    /// 终态已 sealed 但**尚未成功写库**——true 期间该条目仍会被
+    /// `activity_summary_due_flushes` 按既有节流/重试节奏（`ACTIVITY_SUMMARY_THROTTLE_MS`）
+    /// 收进待写批次重试，直到 `flush_activity_summary` 真正写成功才清 false。修复前 writer
+    /// 失败直接 `return`、且 tick 扫描把 sealed 条目一律排除在待写批次外——终态一旦写失败就
+    /// 永远停在"内存里已 sealed、DB 里仍是 running"的状态，违反 M0「有活动 run 终态必封口
+    /// 恰好一次」（独立审查 G1·P1）。非终态条目此字段恒为 false。
+    terminal_pending: bool,
+    dirty: bool,
+    last_flushed_at_ms: Option<u64>,
+    /// R6③（msgfix2 整盘审 P2 顺手）：连续写失败计数——`flush_activity_summary` 每次调用
+    /// writer 失败就 +1，写成功清零。`activity_summary_retry_due` 据此算指数退避窗口。
+    consecutive_failures: u32,
+    /// R6③：最近一次真正尝试写（无论成功失败）的时刻——跟 `last_flushed_at_ms`（只在成功时
+    /// 推进，语义是"最近一次成功发布"）分开：失败也要留一个"上次动手的时间"才能计算退避，
+    /// 不能像旧实现那样只看 `last_flushed_at_ms`（一个从未成功过的条目该字段恒 `None`，旧的
+    /// `map_or(true, ..)` 让它每个 tick 都判定"到期"，写线程对着注定失败的目标原地空转）。
+    last_attempt_at_ms: Option<u64>,
+}
+
+impl RunActivityEntry {
+    fn new(session_id: String) -> Self {
+        Self {
+            session_id,
+            counters: ActivityCounters::default(),
+            state: "running",
+            sealed: false,
+            terminal_pending: false,
+            dirty: false,
+            last_flushed_at_ms: None,
+            consecutive_failures: 0,
+            last_attempt_at_ms: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ActivitySummaryAggregatorState {
+    runs: HashMap<String, RunActivityEntry>,
+}
+
+/// 一次待落库的快照——`apply_activity_summary_delta`/`activity_summary_due_flushes` 产出。
+#[derive(Debug, PartialEq)]
+struct ActivitySummaryFlush {
+    run_id: String,
+    session_id: String,
+    counters: ActivityCounters,
+    state: &'static str,
+}
+
+/// 应用一条 delta 到聚合态，纯函数（不做 I/O，可脱离线程/channel 直接单测）。
+///
+/// **节流留给 tick**：本函数本身**不**判断是否该立即发布——非终态 delta 只更新计数/dirty，
+/// 是否到了节流窗口统一交给 `activity_summary_due_flushes`（worker 每个 tick 调一次），避免
+/// 两处各自判断"是否该发"而彼此不一致。**唯一例外是终态**：终态 delta 命中且这是该 run
+/// 第一次被封口时，本函数恒返回 `Some`——设计稿「终态写取消/压过排队中的 running 节流更新」
+/// 要求终态立即写，不等下一个 tick。
+///
+/// 已 sealed 的 run：任何后续 delta（无论终态还是非终态）一律忽略，返回 `None`（"终态置位后
+/// 到达的 running 更新丢弃"，且终态本身不可能被应用两次）。
+fn apply_activity_summary_delta(
+    state: &mut ActivitySummaryAggregatorState,
+    delta: ActivitySummaryDelta,
+) -> Option<ActivitySummaryFlush> {
+    match delta.kind {
+        ActivitySummaryDeltaKind::Terminal { failed } => {
+            let entry = state.runs.get_mut(&delta.run_id)?;
+            if entry.sealed {
+                return None;
+            }
+            entry.state = if failed { "failed" } else { "done" };
+            entry.sealed = true;
+            // msgfix2 U1 修单三（G1）：sealed 立即挡迟到 running，但落库是否成功是另一件事——
+            // terminal_pending 一直保持 true，直到 `flush_activity_summary` 真正写成功才清掉；
+            // 期间即便这次 immediate attempt（调用方紧接着触发的那次写）失败，`activity_
+            // summary_due_flushes` 也会把这个条目继续收进重试批次（见该函数文档）。
+            entry.terminal_pending = true;
+            entry.dirty = false;
+            Some(ActivitySummaryFlush {
+                run_id: delta.run_id,
+                session_id: entry.session_id.clone(),
+                counters: entry.counters.clone(),
+                state: entry.state,
+            })
+        }
+        ActivitySummaryDeltaKind::ToolCompleted { mcp, failed } => {
+            let entry = state
+                .runs
+                .entry(delta.run_id)
+                .or_insert_with(|| RunActivityEntry::new(delta.session_id));
+            if entry.sealed {
+                return None;
+            }
+            entry.counters.tool_calls += 1;
+            if failed {
+                entry.counters.failed += 1;
+            }
+            if mcp {
+                entry.counters.mcp_calls += 1;
+            }
+            entry.dirty = true;
+            None
+        }
+        ActivitySummaryDeltaKind::PermissionPrompt => {
+            let entry = state
+                .runs
+                .entry(delta.run_id)
+                .or_insert_with(|| RunActivityEntry::new(delta.session_id));
+            if entry.sealed {
+                return None;
+            }
+            entry.counters.permission_prompts += 1;
+            entry.dirty = true;
+            None
+        }
+    }
+}
+
+/// 每个 tick 调一次：扫描待写批次，收进两类条目——① 未 sealed 且 dirty 的常规 running
+/// 快照；② `sealed && terminal_pending`（msgfix2 U1 修单三·G1：终态已到达但尚未成功写库，
+/// 见 `RunActivityEntry::terminal_pending` 文档）——一旦落库成功，`flush_activity_summary`
+/// 会清掉 `terminal_pending`，之后这个 sealed 条目就再也不会被本函数收进批次（既不 dirty
+/// 也不 pending）。两类条目都受同一退避窗口（`activity_summary_retry_due`）约束。不是"有新
+/// delta 才检查"，否则一个 run 停在最后一次工具调用后就再也不会被扫到，它的摘要会永远卡在
+/// 上一次发布（甚至从未发布过）的旧计数上；同理终态如果只在到达那一刻尝试一次，写失败后不会
+/// 再被 tick 捡回来（独立审查 G1 抓到的正是这个缺口）。
+fn activity_summary_due_flushes(
+    state: &ActivitySummaryAggregatorState,
+    now_ms: u64,
+) -> Vec<ActivitySummaryFlush> {
+    state
+        .runs
+        .iter()
+        .filter(|(_, entry)| {
+            (entry.dirty && !entry.sealed) || (entry.sealed && entry.terminal_pending)
+        })
+        .filter(|(_, entry)| activity_summary_retry_due(entry, now_ms))
+        .map(|(run_id, entry)| ActivitySummaryFlush {
+            run_id: run_id.clone(),
+            session_id: entry.session_id.clone(),
+            counters: entry.counters.clone(),
+            state: entry.state,
+        })
+        .collect()
+}
+
+/// R6③（msgfix2 整盘审 P2 顺手）：`activity_summary_due_flushes` 的节流/退避窗口判据，独立
+/// 抽出方便单测。以 `last_attempt_at_ms`（上次真正尝试写的时刻，无论成败，见该字段文档）为
+/// 起点：`consecutive_failures == 0`（从未失败过，或上次已写成功）沿用既有
+/// `ACTIVITY_SUMMARY_THROTTLE_MS`（2s）常规节流；`consecutive_failures > 0` 时窗口按
+/// `THROTTLE_MS * 2^consecutive_failures` 指数放大，封顶 `ACTIVITY_SUMMARY_MAX_BACKOFF_MS`
+/// （30s）。`last_attempt_at_ms` 为 `None`（从未真正尝试过写）时无条件到期——首次写不该等
+/// 节流窗口。
+///
+/// **旧实现的问题**：只看 `last_flushed_at_ms`（只在成功时推进）——一个从未成功过的条目
+/// （目标持续不可写：DB 忙/磁盘满等）该字段恒 `None`，`map_or(true, ..)` 让它每个 tick
+/// （`ACTIVITY_SUMMARY_TICK_MS` = 250ms，4Hz）都判定"到期"，写线程对着注定失败的目标原地
+/// 空转重试，纯粹浪费（真实故障持续期间可能是几十次/秒的无效写尝试）。`.min(20)` 只是防御性
+/// 地界定移位量（`1u64 << n`），避免失败计数在长跑进程里增长到荒谬大小时移位溢出——达到
+/// 20 次失败时退避已经远超 30s 封顶，`.min(20)` 之后再 `.min(MAX)` 结果不变，纯粹是安全网。
+fn activity_summary_retry_due(entry: &RunActivityEntry, now_ms: u64) -> bool {
+    let Some(last_attempt) = entry.last_attempt_at_ms else {
+        return true;
+    };
+    let backoff_ms = if entry.consecutive_failures == 0 {
+        ACTIVITY_SUMMARY_THROTTLE_MS
+    } else {
+        ACTIVITY_SUMMARY_THROTTLE_MS
+            .saturating_mul(1u64 << entry.consecutive_failures.min(20))
+            .min(ACTIVITY_SUMMARY_MAX_BACKOFF_MS)
+    };
+    now_ms.saturating_sub(last_attempt) >= backoff_ms
+}
+
+/// 实际调用注入的 writer 落库一次快照，并按结果更新聚合态。`now_ms` 由调用方传入（而不是
+/// 内部自己调 `now_unix_ms()`）——R6③：同一轮 worker tick 里"扫描到期批次"与"落库这批"共用
+/// 同一个时间戳，且测试能注入确定性时钟验证退避窗口，不依赖真实系统时间推移：
+/// - 写成功 → 清 dirty、推进 `last_flushed_at_ms`/`last_attempt_at_ms`（节流窗口重新计时）、
+///   `consecutive_failures` 清零——**无论该 run 是否已 sealed，条目都不从 `state.runs` 移除**
+///   （msgfix2 F2 修单：终态成功写库后曾经把条目从 map 里删掉，之后一条迟到的 running delta
+///   会在 `apply_activity_summary_delta` 里因为 entry 不存在而 `or_insert_with` 重新造一个新
+///   （未 sealed）条目，等于把已经宣告终态的 run"复活"成 running 重新发布——sealed 必须是
+///   永久 tombstone，`apply_activity_summary_delta` 对已存在且 `sealed==true` 的条目本来就会
+///   直接丢弃后续 delta，只要条目还在就天然挡得住；代价是长跑桌面进程的内存表无界增长，这是
+///   设计稿明文认领的取舍（§4.1「sealed 标记持久保留在内存 map」），不是遗留 bug）。
+/// - 写失败 → 保留 dirty、不推进 `last_flushed_at_ms`，但**推进 `last_attempt_at_ms` 并把
+///   `consecutive_failures` +1**（R6③：旧实现这里完全不碰 `state.runs`，只增计数就
+///   `return`——`activity_summary_due_flushes` 因此拿不到任何"上次失败是什么时候"的信号，
+///   只能靠 `last_flushed_at_ms` 恒 `None` 的旧逻辑判定"到期"，于是原地空转），下一轮 tick
+///   由 `activity_summary_retry_due` 按指数退避窗口自然重试——best-effort，与既有缺口④
+///   republish 失败"只记日志、不回滚已成功的状态"同一容错姿势。**终态快照走的是同一条路径**：
+///   写失败时同样保留 `terminal_pending`（`sealed` 已经在到达那一刻置过，不受这里影响），
+///   下一轮 tick 由 `activity_summary_due_flushes` 把它重新收进批次重试（msgfix2 U1 修单三·
+///   G1）——直到写成功，`entry.terminal_pending` 才在下面清掉。
+fn flush_activity_summary(
+    state: &mut ActivitySummaryAggregatorState,
+    writer: &ActivitySummaryWriter,
+    write_failures: &AtomicU64,
+    flush: ActivitySummaryFlush,
+    now_ms: u64,
+) {
+    let result = writer(
+        &flush.session_id,
+        &flush.run_id,
+        flush.counters.tool_calls,
+        flush.counters.failed,
+        flush.counters.mcp_calls,
+        flush.counters.permission_prompts,
+        flush.state,
+    );
+    if result.is_err() {
+        write_failures.fetch_add(1, Ordering::Relaxed);
+        if let Some(entry) = state.runs.get_mut(&flush.run_id) {
+            entry.last_attempt_at_ms = Some(now_ms);
+            entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        }
+        return;
+    }
+    if let Some(entry) = state.runs.get_mut(&flush.run_id) {
+        entry.dirty = false;
+        // 常规 running 条目此字段恒为 false，这里无条件清是无害 no-op；只有 sealed 的终态
+        // 条目才会真的从 true 翻到 false——写成功之后这个条目既不 dirty 也不再 pending，
+        // `activity_summary_due_flushes` 从此再也不会把它收进任何批次（G1）。
+        entry.terminal_pending = false;
+        entry.last_flushed_at_ms = Some(now_ms);
+        entry.last_attempt_at_ms = Some(now_ms);
+        entry.consecutive_failures = 0;
+    }
+}
+
+/// 应用一批已经到手（非阻塞可读）的 delta，返回按应用顺序产生的待写快照列表——msgfix2 F2
+/// 修单①：worker 主循环过去是"每收一条就检查一次节流到期"，如果 channel 里已经排着
+/// `[running, terminal]`（同一个 run），处理完 running 后立即扫一遍
+/// `activity_summary_due_flushes`——running 那条 `last_flushed_at_ms` 还是 `None`（首次发布
+/// 恒判"到期"，见其文档），会在 terminal 还没被这个函数看到之前就先发布出去，制造出"明明
+/// 已经终态了、却先看到一条 running 摘要"的用户可见闪烁。
+///
+/// 修法：worker 从 channel 拿到第一条后，先把当下已经排队、非阻塞可取的其余 delta 一次性
+/// drain 进同一批（见调用方），整批按到达顺序喂给本函数——终态 delta 本身在
+/// `apply_activity_summary_delta` 里恒定立即返回待写快照（不受节流约束），非终态 delta 只
+/// 置 dirty、从不在这里触发发布；只有 batch 处理完之后调用方才会再去检查节流到期的常规
+/// running 发布。这样"同批里终态排在 running 后面"的情形，只会产出一次 terminal 快照，
+/// running 那条因为函数本身不做节流判断而从未被单独发布过（`state.runs` 里的 dirty 标记
+/// 被 terminal 分支一并清掉，见 `apply_activity_summary_delta` Terminal 分支）——不需要额外
+/// 的"同 run 多条只留最新"去重表，纯函数组合本身就是正确的。
+fn drain_activity_summary_deltas(
+    state: &mut ActivitySummaryAggregatorState,
+    deltas: impl IntoIterator<Item = ActivitySummaryDelta>,
+) -> Vec<ActivitySummaryFlush> {
+    let mut flushes = Vec::new();
+    for delta in deltas {
+        if let Some(flush) = apply_activity_summary_delta(state, delta) {
+            flushes.push(flush);
+        }
+    }
+    flushes
+}
+
+/// 独立串行写线程主循环。`recv_timeout` 短周期 tick——没有新 delta 到达时也定期醒来检查节流
+/// 窗口到期的 dirty run（见 `activity_summary_due_flushes` 文档）。channel 所有发送端析构后
+/// `recv_timeout` 返回 `Disconnected`，线程随之退出（同 `run_session_index_snapshot_worker`
+/// 的"随 Inner 生命周期自然收尾"惯例）。
+fn run_activity_summary_worker(rx: Receiver<ActivitySummaryDelta>, writer: ActivitySummaryWriter) {
+    let mut state = ActivitySummaryAggregatorState::default();
+    let write_failures = AtomicU64::new(0);
+    loop {
+        match rx.recv_timeout(Duration::from_millis(ACTIVITY_SUMMARY_TICK_MS)) {
+            Ok(first) => {
+                // msgfix2 F2 修单①：不是收到就立刻各自判一次节流到期——先把当下已经非阻塞
+                // 可取的其余 delta 一次性 drain 进同一批（`try_recv` 不等待，channel 空了就
+                // 停），整批一起喂给 `drain_activity_summary_deltas`，本轮循环末尾才统一做一次
+                // 节流到期扫描。见该函数文档："排队中的 running→terminal 序列仍会先发布
+                // running" 的根因就是过去每条 delta 各自触发一次 due-flush 检查。
+                let mut batch = vec![first];
+                while let Ok(delta) = rx.try_recv() {
+                    batch.push(delta);
+                }
+                let now_ms = now_unix_ms();
+                for flush in drain_activity_summary_deltas(&mut state, batch) {
+                    flush_activity_summary(&mut state, &writer, &write_failures, flush, now_ms);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        let now_ms = now_unix_ms();
+        for flush in activity_summary_due_flushes(&state, now_ms) {
+            flush_activity_summary(&mut state, &writer, &write_failures, flush, now_ms);
+        }
+    }
+}
+
+/// 配置并启动 L1 活动摘要聚合器（幂等——`OnceLock::get_or_init` 保证进程生命周期内至多 spawn
+/// 一个写线程，同 `ensure_snapshot_worker` 惯例）。调用前功能整体 no-op（`extract_tool_milestones`
+/// 直接跳过，见 `GatewayInnerState::activity_summary_tx` 文档）；调用后 `extract_tool_milestones`
+/// 才开始产 delta、独立写线程才开始落库。
+///
+/// msgfix2 U1b：生产接线已激活——见 `install_activity_summary_writer`（本文件，`GATEWAY` 单例
+/// 建立之后才可能有真实 `&Inner` 可用，同 `install_event_sink` 惯例）+ lib.rs 侧
+/// `remote_gateway_activity_summary_writer`（真实 DB 写 provider，捕获 `AppHandle` 短锁访问
+/// `Db` state，调用 `db::upsert_activity_summary_and_publish`）。**visibility 仍是模块私有**
+/// （不是 `pub(crate)`）——`GatewayInnerState` 本身是模块私有类型，把这个函数提到 `pub(crate)`
+/// 只会产生"函数比它的参数类型更公开"的编译警告，没有实际收益：唯一需要跨模块调用的场景已经
+/// 由 `install_activity_summary_writer`（真正的 `pub(crate)` 入口，签名只暴露 `pub(crate)`
+/// 类型 `ActivitySummaryWriter`，不泄漏 `GatewayInnerState`）覆盖，本函数在模块内的唯一调用方
+/// 也正是它。
+fn configure_activity_summary_writer(state: &GatewayInnerState, writer: ActivitySummaryWriter) {
+    state.activity_summary_tx.get_or_init(|| {
+        let (tx, rx) =
+            mpsc::sync_channel::<ActivitySummaryDelta>(ACTIVITY_SUMMARY_CHANNEL_CAPACITY);
+        thread::Builder::new()
+            .name("remote-activity-summary".to_owned())
+            .spawn(move || run_activity_summary_worker(rx, writer))
+            .expect("failed to start remote-activity-summary thread");
+        state
+            .activity_summary_worker_spawn_count
+            .fetch_add(1, Ordering::Relaxed);
+        tx
+    });
 }
 
 /// P0-b：维护每 session 的"当前 run 归约态"（`partial_snapshots`），供 `control.snapshot`
@@ -4005,15 +5073,35 @@ fn extract_tool_milestones(
 ///
 /// **team 多 lane 局限（如实记档，非本轮设计范围）**：team 会话的多个 member lane 可能对
 /// 同一 `session_id` 交错发来不同 `run_id` 的 batch；本函数按"run_id 变化即重建"策略处理，
-/// 交错到达时**重建会丢弃已积累的归约态**——跨 lane 的 seq 不可比，客户端可能收到水位更高
-/// 但内容更少的快照并覆盖本地已有状态；一期契约只保证 solo / lead 主线程会话的快照准确，
-/// team member lane 精确快照留 BACKLOG。
+/// 交错到达时**重建仍会丢弃已积累的归约态**（内容层面的多 lane 合并/隔离不在本轮范围内）——
+/// 跨 lane 的 seq 不可比，客户端可能收到水位更高但内容更少的快照并覆盖本地已有状态；一期
+/// 契约只保证 solo / lead 主线程会话的快照准确，team member lane 精确快照留 BACKLOG。
 ///
-/// **调用时机（P0-b 返工①）**：本函数在 `enqueue_batch_payload_for_upstream` 里排在 gate
-/// 判断之前，无条件执行——桌面断连（gate 关闭）期间事件仍要喂 reducer，否则重连后
+/// **缺口⑥（team 多 lane·保 lead/latest 活跃 lane；R3·msgfix2 整盘审扩展到流式 batch）**：
+/// 上面这条"内容会被覆盖"的局限保留不动，但**顶占/清空占用者槽位**这件事收窄——一条 batch
+/// 如果裸 `run_id` 与"处理这条 batch 之前"该 session 槽位里已经占用的 run_id 不同，且满足
+/// 下面任一条件，视为**不该触碰占用者**：① 这条 batch 是终态（Completed/RunCloseout）；
+/// ② 它折回的逻辑 run（`activity_summary_logical_run_id`——member lane 的传输层复合 lane id
+/// 折回 `batch.dispatch.run_id`，即它真正归属的 lead run id）与当前占用者相等（说明这是占用
+/// 者名下的一条子 lane，不管终态还是流式）。①②任一成立，整条 batch 对该 session 的 partial
+/// 条目完全不生效（不 rebuild、不 feed、不 remove），当前占用者的归约态原样保留；都不成立
+/// （裸 run_id 不同、且逻辑 run 也不同——真正无关的另一个 run）才走下面正常的
+/// "needs_rebuild/喂事件/终态清空"路径。**R3 之前只有①**：member lane 中途的**流式**事件
+/// 完全没有守卫、会直接命中 needs_rebuild 把占用者的槽位顶替成 member 自己；等 member 自己
+/// 的终态紧随而至时，占用者已经变成了 member（裸 run_id 相等），①这道守卫反而不成立、正常
+/// 清空——两步绕开同一道防线，占用者的归约态照样丢失（红测试
+/// `partial_snapshot_member_lane_streaming_batch_does_not_seize_or_wipe_lead_slot`）。空槽位
+/// （当前无人占用）时任何 run 都能正常声明/清空——这条收窄只保护"槽位已被别的 run 占用"这一
+/// 种情形。
+///
+/// **调用时机（P0-b 返工①·R4 扩展）**：本函数在 `enqueue_batch_payload_for_upstream` 里排在
+/// gate 判断之前，无条件执行——桌面断连（gate 关闭）期间事件仍要喂 reducer，否则重连后
 /// `control.snapshot` 会读到假 idle/陈旧态（同时是"断连窗内条目永久泄漏"与"水位打洞"两个
-/// 同族问题的根修）。gate 只决定"是否入上行队列"（`extract_tool_milestones` 与
-/// `upstream_tx.try_send` 那一段），不影响归约态维护。
+/// 同族问题的根修）。`extract_tool_milestones`（R4）挪到同一位置、同一理由，紧随其后调用
+/// （见该函数就近调用点的 R4 注释）；gate 现在只决定 `upstream_tx.try_send` 那一段本身，
+/// 以及 `extract_tool_milestones` 内部真正的上行帧（`tool.completed` 等，走
+/// `enqueue_milestone_for_upstream` 自带的独立 gate 检查）是否真的入队——不再影响归约态维护
+/// 或聚合器 delta 提取。
 fn maintain_partial_snapshots(
     state: &GatewayInnerState,
     payload: &crate::event_transport::BatchPayload,
@@ -4028,9 +5116,45 @@ fn maintain_partial_snapshots(
         if batch.events.is_empty() {
             continue;
         }
-        let needs_rebuild = snapshots
-            .get(&batch.session_id)
-            .map(|existing| existing.run_id != batch.run_id)
+        let batch_is_terminal = batch.events.iter().any(|sequenced| {
+            matches!(
+                sequenced.event,
+                AgentEvent::Completed { .. } | AgentEvent::RunCloseout { .. }
+            )
+        });
+        let occupant_run_id = snapshots.get(&batch.session_id).map(|e| e.run_id.clone());
+        if let Some(occupant) = &occupant_run_id {
+            if occupant != &batch.run_id {
+                // R3（缺口⑥扩展·msgfix2 整盘审 P1）：占用者存在、本 batch 裸 run_id 与占用者
+                // 不同——两种情形都必须保护占用者不被触碰：
+                // ① `batch_is_terminal`（旧缺口⑥已挡的那半，原样保留）：任何裸 run_id 不同
+                //    的终态一律不得清空/触碰占用者，不管它是不是同一逻辑 run 的子 lane——一条
+                //    真正无关的陌生终态同样不该有资格清掉别人的槽位。
+                // ② 新增：非终态（流式）batch，如果它折回的逻辑 run
+                //    （`activity_summary_logical_run_id`，把 member lane 的传输层复合 lane id
+                //    折回 `batch.dispatch.run_id`，即 lead 的真实 run_id）与占用者相等——说明
+                //    这条 batch 是占用者名下的一条子 lane（典型：member）。旧实现只在①挡过，
+                //    ②完全没有守卫、一律落进下面的 `needs_rebuild`：member lane 的中途流式
+                //    事件先把占用者（如 lead）的 partial 顶掉重建，member 自己的终态随后到
+                //    达时 occupant 已经被换成了 member 的裸 run_id、跟这条终态 batch 相等，
+                //    ①这道守卫（`occupant != batch.run_id`）反而不成立、正常清空——两步就
+                //    绕开了同一道防线，占用者的归约态彻底丢失。
+                //
+                // ①②任一成立就整条 batch 对该 session 的 partial 条目完全不生效：不
+                // rebuild、不 feed、不 remove。真正跟占用者逻辑 run 无关的陌生非终态 batch
+                // （①不成立、②也不成立）才继续落到下面的 `needs_rebuild=true` 正常改朝换代
+                // 路径——与快照维护同层的聚合器（`extract_tool_milestones`）本就用同一个
+                // 函数把 member lane 计数并入父 run，这里改用同一个函数比对，快照槽位归属与
+                // 聚合器归属口径统一，不再各按各的 run_id 定义"这条 batch 属于谁"（旧实现是
+                // "双源漂移"：快照按裸 `batch.run_id`，聚合器按 `dispatch.run_id`）。
+                if batch_is_terminal || activity_summary_logical_run_id(batch) == *occupant {
+                    continue;
+                }
+            }
+        }
+        let needs_rebuild = occupant_run_id
+            .as_deref()
+            .map(|occupant| occupant != batch.run_id)
             .unwrap_or(true);
         if needs_rebuild {
             if !snapshots.contains_key(&batch.session_id)
@@ -4056,18 +5180,11 @@ fn maintain_partial_snapshots(
         let Some(entry) = snapshots.get_mut(&batch.session_id) else {
             continue;
         };
-        let mut terminal = false;
         for sequenced in &batch.events {
             entry.reducer.feed(&sequenced.event);
             entry.last_seq = sequenced.seq;
-            if matches!(
-                sequenced.event,
-                AgentEvent::Completed { .. } | AgentEvent::RunCloseout { .. }
-            ) {
-                terminal = true;
-            }
         }
-        if terminal {
+        if batch_is_terminal {
             snapshots.remove(&batch.session_id);
         }
     }
@@ -4083,13 +5200,26 @@ fn enqueue_batch_payload_for_upstream(
     // `maintain_partial_snapshots` 文档顶部"调用时机"一段。gate 只管下面"是否入上行队列"。
     maintain_partial_snapshots(state, &payload);
 
+    // R4（msgfix2 整盘审 P1）：`extract_tool_milestones` 挪到 gate 判断之前、无条件执行——
+    // 与上面 `maintain_partial_snapshots` 同一姿势，理由更直接：`extract_tool_milestones`
+    // 内部产两类东西——① `tool.completed` 等真正的上行帧（走 `enqueue_milestone_for_upstream`
+    // → `publish_tool_completed_milestone`），这条路径本来就会自己重新读一次
+    // `state.upstream_state` 再决定要不要真正 `try_send`（`enqueue_milestone_for_upstream`
+    // 内部有一份独立的 gate 检查），外层这道 gate 对它是重复保护，挪到 gate 之前不改变它
+    // "只在 gate 打开时才真正入队"的行为；② L1 活动摘要聚合器 delta（`send_activity_
+    // summary_delta`，走独立 channel 落 DB 消息，**不是**上行帧、根本不该受"手机有没有连"
+    // 影响）——旧实现把①②整个函数一起挂在 gate 判断之后，手机没连时函数整体不执行，②唯一
+    // 的生产入口被一并挡住：`ToolCompleted`/`ApprovalRequested`/`Completed`/`RunCloseout`
+    // 等事件从未走到这里，聚合器永远拿不到计数/终态信号，活动摘要永久卡在 running（即便
+    // 之后手机连上，也没有任何补发机制会重新灌入这些已经错过的 delta）。挪到 gate 之前后，
+    // ①的行为不变（内层 gate 兜底），②不再受外层 gate 牵连。
+    extract_tool_milestones(state, milestone_tx, &payload);
+
     let snapshot = state.upstream_state.load(Ordering::Acquire);
     if snapshot & 1 == 0 {
         return;
     }
     let generation = snapshot >> 1;
-
-    extract_tool_milestones(state, milestone_tx, &payload);
 
     match upstream_tx.try_send((generation, LiveQueueItem::Batch(payload))) {
         Ok(()) => {}
@@ -4101,24 +5231,29 @@ fn enqueue_batch_payload_for_upstream(
 
 /// `control.history` 使用的预构建 live 入队口。与 delta 共用同一有界 FIFO、generation
 /// 标签和 drain 归属闸；只绕过 classify，因为 payload 已由 history 契约构造函数定型。
+///
+/// msgfix1 T3（缺口①·M0 §10.9 同一姿势）：返回值 `true` = 已成功 try_send 进队列（尽力而为，
+/// 不保证送达，但已在制品）；`false` = 未能入队（client_msg_id 非法 / upstream 门控关闭 /
+/// 队列满或断连）——调用方（`control.history` 命令臂）据此回真实失败 ack，不再无条件回 `Ok`。
 fn enqueue_prebuilt_live_for_upstream(
     state: &GatewayInnerState,
     upstream_tx: &SyncSender<(u64, LiveQueueItem)>,
     item: MilestoneItem,
-) {
+) -> bool {
     if !is_valid_client_msg_id(&item.client_msg_id) {
         state.upstream_dropped.fetch_add(1, Ordering::Relaxed);
-        return;
+        return false;
     }
     let snapshot = state.upstream_state.load(Ordering::Acquire);
     if snapshot & 1 == 0 {
-        return;
+        return false;
     }
     let generation = snapshot >> 1;
     match upstream_tx.try_send((generation, LiveQueueItem::Prebuilt(item))) {
-        Ok(()) => {}
+        Ok(()) => true,
         Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
             state.upstream_dropped.fetch_add(1, Ordering::Relaxed);
+            false
         }
     }
 }
@@ -4141,11 +5276,38 @@ fn enqueue_milestone_item(
         if let Some(blocks) = item.payload.get_mut("blocks") {
             *blocks = truncate_history_tool_outputs(blocks.clone());
         }
+        // msgfix1 T3（设计稿 §A）：`build_msg_completed_payload` 把预算好的 content_ref
+        // 挂在私有键下——无论是否超预算都必须先把它取出并从 payload 上剥离，绝不能让它
+        // 混进下面的尺寸测量（否则会把整条原始内容的哈希/字节数误算进 payload 尺寸）或
+        // 流到 wire（非超预算消息不该带 content_ref，§10.6「可选字段」）。
+        let content_ref_source = item
+            .payload
+            .as_object_mut()
+            .and_then(|obj| obj.remove(MSG_COMPLETED_REF_SOURCE_KEY));
         if milestone_frame_bytes(&item.t, &item.payload) > SNAPSHOT_SEND_BUDGET_BYTES {
-            state
-                .replay_oversized_dropped
-                .fetch_add(1, Ordering::Relaxed);
-            return;
+            match content_ref_source {
+                Some(content_ref) => {
+                    // 超预算不再静默丢弃——降级为块级 preview + content_ref，让远端至少
+                    // 看得见这条消息、按需可拉全文（缺口①②）。计数器语义随之从「丢弃次数」
+                    // 改为「降级为 preview 的次数」，继续保持指标可观测。
+                    item.payload =
+                        downgrade_to_preview_payload(&item.payload, content_ref, &item.t);
+                    state
+                        .replay_oversized_dropped
+                        .fetch_add(1, Ordering::Relaxed);
+                    // 不 return——降级后的 payload 走下面正常入队路径。
+                }
+                None => {
+                    // 防御性兜底：理论上生产两条调用点（`publish_msg_completed_milestone`/
+                    // `publish_msg_and_card_replay_rows`）都经 `build_msg_completed_payload`
+                    // 构造、恒带 ref source。没有 ref source 就造不出合规 content_ref（宁可
+                    // 保留旧的丢弃语义，也不伪造 revision/sha256——§10.6 硬约束）。
+                    state
+                        .replay_oversized_dropped
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
         }
     }
     match milestone_tx.try_send((generation, item)) {
@@ -4269,28 +5431,294 @@ pub(crate) fn test_take_session_index_created_payload_log() -> Vec<Value> {
     TEST_SESSION_INDEX_CREATED_PAYLOAD_LOG.with(|log| log.borrow_mut().drain(..).collect())
 }
 
+/// 生产用 sha256 hex（小写）——`content_ref.content_sha256`（M0 §10.6）唯一的落地点。测试
+/// 模块另有一份同构的 `wire_v1_sha256_ascii_hex`（服务 wire fixture KAT），二者用途不同、
+/// 互不复用：那份在 `#[cfg(test)]` 区域内，生产代码不可见。
+fn sha256_hex_lower(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// content_ref 四字段（M0 §10.6）：`total_bytes`/`content_sha256` 必须对调用方传入的
+/// `content_raw`（DB `messages.content` 原始 JSON 字符串，未经任何重序列化）计算——与
+/// `SNAPSHOT_SEND_BUDGET_BYTES`/`HISTORY_SEND_BUDGET_BYTES` 的尺寸预算同口径（UTF-8 字节数）。
+fn build_content_ref(message_id: i64, revision: i64, content_raw: &str) -> Value {
+    serde_json::json!({
+        "message_id": message_id,
+        "revision": revision,
+        "content_sha256": sha256_hex_lower(content_raw.as_bytes()),
+        "total_bytes": content_raw.len(),
+    })
+}
+
+/// msgfix1 T4（M0 §10.5 `msg.fetch.error`）：六值 code 枚举的通用构造——`current_ref` 仅
+/// `stale_revision` 必填，其余 code 整个省略该字段（不是 `null`，见样张
+/// `data-plane-v1.json` 的 `msg_fetch_error_not_found`——msgfix1 T7 B5：pending 版已合入
+/// 正式文件并删除，改指正式文件）。
+fn msg_fetch_error_payload(code: &str, current_ref: Option<Value>) -> Value {
+    let mut frame = serde_json::json!({"t": "msg.fetch.error", "code": code});
+    if let Some(current_ref) = current_ref {
+        frame["current_ref"] = current_ref;
+    }
+    frame
+}
+
+/// msgfix1 T4（M0 §10.5 `msg.chunk`）+ §10.9（重组安全/offset 续传）：把消息原文按
+/// `CHUNK_RAW_BYTES` 切成有序分片，逐片产 `msg.chunk` 密文体。`start_offset` 支持 `msg.fetch`
+/// 的 `offset` 续传语义——只从这个偏移开始切，不重复发送客户端已经拿到的前缀；越界（
+/// `start_offset >= content.len()`）时钳到末尾。`content_sha256`/`total_bytes` 恒对**全量**
+/// `content`（不是从 `start_offset` 起的子串）计算，与 `content_ref`（M0 §10.6）同一份数，供
+/// 客户端做§10.9「完成后整体校验」。切片按裸字节边界切，不保证落在 UTF-8 字符边界上——
+/// `msg.chunk` 传输的是不透明字节序列，客户端要拼完全部分片才按 UTF-8 解释，切一半的多字节
+/// 序列本就是合法的中间态。
+///
+/// **恒返回非空 `Vec`**——`start_offset >= content.len()`（客户端已经拿到全部内容、纯粹用同一
+/// `offset` 收尾确认，或消息原文恰好为空）时不会退化成空序列悄悄什么都不发：产出唯一一片
+/// `chunk_len: 0`、`offset: total_bytes` 的终态空分片。这片本身就满足 §10.9 的重组连续性
+/// （它是这次响应的第一也是最后一片，没有"上一片"要对齐）与整体 SHA-256 校验（客户端此前已
+/// 经把 `content` 拼全，这片只是补一个显式终态信号，不携带新字节），让调用方（`handle_msg_
+/// fetch_at`）永远有恰好一帧可以标记 `final_frame: true` 去释放单飞行占用——不需要在没有分片
+/// 可发时额外分叉出"到底该不该占单飞行槽位"的第二套判断。
+fn build_msg_chunks(
+    message_id: i64,
+    revision: i64,
+    content: &[u8],
+    start_offset: usize,
+) -> Vec<Value> {
+    let total_bytes = content.len();
+    let content_sha256 = sha256_hex_lower(content);
+    let mut chunks = Vec::new();
+    let mut offset = start_offset.min(total_bytes);
+    while offset < total_bytes {
+        let end = (offset + CHUNK_RAW_BYTES).min(total_bytes);
+        let slice = &content[offset..end];
+        chunks.push(serde_json::json!({
+            "t": "msg.chunk",
+            "message_id": message_id,
+            "revision": revision,
+            "content_sha256": content_sha256,
+            "total_bytes": total_bytes,
+            "offset": offset,
+            "chunk_len": slice.len(),
+            "bytes_b64": STANDARD.encode(slice),
+        }));
+        offset = end;
+    }
+    if chunks.is_empty() {
+        chunks.push(serde_json::json!({
+            "t": "msg.chunk",
+            "message_id": message_id,
+            "revision": revision,
+            "content_sha256": content_sha256,
+            "total_bytes": total_bytes,
+            "offset": total_bytes,
+            "chunk_len": 0,
+            "bytes_b64": "",
+        }));
+    }
+    chunks
+}
+
+/// msgfix1 T4（M0 §10.9 单飞行 + 超时释放）：某 session 现有的在途 fetch 记录是否仍然"占着"
+/// 单飞行槽位——超时（`MSG_FETCH_INFLIGHT_TIMEOUT_MS`）后视为已释放。纯函数，供不依赖
+/// provider/socket 的单元测试直接钉超时边界（含时钟回拨的 `saturating_sub` 防御）。
+fn msg_fetch_inflight_is_active(accepted_at_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(accepted_at_ms) < MSG_FETCH_INFLIGHT_TIMEOUT_MS
+}
+
+/// msgfix1 T4（M0 §10.9 per-source 60s 字节预算）：纯函数版本——先按
+/// `now_ms - MSG_FETCH_BYTE_BUDGET_WINDOW_MS` 剪掉窗口外的陈旧条目，再判断加上
+/// `requested_bytes` 是否仍在 `MSG_FETCH_BYTE_BUDGET_PER_WINDOW` 之内；放行时把这次请求记进
+/// 窗口。返回 `(是否放行, 剪枝并可能追加记账后的窗口)`——调用方在同一次加锁临界区内原地替换
+/// map 里的 `VecDeque`，保证"剪枝 + 判定 + 放行记账"三步原子。
+fn msg_fetch_budget_admit(
+    mut window: VecDeque<(u64, usize)>,
+    now_ms: u64,
+    requested_bytes: usize,
+) -> (bool, VecDeque<(u64, usize)>) {
+    while let Some((at_ms, _)) = window.front() {
+        if now_ms.saturating_sub(*at_ms) >= MSG_FETCH_BYTE_BUDGET_WINDOW_MS {
+            window.pop_front();
+        } else {
+            break;
+        }
+    }
+    let used: u64 = window.iter().map(|(_, bytes)| *bytes as u64).sum();
+    let admit = used.saturating_add(requested_bytes as u64) <= MSG_FETCH_BYTE_BUDGET_PER_WINDOW;
+    if admit {
+        window.push_back((now_ms, requested_bytes));
+    }
+    (admit, window)
+}
+
+/// msgfix1 T4 返修②（skeptic 补审）：check-and-insert——若 `(session, command_id)` 已经在
+/// 账本里（意味着这个 command_id 之前已经被 `handle_msg_fetch_at` 处理过一次，无论那次成功
+/// 还是失败），返回 `false`（拒绝复用）；否则记入账本（容量满时 FIFO 淘汰最老一条）并返回
+/// `true`（放行——本次是这个 `(session, command_id)` 第一次被处理）。见 `MsgFetchCommandLedger`
+/// doc。
+fn msg_fetch_command_ledger_admit(
+    state: &GatewayInnerState,
+    session: &str,
+    command_id: &str,
+) -> bool {
+    let mut ledger = lock(&state.msg_fetch_command_ledger);
+    let key = (session.to_owned(), command_id.to_owned());
+    if ledger.seen.contains(&key) {
+        return false;
+    }
+    if ledger.order.len() >= MSG_FETCH_COMMAND_LEDGER_CAPACITY {
+        if let Some(oldest) = ledger.order.pop_front() {
+            ledger.seen.remove(&oldest);
+        }
+    }
+    ledger.seen.insert(key.clone());
+    ledger.order.push_back(key);
+    true
+}
+
+/// actionable 块型名单（设计稿 §A「权限请求/确认卡」）：`approval`（审批卡，对应用户需要放行/
+/// 拒绝的权限请求，见 `db::Block::Approval`）、`decision_card`（ask/dispatch_confirm 两种
+/// kind 共用同一块型，对应确认卡/决策卡，见 `db::Block::DecisionCard`）、`scope_change`
+/// （msgfix1 T3 返修 P0-1：来自 `AgentEvent::NeedsDecision`，UI 呈现「接受并继续」这类需要
+/// 用户放行的动作，见 `db::Block::ScopeChange`/`agent_event::ScopeChange`——语义上与
+/// approval/decision_card 同级，都是"此刻等待用户处理"）。这三类块承载"需要用户立即行动"
+/// 的语义，preview 降级时必须原样保留，绝不能被截断/丢弃吞掉。其余块型
+/// （text/image/thinking/tool/run_card/team_run/dispatch_card/lead_summary/coding_task/
+/// context_compacted/context_truncated/run_terminal）均为状态展示或历史记录，不携带"此刻
+/// 必须由用户处理"的语义，preview 降级时按块级选择规则处理（text 特殊，其余丢弃）。
+fn is_actionable_block_type(block_type: &str) -> bool {
+    matches!(block_type, "approval" | "decision_card" | "scope_change")
+}
+
+/// msgfix2 U1 修单三（G2·独立审查残余 P1）：`extract_tool_milestones` 里 L1 聚合器"哪些事件
+/// 的原始内容允许进入摘要"这个判定，在本函数出现之前只以 `debug_assert!(is_actionable_
+/// block_type(..))` 的形式存在——release 构建这行整体消失，实际路由行为仍由各 match 分支各自
+/// 手写的逻辑决定，两者只是碰巧一致，没有代码层面的绑定：白名单改了却忘记同步改分支（或反
+/// 过来）会在生产环境悄无声息地漂移，不会有任何信号。
+///
+/// 本函数把这道判定收拢成一次**运行时真调用**（release 构建同样生效，不是只在 debug 构建下
+/// 才存在的断言）：`true` = `block_type` 不是 actionable 类型，事件内容允许正常参与 L1 聚合；
+/// `false` = actionable，调用方必须走受限路径（如 approval 只产生不带字段的计数 delta）或
+/// 完全跳过（如 scope_change 零 delta 贡献）——调用方现在真的 `if` 这个返回值来决定分支行为，
+/// 不是"写了个断言，两条分支各自硬编码同样的结论，靠人眼保持一致"。内部直接复用
+/// `is_actionable_block_type`（刀 1 单点白名单），不是另起一份判断表。
+fn event_joins_l1_aggregation(block_type: &str) -> bool {
+    !is_actionable_block_type(block_type)
+}
+
+/// 块级 preview 构造（纯函数，设计稿 §A）：actionable 块原样保留；首个非 actionable 的 text
+/// 块 UTF-8 安全截断到 `OVERSIZED_PREVIEW_TEXT_HEAD_BYTES` 后追加"内容较长"提示，合并进同一个
+/// text 块（与样张 `msg_completed_with_content_ref` 的 `blocks[0].text` 形状一致）；其余块型
+/// （tool 等自由长文本载体）与超出首个的 text 块一律丢弃——只留 content_ref 可按需拉全文。
+/// `truncate_utf8` 按 `str::is_char_boundary` 回退，Rust `str` 恒为合法 UTF-8，因此这里的
+/// 截断天然不会劈开任何码点，也就不存在"劈开代理对"的可能（代理对是 UTF-16 概念，Rust 字符串
+/// 里一个 Unicode 标量值要么整体保留、要么整体不含，见函数级测试）。
+fn build_oversized_preview_blocks(blocks: &Value) -> Value {
+    let mut preview: Vec<Value> = Vec::new();
+    let mut preview_text: Option<String> = None;
+    if let Some(items) = blocks.as_array() {
+        for block in items {
+            let Some(block_type) = block.get("type").and_then(Value::as_str) else {
+                continue;
+            };
+            if is_actionable_block_type(block_type) {
+                preview.push(block.clone());
+                continue;
+            }
+            if block_type == "text" && preview_text.is_none() {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    preview_text = Some(truncate_utf8(text, OVERSIZED_PREVIEW_TEXT_HEAD_BYTES));
+                }
+            }
+        }
+    }
+    let mut combined = preview_text.unwrap_or_default();
+    combined.push_str(OVERSIZED_PREVIEW_TRUNCATION_NOTICE);
+    preview.push(serde_json::json!({"type": "text", "text": combined}));
+    Value::Array(preview)
+}
+
+/// 把一条已超预算的 `msg.completed`/history-row payload 降级为 preview + content_ref
+/// （设计稿 §A）。`payload` 必须已含 `message_id`/`role`/`blocks`（可选 `agent`）；返回值在此
+/// 基础上替换 `blocks` 为 preview 版本、附加 `content_ref`。**构造后整帧仍须过预算**——preview
+/// 本身超预算时（如 actionable 块本身就很大）进一步退化为"仅提示块 + content_ref"，ref 永不
+/// 丢（设计稿 §A 明文约束）。
+/// 二次退化的最终形态——仅一个提示文本块，不含任何原始内容（连 actionable 块也不留）。
+/// msgfix1 T3 返修 P0-1：`downgrade_to_preview_payload`（msg.completed 口）与 history
+/// 单行降级（`build_history_page_with_limit`）共用同一常量形态，保证两口"仅提示块 +
+/// content_ref"的最终表示逐字节一致——ref 永不丢是两口共同的硬不变量，不是各自各写一份。
+fn notice_only_preview_blocks() -> Value {
+    serde_json::json!([{"type": "text", "text": OVERSIZED_PREVIEW_TRUNCATION_NOTICE}])
+}
+
+fn downgrade_to_preview_payload(payload: &Value, content_ref: Value, t: &str) -> Value {
+    let blocks = payload
+        .get("blocks")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
+    let mut degraded = payload.clone();
+    degraded["blocks"] = build_oversized_preview_blocks(&blocks);
+    degraded["content_ref"] = content_ref;
+    if milestone_frame_bytes(t, &degraded) > SNAPSHOT_SEND_BUDGET_BYTES {
+        degraded["blocks"] = notice_only_preview_blocks();
+    }
+    degraded
+}
+
 /// `agent` = 落库时的 `agent_name_snapshot`（如 `"Claude"`/`"Codex"`）——`Some` 时插入
 /// optional `"agent"` 键，`None` 时整个键省略（不是 `null`），保持老消费方（无该键时按老形状
 /// 解析）向后兼容。user 消息 / 无 agent 归属的场景走 `None`。
+///
+/// msgfix1 T3：`revision`/`content_raw` 用于预计算 content_ref（M0 §10.6），挂在私有键
+/// `MSG_COMPLETED_REF_SOURCE_KEY` 下随 payload 一起传递给 `enqueue_milestone_item`——该函数
+/// 决定是否需要把消息降级为 preview，需要时才会真正把 content_ref 摆上顶层；不需要时会把这个
+/// 私有键整个剥掉，绝不流到 wire（非超预算消息不该带 content_ref，见该常量文档）。
+///
+/// msgfix2 U1（M0 §10.10）：`revision` 现在**恒**摆上顶层（不再只塞进 content_ref 内部）——
+/// 与 content_ref.revision 同值并存（旧客户端不识别未知字段仍照常渲染其余字段，见该条文
+/// 「前向兼容」段）。这是本函数覆盖的两个产出点（live 首发 `publish_msg_completed_milestone`
+/// / 重连补发批 `publish_msg_and_card_replay_rows`）共用同一份逻辑之所以只改一处就能覆盖两点
+/// 的原因；第三点（history 分页）走独立的 `history_message_from_parts`，同样补了顶层 revision。
 pub(crate) fn build_msg_completed_payload(
     message_id: i64,
     role: &str,
     blocks: Value,
     agent: Option<&str>,
+    revision: i64,
+    content_raw: &str,
 ) -> Value {
     let mut payload = serde_json::json!({
         "message_id": message_id,
         "role": role,
         "blocks": blocks,
+        "revision": revision,
     });
     if let Some(agent) = agent {
         payload["agent"] = Value::String(agent.to_owned());
     }
+    payload[MSG_COMPLETED_REF_SOURCE_KEY] = build_content_ref(message_id, revision, content_raw);
     payload
 }
 
-pub(crate) fn derive_msg_completed_client_msg_id(session_id: &str, dedup_key: &str) -> String {
-    derive_client_msg_id(&format!("msg.completed|{session_id}|{dedup_key}"))
+/// msgfix1 T5（缺口④·M0 §10.7）：`revision` 参与派生——`revision==1` 与旧派生逐字节相同
+/// （存量零扰动，client-msg-id-derivation-v1.json 首条既有向量钉死），`revision>1` 在 name
+/// 末尾追加 `|<revision>`（与合入的 revision KAT 向量互证）。每个 revision 天然是一个新
+/// client_msg_id，relay 幂等去重不会把"终态改写后的重发"当成旧事件吞掉。
+pub(crate) fn derive_msg_completed_client_msg_id(
+    session_id: &str,
+    dedup_key: &str,
+    revision: i64,
+) -> String {
+    if revision == 1 {
+        derive_client_msg_id(&format!("msg.completed|{session_id}|{dedup_key}"))
+    } else {
+        derive_client_msg_id(&format!(
+            "msg.completed|{session_id}|{dedup_key}|{revision}"
+        ))
+    }
 }
 
 /// idlefix-T1 缺口②：连接后补发批里的 `run.status` 现状帧专用——与首发（live，
@@ -4315,10 +5743,13 @@ pub(crate) fn publish_msg_completed_milestone(
     role: &str,
     blocks: Value,
     agent: Option<&str>,
+    revision: i64,
+    content_raw: &str,
 ) {
     record_test_publish("msg.completed");
-    let client_msg_id = derive_msg_completed_client_msg_id(session_id, dedup_key);
-    let payload = build_msg_completed_payload(message_id, role, blocks, agent);
+    let client_msg_id = derive_msg_completed_client_msg_id(session_id, dedup_key, revision);
+    let payload =
+        build_msg_completed_payload(message_id, role, blocks, agent, revision, content_raw);
     publish_milestone(Some(session_id), "msg.completed", payload, client_msg_id);
 }
 
@@ -4521,6 +5952,18 @@ pub(crate) fn install_event_sink(transport: &crate::event_transport::EventTransp
             payload,
         );
     });
+}
+
+/// msgfix2 U1b：L1 聚合器生产接线的挂载点——`GatewayInnerState` 是模块私有类型、`GATEWAY`
+/// 是模块私有 static，lib.rs 拿不到 `&GatewayInnerState`，因此不能直接调
+/// `configure_activity_summary_writer`；这个 `pub(crate)` 包装函数是唯一的跨模块入口，同
+/// `install_event_sink` 同一惯例（`setup()` 之后才有 `GATEWAY.get()`，调用方——lib.rs——在
+/// `remote_gateway::setup(...)` 紧随其后调用本函数，传入捕获真实 DB 连接的 writer）。
+pub(crate) fn install_activity_summary_writer(writer: ActivitySummaryWriter) {
+    let Some(inner) = GATEWAY.get() else {
+        return;
+    };
+    configure_activity_summary_writer(&inner.state, writer);
 }
 
 fn drain_close(socket: &mut tungstenite::WebSocket<MaybeTlsStream<TcpStream>>) {
@@ -4758,19 +6201,68 @@ fn snapshot_frame_bytes(payload: &Value) -> usize {
     milestone_frame_bytes("snapshot", payload)
 }
 
-/// P0-b 返工②·微返工第 3 轮重写：`build_snapshot_payload` 的收敛实体——见该函数文档"尺寸
-/// 预算"一段的顺序论证。`session`/`run_id`/`through_run_seq` 只用于重算试探帧的序列化尺寸
-/// （跟真正发出去的信封结构一致，不是只测 `blocks` 数组本身），不参与截断判断本身。
+/// 缺口②：提示文案拼上被淘汰块数——`"（快照已截断，仅含最近内容）(N 块折叠)"`。`folded_count`
+/// 是本次收敛整体淘汰掉的块数（不含提示块自身）。
+fn snapshot_truncated_notice_text(folded_count: usize) -> String {
+    format!("{SNAPSHOT_TRUNCATED_NOTICE}({folded_count} 块折叠)")
+}
+
+/// 缺口②：`shrink_snapshot_blocks_to_budget` 的"淘汰候选优先级"分类——只有 `Block::Text`
+/// （面向用户的叙述正文）算"text 叙述块"、次先淘汰；其余非 actionable 块型（`Tool`/
+/// `Thinking`/`DispatchCard`/…，笼统称"工具类块"）优先淘汰。
+fn is_snapshot_narrative_text_block(block: &crate::db::Block) -> bool {
+    matches!(block, crate::db::Block::Text { .. })
+}
+
+/// R2（msgfix2 整盘审）：`shrink_snapshot_blocks_to_budget` 的第三级判据——actionable 块
+/// （approval/decision_card/scope_change，见 `is_actionable_block_type`）永不进淘汰候选序列，
+/// 不管它是不是 `Block::Text`（三者都不是，但显式排除比"恰好不落进 narrative 分类"更稳）。
+/// 复用 `is_actionable_block_type`（block_type 字符串白名单单点）而不是另起一份
+/// `matches!(block, Block::Approval{..}|Block::DecisionCard{..}|Block::ScopeChange{..})`——
+/// `Block` 是带 `#[serde(tag = "type")]` 的 tagged union，序列化取回 `"type"` 字段字符串
+/// 就是该块在 wire 上的真实类型标签，与白名单判据同一口径，不会因为两份手写列表各自维护而
+/// 漂移（`build_oversized_preview_blocks` 也是同一白名单同一姿势，只是那边天然是 `Value`）。
+fn is_snapshot_actionable_block(block: &crate::db::Block) -> bool {
+    serde_json::to_value(block)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|block_type| is_actionable_block_type(block_type))
+        })
+        .unwrap_or(false)
+}
+
+/// P0-b 返工②·微返工第 3 轮重写·缺口②（v4.1）再重写：`build_snapshot_payload` 的收敛实体
+/// ——见该函数文档"尺寸预算"一段的顺序论证。`session`/`run_id`/`through_run_seq` 只用于重算
+/// 试探帧的序列化尺寸（跟真正发出去的信封结构一致，不是只测 `blocks` 数组本身），不参与
+/// 截断判断本身。
 ///
 /// **计量对象含 `t`**：`frame_bytes` 内部直接把 `milestone_payload` 随后会合并进去的
 /// `"t":"snapshot"` 字段一并算进去——否则预算判断用的是裸 payload，成品还要再被 `t` 字段
 /// 撑大一截，单个 32KiB text 块这类边界情形会被判定"在预算内"但实际成品超预算。
 ///
-/// **允许丢尽 + 单次尾向前累计**：截断提示块先按"仅提示块"的整帧尺寸占用预算基线，剩余
-/// 预算用来从最新（数组尾部）往最老单次遍历累计每块的边际字节数（序列化长度 + 1 个数组分
-/// 隔逗号），一旦某块放不下就停——保留的是能装下的最长后缀，不再对整帧反复重序列化（消
-/// 原实现"每丢一块就整帧重序列化一次"的 O(n²)）。业务块允许被丢尽：预算连一个块都装不下
-/// 时，成品退化为只有提示块 + 水印字段。
+/// **按类型选择淘汰、保留原块顺序（缺口②·codex P2 修正，取代旧"保尾弃头"；R2·msgfix2 整盘
+/// 审改三级）**：淘汰候选按"类型优先级、同优先级内由旧到新"排出一个固定顺序——**三级**：
+/// ① 工具类块（非 actionable 且非 `Block::Text` 的一切，如 `Tool`/`Thinking`/`DispatchCard`）
+/// 最先淘汰；② text 叙述块（`Block::Text`）次之；③ actionable 块（approval/decision_card/
+/// scope_change，`is_snapshot_actionable_block`）**永不进候选序列**——不管预算多紧，都不会
+/// 被淘汰到。旧实现是二元判据（只分"text"/"非 text"），actionable 块（如 approval 卡）恰好
+/// 不是 `Block::Text`，被并进"工具类块"那一档跟真正的工具输出一起最先陪跑淘汰，与
+/// `is_actionable_block_type`（L0 白名单：actionable 块的原始内容不允许被丢弃/降级）直接
+/// 打架——一条超预算快照如果同时有 approval 卡和大量 text/tool 块，旧实现可能把 approval 卡
+/// 也淘汰掉，用户永远看不到那张等待批准的卡。同一优先级内仍延续旧实现"越老越先丢"的时间
+/// 近因偏好。沿这个候选顺序累计淘汰，直到剩余块的边际字节总和落回预算内（或非 actionable
+/// 候选全部淘汰尽——见下方"允许丢尽"段：即便如此，actionable 块依旧不在候选序列里，不受
+/// 影响）。**返回时严格按 `blocks` 原始顺序过滤保留集合**——本函数只决定"淘汰哪些"，不改变
+/// 被保留块之间的相对顺序，渲染顺序不受影响。提示文案（`snapshot_truncated_notice_text`）
+/// 带上被淘汰的块数计数。已删除旧版"已落库前缀"判据的位置——实勘本函数从未真正实现过按
+/// "是否已落库"分层的淘汰（那是一个从未落地的设想，无元数据支撑），此处不留任何相关分支。
+/// 完整 ref 化（把丢弃的块换成可按需拉取的引用）仍不做，维持现状（丢弃即真丢弃）。
+///
+/// **允许丢尽**：预算连提示块自身都装不下的极端情形（见下方论证，当前输入契约下不可达）
+/// 会把业务块全部淘汰，成品只剩提示块 + 水印字段。
 ///
 /// P0-b 微返工第 4 轮：整帧尺寸计量收敛到 `snapshot_frame_bytes`——`control.snapshot` 臂
 /// 发送侧兜底（`SNAPSHOT_SEND_BUDGET_BYTES`）量最终成品也调用同一个函数，两处口径统一
@@ -4801,50 +6293,86 @@ fn shrink_snapshot_blocks_to_budget(
         return bounded;
     }
 
-    let notice = crate::db::Block::Text {
-        text: SNAPSHOT_TRUNCATED_NOTICE.to_owned(),
-    };
-    // 提示块先计入预算：以"仅提示块"的整帧尺寸做基线，而不是在丢块循环之后才把它加进去
-    // （旧实现的 bug (b)——那样插入的提示块本身完全不受预算约束）。
-    //
-    // P0-b 微返工第 4 轮如实论证：下面这行算出的 `base_bytes` 在当前输入契约下不可能超过
-    // `SNAPSHOT_PAYLOAD_BUDGET_BYTES`（32,768B）——`if base_bytes <= ...` 这条分支保留作
-    // 纵深防御，不代表判定它会被触发。论证四要素：
-    // · `session` ≤128 字节——`handle_command_envelope` 的 control.snapshot 臂已经用
-    //   `SESSION_ID_MAX_BYTES` 挡住超长值，走不到这里；
-    // · `run_id` 是内部生成的固定格式短 id（`new_run_id()` → `run-{16 hex}-{8 hex}-{8 hex}`，
-    //   恒 38 字节），不是外部输入拼接进来的；
-    // · `through_run_seq` 是 `u64`，十进制最多 20 位；
-    // · 提示文案（`SNAPSHOT_TRUNCATED_NOTICE`）是固定短字符串，序列化成 `Block::Text` 后
-    //   67 字节。
-    // 把这四项连同 JSON 结构开销（字段名、引号、大括号/逗号、合并进去的 `"t":"snapshot"`）
-    // 实测拼出的"仅提示块"成品是 360 字节（128 字节 ASCII session + `u64::MAX` 的 20 位
-    // 水位 + 38 字节 run_id）；即便 session 里全是需要 JSON 转义的字符把它翻倍，也只是
-    // 几百字节量级——比 32,768B 预算低接近两个数量级，故这条分支不可达。仍原样保留：未来
-    // 任何一项假设被打破（例如 run_id 生成规则改成拼接外部字符串），它会自动接住，不会让
-    // 超帧静默溜出去。
-    let base_bytes = frame_bytes(std::slice::from_ref(&notice));
-    let mut budget_left = SNAPSHOT_PAYLOAD_BUDGET_BYTES.saturating_sub(base_bytes);
+    // 淘汰候选顺序（R2 三级）：工具类块（由旧到新）排在前面，text 叙述块（由旧到新）排在
+    // 中间，actionable 块（approval/decision_card/scope_change）整个不进这个列表——见
+    // `is_snapshot_narrative_text_block`/`is_snapshot_actionable_block` 与函数文档"按类型
+    // 选择淘汰"一段。
+    let eviction_order: Vec<usize> = bounded
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| {
+            !is_snapshot_narrative_text_block(block) && !is_snapshot_actionable_block(block)
+        })
+        .map(|(idx, _)| idx)
+        .chain(
+            bounded
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| {
+                    is_snapshot_narrative_text_block(block) && !is_snapshot_actionable_block(block)
+                })
+                .map(|(idx, _)| idx),
+        )
+        .collect();
 
-    // 从尾（最新）向前单次遍历累计，确定能保留的最长后缀；业务块允许丢尽（bug (a) 修复——
-    // 旧实现的 `bounded.len() > 1` 循环守卫永远保留最后一块，哪怕它自己就超预算）。
-    let mut kept_from = bounded.len();
+    // 提示块先计入预算，且用"全部块都被淘汰"这一最坏位数场景估算提示文案里的计数长度——
+    // 保证选块阶段绝不会低估提示块开销（真实淘汰数 ≤ 这个估算值，真实文案只会更短，选块
+    // 阶段判定"装得下"的结果不会被最终文案反过来撑爆）。
+    //
+    // P0-b 微返工第 4 轮如实论证（缺口②延续同一结论，量级不变）：下面这行算出的
+    // `base_bytes` 在当前输入契约下不可能超过 `SNAPSHOT_PAYLOAD_BUDGET_BYTES`（32,768B）
+    // ——`if base_bytes <= ...` 这条分支保留作纵深防御，不代表判定它会被触发。论证要素：
+    // `session` ≤128 字节（`SESSION_ID_MAX_BYTES` 挡住超长值）、`run_id` 恒 38 字节固定
+    // 格式、`through_run_seq` 十进制最多 20 位、提示文案是固定短字符串加个位数不多的淘汰
+    // 计数——四项加 JSON 结构开销，实测量级是几百字节，比 32,768B 预算低接近两个数量级。
+    let worst_case_notice = crate::db::Block::Text {
+        text: snapshot_truncated_notice_text(bounded.len()),
+    };
+    let base_bytes = frame_bytes(std::slice::from_ref(&worst_case_notice));
+
+    let mut kept = vec![true; bounded.len()];
+    let mut kept_bytes: usize = bounded
+        .iter()
+        .map(|block| {
+            serde_json::to_string(block)
+                .map(|json| json.len() + 1) // +1：数组分隔逗号
+                .unwrap_or(usize::MAX)
+        })
+        .sum();
+    let mut evicted_count = 0usize;
+
     if base_bytes <= SNAPSHOT_PAYLOAD_BUDGET_BYTES {
-        for (idx, block) in bounded.iter().enumerate().rev() {
-            let marginal = serde_json::to_string(block)
-                .map(|json| json.len() + 1) // +1：这块与前一个元素之间的数组分隔逗号
-                .unwrap_or(usize::MAX);
-            if marginal > budget_left {
+        let budget_left_for_blocks = SNAPSHOT_PAYLOAD_BUDGET_BYTES - base_bytes;
+        for idx in eviction_order {
+            if kept_bytes <= budget_left_for_blocks {
                 break;
             }
-            budget_left -= marginal;
-            kept_from = idx;
+            let marginal = serde_json::to_string(&bounded[idx])
+                .map(|json| json.len() + 1)
+                .unwrap_or(usize::MAX);
+            kept[idx] = false;
+            kept_bytes = kept_bytes.saturating_sub(marginal);
+            evicted_count += 1;
         }
+    } else {
+        // 极端兜底（论证同上）：全部业务块丢尽，只剩提示块。
+        kept = vec![false; bounded.len()];
+        evicted_count = bounded.len();
     }
 
-    let mut result = Vec::with_capacity(1 + bounded.len().saturating_sub(kept_from));
+    let notice = crate::db::Block::Text {
+        text: snapshot_truncated_notice_text(evicted_count),
+    };
+    let mut result = Vec::with_capacity(1 + kept.iter().filter(|keep| **keep).count());
     result.push(notice);
-    result.extend(bounded.into_iter().skip(kept_from));
+    // 按 `bounded` 原始顺序过滤——被保留块之间的相对顺序不变，不按淘汰候选顺序重排。
+    result.extend(
+        bounded
+            .into_iter()
+            .zip(kept)
+            .filter(|(_, keep)| *keep)
+            .map(|(block, _)| block),
+    );
     result
 }
 
@@ -4884,7 +6412,9 @@ fn truncate_history_tool_outputs(mut blocks: Value) -> Value {
             continue;
         };
         if let Some(text) = output.as_str() {
-            *output = Value::String(truncate_utf8(text, OUTPUT_TRUNCATE_BYTES));
+            // msgfix1 T7 B2：msg.completed（4592 一带经 enqueue_milestone_item）与 history
+            // 查询（5653 一带）共用本函数——两口都要在截断发生时带上可见化标记。
+            *output = Value::String(truncate_utf8_with_marker(text, OUTPUT_TRUNCATE_BYTES));
         }
     }
     blocks
@@ -4905,12 +6435,38 @@ fn history_payload(
     })
 }
 
+/// history wire message 的通用构造：`content_ref` 为 `None` 时整个键省略（不是 `null`）——
+/// 普通大小的消息不带该字段（M0 §10.6「可选字段」），只有降级为 preview 时才附加。
+///
+/// msgfix2 U1（M0 §10.10）：`revision` 恒摆上顶层——history row 是顶层 revision 三个产出点
+/// 之一（另两点是 live 首发/重连补发批，都走 `build_msg_completed_payload`）。
+fn history_message_from_parts(
+    message_id: i64,
+    role: &str,
+    blocks: Value,
+    revision: i64,
+    content_ref: Option<Value>,
+) -> Value {
+    let mut message = serde_json::json!({
+        "message_id": message_id,
+        "role": role,
+        "blocks": blocks,
+        "revision": revision,
+    });
+    if let Some(content_ref) = content_ref {
+        message["content_ref"] = content_ref;
+    }
+    message
+}
+
 fn history_message(row: &SessionHistoryRow) -> Value {
-    serde_json::json!({
-        "message_id": row.message_id,
-        "role": row.role,
-        "blocks": truncate_history_tool_outputs(row.content_json.clone()),
-    })
+    history_message_from_parts(
+        row.message_id,
+        &row.role,
+        truncate_history_tool_outputs(row.content_json.clone()),
+        row.revision,
+        None,
+    )
 }
 
 /// DB 行按最新→最旧输入。先把每条工具 output 收敛到既有上限，再从最新向前装页；wire 输出
@@ -4938,8 +6494,8 @@ fn build_history_page_with_limit(
     let mut oldest_scanned = None;
 
     for (index, row) in rows.iter().enumerate() {
-        let message = history_message(row);
         let row_has_older = database_has_more || index + 1 < rows.len();
+        let mut message = history_message(row);
         let single = history_payload(
             session,
             before_message_id,
@@ -4951,9 +6507,45 @@ fn build_history_page_with_limit(
             .unwrap_or(usize::MAX)
             > HISTORY_SEND_BUDGET_BYTES
         {
+            // msgfix1 T3（设计稿 §A）：超预算不再整条丢弃——降级为块级 preview +
+            // content_ref，让远端至少看得见这条消息、按需可拉全文。`oversized_dropped`
+            // 计数器语义随之改为「本条降级为 preview 的次数」，继续保持指标可观测。
+            let content_ref = build_content_ref(row.message_id, row.revision, &row.content_raw);
+            let preview_message = history_message_from_parts(
+                row.message_id,
+                &row.role,
+                build_oversized_preview_blocks(&row.content_json),
+                row.revision,
+                Some(content_ref.clone()),
+            );
+            let preview_single = history_payload(
+                session,
+                before_message_id,
+                std::slice::from_ref(&preview_message),
+                row_has_older.then_some(row.message_id),
+            );
             oversized_dropped += 1;
-            oldest_scanned = Some(row.message_id);
-            continue;
+            // msgfix1 T3 返修 P0-1：块级 preview 本身仍超预算时（如 actionable 块本身巨大）
+            // 不再丢行——退化到与 `downgrade_to_preview_payload`（msg.completed 口）共用
+            // 的同一"仅提示块 + content_ref"终态（`notice_only_preview_blocks`）。这一级在
+            // 设计上必然装得下（content_ref 固定四字段 + 定长提示文案 + 有界 session/游标
+            // 开销，远小于 44KiB HISTORY_SEND_BUDGET_BYTES）——ref 永不丢是硬不变量，这里
+            // 不再有"如实丢弃"这条退路。
+            if serde_json::to_vec(&preview_single)
+                .map(|json| json.len())
+                .unwrap_or(usize::MAX)
+                > HISTORY_SEND_BUDGET_BYTES
+            {
+                message = history_message_from_parts(
+                    row.message_id,
+                    &row.role,
+                    notice_only_preview_blocks(),
+                    row.revision,
+                    Some(content_ref),
+                );
+            } else {
+                message = preview_message;
+            }
         }
 
         kept_desc.push(message);
@@ -4993,6 +6585,251 @@ fn build_history_page_with_limit(
         payload: history_payload(session, before_message_id, &messages, next_scan_before),
         oversized_dropped,
         next_scan_before,
+    }
+}
+
+/// msgfix1 T4（M0 §10.4/§10.9）：`msg.fetch` 的完整校验链 + 分片入队——生产入口，`now_ms` 取
+/// 真实时钟。**没有直接返回值**：`msg.fetch` 不像 `input.send`/`control.stop` 那样回一个
+/// `input.ack`——按 M0 §10.5，它唯一的应答形态是 `reply` kind 下的 `msg.chunk`/
+/// `msg.fetch.error`，全部经 `try_enqueue_reply` 送进 `state.reply_queue`，由
+/// `drain_reply_queue` 异步发出（见 `handle_command_envelope` 该分支 doc）。
+fn handle_msg_fetch(
+    inner: &Inner,
+    session: &str,
+    command_id: &str,
+    message_id: i64,
+    requested_revision: i64,
+    offset: usize,
+) {
+    handle_msg_fetch_at(
+        inner,
+        session,
+        command_id,
+        message_id,
+        requested_revision,
+        offset,
+        now_unix_ms(),
+    );
+}
+
+/// `handle_msg_fetch` 的可测试核心——`now_ms` 显式传入，供单元测试钉死单飞行超时/字节预算
+/// 窗口的边界（同 `is_control_stop_stale` 既有姿势）。校验链顺序固定（任务书 §3 明文 + 返修
+/// 补的两条）：
+/// ⓪ command_id 复用账本（返修②）→ busy；①归属(active repo)+消息存在/归属+会话软删 →
+/// forbidden/not_found/soft_deleted；②revision 校验 → stale_revision(+current_ref)；
+/// ③total_bytes 上限 → too_large；③.5 offset 越界（返修④，M0 §10.4）→ not_found；④单飞行+60s
+/// 字节预算 → busy；⑤全过 → 切片入队。
+fn handle_msg_fetch_at(
+    inner: &Inner,
+    session: &str,
+    command_id: &str,
+    message_id: i64,
+    requested_revision: i64,
+    offset: usize,
+    now_ms: u64,
+) {
+    let state = &inner.state;
+    // msgfix1 T4 返修③（skeptic 补审）：入队那一刻的连接 generation 一并存进每条
+    // `ReplyQueueItem`——`drain_reply_queue` 出队时据此判断这条数据是不是跨连接残留（见该
+    // 函数 doc）。
+    let connection_generation = state.connection_generation_snapshot();
+
+    // 步骤⓪（返修②·skeptic 补审）：command_id 复用账本——这个 `(session, command_id)`
+    // 之前处理过，一律拒绝复用（回 busy，引导客户端换新 command_id）。必须放在最前面：一旦
+    // 放行，下面每一条早退路径都会把这次 `(session, command_id)` 记进 `msg_fetch_inflight`/
+    // `reply_queue`，而 `generation` 判定的正确性前提就是"同一 `(session, command_id)` 只会
+    // 被这个函数处理一次"。
+    if !msg_fetch_command_ledger_admit(state, session, command_id) {
+        // 这条 busy 回复本身也走一次全新 generation——它不会被写进 `msg_fetch_inflight`
+        // （压根没到步骤④），`generation` 字段只是满足 `ReplyQueueItem` 的结构要求，不参与
+        // 任何后续比对。
+        let generation = state
+            .msg_fetch_generation_counter
+            .fetch_add(1, Ordering::Relaxed);
+        if !try_enqueue_reply(
+            state,
+            ReplyQueueItem {
+                session: Some(session.to_owned()),
+                command_id: command_id.to_owned(),
+                payload: msg_fetch_error_payload("busy", None),
+                final_frame: true,
+                generation,
+                connection_generation,
+            },
+        ) {
+            state.reply_queue_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
+    let generation = state
+        .msg_fetch_generation_counter
+        .fetch_add(1, Ordering::Relaxed);
+
+    let reply_error = |code: &str, current_ref: Option<Value>| {
+        if !try_enqueue_reply(
+            state,
+            ReplyQueueItem {
+                session: Some(session.to_owned()),
+                command_id: command_id.to_owned(),
+                payload: msg_fetch_error_payload(code, current_ref),
+                final_frame: true,
+                generation,
+                connection_generation,
+            },
+        ) {
+            // reply_queue 已满到连这条终态错误都塞不进去——双重饱和的极端情形（见
+            // `REPLY_QUEUE_CAPACITY` doc），如实计数，不假装发出去了。此刻这个 session 还没有
+            // 被本次请求占用单飞行槽位（这条早退发生在①-③步，占用要等第④步才写入），不需要
+            // 额外释放。
+            state.reply_queue_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+
+    // 步骤①：active repo 归属闸——先于任何消息级查询，越权请求连"这个 message_id 存不存在"
+    // 都探不出来（不泄露存在性差异，同 `command_session_allowed` 既有姿势）。
+    if !command_session_allowed(inner, session) {
+        reply_error("forbidden", None);
+        return;
+    }
+    let (content_raw, revision, session_deleted) =
+        match (inner.message_fetch_provider)(session, message_id) {
+            Ok(MessageForFetchResult::Found {
+                content_raw,
+                revision,
+                session_deleted,
+            }) => (content_raw, revision, session_deleted),
+            Ok(MessageForFetchResult::WrongSession) => {
+                reply_error("forbidden", None);
+                return;
+            }
+            Ok(MessageForFetchResult::NotFound) => {
+                reply_error("not_found", None);
+                return;
+            }
+            Err(error) => {
+                // 查询本身失败（DB 错误）——fail-closed，不当"未知即放行"；也不把内部错误细节
+                // 泄露给远端，`forbidden` 是六值枚举里最贴近"拒绝、不解释原因"的现成 code。
+                eprintln!("remote gateway: msg.fetch lookup failed — {error}");
+                reply_error("forbidden", None);
+                return;
+            }
+        };
+    if session_deleted {
+        reply_error("soft_deleted", None);
+        return;
+    }
+
+    // 步骤②：revision 校验——`offset` 续传按当前 revision 校验，不符即 stale。
+    if requested_revision != revision {
+        reply_error(
+            "stale_revision",
+            Some(build_content_ref(message_id, revision, &content_raw)),
+        );
+        return;
+    }
+
+    // 步骤③：total_bytes 上限。
+    if content_raw.len() > MSG_FETCH_TOTAL_BYTES_LIMIT {
+        reply_error("too_large", None);
+        return;
+    }
+
+    // 步骤③.5（返修④，M0 §10.4 新条文）：offset 越界——严格大于 total_bytes 是协议误用（不是
+    // "已经拿到全部内容"这种合法收尾态，那种情形是 `offset == total_bytes`，继续走步骤⑤产出
+    // 单片零长终态帧，见 `build_msg_chunks` doc）。回 `not_found` 而不是此前的静默钳位——更
+    // 诚实地告诉客户端这个请求本身不合法，而不是假装成功却什么都不做。
+    if offset > content_raw.len() {
+        reply_error("not_found", None);
+        return;
+    }
+
+    // 步骤④：单飞行闸（per-session）+ 60s 字节预算（msgfix1 T7 B1：gateway 全局聚合，不再
+    // per-session 分桶）——两把锁按固定顺序（inflight 先于 budget）依次拿、依次放，不嵌套持锁
+    // 跨越业务逻辑，避免与其它持锁路径产生锁序分歧。
+    let total_bytes = content_raw.len();
+    {
+        let mut inflight = lock(&state.msg_fetch_inflight);
+        if let Some(existing) = inflight.get(session) {
+            if msg_fetch_inflight_is_active(existing.accepted_at_ms, now_ms) {
+                drop(inflight);
+                reply_error("busy", None);
+                return;
+            }
+        }
+        // 返修②（skeptic 补审）：接管前记下被取代那次接受的 generation——释放锁之后立刻拿它去
+        // 清 `reply_queue` 里同 generation 的残片（见 `purge_stale_reply_queue_generation`
+        // doc），避免旧 fetch 的分片继续被正常 drain 发给已经不再关心它们的客户端。
+        let superseded_generation = inflight.get(session).map(|entry| entry.generation);
+        inflight.insert(
+            session.to_owned(),
+            MsgFetchInflightEntry {
+                command_id: command_id.to_owned(),
+                accepted_at_ms: now_ms,
+                generation,
+            },
+        );
+        drop(inflight);
+        if let Some(superseded_generation) = superseded_generation {
+            purge_stale_reply_queue_generation(state, session, superseded_generation);
+        }
+    }
+    let admitted = {
+        let mut budget_slot = lock(&state.msg_fetch_byte_budget);
+        let window = std::mem::take(&mut *budget_slot);
+        let (admit, window) = msg_fetch_budget_admit(window, now_ms, total_bytes);
+        *budget_slot = window;
+        admit
+    };
+    if !admitted {
+        // 预算不放行——释放刚占的单飞行槽位（这次请求从未真正开始传输，不该占着槽位等
+        // 30 秒超时才被动释放），再回 busy。
+        clear_msg_fetch_inflight_if_matches(state, session, generation);
+        reply_error("busy", None);
+        return;
+    }
+
+    // 步骤⑤：全过——切片入队。`build_msg_chunks` 恒返回非空序列（见其 doc），因此
+    // `last_index` 恒可算，`final_frame` 恒有归宿。
+    let chunks = build_msg_chunks(message_id, revision, content_raw.as_bytes(), offset);
+    let last_index = chunks.len() - 1;
+    let mut fully_enqueued = true;
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let enqueued = try_enqueue_reply_chunk(
+            state,
+            ReplyQueueItem {
+                session: Some(session.to_owned()),
+                command_id: command_id.to_owned(),
+                payload: chunk,
+                final_frame: index == last_index,
+                generation,
+                connection_generation,
+            },
+        );
+        if !enqueued {
+            fully_enqueued = false;
+            break;
+        }
+    }
+    if !fully_enqueued {
+        // M0 §10.9：满→丢整个传输并回 busy 终态（可观测，不静默）。已经入队的前缀分片仍会
+        // 被正常发出——客户端按同一 command_id 收到"部分分片 + busy 终态"，§10.9 的整体
+        // SHA-256 校验天然通不过，会弃拉并可用同一/新 command_id 重试，不会展示半截内容。
+        if !try_enqueue_reply(
+            state,
+            ReplyQueueItem {
+                session: Some(session.to_owned()),
+                command_id: command_id.to_owned(),
+                payload: msg_fetch_error_payload("busy", None),
+                final_frame: true,
+                generation,
+                connection_generation,
+            },
+        ) {
+            // 双重饱和——连兜底 error 都塞不进去。释放单飞行槽位，不然会一直卡到超时；
+            // 如实计数，不假装已经通知到客户端。
+            state.reply_queue_dropped.fetch_add(1, Ordering::Relaxed);
+            clear_msg_fetch_inflight_if_matches(state, session, generation);
+        }
     }
 }
 
@@ -5218,7 +7055,9 @@ fn handle_command_envelope(
                 .unwrap_or_else(|| "latest".to_owned());
             let client_msg_id =
                 derive_client_msg_id(&format!("history|{session}|{command_id}|{cursor_name}"));
-            enqueue_prebuilt_live_for_upstream(
+            // msgfix1 T3（缺口①）：入队失败（门控关闭/队列满断连）必须回真实失败 ack——
+            // 此前无条件回 `Ok`，客户端会以为帧已在路上，实则从未入队、永不到达。
+            let enqueued = enqueue_prebuilt_live_for_upstream(
                 state,
                 &inner.upstream_tx,
                 MilestoneItem {
@@ -5228,7 +7067,14 @@ fn handle_command_envelope(
                     client_msg_id,
                 },
             );
-            Some(input_ack_json(&command_id, AckOutcome::Ok))
+            Some(input_ack_json(
+                &command_id,
+                if enqueued {
+                    AckOutcome::Ok
+                } else {
+                    AckOutcome::Failed
+                },
+            ))
         }
         ("control", Some("control.snapshot")) => {
             let Some(session) = payload.get("session").and_then(Value::as_str) else {
@@ -5300,6 +7146,46 @@ fn handle_command_envelope(
                 },
             );
             Some(input_ack_json(&command_id, AckOutcome::Ok))
+        }
+        ("control", Some("msg.fetch")) => {
+            // msgfix1 T4（M0 §10.4）：`{session, message_id, revision, offset}` 四字段——字段
+            // 缺失/类型不符是协议违例（走既有 `failed()`），与业务级拒绝（越权/软删/过大/
+            // stale/busy——那些走 `msg.fetch.error` reply，不是这里）是两层不同的失败。
+            let Some(session) = payload.get("session").and_then(Value::as_str) else {
+                return failed();
+            };
+            if session.len() > SESSION_ID_MAX_BYTES {
+                return failed();
+            }
+            let Some(message_id) = payload.get("message_id").and_then(Value::as_i64) else {
+                return failed();
+            };
+            let Some(requested_revision) = payload.get("revision").and_then(Value::as_i64) else {
+                return failed();
+            };
+            let Some(offset) = payload
+                .get("offset")
+                .and_then(Value::as_i64)
+                .filter(|value| *value >= 0)
+                .and_then(|value| usize::try_from(value).ok())
+            else {
+                return failed();
+            };
+            // msgfix1 T4：`msg.fetch` 不像 `input.send`/`control.stop`/`control.history`/
+            // `control.snapshot` 那样回一个 `input.ack`——按 M0 §10.5，它唯一的应答形态是
+            // `reply` kind 下的 `msg.chunk`/`msg.fetch.error`，全部由 `handle_msg_fetch`
+            // 经 `try_enqueue_reply` 送进独立的 `reply_queue`（M0 §10.9），由
+            // `drain_reply_queue` 异步发出。这里返回 `None`——不是"处理失败"，是"响应已经
+            // 走另一条通道，这条 `handle_frame` 调用没有直接要回写 socket 的 Value"。
+            handle_msg_fetch(
+                inner,
+                session,
+                &command_id,
+                message_id,
+                requested_revision,
+                offset,
+            );
+            None
         }
         _ => failed(),
     }
@@ -5552,6 +7438,78 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    /// msgfix1 T4（M0 §10.8）：`CHUNK_RAW_BYTES` 的生成式钉死测试——真实走
+    /// `remote_crypto::seal`（真 AES-256-GCM，密文=明文+16B tag，不是估算）+
+    /// `build_envelope_json`（真实 wire envelope 构造），用最坏转义样张 + 各字段边界值量出
+    /// 最终 wire 帧字节数，断言 ≤ 64KiB 硬闸且余量 ≥10%。任何未来改动（envelope 加字段/
+    /// `CHUNK_RAW_BYTES` 被调大）都会被这条测试如实钉住，不允许"拍脑袋改数字不重新量"。
+    fn worst_case_msg_chunk_wire_len(raw_len: usize) -> usize {
+        // 最坏转义原始字节：高位不可打印字节（0xFF）与 ASCII 双引号（0x22）交替——排除"这段
+        // 原始字节的 base64 编码恰好落在对 JSON/base64 都友好的巧合区间"的侥幸；反正
+        // `bytes_b64` 是 base64 之后的值，字母表本就不含需要 JSON 转义的字符，这里的"最坏"
+        // 落在纯粹的尺寸膨胀上，不是转义膨胀。
+        let raw_bytes: Vec<u8> = (0..raw_len)
+            .map(|i| if i % 2 == 0 { 0x22 } else { 0xff })
+            .collect();
+        let bytes_b64 = STANDARD.encode(&raw_bytes);
+        let plaintext = serde_json::json!({
+            "t": "msg.chunk",
+            "message_id": i64::MAX,
+            "revision": i64::MAX,
+            "content_sha256": "f".repeat(64),
+            "total_bytes": MSG_FETCH_TOTAL_BYTES_LIMIT as i64,
+            "offset": MSG_FETCH_TOTAL_BYTES_LIMIT as i64,
+            "chunk_len": raw_len,
+            "bytes_b64": bytes_b64,
+        });
+        let plaintext_bytes = serde_json::to_vec(&plaintext).expect("plaintext serializes");
+        let meta = EnvelopeMeta {
+            v: 1,
+            room: "a".repeat(32),
+            epoch: u64::MAX,
+            kind: "reply".to_owned(),
+            session: Some("s".repeat(SESSION_ID_MAX_BYTES)),
+            command_id: Some("c".repeat(COMMAND_ID_MAX_LEN)),
+        };
+        let (ct, n) = crate::remote_crypto::seal(&[7_u8; 32], &meta, &plaintext_bytes);
+        let envelope = build_envelope_json(&meta, &ct, &n, u64::MAX, None);
+        envelope.to_string().len()
+    }
+
+    #[test]
+    fn msg_chunk_raw_bytes_worst_case_wire_frame_stays_under_relay_limit_with_margin() {
+        const RELAY_FRAME_LIMIT_BYTES: usize = 64 * 1024;
+        let wire_len = worst_case_msg_chunk_wire_len(CHUNK_RAW_BYTES);
+        assert!(
+            wire_len <= RELAY_FRAME_LIMIT_BYTES,
+            "worst-case msg.chunk wire frame ({wire_len}B) must stay under relay's 64KiB hard \
+             gate — bumping CHUNK_RAW_BYTES without re-measuring this bites in production"
+        );
+        let margin = RELAY_FRAME_LIMIT_BYTES - wire_len;
+        let required_margin = RELAY_FRAME_LIMIT_BYTES / 10;
+        assert!(
+            margin >= required_margin,
+            "margin {margin}B must be >= 10% of {RELAY_FRAME_LIMIT_BYTES}B \
+             ({required_margin}B) — got wire_len={wire_len}B"
+        );
+    }
+
+    /// 反向语料：确认这条测试真的在测东西，不是恒真断言——量级更大的候选值（32KiB）在同一套
+    /// 最坏样张下 margin 会跌破 10% 门槛，证明 `CHUNK_RAW_BYTES` 不是随便选的余量充裕值。
+    #[test]
+    fn msg_chunk_raw_bytes_measurement_actually_constrains_the_candidate() {
+        const RELAY_FRAME_LIMIT_BYTES: usize = 64 * 1024;
+        let too_large_candidate = 32 * 1024;
+        let wire_len = worst_case_msg_chunk_wire_len(too_large_candidate);
+        let margin = RELAY_FRAME_LIMIT_BYTES.saturating_sub(wire_len);
+        assert!(
+            margin < RELAY_FRAME_LIMIT_BYTES / 10,
+            "expected a too-large chunk candidate ({too_large_candidate}B) to violate the 10% \
+             margin bar (margin={margin}B) — if this fails, the measurement stopped being a \
+             real constraint"
+        );
+    }
 
     #[test]
     fn gateway_status_carries_all_internal_counters() {
@@ -6029,6 +7987,17 @@ mod tests {
         Box::new(|session_id, _, _| {
             Err(format!(
                 "unexpected session history lookup for session {session_id}"
+            ))
+        })
+    }
+
+    /// msgfix1 T4：默认对未预期的 `msg.fetch` provider 调用报错——同
+    /// `test_session_history_provider` 既有姿势，测试没预期到会命中这里就该显式失败，而不是
+    /// 悄悄返回一个看似合理的默认值掩盖误用。
+    fn test_message_fetch_provider() -> MessageFetchProvider {
+        Box::new(|session_id, message_id| {
+            Err(format!(
+                "unexpected message fetch lookup for session {session_id} message {message_id}"
             ))
         })
     }
@@ -8899,6 +10868,16 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// `build_msg_completed_payload` 把预算好的 content_ref 挂在私有键
+    /// `MSG_COMPLETED_REF_SOURCE_KEY` 下（供 `enqueue_milestone_item` 消费，见该常量文档）——
+    /// 测试断言公开可见的 wire 形状时先剥掉它，就像生产路径最终发出去之前必然经历的那一步。
+    fn strip_ref_source(mut payload: Value) -> Value {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove(MSG_COMPLETED_REF_SOURCE_KEY);
+        }
+        payload
+    }
+
     #[test]
     fn builds_msg_completed_payload() {
         let blocks = serde_json::json!([
@@ -8906,12 +10885,14 @@ mod tests {
             { "type": "code", "code": "ok" }
         ]);
 
+        let payload = build_msg_completed_payload(42, "assistant", blocks.clone(), None, 1, "raw");
         assert_eq!(
-            build_msg_completed_payload(42, "assistant", blocks.clone(), None),
+            strip_ref_source(payload),
             serde_json::json!({
                 "message_id": 42,
                 "role": "assistant",
                 "blocks": blocks,
+                "revision": 1,
             })
         );
     }
@@ -8923,31 +10904,61 @@ mod tests {
         let blocks = serde_json::json!([{ "type": "text", "text": "done" }]);
 
         let with_agent =
-            build_msg_completed_payload(42, "assistant", blocks.clone(), Some("Claude"));
+            build_msg_completed_payload(42, "assistant", blocks.clone(), Some("Claude"), 1, "raw");
         assert_eq!(with_agent["agent"], "Claude");
         assert_eq!(
-            with_agent,
+            strip_ref_source(with_agent),
             serde_json::json!({
                 "message_id": 42,
                 "role": "assistant",
                 "blocks": blocks,
                 "agent": "Claude",
+                "revision": 1,
             })
         );
 
-        let without_agent = build_msg_completed_payload(42, "assistant", blocks.clone(), None);
+        let without_agent =
+            build_msg_completed_payload(42, "assistant", blocks.clone(), None, 1, "raw");
         assert!(
             without_agent.get("agent").is_none(),
             "agent key must be omitted (not null) when agent is None"
         );
         assert_eq!(
-            without_agent,
+            strip_ref_source(without_agent),
             serde_json::json!({
                 "message_id": 42,
                 "role": "assistant",
                 "blocks": blocks,
+                "revision": 1,
             })
         );
+    }
+
+    /// msgfix1 T3（M0 §10.6）：`build_msg_completed_payload` 预算好的 content_ref 必须对
+    /// `content_raw` 原文字节计算——sha256/total_bytes 与直接对同一字符串计算的结果逐字节一致；
+    /// 非超预算路径顶层不带 `content_ref`（只在 `enqueue_milestone_item` 判定超预算时才附加）。
+    #[test]
+    fn msg_completed_payload_ref_source_matches_content_raw_bytes() {
+        let content_raw = r#"[{"type":"text","text":"hello"}]"#;
+        let payload = build_msg_completed_payload(
+            7,
+            "assistant",
+            serde_json::json!([{"type": "text", "text": "hello"}]),
+            None,
+            3,
+            content_raw,
+        );
+        let ref_source = payload
+            .get(MSG_COMPLETED_REF_SOURCE_KEY)
+            .expect("ref source must be present before stripping");
+        assert_eq!(ref_source["message_id"], 7);
+        assert_eq!(ref_source["revision"], 3);
+        assert_eq!(ref_source["total_bytes"], content_raw.len() as u64);
+        assert_eq!(
+            ref_source["content_sha256"],
+            sha256_hex_lower(content_raw.as_bytes())
+        );
+        assert!(strip_ref_source(payload).get("content_ref").is_none());
     }
 
     #[test]
@@ -9187,8 +11198,37 @@ mod tests {
     #[test]
     fn derives_msg_completed_client_msg_id_from_kat() {
         assert_eq!(
-            derive_msg_completed_client_msg_id("s-1", "dk-1"),
+            derive_msg_completed_client_msg_id("s-1", "dk-1", 1),
             "73996db9-9424-5e73-acb6-965bf87bfb80"
+        );
+    }
+
+    #[test]
+    fn derives_msg_completed_client_msg_id_revision_matches_kat_vectors() {
+        // msgfix1 T5（缺口④）：revision==1 逐字节沿用旧派生（存量零扰动，同上一条钉死的
+        // 既有向量）；revision>1 在 name 末尾追加 `|<revision>`，与
+        // client-msg-id-derivation-v1.json 里的两条 revision>1 KAT 向量互证——msgfix1 T7 B5：
+        // 这两条向量原先在 pending 版样张里，T5 合入正式文件时已一并带过来并删除 pending 版，
+        // 这里改指正式文件。
+        assert_eq!(
+            derive_msg_completed_client_msg_id("s-1", "dk-1", 1),
+            "73996db9-9424-5e73-acb6-965bf87bfb80",
+            "revision==1 必须与旧向量逐字节相同"
+        );
+        assert_eq!(
+            derive_msg_completed_client_msg_id("s-1", "dk-1", 2),
+            "d4d27c2b-e6dd-53b3-b789-e5e747ae9e15",
+            "revision==2 必须匹配 name 追加 `|2` 后的 KAT"
+        );
+        assert_eq!(
+            derive_msg_completed_client_msg_id("s-1", "dk-1", 3),
+            "5585d9d6-5d34-5023-997c-86ea84dec1b9",
+            "revision==3 必须匹配 name 追加 `|3` 后的 KAT"
+        );
+        assert_ne!(
+            derive_msg_completed_client_msg_id("s-1", "dk-1", 2),
+            derive_msg_completed_client_msg_id("s-1", "dk-1", 3),
+            "不同 revision 必须派生出不同 client_msg_id（各自都是新事件）"
         );
     }
 
@@ -9442,6 +11482,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: test_session_repo_provider(),
             session_history_provider: test_session_history_provider(),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -9531,6 +11572,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: test_session_repo_provider(),
             session_history_provider: test_session_history_provider(),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -14345,6 +16387,1473 @@ mod tests {
     }
 
     #[test]
+    fn truncate_utf8_with_marker_appends_marker_only_when_truncation_actually_happens() {
+        // msgfix1 T7 B2：真正发生截断时，总字节数恒 ≤ max_bytes（标记计入预算之内，不会把
+        // 消息顶超），且结果以固定标记收尾。
+        let oversized = "x".repeat(OUTPUT_TRUNCATE_BYTES + 17);
+        let truncated = truncate_utf8_with_marker(&oversized, OUTPUT_TRUNCATE_BYTES);
+        assert!(truncated.len() <= OUTPUT_TRUNCATE_BYTES);
+        assert!(truncated.ends_with(TOOL_OUTPUT_TRUNCATION_MARKER));
+        assert!(
+            truncated.starts_with(
+                &"x".repeat(OUTPUT_TRUNCATE_BYTES - TOOL_OUTPUT_TRUNCATION_MARKER.len())
+            ),
+            "正文应保留腾出标记空间后的最大前缀"
+        );
+
+        // 未截断（原文本本就不超预算）时原样返回，不附加标记。
+        let short = "well under the cap";
+        assert_eq!(
+            truncate_utf8_with_marker(short, OUTPUT_TRUNCATE_BYTES),
+            short
+        );
+        assert!(!truncate_utf8_with_marker(short, OUTPUT_TRUNCATE_BYTES)
+            .contains(TOOL_OUTPUT_TRUNCATION_MARKER));
+    }
+
+    // ========================================================================================
+    // msgfix1 T3（设计稿 §A）：超限消息块级 preview + content_ref 纯函数覆盖。
+    // ========================================================================================
+
+    #[test]
+    fn is_actionable_block_type_matches_approval_decision_card_and_scope_change_only() {
+        assert!(is_actionable_block_type("approval"));
+        assert!(is_actionable_block_type("decision_card"));
+        // msgfix1 T3 返修 P0-1：scope_change 来自 NeedsDecision、UI 有「接受并继续」用户
+        // 行动，语义上与 approval/decision_card 同级，必须一起判定为 actionable。
+        assert!(is_actionable_block_type("scope_change"));
+        for benign in [
+            "text",
+            "image",
+            "thinking",
+            "tool",
+            "run_card",
+            "team_run",
+            "dispatch_card",
+            "lead_summary",
+            "coding_task",
+            "context_compacted",
+            "context_truncated",
+            "run_terminal",
+        ] {
+            assert!(
+                !is_actionable_block_type(benign),
+                "{benign} 不应判定为 actionable"
+            );
+        }
+    }
+
+    #[test]
+    fn event_joins_l1_aggregation_rejects_actionable_types_at_runtime_not_just_debug_assert() {
+        // msgfix2 U1 修单三（G2·独立审查残余 P1）：反向测试——`event_joins_l1_aggregation`
+        // 是 `extract_tool_milestones` 里真正被 `if` 调用、决定分支行为的单点函数（不是只在
+        // debug 构建下才存在的 `debug_assert!`）。actionable 类型必须被这个函数在运行时真实
+        // 拒收（返回 false）；非 actionable 类型必须放行（返回 true）——release 构建下语义
+        // 同样成立，因为这不是断言，是一次普通函数调用的返回值。
+        for actionable in ["approval", "decision_card", "scope_change"] {
+            assert!(
+                !event_joins_l1_aggregation(actionable),
+                "actionable 类型 {actionable} 必须被单点函数拒收（不允许并入 L1）"
+            );
+        }
+        for benign in ["text", "tool", "thinking", "run_card", "unknown_block_type"] {
+            assert!(
+                event_joins_l1_aggregation(benign),
+                "非 actionable 类型 {benign} 必须被单点函数放行"
+            );
+        }
+    }
+
+    #[test]
+    fn build_content_ref_matches_raw_bytes_sha256_and_length() {
+        let content_raw = "hello content ref";
+        let content_ref = build_content_ref(9, 3, content_raw);
+        assert_eq!(content_ref["message_id"], 9);
+        assert_eq!(content_ref["revision"], 3);
+        assert_eq!(content_ref["total_bytes"], content_raw.len() as u64);
+        assert_eq!(
+            content_ref["content_sha256"],
+            sha256_hex_lower(content_raw.as_bytes())
+        );
+        // 同一原文两次求哈希必须逐字节一致（sha256 是确定性函数，非防御性但值得钉住回归）。
+        assert_eq!(
+            build_content_ref(9, 3, content_raw)["content_sha256"],
+            content_ref["content_sha256"]
+        );
+    }
+
+    // ---- msgfix1 T4：build_msg_chunks（M0 §10.5/§10.9 重组安全 + offset 续传）----
+
+    #[test]
+    fn build_msg_chunks_round_trips_exact_bytes_and_sha256_with_uneven_last_chunk() {
+        // 故意不是 CHUNK_RAW_BYTES 的整数倍——钉住"最后一片 chunk_len 不足整片"这个边界。
+        let content: Vec<u8> = (0..(CHUNK_RAW_BYTES * 2 + 777))
+            .map(|i| (i % 256) as u8)
+            .collect();
+        let message_id = 42;
+        let revision = 3;
+        let chunks = build_msg_chunks(message_id, revision, &content, 0);
+
+        assert_eq!(chunks.len(), 3, "两整片 + 一个 777 字节尾片");
+        let expected_sha256 = sha256_hex_lower(&content);
+        let mut reassembled = Vec::new();
+        let mut expected_offset = 0usize;
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk["t"], "msg.chunk");
+            assert_eq!(chunk["message_id"], message_id);
+            assert_eq!(chunk["revision"], revision);
+            assert_eq!(chunk["content_sha256"], expected_sha256);
+            assert_eq!(chunk["total_bytes"], content.len() as u64);
+            assert_eq!(
+                chunk["offset"], expected_offset as u64,
+                "offset 必须与上一片 offset+chunk_len 连续（§10.9 重组安全）"
+            );
+            let chunk_len = chunk["chunk_len"].as_u64().unwrap() as usize;
+            let bytes = STANDARD
+                .decode(chunk["bytes_b64"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(bytes.len(), chunk_len);
+            if index == chunks.len() - 1 {
+                assert_eq!(chunk_len, 777, "最后一片必须是不足整片的余数");
+            } else {
+                assert_eq!(chunk_len, CHUNK_RAW_BYTES, "非末片必须是满片");
+            }
+            reassembled.extend_from_slice(&bytes);
+            expected_offset += chunk_len;
+        }
+        assert_eq!(
+            reassembled, content,
+            "全部分片按 offset 顺序拼接必须还原原文字节"
+        );
+        assert_eq!(
+            sha256_hex_lower(&reassembled),
+            expected_sha256,
+            "拼接后重新计算的 sha256 必须与 content_sha256 相符（§10.9 完成后整体校验）"
+        );
+    }
+
+    #[test]
+    fn build_msg_chunks_resumes_from_offset_and_reuses_full_content_sha256() {
+        let content: Vec<u8> = (0..(CHUNK_RAW_BYTES * 3))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let full_sha256 = sha256_hex_lower(&content);
+        let resume_offset = CHUNK_RAW_BYTES + 100;
+
+        let chunks = build_msg_chunks(1, 1, &content, resume_offset);
+
+        assert_eq!(
+            chunks[0]["offset"], resume_offset as u64,
+            "第一片必须从请求的 offset 开始，不重发客户端已经拿到的前缀"
+        );
+        for chunk in &chunks {
+            assert_eq!(
+                chunk["content_sha256"], full_sha256,
+                "content_sha256 恒对全量 content 计算，不是从 offset 起的子串"
+            );
+            assert_eq!(chunk["total_bytes"], content.len() as u64);
+        }
+        let mut reassembled_tail = Vec::new();
+        for chunk in &chunks {
+            reassembled_tail.extend(
+                STANDARD
+                    .decode(chunk["bytes_b64"].as_str().unwrap())
+                    .unwrap(),
+            );
+        }
+        assert_eq!(reassembled_tail, content[resume_offset..]);
+    }
+
+    #[test]
+    fn build_msg_chunks_offset_at_end_produces_single_zero_length_terminal_chunk() {
+        let content = b"short message body".to_vec();
+        let chunks = build_msg_chunks(7, 1, &content, content.len());
+
+        assert_eq!(
+            chunks.len(),
+            1,
+            "offset 已到达末尾时仍必须返回恰好一片终态帧，不是空序列"
+        );
+        assert_eq!(chunks[0]["offset"], content.len() as u64);
+        assert_eq!(chunks[0]["chunk_len"], 0);
+        assert_eq!(chunks[0]["bytes_b64"], "");
+        assert_eq!(chunks[0]["content_sha256"], sha256_hex_lower(&content));
+    }
+
+    #[test]
+    fn build_msg_chunks_offset_past_end_is_clamped_not_panicking() {
+        let content = b"tiny".to_vec();
+        let chunks = build_msg_chunks(7, 1, &content, content.len() + 1_000_000);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["offset"], content.len() as u64);
+        assert_eq!(chunks[0]["chunk_len"], 0);
+    }
+
+    // ---- msgfix1 T4：msg_fetch_error_payload（M0 §10.5 六值 code 枚举）----
+
+    #[test]
+    fn msg_fetch_error_payload_stale_revision_carries_current_ref_and_other_codes_omit_key() {
+        let current_ref = build_content_ref(4821, 3, "new content");
+        let stale = msg_fetch_error_payload("stale_revision", Some(current_ref.clone()));
+        assert_eq!(stale["t"], "msg.fetch.error");
+        assert_eq!(stale["code"], "stale_revision");
+        assert_eq!(stale["current_ref"], current_ref);
+
+        for code in [
+            "soft_deleted",
+            "forbidden",
+            "too_large",
+            "busy",
+            "not_found",
+        ] {
+            let frame = msg_fetch_error_payload(code, None);
+            assert_eq!(frame["code"], code);
+            assert!(
+                frame.get("current_ref").is_none(),
+                "{code} 必须整个省略 current_ref 键，不是带 null（对齐样张 msg_fetch_error_not_found）"
+            );
+        }
+    }
+
+    // ---- msgfix1 T4：单飞行超时 + 60s 字节预算（M0 §10.9 滥用闸）纯函数边界 ----
+
+    #[test]
+    fn msg_fetch_inflight_is_active_boundary() {
+        assert!(msg_fetch_inflight_is_active(1_000, 1_000));
+        assert!(msg_fetch_inflight_is_active(
+            1_000,
+            1_000 + MSG_FETCH_INFLIGHT_TIMEOUT_MS - 1
+        ));
+        assert!(!msg_fetch_inflight_is_active(
+            1_000,
+            1_000 + MSG_FETCH_INFLIGHT_TIMEOUT_MS
+        ));
+        assert!(!msg_fetch_inflight_is_active(
+            1_000,
+            1_000 + MSG_FETCH_INFLIGHT_TIMEOUT_MS + 1
+        ));
+        // 时钟回拨（now < accepted_at）防御：saturating_sub 不下溢 panic，视作刚接受。
+        assert!(msg_fetch_inflight_is_active(10_000, 1_000));
+    }
+
+    #[test]
+    fn msg_fetch_budget_admit_accepts_within_window_and_rejects_over_budget() {
+        let window = VecDeque::new();
+        let (admit1, window) = msg_fetch_budget_admit(window, 0, MSG_FETCH_TOTAL_BYTES_LIMIT);
+        assert!(
+            admit1,
+            "第一次满额 fetch 必须放行（8MiB 预算装得下一次 4MiB）"
+        );
+        let (admit2, window) = msg_fetch_budget_admit(window, 1_000, MSG_FETCH_TOTAL_BYTES_LIMIT);
+        assert!(
+            admit2,
+            "第二次满额 fetch 仍在 8MiB/60s 预算内（两次共 8MiB）"
+        );
+        let (admit3, _window) = msg_fetch_budget_admit(window, 2_000, 1);
+        assert!(
+            !admit3,
+            "两次满额已经用满 8MiB 预算，第三次哪怕只多 1 字节也必须拒绝"
+        );
+    }
+
+    #[test]
+    fn msg_fetch_budget_admit_prunes_entries_older_than_the_sliding_window() {
+        let window = VecDeque::new();
+        let (admit1, window) = msg_fetch_budget_admit(window, 0, MSG_FETCH_TOTAL_BYTES_LIMIT);
+        assert!(admit1);
+        let (admit2, window) = msg_fetch_budget_admit(window, 0, MSG_FETCH_TOTAL_BYTES_LIMIT);
+        assert!(admit2, "两次满额恰好用满预算");
+        // 窗口翻篇（>= 60s 之后）：陈旧条目必须被剪掉，预算重新可用——不是永久累积上限。
+        let now_after_window = MSG_FETCH_BYTE_BUDGET_WINDOW_MS;
+        let (admit3, window) =
+            msg_fetch_budget_admit(window, now_after_window, MSG_FETCH_TOTAL_BYTES_LIMIT);
+        assert!(admit3, "窗口翻篇后陈旧记账必须被剪掉，预算恢复");
+        assert_eq!(
+            window.len(),
+            1,
+            "翻篇后只剩这一次新记账，两条陈旧条目已被剪掉"
+        );
+    }
+
+    // ---- msgfix1 T4：build_envelope_json / send_upstream_value 的 command_id 直通 ----
+
+    #[test]
+    fn build_envelope_json_reflects_meta_command_id_for_reply_kind() {
+        let meta = EnvelopeMeta {
+            v: 1,
+            room: "0123456789abcdef0123456789abcdef".to_owned(),
+            epoch: 1,
+            kind: "reply".to_owned(),
+            session: Some("sess-1".to_owned()),
+            command_id: Some("cmd-fetch-1".to_owned()),
+        };
+        let envelope = build_envelope_json(&meta, "ct", "n", 1, None);
+        assert_eq!(envelope["kind"], "reply");
+        assert_eq!(envelope["command_id"], "cmd-fetch-1");
+        assert_eq!(envelope["seq"], Value::Null);
+        assert!(
+            envelope.get("client_msg_id").is_none(),
+            "reply 禁止携带 client_msg_id（M0 §10.1）"
+        );
+    }
+
+    #[test]
+    fn build_envelope_json_command_id_participates_in_aad_matching_seal() {
+        // AAD 拼串含 command_id（remote_crypto::build_aad）——envelope JSON 里的 command_id
+        // 必须与 seal 时用来算 AAD 的那份逐字节同源，不能各写一份产生分裂。
+        let meta = EnvelopeMeta {
+            v: 1,
+            room: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            epoch: 1,
+            kind: "reply".to_owned(),
+            session: Some("sess-1".to_owned()),
+            command_id: Some("cmd-fetch-2".to_owned()),
+        };
+        let key = [3_u8; 32];
+        let (ct, n) = crate::remote_crypto::seal(&key, &meta, br#"{"t":"msg.chunk"}"#);
+        let envelope = build_envelope_json(&meta, &ct, &n, 1, None);
+        assert_eq!(envelope["command_id"], "cmd-fetch-2");
+        // 用信封里如实回显的 command_id 重建 meta 再解密——证明两处 command_id 同源。
+        let reopened_meta = EnvelopeMeta {
+            v: envelope["v"].as_u64().unwrap() as u32,
+            room: envelope["room"].as_str().unwrap().to_owned(),
+            epoch: envelope["epoch"].as_u64().unwrap(),
+            kind: envelope["kind"].as_str().unwrap().to_owned(),
+            session: envelope["session"].as_str().map(str::to_owned),
+            command_id: envelope["command_id"].as_str().map(str::to_owned),
+        };
+        let plaintext = crate::remote_crypto::open(
+            &key,
+            &reopened_meta,
+            envelope["ct"].as_str().unwrap(),
+            envelope["n"].as_str().unwrap(),
+        )
+        .expect("decrypt must succeed when command_id round-trips through the envelope");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&plaintext).unwrap()["t"],
+            "msg.chunk"
+        );
+    }
+
+    // ---- msgfix1 T4：handle_msg_fetch_at 校验链——每个 error code 一条正例 + 成功路径 ----
+
+    fn msg_fetch_error_reply(inner: &Inner) -> Value {
+        lock(&inner.state.reply_queue)
+            .pop_front()
+            .expect("reply_queue must contain exactly one item")
+            .payload
+    }
+
+    #[test]
+    fn handle_msg_fetch_forbidden_when_session_not_in_active_repo() {
+        let inner = test_inner_for_msg_fetch(|_, _| {
+            panic!("must not reach message_fetch_provider when the active-repo gate rejects first")
+        });
+        *lock(&inner.state.active_repo_id_for_gating) = Some("some-other-repo".to_owned());
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 4821, 1, 0, 1_000);
+
+        let error = msg_fetch_error_reply(&inner);
+        assert_eq!(error["t"], "msg.fetch.error");
+        assert_eq!(error["code"], "forbidden");
+    }
+
+    #[test]
+    fn handle_msg_fetch_forbidden_when_message_belongs_to_a_different_session() {
+        let inner = test_inner_for_msg_fetch(|_, _| Ok(MessageForFetchResult::WrongSession));
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 4821, 1, 0, 1_000);
+
+        assert_eq!(msg_fetch_error_reply(&inner)["code"], "forbidden");
+    }
+
+    #[test]
+    fn handle_msg_fetch_not_found_when_message_id_does_not_exist_anywhere() {
+        let inner = test_inner_for_msg_fetch(|_, _| Ok(MessageForFetchResult::NotFound));
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 999_999, 1, 0, 1_000);
+
+        assert_eq!(msg_fetch_error_reply(&inner)["code"], "not_found");
+    }
+
+    #[test]
+    fn handle_msg_fetch_forbidden_when_provider_errors_fail_closed() {
+        let inner = test_inner_for_msg_fetch(|_, _| Err("simulated db failure".to_owned()));
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 4821, 1, 0, 1_000);
+
+        assert_eq!(
+            msg_fetch_error_reply(&inner)["code"],
+            "forbidden",
+            "provider 查询失败必须 fail-closed，不当未知即放行"
+        );
+    }
+
+    #[test]
+    fn handle_msg_fetch_soft_deleted_when_owning_session_is_soft_deleted() {
+        let inner = test_inner_for_msg_fetch(|_, _| {
+            Ok(MessageForFetchResult::Found {
+                content_raw: "\"hello\"".to_owned(),
+                revision: 1,
+                session_deleted: true,
+            })
+        });
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 4821, 1, 0, 1_000);
+
+        assert_eq!(msg_fetch_error_reply(&inner)["code"], "soft_deleted");
+    }
+
+    #[test]
+    fn handle_msg_fetch_stale_revision_carries_current_ref_built_from_live_content() {
+        let content_raw = "\"current content\"".to_owned();
+        let inner = test_inner_for_msg_fetch(move |_, _| {
+            Ok(MessageForFetchResult::Found {
+                content_raw: content_raw.clone(),
+                revision: 5,
+                session_deleted: false,
+            })
+        });
+        // 请求带 revision=1，桌面当前 revision=5——stale。
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 4821, 1, 0, 1_000);
+
+        let error = msg_fetch_error_reply(&inner);
+        assert_eq!(error["code"], "stale_revision");
+        let expected_current_ref = build_content_ref(4821, 5, "\"current content\"");
+        assert_eq!(error["current_ref"], expected_current_ref);
+    }
+
+    #[test]
+    fn handle_msg_fetch_too_large_when_content_exceeds_four_mib() {
+        let oversized = "x".repeat(MSG_FETCH_TOTAL_BYTES_LIMIT + 1);
+        let inner = test_inner_for_msg_fetch(move |_, _| {
+            Ok(MessageForFetchResult::Found {
+                content_raw: oversized.clone(),
+                revision: 1,
+                session_deleted: false,
+            })
+        });
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 4821, 1, 0, 1_000);
+
+        assert_eq!(msg_fetch_error_reply(&inner)["code"], "too_large");
+    }
+
+    #[test]
+    fn handle_msg_fetch_success_enqueues_reassemblable_chunks_and_marks_only_last_as_final() {
+        let content_raw = serde_json::to_string(&serde_json::json!(["a", "b", "c"])).unwrap();
+        let expected_sha256 = sha256_hex_lower(content_raw.as_bytes());
+        let content_for_provider = content_raw.clone();
+        let inner = test_inner_for_msg_fetch(move |session, message_id| {
+            assert_eq!(session, "sess-1");
+            assert_eq!(message_id, 4821);
+            Ok(MessageForFetchResult::Found {
+                content_raw: content_for_provider.clone(),
+                revision: 1,
+                session_deleted: false,
+            })
+        });
+
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 4821, 1, 0, 1_000);
+
+        let mut queue = lock(&inner.state.reply_queue);
+        assert_eq!(queue.len(), 1, "内容很短，一片就装得下");
+        let item = queue.pop_front().unwrap();
+        drop(queue);
+        assert!(item.final_frame, "唯一一片必须标记为 final");
+        assert_eq!(item.session.as_deref(), Some("sess-1"));
+        assert_eq!(item.command_id, "cmd-1");
+        assert_eq!(item.payload["t"], "msg.chunk");
+        assert_eq!(item.payload["content_sha256"], expected_sha256);
+        assert_eq!(item.payload["revision"], 1);
+        let bytes = STANDARD
+            .decode(item.payload["bytes_b64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(bytes, content_raw.as_bytes());
+
+        // 成功路径必须占用单飞行槽位，直到（在真实 drain 中）最后一帧被发出才释放——
+        // 这里没有跑 drain_reply_queue，槽位应仍然在。
+        assert!(lock(&inner.state.msg_fetch_inflight).contains_key("sess-1"));
+    }
+
+    #[test]
+    fn handle_msg_fetch_busy_when_a_second_fetch_arrives_before_the_first_is_drained() {
+        let inner = test_inner_for_msg_fetch(|_, _| {
+            Ok(MessageForFetchResult::Found {
+                content_raw: "\"hello\"".to_owned(),
+                revision: 1,
+                session_deleted: false,
+            })
+        });
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 4821, 1, 0, 1_000);
+        // 第一条已经入队但从未被 drain（没有调用 drain_reply_queue），单飞行槽位仍占着。
+        assert_eq!(lock(&inner.state.reply_queue).len(), 1);
+
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-2", 4821, 1, 0, 1_500);
+
+        let mut queue = lock(&inner.state.reply_queue);
+        assert_eq!(
+            queue.len(),
+            2,
+            "第一条 chunk 仍在队列里，第二条请求追加了一条 busy 终态"
+        );
+        let busy = queue.pop_back().unwrap();
+        assert_eq!(busy.command_id, "cmd-2");
+        assert_eq!(busy.payload["code"], "busy");
+        assert!(busy.final_frame);
+    }
+
+    #[test]
+    fn handle_msg_fetch_inflight_releases_after_timeout_and_admits_new_request() {
+        let inner = test_inner_for_msg_fetch(|_, _| {
+            Ok(MessageForFetchResult::Found {
+                content_raw: "\"hello\"".to_owned(),
+                revision: 1,
+                session_deleted: false,
+            })
+        });
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 4821, 1, 0, 1_000);
+        assert_eq!(lock(&inner.state.reply_queue).len(), 1);
+        let superseded_generation = lock(&inner.state.msg_fetch_inflight)
+            .get("sess-1")
+            .unwrap()
+            .generation;
+
+        // 超时之后：新请求必须被放行（不是 busy），旧占用被新 command_id 接管。
+        let now_after_timeout = 1_000 + MSG_FETCH_INFLIGHT_TIMEOUT_MS;
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-2", 4821, 1, 0, now_after_timeout);
+
+        // 返修②（skeptic 补审）：接管必须把旧 generation 还没发出的残片从队列里清掉——不是
+        // "旧片仍在、新片追加"（那条旧路径正是 bug 本身：旧终片将来被 drain 时会用同一个
+        // command_id 误清新占用）。清掉之后队列里只剩新请求自己的 1 条 chunk。
+        let queue = lock(&inner.state.reply_queue);
+        assert_eq!(
+            queue.len(),
+            1,
+            "旧 generation 的残片必须被超时接管顺手清掉，不是继续留着排队"
+        );
+        assert!(queue.iter().all(|item| item.payload["t"] == "msg.chunk"));
+        assert!(
+            queue
+                .iter()
+                .all(|item| item.generation != superseded_generation),
+            "队列里不该再有属于被取代那次接受的残片"
+        );
+        drop(queue);
+        assert_eq!(
+            inner
+                .state
+                .reply_queue_stale_generation_purged
+                .load(Ordering::Relaxed),
+            1,
+            "必须如实计数被清掉的残片数"
+        );
+        let inflight = lock(&inner.state.msg_fetch_inflight);
+        let current = inflight.get("sess-1").unwrap();
+        assert_eq!(
+            current.command_id, "cmd-2",
+            "槽位必须被新请求的 command_id 接管"
+        );
+        assert_ne!(
+            current.generation, superseded_generation,
+            "新占用必须领到一个全新的 generation"
+        );
+    }
+
+    #[test]
+    fn handle_msg_fetch_busy_when_gateway_wide_byte_budget_is_exhausted() {
+        let big_content = "x".repeat(MSG_FETCH_TOTAL_BYTES_LIMIT);
+        let inner = test_inner_for_msg_fetch(move |_, _| {
+            Ok(MessageForFetchResult::Found {
+                content_raw: big_content.clone(),
+                revision: 1,
+                session_deleted: false,
+            })
+        });
+        // 两次满额拉取用满 8MiB/60s 预算——分两次调用，每次之间人为清掉单飞行槽位（模拟已经
+        // 被正常 drain 释放，这条测试只想孤立"字节预算"这一层闸，不与单飞行闸的 busy 混淆）。
+        // 直接 `remove` 而不是走 `clear_msg_fetch_inflight_if_matches`——那个函数现在按
+        // generation 匹配，测试这里不需要知道内部分配的 generation 值，直接清空槽位即可。
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 1, 1, 0, 0);
+        lock(&inner.state.msg_fetch_inflight).remove("sess-1");
+        lock(&inner.state.reply_queue).clear();
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-2", 1, 1, 0, 1_000);
+        lock(&inner.state.msg_fetch_inflight).remove("sess-1");
+        lock(&inner.state.reply_queue).clear();
+
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-3", 1, 1, 0, 2_000);
+
+        let error = msg_fetch_error_reply(&inner);
+        assert_eq!(error["code"], "busy");
+        assert!(
+            !lock(&inner.state.msg_fetch_inflight).contains_key("sess-1"),
+            "预算拒绝的请求不该占着单飞行槽位"
+        );
+    }
+
+    /// msgfix1 T7 B1（opus 整盘审 P1-2 后半）：改口径为 gateway 全局聚合后，两个不同 session
+    /// 交替拉取也必须共享同一份 8MiB/60s 预算——旧的 per-session 分桶写法这里会各自放行、
+    /// 合计 16MiB 越过 relay 单连接 16MiB 固定窗；新写法第二个 session 的满额请求必须吃 busy。
+    #[test]
+    fn handle_msg_fetch_busy_when_two_sessions_together_exhaust_the_gateway_wide_budget() {
+        let big_content = "x".repeat(MSG_FETCH_TOTAL_BYTES_LIMIT);
+        let inner = test_inner_for_msg_fetch(move |_, _| {
+            Ok(MessageForFetchResult::Found {
+                content_raw: big_content.clone(),
+                revision: 1,
+                session_deleted: false,
+            })
+        });
+
+        // sess-1 一次满额拉取（4MiB）——单飞行闸只挡同 session 内并发，不影响 sess-2。每次调用
+        // 后人为清掉该 session 的单飞行槽位（同上一条测试姿势），保证第三次调用吃到的是"字节
+        // 预算"闸，不是"单飞行"闸。
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 1, 1, 0, 0);
+        {
+            let queue = lock(&inner.state.reply_queue);
+            assert!(
+                !queue.is_empty(),
+                "sess-1 首次满额拉取应正常切片入队（预算充足）"
+            );
+            assert_eq!(
+                queue.front().unwrap().payload["t"],
+                "msg.chunk",
+                "sess-1 第一次满额拉取不该被预算拒绝"
+            );
+        }
+        lock(&inner.state.msg_fetch_inflight).remove("sess-1");
+        lock(&inner.state.reply_queue).clear();
+
+        // sess-2 再来一次满额拉取（另 4MiB）——两个 session 合计恰好 8MiB，仍在预算内，必须
+        // 放行（证明预算是跨 session 共享同一份，不是两个 session 各自领 8MiB）。
+        handle_msg_fetch_at(&inner, "sess-2", "cmd-2", 1, 1, 0, 1_000);
+        {
+            let queue = lock(&inner.state.reply_queue);
+            assert!(
+                !queue.is_empty(),
+                "sess-2 的满额拉取与 sess-1 合计恰好 8MiB，仍应放行"
+            );
+            assert_eq!(
+                queue.front().unwrap().payload["t"],
+                "msg.chunk",
+                "sess-2 不该被预算拒绝"
+            );
+        }
+        lock(&inner.state.msg_fetch_inflight).remove("sess-2");
+        lock(&inner.state.reply_queue).clear();
+
+        // sess-1 第三次满额拉取——两 session 合计已达 8MiB 上限，这次必须吃 busy；若预算仍是
+        // per-session 分桶，sess-1 单独看只用了 4MiB，会被误放行。
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-3", 1, 1, 0, 2_000);
+
+        let error = msg_fetch_error_reply(&inner);
+        assert_eq!(
+            error["code"], "busy",
+            "两个 session 合计已用满 gateway 全局 8MiB/60s 预算，第三次满额拉取必须拒绝"
+        );
+    }
+
+    #[test]
+    fn handle_msg_fetch_offset_resume_only_sends_the_remaining_tail() {
+        // 纯 ASCII 可打印字符——避免字节切片落在多字节 UTF-8 字符中间导致 String 构造失败；
+        // `content_raw` 在生产路径里就是 DB 原样字符串，这里只需要一段长度可控、内容可校验的
+        // 合法 UTF-8 文本。
+        let content_string: String = (0..(CHUNK_RAW_BYTES * 2))
+            .map(|i| (b'a' + (i % 26) as u8) as char)
+            .collect();
+        let inner = test_inner_for_msg_fetch(move |_, _| {
+            Ok(MessageForFetchResult::Found {
+                content_raw: content_string.clone(),
+                revision: 1,
+                session_deleted: false,
+            })
+        });
+
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 4821, 1, CHUNK_RAW_BYTES, 1_000);
+
+        let queue = lock(&inner.state.reply_queue);
+        assert_eq!(queue.len(), 1, "只剩第二整片需要发");
+        assert_eq!(queue[0].payload["offset"], CHUNK_RAW_BYTES as u64);
+        assert_eq!(queue[0].payload["chunk_len"], CHUNK_RAW_BYTES as u64);
+    }
+
+    #[test]
+    fn handle_msg_fetch_reply_queue_full_aborts_transfer_and_appends_busy_terminal() {
+        let big_content = "x".repeat(CHUNK_RAW_BYTES * 5);
+        let inner = test_inner_for_msg_fetch(move |_, _| {
+            Ok(MessageForFetchResult::Found {
+                content_raw: big_content.clone(),
+                revision: 1,
+                session_deleted: false,
+            })
+        });
+        // 预先灌满到只留 3 个空位——5 片的传输必然中途塞不下（`try_enqueue_reply_chunk` 少留
+        // 1 个坑位，2 片能进、第 3 片起失败），但必须还留得出地方放兜底 busy 终态。
+        {
+            let mut queue = lock(&inner.state.reply_queue);
+            for _ in 0..(REPLY_QUEUE_CAPACITY - 3) {
+                queue.push_back(ReplyQueueItem {
+                    session: Some("filler".to_owned()),
+                    command_id: "filler".to_owned(),
+                    payload: serde_json::json!({"t": "msg.chunk"}),
+                    final_frame: false,
+                    generation: 0,
+                    connection_generation: 0,
+                });
+            }
+        }
+
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 4821, 1, 0, 1_000);
+
+        let queue = lock(&inner.state.reply_queue);
+        let last = queue.back().expect("queue must not be empty");
+        assert_eq!(
+            last.command_id, "cmd-1",
+            "队列满时必须追加本次 fetch 的兜底 busy 终态"
+        );
+        assert_eq!(last.payload["t"], "msg.fetch.error");
+        assert_eq!(last.payload["code"], "busy");
+        assert!(last.final_frame);
+        assert_eq!(
+            inner.state.reply_queue_dropped.load(Ordering::Relaxed),
+            0,
+            "留了坑位给兜底 error，不该走双重饱和计数"
+        );
+    }
+
+    /// 合成的极端边——正常单线程处理下 `reply_queue` 只由 `handle_msg_fetch_at` 一个生产者
+    /// 写入，`try_enqueue_reply_chunk` 的"少留 1 坑"设计已经让"分片中途塞不下但兜底 error
+    /// 还放得下"恒成立；这条测试用「预先把队列写到刚好等于容量」模拟一种本函数自身走不到、
+    /// 但 `try_enqueue_reply`/`reply_queue_dropped` 文档承诺过要兜底的假想场景（未来架构演进
+    /// 若引入第二个并发生产者，这条防线就会变得可达）——钉死"双重饱和"分支本身的行为：如实
+    /// 计数、释放单飞行占用，不假装通知到了客户端。
+    #[test]
+    fn handle_msg_fetch_double_saturation_drops_and_releases_inflight_when_even_the_busy_error_cannot_fit(
+    ) {
+        let inner = test_inner_for_msg_fetch(|_, _| {
+            Ok(MessageForFetchResult::Found {
+                content_raw: "\"hello\"".to_owned(),
+                revision: 1,
+                session_deleted: false,
+            })
+        });
+        {
+            let mut queue = lock(&inner.state.reply_queue);
+            for _ in 0..REPLY_QUEUE_CAPACITY {
+                queue.push_back(ReplyQueueItem {
+                    session: Some("filler".to_owned()),
+                    command_id: "filler".to_owned(),
+                    payload: serde_json::json!({"t": "msg.chunk"}),
+                    final_frame: false,
+                    generation: 0,
+                    connection_generation: 0,
+                });
+            }
+        }
+
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 4821, 1, 0, 1_000);
+
+        assert_eq!(
+            lock(&inner.state.reply_queue).len(),
+            REPLY_QUEUE_CAPACITY,
+            "队列已经写满，本次请求一帧都塞不进去"
+        );
+        assert_eq!(inner.state.reply_queue_dropped.load(Ordering::Relaxed), 1);
+        assert!(
+            !lock(&inner.state.msg_fetch_inflight).contains_key("sess-1"),
+            "双重饱和也必须释放单飞行占用，不然会一直卡到超时"
+        );
+    }
+
+    // ---- msgfix1 T4：handle_frame 端到端——msg.fetch 字段缺失是协议违例，不是业务拒绝 ----
+
+    #[test]
+    fn handle_frame_msg_fetch_malformed_fields_are_protocol_failures_not_business_errors() {
+        let k_room = Zeroizing::new([9_u8; 32]);
+        let inner =
+            test_inner_for_msg_fetch(|_, _| panic!("must not reach provider on malformed frame"));
+
+        let malformed_payloads = [
+            serde_json::json!({"t": "msg.fetch", "message_id": 1, "revision": 1, "offset": 0}),
+            serde_json::json!({"t": "msg.fetch", "session": "sess-1", "revision": 1, "offset": 0}),
+            serde_json::json!({"t": "msg.fetch", "session": "sess-1", "message_id": 1, "offset": 0}),
+            serde_json::json!({"t": "msg.fetch", "session": "sess-1", "message_id": 1, "revision": 1}),
+            serde_json::json!({
+                "t": "msg.fetch", "session": "sess-1", "message_id": 1, "revision": 1, "offset": -1
+            }),
+        ];
+        for (index, payload) in malformed_payloads.iter().enumerate() {
+            let envelope = seal_command_envelope(
+                &k_room,
+                "0123456789abcdef0123456789abcdef",
+                1,
+                "control",
+                "sess-1",
+                &format!("cmd-malformed-{index}"),
+                payload,
+            );
+            let response = handle_frame(&inner, &envelope.to_string(), Some(&k_room))
+                .expect("malformed msg.fetch must still ack failed, not silently drop");
+            assert_eq!(response["t"], "input.ack");
+            assert_eq!(response["outcome"], "failed");
+        }
+        assert!(
+            lock(&inner.state.reply_queue).is_empty(),
+            "协议违例绝不能流到 reply 通道"
+        );
+    }
+
+    // ---- msgfix1 T4：wire fixture 形状比对（data-plane-v1.json / wire-v1.json——T6/T1 已把
+    // *-v1.9-pending.json 合入这两份正式文件并删除 pending 版，这里改指正式文件；样张条目名
+    // 未变，仍按名字查找，不依赖下标/总条数）----
+
+    #[test]
+    fn data_plane_v1_msg_fetch_family_matches_our_wire_shapes() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../remote-relay/fixtures/data-plane-v1.json"
+        ))
+        .expect("data-plane-v1 fixture must be valid JSON");
+        let cases = fixture["cases"].as_array().expect("cases must be an array");
+        let find_frame = |name: &str| -> Value {
+            cases
+                .iter()
+                .find(|case| case["name"] == name)
+                .unwrap_or_else(|| panic!("fixture case {name} not found"))["frame"]
+                .clone()
+        };
+
+        let fetch_request = find_frame("msg_fetch_request");
+        assert_eq!(fetch_request["t"], "msg.fetch");
+        for key in ["session", "message_id", "revision", "offset"] {
+            assert!(
+                fetch_request.get(key).is_some(),
+                "样张 msg_fetch_request 缺 {key}——我们的 match arm 解析集合与样张脱节"
+            );
+        }
+
+        let chunk_sample = find_frame("msg_chunk");
+        let produced_chunk = &build_msg_chunks(4821, 2, b"hello content", 0)[0];
+        let chunk_keys = chunk_sample
+            .as_object()
+            .expect("msg_chunk sample must be an object")
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let produced_keys = produced_chunk
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            chunk_keys, produced_keys,
+            "msg.chunk 字段集合必须与样张逐键一致"
+        );
+
+        let stale_sample = find_frame("msg_fetch_error_stale_revision");
+        assert!(stale_sample.get("current_ref").is_some());
+        let produced_stale =
+            msg_fetch_error_payload("stale_revision", Some(build_content_ref(4821, 3, "x")));
+        assert!(produced_stale.get("current_ref").is_some());
+
+        let not_found_sample = find_frame("msg_fetch_error_not_found");
+        assert!(
+            not_found_sample.get("current_ref").is_none(),
+            "样张 not_found 分支不带 current_ref 键（不是 null）——我们的构造必须同形"
+        );
+        let produced_not_found = msg_fetch_error_payload("not_found", None);
+        assert!(produced_not_found.get("current_ref").is_none());
+    }
+
+    #[test]
+    fn wire_v1_reply_envelope_shape_and_aad_match_our_seal_path() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../remote-relay/fixtures/wire-v1.json"))
+                .expect("wire-v1 fixture must be valid JSON");
+        let cases = fixture.as_array().expect("wire-v1 must be an array");
+        let reply_case = cases
+            .iter()
+            .find(|case| case["name"] == "reply_with_command_id")
+            .expect("reply_with_command_id case must exist");
+        let sample_envelope = &reply_case["envelope"];
+        assert_eq!(sample_envelope["kind"], "reply");
+        assert!(sample_envelope.get("client_msg_id").is_none());
+        assert_eq!(sample_envelope["seq"], Value::Null);
+
+        let meta = EnvelopeMeta {
+            v: 1,
+            room: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            epoch: 1,
+            kind: "reply".to_owned(),
+            session: Some("sess-1".to_owned()),
+            command_id: Some("cmd-fetch-1".to_owned()),
+        };
+        let aad = crate::remote_crypto::build_aad(&meta);
+        assert_eq!(
+            aad,
+            reply_case["expect"]["aad"].as_str().unwrap(),
+            "AAD 拼串必须与样张逐字节一致（v|room|epoch|kind|session|command_id）"
+        );
+
+        let (ct, n) = crate::remote_crypto::seal(&[1_u8; 32], &meta, br#"{"t":"msg.chunk"}"#);
+        let produced_envelope = build_envelope_json(&meta, &ct, &n, 1_765_430_400_123, None);
+        for key in sample_envelope.as_object().unwrap().keys() {
+            if matches!(key.as_str(), "ct" | "n" | "ts") {
+                continue; // 密文/nonce/时间戳每次都不同，只比对结构键集合与其余字段取值。
+            }
+            assert_eq!(
+                produced_envelope.get(key),
+                sample_envelope.get(key),
+                "字段 {key} 必须与样张一致"
+            );
+        }
+    }
+
+    // ---- msgfix1 T4：drain_reply_queue 端到端——真实 socket 收发 + 重组 + 单飞行释放 ----
+
+    #[test]
+    fn drain_reply_queue_sends_real_reply_frames_that_reassemble_and_release_inflight_on_final_chunk(
+    ) {
+        let content: Vec<u8> = (0..(CHUNK_RAW_BYTES * 2 + 500))
+            .map(|i| (i % 256) as u8)
+            .collect();
+        let expected_sha256 = sha256_hex_lower(&content);
+
+        let state = GatewayInnerState::default();
+        // 返修③（skeptic 补审）：`drain_reply_queue` 出队时补了一次归属复核——这条测试必须
+        // 配一个 active repo，不然 "sess-1" 会被新加的复核判 `repo_denied` 而不是真的发出去
+        // （同 `drain_upstream_processes_at_most_one_bounded_round` 等既有 drain 测试姿势）。
+        *lock(&state.active_repo_id_for_gating) = Some(TEST_DEFAULT_ACTIVE_REPO_ID.to_owned());
+        let connection_generation = state.connection_generation_snapshot();
+        let generation = 42;
+        lock(&state.msg_fetch_inflight).insert(
+            "sess-1".to_owned(),
+            MsgFetchInflightEntry {
+                command_id: "cmd-1".to_owned(),
+                accepted_at_ms: 1_000,
+                generation,
+            },
+        );
+        let chunks = build_msg_chunks(4821, 2, &content, 0);
+        assert_eq!(chunks.len(), 3, "两整片 + 一个 500 字节尾片");
+        let last_index = chunks.len() - 1;
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            assert!(try_enqueue_reply_chunk(
+                &state,
+                ReplyQueueItem {
+                    session: Some("sess-1".to_owned()),
+                    command_id: "cmd-1".to_owned(),
+                    payload: chunk,
+                    final_frame: index == last_index,
+                    generation,
+                    connection_generation,
+                }
+            ));
+        }
+
+        let k_room = Zeroizing::new([5_u8; 32]);
+        let room = "0123456789abcdef0123456789abcdef";
+        let (addr, frames, server) = spawn_recording_server(3);
+        let (mut socket, _) = connect_with_config(format!("ws://{addr}"), None, 3)
+            .expect("client should connect to recording server");
+        let (_upstream_tx, upstream_rx) = mpsc::sync_channel(1);
+        let (_milestone_tx, milestone_rx) = mpsc::sync_channel(1);
+
+        drain_upstream(
+            &mut socket,
+            &state,
+            &upstream_rx,
+            &milestone_rx,
+            Some(&k_room),
+            room,
+            &test_session_repo_provider_allowing_default_repo(),
+            &mut HashMap::new(),
+            &mut 0u64,
+        )
+        .expect("drain_upstream must forward all three reply frames");
+        drop(socket);
+        server.join().expect("recording server should not panic");
+
+        let mut reassembled = Vec::new();
+        let mut received = 0;
+        while let Ok(envelope) = frames.recv_timeout(Duration::from_millis(500)) {
+            received += 1;
+            assert_eq!(envelope["kind"], "reply");
+            assert_eq!(envelope["command_id"], "cmd-1");
+            assert_eq!(envelope["session"], "sess-1");
+            assert_eq!(envelope["seq"], Value::Null);
+            assert!(envelope.get("client_msg_id").is_none());
+            let plaintext = open_upstream_envelope(&k_room, &envelope);
+            assert_eq!(plaintext["t"], "msg.chunk");
+            let bytes = STANDARD
+                .decode(plaintext["bytes_b64"].as_str().unwrap())
+                .unwrap();
+            let offset = plaintext["offset"].as_u64().unwrap() as usize;
+            if reassembled.len() < offset {
+                panic!("gap detected before offset {offset}");
+            }
+            reassembled.truncate(offset);
+            reassembled.extend_from_slice(&bytes);
+        }
+        assert_eq!(received, 3, "三片必须全部真实发出");
+        assert_eq!(reassembled, content, "三片按 offset 拼接必须还原原文字节");
+        assert_eq!(sha256_hex_lower(&reassembled), expected_sha256);
+
+        assert!(
+            !lock(&state.msg_fetch_inflight).contains_key("sess-1"),
+            "最后一片真实发出后必须释放单飞行占用"
+        );
+    }
+
+    // ---- msgfix1 T4 返修①-④（skeptic 补审四条修单）----
+
+    // ---- 返修②：command_id 复用生命周期 ----
+
+    #[test]
+    fn msg_fetch_command_ledger_admit_rejects_exact_duplicate_but_admits_distinct_pairs() {
+        let state = GatewayInnerState::default();
+        assert!(msg_fetch_command_ledger_admit(&state, "sess-1", "cmd-1"));
+        assert!(
+            !msg_fetch_command_ledger_admit(&state, "sess-1", "cmd-1"),
+            "同一 (session, command_id) 第二次必须拒绝"
+        );
+        assert!(
+            msg_fetch_command_ledger_admit(&state, "sess-1", "cmd-2"),
+            "同 session 不同 command_id 必须放行"
+        );
+        assert!(
+            msg_fetch_command_ledger_admit(&state, "sess-2", "cmd-1"),
+            "同 command_id 不同 session 必须放行——账本按 (session, command_id) 联合键"
+        );
+    }
+
+    #[test]
+    fn msg_fetch_command_ledger_admit_evicts_oldest_entry_at_capacity() {
+        let state = GatewayInnerState::default();
+        for i in 0..MSG_FETCH_COMMAND_LEDGER_CAPACITY {
+            assert!(msg_fetch_command_ledger_admit(
+                &state,
+                "sess-1",
+                &format!("cmd-{i}")
+            ));
+        }
+        // 再提交一个新的，把最老的 cmd-0 挤出账本——`msg_fetch_command_ledger_admit` 本身是
+        // "查+插"合一的有副作用调用，这条测试之后不再对同一个 `state` 做进一步 admit（每次
+        // 调用都会再淘汰一条），避免链式断言互相踩踏、造成误导性的失败。
+        assert!(msg_fetch_command_ledger_admit(
+            &state,
+            "sess-1",
+            "cmd-overflow"
+        ));
+        assert!(
+            msg_fetch_command_ledger_admit(&state, "sess-1", "cmd-0"),
+            "容量满后最老的一条被淘汰——cmd-0 现在必须能重新被提交"
+        );
+    }
+
+    #[test]
+    fn msg_fetch_command_ledger_admit_keeps_entries_alive_below_capacity() {
+        let state = GatewayInnerState::default();
+        // 只填到容量减一——不触发任何淘汰，账本里的每一条都必须继续拒绝复用。
+        for i in 0..(MSG_FETCH_COMMAND_LEDGER_CAPACITY - 1) {
+            assert!(msg_fetch_command_ledger_admit(
+                &state,
+                "sess-1",
+                &format!("cmd-{i}")
+            ));
+        }
+        assert!(
+            !msg_fetch_command_ledger_admit(&state, "sess-1", "cmd-0"),
+            "未触发淘汰前，最早提交的一条也必须仍然拒绝复用"
+        );
+    }
+
+    #[test]
+    fn handle_msg_fetch_rejects_command_id_reuse_after_an_error_terminal() {
+        let provider_calls = Arc::new(AtomicU64::new(0));
+        let provider_calls_for_closure = Arc::clone(&provider_calls);
+        let inner = test_inner_for_msg_fetch(move |_, _| {
+            provider_calls_for_closure.fetch_add(1, Ordering::Relaxed);
+            Ok(MessageForFetchResult::NotFound)
+        });
+
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 4821, 1, 0, 1_000);
+        assert_eq!(msg_fetch_error_reply(&inner)["code"], "not_found");
+        assert_eq!(provider_calls.load(Ordering::Relaxed), 1);
+
+        // 同一 (session, command_id) 复用——即便这次带的是完全不同的 message_id/revision，
+        // 账本检查发生在最前面，provider 根本不会被再次调用。
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 999, 5, 0, 2_000);
+        assert_eq!(
+            provider_calls.load(Ordering::Relaxed),
+            1,
+            "被账本拒绝的复用请求不该再碰 message_fetch_provider"
+        );
+        let error = msg_fetch_error_reply(&inner);
+        assert_eq!(error["code"], "busy");
+        assert_eq!(error["t"], "msg.fetch.error");
+    }
+
+    #[test]
+    fn handle_msg_fetch_rejects_command_id_reuse_even_after_a_successful_terminal() {
+        let inner = test_inner_for_msg_fetch(|_, _| {
+            Ok(MessageForFetchResult::Found {
+                content_raw: "\"hello\"".to_owned(),
+                revision: 1,
+                session_deleted: false,
+            })
+        });
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 4821, 1, 0, 1_000);
+        assert_eq!(lock(&inner.state.reply_queue).len(), 1, "正常一片成功入队");
+
+        // 让第一次请求"结束"（释放单飞行槽位），模拟客户端已经收全数据——即便如此，复用同一
+        // command_id 仍必须被拒绝：账本判定跟 inflight 是否仍占用无关，只看这个 (session,
+        // command_id) 是不是已经被处理过。
+        lock(&inner.state.msg_fetch_inflight).remove("sess-1");
+        lock(&inner.state.reply_queue).clear();
+
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 4821, 1, 0, 2_000);
+        let error = msg_fetch_error_reply(&inner);
+        assert_eq!(
+            error["code"], "busy",
+            "已经成功处理过一次的 command_id 复用同样必须拒绝，不是只挡 error 路径"
+        );
+    }
+
+    // ---- 返修③：reply 出队二次归属闸 ----
+
+    #[test]
+    fn drain_reply_queue_drops_items_with_a_stale_connection_generation() {
+        let state = GatewayInnerState::default();
+        *lock(&state.active_repo_id_for_gating) = Some(TEST_DEFAULT_ACTIVE_REPO_ID.to_owned());
+        let current_connection_generation = state.connection_generation_snapshot();
+        assert!(try_enqueue_reply(
+            &state,
+            ReplyQueueItem {
+                session: Some("sess-1".to_owned()),
+                command_id: "cmd-1".to_owned(),
+                payload: serde_json::json!({"t": "msg.fetch.error", "code": "not_found"}),
+                final_frame: true,
+                generation: 1,
+                // 跟当前连接 generation 不一致——模拟这条残片是断线重连前那个连接留下的。
+                connection_generation: current_connection_generation + 1000,
+            }
+        ));
+
+        let (addr, server) = spawn_discarding_server();
+        let (mut socket, _) = connect_with_config(format!("ws://{addr}"), None, 3)
+            .expect("client should connect to discarding server");
+        let (_upstream_tx, upstream_rx) = mpsc::sync_channel(1);
+        let (_milestone_tx, milestone_rx) = mpsc::sync_channel(1);
+
+        drain_upstream(
+            &mut socket,
+            &state,
+            &upstream_rx,
+            &milestone_rx,
+            Some(&Zeroizing::new([7_u8; 32])),
+            "0123456789abcdef0123456789abcdef",
+            &test_session_repo_provider_allowing_default_repo(),
+            &mut HashMap::new(),
+            &mut 0u64,
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.frames_sent.load(Ordering::Relaxed),
+            0,
+            "跨连接残留的 reply 条目绝不能被真的发出去"
+        );
+        assert_eq!(
+            state.reply_stale_connection_dropped.load(Ordering::Relaxed),
+            1
+        );
+        assert!(lock(&state.reply_queue).is_empty());
+        drop(socket);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn drain_reply_queue_drops_items_when_session_no_longer_belongs_to_active_repo() {
+        let state = GatewayInnerState::default();
+        *lock(&state.active_repo_id_for_gating) = Some(TEST_DEFAULT_ACTIVE_REPO_ID.to_owned());
+        let connection_generation = state.connection_generation_snapshot();
+        assert!(try_enqueue_reply(
+            &state,
+            ReplyQueueItem {
+                session: Some("sess-switched-repo".to_owned()),
+                command_id: "cmd-1".to_owned(),
+                payload: serde_json::json!({"t": "msg.fetch.error", "code": "not_found"}),
+                final_frame: true,
+                generation: 1,
+                connection_generation,
+            }
+        ));
+
+        let (addr, server) = spawn_discarding_server();
+        let (mut socket, _) = connect_with_config(format!("ws://{addr}"), None, 3)
+            .expect("client should connect to discarding server");
+        let (_upstream_tx, upstream_rx) = mpsc::sync_channel(1);
+        let (_milestone_tx, milestone_rx) = mpsc::sync_channel(1);
+        // session 现在查出来属于跟 active repo 不同的另一个 repo——模拟入队之后用户切换了
+        // active project。
+        let session_repo_provider: SessionRepoProvider =
+            Box::new(|_session_id| Ok(Some("some-other-repo".to_owned())));
+
+        drain_upstream(
+            &mut socket,
+            &state,
+            &upstream_rx,
+            &milestone_rx,
+            Some(&Zeroizing::new([7_u8; 32])),
+            "0123456789abcdef0123456789abcdef",
+            &session_repo_provider,
+            &mut HashMap::new(),
+            &mut 0u64,
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.frames_sent.load(Ordering::Relaxed),
+            0,
+            "归属已经变化的 session 的残片绝不能被真的发出去"
+        );
+        assert_eq!(state.reply_repo_filtered_dropped.load(Ordering::Relaxed), 1);
+        assert!(lock(&state.reply_queue).is_empty());
+        drop(socket);
+        server.join().unwrap();
+    }
+
+    // ---- 返修④：offset 越界（M0 §10.4 新条文）----
+
+    #[test]
+    fn handle_msg_fetch_offset_beyond_total_bytes_is_rejected_as_not_found() {
+        let content_raw = "\"short\"".to_owned();
+        let total_bytes = content_raw.len();
+        let inner = test_inner_for_msg_fetch(move |_, _| {
+            Ok(MessageForFetchResult::Found {
+                content_raw: content_raw.clone(),
+                revision: 1,
+                session_deleted: false,
+            })
+        });
+
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 4821, 1, total_bytes + 1, 1_000);
+
+        let error = msg_fetch_error_reply(&inner);
+        assert_eq!(
+            error["code"], "not_found",
+            "offset 严格大于 total_bytes 必须回 not_found，不是静默钳位发零长终片"
+        );
+        assert!(
+            !lock(&inner.state.msg_fetch_inflight).contains_key("sess-1"),
+            "被拒绝的请求不该占用单飞行槽位"
+        );
+    }
+
+    #[test]
+    fn handle_msg_fetch_offset_exactly_at_total_bytes_still_succeeds_with_a_terminal_chunk() {
+        let content_raw = "\"short\"".to_owned();
+        let total_bytes = content_raw.len();
+        let inner = test_inner_for_msg_fetch(move |_, _| {
+            Ok(MessageForFetchResult::Found {
+                content_raw: content_raw.clone(),
+                revision: 1,
+                session_deleted: false,
+            })
+        });
+
+        handle_msg_fetch_at(&inner, "sess-1", "cmd-1", 4821, 1, total_bytes, 1_000);
+
+        let mut queue = lock(&inner.state.reply_queue);
+        assert_eq!(
+            queue.len(),
+            1,
+            "offset == total_bytes 是合法的收尾态，不是越界——必须正常产出零长终片"
+        );
+        let item = queue.pop_front().unwrap();
+        assert_eq!(item.payload["t"], "msg.chunk");
+        assert_eq!(item.payload["chunk_len"], 0);
+        assert_eq!(item.payload["offset"], total_bytes as u64);
+    }
+
+    #[test]
+    fn build_oversized_preview_blocks_truncates_first_text_block_and_appends_notice() {
+        let text = "x".repeat(OVERSIZED_PREVIEW_TEXT_HEAD_BYTES + 200);
+        let blocks = serde_json::json!([{"type": "text", "text": text}]);
+        let preview = build_oversized_preview_blocks(&blocks);
+        let array = preview.as_array().unwrap();
+        assert_eq!(array.len(), 1, "全 text 超限退化为单条合并文本块");
+        let preview_text = array[0]["text"].as_str().unwrap();
+        assert!(preview_text.ends_with(OVERSIZED_PREVIEW_TRUNCATION_NOTICE));
+        let head = &preview_text[..preview_text.len() - OVERSIZED_PREVIEW_TRUNCATION_NOTICE.len()];
+        assert_eq!(head.len(), OVERSIZED_PREVIEW_TEXT_HEAD_BYTES);
+        assert_eq!(head, "x".repeat(OVERSIZED_PREVIEW_TEXT_HEAD_BYTES));
+    }
+
+    #[test]
+    fn build_oversized_preview_blocks_respects_utf8_char_boundary_at_cutoff() {
+        // 边界恰好落在一个多字节字符中间：截断必须回退到上一个合法字符边界，不panic、不产出
+        // 非法 UTF-8。
+        let head = "a".repeat(OVERSIZED_PREVIEW_TEXT_HEAD_BYTES - 1);
+        let text = format!("{head}界多字节收尾");
+        let blocks = serde_json::json!([{"type": "text", "text": text}]);
+        let preview = build_oversized_preview_blocks(&blocks);
+        let preview_text = preview[0]["text"].as_str().unwrap();
+        assert!(preview_text.is_char_boundary(preview_text.len()));
+        assert!(preview_text.ends_with(OVERSIZED_PREVIEW_TRUNCATION_NOTICE));
+    }
+
+    #[test]
+    fn build_oversized_preview_blocks_never_splits_a_surrogate_pair_astral_char() {
+        // "😀"（U+1F600）在 UTF-16 里是一对代理项；Rust `str` 是合法 UTF-8，`truncate_utf8`
+        // 按 `is_char_boundary` 回退，天然不可能只保留半个标量值——这里验证端到端结果：
+        // 截断点前恰好卡在这个 4 字节表情前时，表情要么完整保留、要么整体不出现，两种都合法，
+        // 唯独不允许出现在 JSON 序列化/反序列化时产生非法字符串（若劈开会在这一步直接 panic
+        // 或产出替换字符，测试改用「输出恒是合法 UTF-8 且不含 U+FFFD」来钉死）。
+        let head = "a".repeat(OVERSIZED_PREVIEW_TEXT_HEAD_BYTES - 2);
+        let text = format!("{head}😀tail-after-emoji");
+        let blocks = serde_json::json!([{"type": "text", "text": text}]);
+        let preview = build_oversized_preview_blocks(&blocks);
+        let preview_text = preview[0]["text"].as_str().unwrap();
+        assert!(
+            !preview_text.contains('\u{FFFD}'),
+            "不得产出 UTF-8 替换字符"
+        );
+        // 序列化/反序列化往返验证输出是合法 UTF-8 JSON 字符串。
+        let round_tripped: String =
+            serde_json::from_value(serde_json::Value::String(preview_text.to_owned())).unwrap();
+        assert_eq!(round_tripped, preview_text);
+    }
+
+    #[test]
+    fn build_oversized_preview_blocks_keeps_actionable_blocks_verbatim() {
+        let decision_card = serde_json::json!({
+            "type": "decision_card",
+            "decision_id": "dc-1",
+            "kind": "ask",
+            "question": "deploy?",
+            "options": ["yes", "no"],
+            "status": "pending",
+        });
+        let approval = serde_json::json!({
+            "type": "approval",
+            "approval_id": "ap-1",
+            "status": "pending",
+        });
+        let huge_text = "z".repeat(OVERSIZED_PREVIEW_TEXT_HEAD_BYTES + 999);
+        let blocks = serde_json::json!([
+            decision_card.clone(),
+            {"type": "text", "text": huge_text},
+            approval.clone(),
+            {"type": "tool", "id": "t1", "output": "dropped"},
+        ]);
+        let preview = build_oversized_preview_blocks(&blocks);
+        let array = preview.as_array().unwrap();
+        // actionable 两块原样保留 + 一条合并文本块，tool 块整体丢弃。
+        assert_eq!(array.len(), 3);
+        assert_eq!(array[0], decision_card);
+        assert_eq!(array[1], approval);
+        assert_eq!(array[2]["type"], "text");
+        assert!(array[2]["text"]
+            .as_str()
+            .unwrap()
+            .ends_with(OVERSIZED_PREVIEW_TRUNCATION_NOTICE));
+        assert!(array.iter().all(|block| block["type"] != "tool"));
+    }
+
+    #[test]
+    fn build_oversized_preview_blocks_on_no_text_block_still_yields_notice_only() {
+        let blocks = serde_json::json!([{"type": "tool", "id": "t1", "output": "dropped"}]);
+        let preview = build_oversized_preview_blocks(&blocks);
+        let array = preview.as_array().unwrap();
+        assert_eq!(array.len(), 1);
+        assert_eq!(array[0]["text"], OVERSIZED_PREVIEW_TRUNCATION_NOTICE);
+    }
+
+    #[test]
+    fn downgrade_to_preview_payload_falls_back_to_notice_only_when_actionable_blocks_still_overflow(
+    ) {
+        // 构造后整帧仍须过预算（设计稿 §A）：即便只剩 actionable 块，若它们本身巨大到超预算，
+        // 必须进一步退化为"仅提示块 + content_ref"——ref 永不丢。
+        let huge_question = "q".repeat(SNAPSHOT_SEND_BUDGET_BYTES + 1024);
+        let payload = serde_json::json!({
+            "message_id": 5,
+            "role": "assistant",
+            "blocks": [{
+                "type": "decision_card",
+                "decision_id": "dc-huge",
+                "kind": "ask",
+                "question": huge_question,
+                "options": ["yes", "no"],
+                "status": "pending",
+            }],
+        });
+        let content_ref = build_content_ref(5, 1, "raw");
+        let degraded = downgrade_to_preview_payload(&payload, content_ref.clone(), "msg.completed");
+        assert!(milestone_frame_bytes("msg.completed", &degraded) <= SNAPSHOT_SEND_BUDGET_BYTES);
+        assert_eq!(degraded["content_ref"], content_ref, "ref 永不丢");
+        let blocks = degraded["blocks"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["text"], OVERSIZED_PREVIEW_TRUNCATION_NOTICE);
+    }
+
+    /// msgfix1 T3 返修 P1-1：history 口的同一变异（巨型 actionable 块本身就超预算）此前不
+    /// 转红——`build_history_page_with_limit` 的二次退化在返修前直接丢行（P0-1），只有
+    /// msg.completed 口的 `downgrade_to_preview_payload_falls_back_to_notice_only_when_
+    /// actionable_blocks_still_overflow` 能抓到这个变异。这里走真实 history 分页函数端到端
+    /// 验证：巨型 decision_card 单独就超 `HISTORY_SEND_BUDGET_BYTES`，preview（原样保留
+    /// actionable 块）仍超预算，必须退化到"仅提示块 + content_ref"而不是从页面里消失。
+    #[test]
+    fn history_page_downgrades_oversized_actionable_only_message_to_notice_only_with_ref() {
+        let huge_question = "q".repeat(HISTORY_SEND_BUDGET_BYTES + 1024);
+        let content_json = serde_json::json!([{
+            "type": "decision_card",
+            "decision_id": "dc-huge-history",
+            "kind": "ask",
+            "question": huge_question,
+            "options": ["yes", "no"],
+            "status": "pending",
+        }]);
+        let content_raw = serde_json::to_string(&content_json).unwrap();
+        let row = SessionHistoryRow {
+            message_id: 61,
+            role: "assistant".to_owned(),
+            content_json,
+            content_raw: content_raw.clone(),
+            revision: 2,
+        };
+        let page = build_history_page("history-huge-actionable", None, vec![row]);
+        assert_eq!(
+            page.oversized_dropped, 1,
+            "巨型消息必须计入降级计数，不是被悄悄跳过"
+        );
+        let messages = page.payload["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "巨型 actionable 消息必须仍出现在页面里，不能因为 preview 仍超预算就消失"
+        );
+        assert_eq!(messages[0]["message_id"], 61);
+        // preview（保留 decision_card 原样）本身就超预算，必须已经退化到仅提示块——
+        // decision_card 不应该出现在最终 blocks 里。
+        let blocks = messages[0]["blocks"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], OVERSIZED_PREVIEW_TRUNCATION_NOTICE);
+        assert!(
+            !blocks.iter().any(|block| block["type"] == "decision_card"),
+            "二次退化后 actionable 块也不应再出现"
+        );
+        let content_ref = &messages[0]["content_ref"];
+        assert_eq!(content_ref["message_id"], 61, "ref 永不丢");
+        assert_eq!(content_ref["revision"], 2);
+        assert_eq!(content_ref["total_bytes"], content_raw.len() as u64);
+        assert_eq!(
+            content_ref["content_sha256"],
+            sha256_hex_lower(content_raw.as_bytes())
+        );
+        assert!(
+            serde_json::to_vec(&page.payload).unwrap().len() <= HISTORY_SEND_BUDGET_BYTES,
+            "退化后的页面必须自身也过预算"
+        );
+    }
+
+    #[test]
     fn skips_agent_event_variants_outside_the_upstream_catalog() {
         use crate::agent_event::{AgentEvent, ToolStatus};
 
@@ -14439,7 +17948,7 @@ mod tests {
             .as_array()
             .expect("client-msg-id fixture vectors must be an array");
 
-        assert_eq!(vectors.len(), 4);
+        assert_eq!(vectors.len(), 6);
         for vector in vectors {
             let name = vector["name"]
                 .as_str()
@@ -14516,7 +18025,7 @@ mod tests {
         .unwrap();
         let rows = crate::db::list_recent_milestone_replay_rows(&c, 10).unwrap();
         assert_eq!(rows.len(), 1);
-        let expected = derive_msg_completed_client_msg_id("replay-derive", "run_flush:derive");
+        let expected = derive_msg_completed_client_msg_id("replay-derive", "run_flush:derive", 1);
         let (inner, milestone_rx) = test_inner_with_k_room_snapshot_and_replay_providers(
             || None,
             |_| Some(Zeroizing::new([1_u8; 32])),
@@ -14541,17 +18050,32 @@ mod tests {
     }
 
     #[test]
-    fn replay_batch_oversized_message_and_live_publish_are_dropped_and_counted() {
-        let oversized_blocks = serde_json::json!([{
-            "type": "text",
-            "text": "x".repeat(SNAPSHOT_SEND_BUDGET_BYTES + 1024),
-        }]);
+    fn replay_batch_oversized_message_and_live_publish_are_downgraded_to_preview_and_counted() {
+        let oversized_text = "x".repeat(SNAPSHOT_SEND_BUDGET_BYTES + 1024);
+        // msgfix1 T3 返修 P1-2：raw content 故意手写成非规范形态（多余空白 + 键顺序与
+        // `serde_json::to_string` 默认输出相反）——钉死"sha256/total_bytes 必须对 DB
+        // 原文字节计算"而非对 content_json 重序列化取哈希；下面额外断言 ref 对"重序列化
+        // 后的规范形式"不成立，正反双向锁死这条契约（否则"误改成重序列化 Value 取哈希"
+        // 这类回归所有语料都来自同一 Value 的序列化，会全绿放过）。
+        let replay_content_raw = format!(
+            "[ {{ \"text\":  {text_json} ,  \"type\":\"text\" }} ]",
+            text_json = serde_json::to_string(&oversized_text).unwrap()
+        );
+        let oversized_blocks: Value =
+            serde_json::from_str(&replay_content_raw).expect("hand-written raw content must parse");
+        let canonical_reserialized = serde_json::to_string(&oversized_blocks).unwrap();
+        assert_ne!(
+            replay_content_raw, canonical_reserialized,
+            "测试语料必须与规范重序列化不同，否则测不出「误用重序列化」这类回归"
+        );
         let replay_row = crate::db::MilestoneReplayRow {
             session_id: "replay-oversized".into(),
             message_id: 41,
             role: "assistant".into(),
             content_json: oversized_blocks.clone(),
+            content: replay_content_raw.clone(),
             dedup_key: "replay-oversized-dedup".into(),
+            revision: 5,
         };
         let (inner, milestone_rx) = test_inner_with_k_room_snapshot_and_replay_providers(
             || None,
@@ -14562,27 +18086,90 @@ mod tests {
         );
         let generation = inner.state.advance_generation_and_set_gate(true);
 
+        // msgfix1 T3（设计稿 §A）：超预算消息不再静默丢弃——降级为 preview + content_ref
+        // 后仍然入队送达，`replay_oversized_dropped` 计数器语义改为"降级为 preview 的次数"。
         publish_milestone_replay_batch_on_connect(&inner, generation);
-        assert!(milestone_rx.try_recv().is_err());
+        let (_, replay_item) = milestone_rx
+            .try_recv()
+            .expect("oversized replay message must be delivered as a preview, not dropped");
+        assert_eq!(replay_item.t, "msg.completed");
+        assert!(
+            milestone_frame_bytes(&replay_item.t, &replay_item.payload)
+                <= SNAPSHOT_SEND_BUDGET_BYTES
+        );
+        let replay_ref = &replay_item.payload["content_ref"];
+        assert_eq!(replay_ref["message_id"], 41);
+        assert_eq!(replay_ref["revision"], 5);
+        assert_eq!(replay_ref["total_bytes"], replay_content_raw.len() as u64);
+        assert_eq!(
+            replay_ref["content_sha256"],
+            sha256_hex_lower(replay_content_raw.as_bytes())
+        );
+        // msgfix1 T3 返修 P1-2（反向钉死）：ref 绝不能对"重序列化后的规范形式"成立——
+        // 如果生产代码退化成对 content_json 重新序列化取哈希/长度，这两条会立刻转红。
+        assert_ne!(
+            replay_ref["total_bytes"],
+            canonical_reserialized.len() as u64,
+            "total_bytes 不能对重序列化后的规范形式成立"
+        );
+        assert_ne!(
+            replay_ref["content_sha256"],
+            sha256_hex_lower(canonical_reserialized.as_bytes()),
+            "content_sha256 不能对重序列化后的规范形式成立"
+        );
+        assert!(
+            replay_item.payload["blocks"][0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with(OVERSIZED_PREVIEW_TRUNCATION_NOTICE),
+            "preview text must end with the truncation notice"
+        );
         assert_eq!(
             inner.state.replay_oversized_dropped.load(Ordering::Relaxed),
             1
         );
 
+        let live_blocks = serde_json::json!([{
+            "type": "text",
+            "text": "y".repeat(SNAPSHOT_SEND_BUDGET_BYTES + 1024),
+        }]);
+        let live_content_raw = serde_json::to_string(&live_blocks).unwrap();
         enqueue_milestone_for_upstream(
             &inner.state,
             &inner.milestone_tx,
             MilestoneItem {
                 session: Some("live-oversized".into()),
                 t: "msg.completed".into(),
-                payload: build_msg_completed_payload(42, "assistant", oversized_blocks, None),
+                payload: build_msg_completed_payload(
+                    42,
+                    "assistant",
+                    live_blocks,
+                    None,
+                    2,
+                    &live_content_raw,
+                ),
                 client_msg_id: derive_msg_completed_client_msg_id(
                     "live-oversized",
                     "live-oversized-dedup",
+                    2,
                 ),
             },
         );
-        assert!(milestone_rx.try_recv().is_err());
+        let (_, live_item) = milestone_rx
+            .try_recv()
+            .expect("oversized live publish must be delivered as a preview, not dropped");
+        assert_eq!(live_item.t, "msg.completed");
+        assert!(
+            milestone_frame_bytes(&live_item.t, &live_item.payload) <= SNAPSHOT_SEND_BUDGET_BYTES
+        );
+        let live_ref = &live_item.payload["content_ref"];
+        assert_eq!(live_ref["message_id"], 42);
+        assert_eq!(live_ref["revision"], 2);
+        assert_eq!(live_ref["total_bytes"], live_content_raw.len() as u64);
+        assert_eq!(
+            live_ref["content_sha256"],
+            sha256_hex_lower(live_content_raw.as_bytes())
+        );
         assert_eq!(
             inner.state.replay_oversized_dropped.load(Ordering::Relaxed),
             2
@@ -14597,7 +18184,9 @@ mod tests {
             message_id: 43,
             role: "assistant".into(),
             content_json: blocks.clone(),
+            content: serde_json::to_string(&blocks).unwrap(),
             dedup_key: "replay-normal-dedup".into(),
+            revision: 1,
         };
         let (inner, milestone_rx) = test_inner_with_k_room_snapshot_and_replay_providers(
             || None,
@@ -14614,6 +18203,10 @@ mod tests {
         assert_eq!(item_generation, generation);
         assert_eq!(item.t, "msg.completed");
         assert_eq!(item.payload["blocks"], blocks);
+        // msgfix1 T3（M0 §10.6「可选字段」）：非超预算消息顶层不带 content_ref，内部
+        // ref-source 私有键也不得泄漏到 wire。
+        assert!(item.payload.get("content_ref").is_none());
+        assert!(item.payload.get(MSG_COMPLETED_REF_SOURCE_KEY).is_none());
         assert!(milestone_rx.try_recv().is_err());
         assert_eq!(
             inner.state.replay_oversized_dropped.load(Ordering::Relaxed),
@@ -14623,21 +18216,24 @@ mod tests {
 
     #[test]
     fn replay_batch_tool_output_truncation_makes_message_sendable() {
+        let content_json = serde_json::json!([{
+            "type": "tool",
+            "id": "tool-1",
+            "tool": "shell",
+            "summary": "ran",
+            "card": "command",
+            "status": "ok",
+            "exit_code": 0,
+            "output": "y".repeat(SNAPSHOT_SEND_BUDGET_BYTES + 1024),
+        }]);
         let replay_row = crate::db::MilestoneReplayRow {
             session_id: "replay-truncated-tool".into(),
             message_id: 44,
             role: "assistant".into(),
-            content_json: serde_json::json!([{
-                "type": "tool",
-                "id": "tool-1",
-                "tool": "shell",
-                "summary": "ran",
-                "card": "command",
-                "status": "ok",
-                "exit_code": 0,
-                "output": "y".repeat(SNAPSHOT_SEND_BUDGET_BYTES + 1024),
-            }]),
+            content_json: content_json.clone(),
+            content: serde_json::to_string(&content_json).unwrap(),
             dedup_key: "replay-truncated-tool-dedup".into(),
+            revision: 1,
         };
         let (inner, milestone_rx) = test_inner_with_k_room_snapshot_and_replay_providers(
             || None,
@@ -14652,9 +18248,13 @@ mod tests {
 
         let (_, item) = milestone_rx.try_recv().unwrap();
         assert_eq!(item.t, "msg.completed");
-        assert_eq!(
-            item.payload["blocks"][0]["output"].as_str().unwrap().len(),
-            OUTPUT_TRUNCATE_BYTES
+        let truncated_output = item.payload["blocks"][0]["output"].as_str().unwrap();
+        assert_eq!(truncated_output.len(), OUTPUT_TRUNCATE_BYTES);
+        // msgfix1 T7 B2：msg.completed 口截断必须带可见化标记——不能让远端读者以为内容天然
+        // 就在这里结束。
+        assert!(
+            truncated_output.ends_with(TOOL_OUTPUT_TRUNCATION_MARKER),
+            "截断的工具输出必须带 {TOOL_OUTPUT_TRUNCATION_MARKER:?} 标记"
         );
         assert!(milestone_frame_bytes(&item.t, &item.payload) <= SNAPSHOT_SEND_BUDGET_BYTES);
         assert_eq!(
@@ -14689,7 +18289,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].role, "user");
         let expected =
-            derive_msg_completed_client_msg_id("replay-user", "remote_input:cmd-replay-user");
+            derive_msg_completed_client_msg_id("replay-user", "remote_input:cmd-replay-user", 1);
         let (inner, milestone_rx) = test_inner_with_k_room_snapshot_and_replay_providers(
             || None,
             |_| Some(Zeroizing::new([1_u8; 32])),
@@ -14722,14 +18322,18 @@ mod tests {
                 message_id: 11,
                 role: "assistant".into(),
                 content_json: serde_json::json!([]),
+                content: "[]".into(),
                 dedup_key: "d1".into(),
+                revision: 1,
             },
             crate::db::MilestoneReplayRow {
                 session_id: "s2".into(),
                 message_id: 12,
                 role: "assistant".into(),
                 content_json: serde_json::json!([]),
+                content: "[]".into(),
                 dedup_key: "d2".into(),
+                revision: 1,
             },
         ];
         let (inner, milestone_rx) = test_inner_with_k_room_snapshot_and_replay_providers(
@@ -14763,18 +18367,21 @@ mod tests {
 
     #[test]
     fn milestone_replay_rebuilds_resolved_and_pending_decision_cards() {
+        let chosen_content_json = serde_json::json!([{
+            "type": "decision_card",
+            "decision_id": "dc-1",
+            "status": "chosen",
+            "chosen_option": "A",
+            "unknown_future_field": { "preserved": true }
+        }]);
         let chosen_row = crate::db::MilestoneReplayRow {
             session_id: "card-session".into(),
             message_id: 21,
             role: "assistant".into(),
-            content_json: serde_json::json!([{
-                "type": "decision_card",
-                "decision_id": "dc-1",
-                "status": "chosen",
-                "chosen_option": "A",
-                "unknown_future_field": { "preserved": true }
-            }]),
+            content_json: chosen_content_json.clone(),
+            content: serde_json::to_string(&chosen_content_json).unwrap(),
             dedup_key: "card-chosen".into(),
+            revision: 1,
         };
         let (inner, milestone_rx) = test_inner_with_k_room_snapshot_and_replay_providers(
             || None,
@@ -14808,17 +18415,20 @@ mod tests {
         );
         assert_eq!(resolved.payload["chosen_option"], "A");
 
+        let pending_content_json = serde_json::json!([{
+            "type": "decision_card",
+            "decision_id": "dc-2",
+            "status": "pending",
+            "chosen_option": null
+        }]);
         let pending_row = crate::db::MilestoneReplayRow {
             session_id: "card-session".into(),
             message_id: 22,
             role: "assistant".into(),
-            content_json: serde_json::json!([{
-                "type": "decision_card",
-                "decision_id": "dc-2",
-                "status": "pending",
-                "chosen_option": null
-            }]),
+            content_json: pending_content_json.clone(),
+            content: serde_json::to_string(&pending_content_json).unwrap(),
             dedup_key: "card-pending".into(),
+            revision: 1,
         };
         let (pending_inner, pending_rx) = test_inner_with_k_room_snapshot_and_replay_providers(
             || None,
@@ -14895,7 +18505,9 @@ mod tests {
             message_id: 31,
             role: "assistant".into(),
             content_json: serde_json::json!([]),
+            content: "[]".into(),
             dedup_key: "d-runstatus-fail".into(),
+            revision: 1,
         };
         let (inner, milestone_rx) = test_inner_with_k_room_snapshot_and_replay_providers(
             || None,
@@ -15922,6 +19534,269 @@ mod tests {
         );
     }
 
+    // ---- 缺口⑥（msgfix2 U2）：team 多 lane——保 lead/latest 活跃 lane，member 终态不清 ----
+
+    #[test]
+    fn partial_snapshot_foreign_lane_terminal_does_not_clear_current_lane() {
+        use crate::agent_event::AgentEvent;
+
+        let state = GatewayInnerState::default();
+        state.advance_generation_and_set_gate(true);
+        let (upstream_tx, _upstream_rx) = mpsc::sync_channel(2);
+        let (milestone_tx, _milestone_rx) = mpsc::sync_channel(2);
+
+        // lead 的 run 先声明该 session 的 partial 槽位。
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            single_event_payload(
+                "run-lead",
+                "sess-team",
+                AgentEvent::TextDelta {
+                    text: "lead progress".to_owned(),
+                },
+            ),
+        );
+
+        // member lane（不同 run_id，同一 session_id）单独一条 batch 携带自己的终态事件。
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            crate::event_transport::BatchPayload {
+                batches: vec![crate::event_transport::RunBatch {
+                    session_id: "sess-team".to_owned(),
+                    run_id: "run-member".to_owned(),
+                    dispatch: None,
+                    events: vec![crate::event_transport::SequencedEvent {
+                        seq: 1,
+                        event: AgentEvent::Completed {
+                            cost_usd: None,
+                            input_tokens: None,
+                            output_tokens: None,
+                            final_text: None,
+                            result: None,
+                            run_id: None,
+                            commit_sha: None,
+                            files_changed: None,
+                            insertions: None,
+                            deletions: None,
+                            interrupted: None,
+                        },
+                    }],
+                }],
+            },
+        );
+
+        let snapshots = lock(&state.partial_snapshots);
+        let entry = snapshots
+            .get("sess-team")
+            .expect("member lane 的终态不属于当前占用槽位的 run——不得清掉 lead 的 partial 条目");
+        assert_eq!(
+            entry.run_id, "run-lead",
+            "槽位占用者必须仍是 lead，未被 member 的终态 batch 触碰"
+        );
+        assert_eq!(
+            entry.last_seq, 1,
+            "lead 的归约态不应被 member 的 batch 推进"
+        );
+        assert_eq!(
+            entry.reducer.snapshot_blocks(),
+            vec![crate::db::Block::Text {
+                text: "lead progress".to_owned()
+            }],
+            "lead 自己的归约内容必须原样保留，不被 member 的终态 batch 覆盖或清空"
+        );
+    }
+
+    #[test]
+    fn partial_snapshot_own_lane_terminal_still_clears_normally() {
+        use crate::agent_event::AgentEvent;
+
+        let state = GatewayInnerState::default();
+        state.advance_generation_and_set_gate(true);
+        let (upstream_tx, _upstream_rx) = mpsc::sync_channel(2);
+        let (milestone_tx, _milestone_rx) = mpsc::sync_channel(2);
+
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            single_event_payload(
+                "run-lead",
+                "sess-team-2",
+                AgentEvent::TextDelta {
+                    text: "lead progress".to_owned(),
+                },
+            ),
+        );
+        assert!(
+            lock(&state.partial_snapshots).contains_key("sess-team-2"),
+            "前置：lead 的非终态事件必须先建立 partial 条目"
+        );
+
+        // 同一个 run_id（lead 自己）的终态——必须正常清空，缺口⑥的收窄只保护"别的 lane"。
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            crate::event_transport::BatchPayload {
+                batches: vec![crate::event_transport::RunBatch {
+                    session_id: "sess-team-2".to_owned(),
+                    run_id: "run-lead".to_owned(),
+                    dispatch: None,
+                    events: vec![crate::event_transport::SequencedEvent {
+                        seq: 2,
+                        event: AgentEvent::RunCloseout {
+                            run_id: "run-lead".to_owned(),
+                            commit_sha: None,
+                            files_changed: None,
+                            insertions: None,
+                            deletions: None,
+                            interrupted: None,
+                        },
+                    }],
+                }],
+            },
+        );
+
+        assert!(
+            !lock(&state.partial_snapshots).contains_key("sess-team-2"),
+            "lead 自身的终态必须正常清掉该 session 的 partial 条目"
+        );
+    }
+
+    #[test]
+    fn partial_snapshot_member_lane_streaming_batch_does_not_seize_or_wipe_lead_slot() {
+        use crate::agent_event::AgentEvent;
+
+        // R3（缺口⑥扩展·msgfix2 整盘审 P1）：完整轨迹——lead 事件先占住槽位 → member lane
+        // 的非终态（流式）事件穿插到达（裸 run_id 是复合 lane id，跟占用者不同，但
+        // `dispatch.run_id` 折回 lead 的真实 run_id）→ member lane 自己的终态紧随其后。修复
+        // 前：member 的流式事件命中旧 `needs_rebuild`（只比较裸 run_id）、把整个槽位重建成
+        // member 自己的归约态，lead 的内容当场丢失；member 终态随后到达时，占用者已经变成
+        // member 自己（裸 run_id 相等），缺口⑥那道"occupant != batch.run_id"终态守卫反而
+        // 不成立，正常清空——两步绕开同一道防线。修复后：member 的流式 + 终态 batch 全部对
+        // lead 的槽位完全不生效，lead 的归约态必须原样在。
+        let state = GatewayInnerState::default();
+        state.advance_generation_and_set_gate(true);
+        let (upstream_tx, _upstream_rx) = mpsc::sync_channel(4);
+        let (milestone_tx, _milestone_rx) = mpsc::sync_channel(4);
+
+        // ① lead 事件先占住 sess-team-3 的槽位。
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            single_event_payload(
+                "run-lead",
+                "sess-team-3",
+                AgentEvent::TextDelta {
+                    text: "lead progress".to_owned(),
+                },
+            ),
+        );
+
+        // ② member lane 的非终态流式事件穿插——裸 run_id 是复合 lane id，`dispatch.run_id`
+        // 折回 lead 的真实 run_id。
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            crate::event_transport::BatchPayload {
+                batches: vec![crate::event_transport::RunBatch {
+                    session_id: "sess-team-3".to_owned(),
+                    run_id: "member:run-lead:assignment-1".to_owned(),
+                    dispatch: Some(crate::agent_event::DispatchMeta {
+                        run_id: Some("run-lead".to_owned()),
+                        assignment_id: Some("assignment-1".to_owned()),
+                        ..Default::default()
+                    }),
+                    events: vec![crate::event_transport::SequencedEvent {
+                        seq: 1,
+                        event: AgentEvent::TextDelta {
+                            text: "member progress should not appear".to_owned(),
+                        },
+                    }],
+                }],
+            },
+        );
+
+        {
+            let snapshots = lock(&state.partial_snapshots);
+            let entry = snapshots
+                .get("sess-team-3")
+                .expect("member lane 的流式事件不得清掉/重建占用者的槽位");
+            assert_eq!(
+                entry.run_id, "run-lead",
+                "槽位占用者必须仍是 lead，未被 member 的流式 batch 顶替"
+            );
+            assert_eq!(
+                entry.last_seq, 1,
+                "lead 的归约态水位不应被 member 的流式 batch 推进"
+            );
+            assert_eq!(
+                entry.reducer.snapshot_blocks(),
+                vec![crate::db::Block::Text {
+                    text: "lead progress".to_owned()
+                }],
+                "lead 自己的归约内容必须原样保留，不被 member 的流式事件混入/覆盖"
+            );
+        }
+
+        // ③ member lane 自己的终态紧随其后——同一条子 lane，同样不得触碰占用者。
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            crate::event_transport::BatchPayload {
+                batches: vec![crate::event_transport::RunBatch {
+                    session_id: "sess-team-3".to_owned(),
+                    run_id: "member:run-lead:assignment-1".to_owned(),
+                    dispatch: Some(crate::agent_event::DispatchMeta {
+                        run_id: Some("run-lead".to_owned()),
+                        assignment_id: Some("assignment-1".to_owned()),
+                        ..Default::default()
+                    }),
+                    events: vec![crate::event_transport::SequencedEvent {
+                        seq: 2,
+                        event: AgentEvent::Completed {
+                            cost_usd: None,
+                            input_tokens: None,
+                            output_tokens: None,
+                            final_text: None,
+                            result: None,
+                            run_id: None,
+                            commit_sha: None,
+                            files_changed: None,
+                            insertions: None,
+                            deletions: None,
+                            interrupted: None,
+                        },
+                    }],
+                }],
+            },
+        );
+
+        let snapshots = lock(&state.partial_snapshots);
+        let entry = snapshots
+            .get("sess-team-3")
+            .expect("member lane 自己的终态也不得清掉占用者的槽位");
+        assert_eq!(entry.run_id, "run-lead");
+        assert_eq!(
+            entry.last_seq, 1,
+            "lead 的水位不应被 member 的终态 batch 推进"
+        );
+        assert_eq!(
+            entry.reducer.snapshot_blocks(),
+            vec![crate::db::Block::Text {
+                text: "lead progress".to_owned()
+            }],
+            "member 终态 batch 之后，lead partial 内容必须原样在"
+        );
+    }
+
     // P0-b 返工①【阻断修复】：gate 关闭（桌面断连）期间归约态必须照常推进/清理——这是修复
     // 项①的核心回归测试；把 `maintain_partial_snapshots` 挪回 gate 判断之后会让这条测试变红
     // （变异自证，见任务书硬约束）。
@@ -16027,6 +19902,111 @@ mod tests {
             lock(&state.partial_snapshots).contains_key("sess-after-reconnect"),
             "重连开 gate 后归约态维护必须继续正常工作"
         );
+    }
+
+    #[test]
+    fn extract_tool_milestones_runs_even_when_upstream_gate_is_closed_and_can_seal_terminal() {
+        // R4（msgfix2 整盘审 P1）：`extract_tool_milestones`（L1 聚合器 delta 唯一产地）挪到
+        // gate 判断之前，与 `maintain_partial_snapshots_runs_even_when_upstream_gate_is_closed`
+        // 同一姿势的回归测试——旧实现把整个函数挂在 gate 判断之后，手机没连（gate 关闭）期间
+        // `ToolCompleted`/`Completed` 之类事件从未走到这里，聚合器永远拿不到计数/终态信号，
+        // 活动摘要永久卡在 running。本测试锁：gate 关闭期间 ToolCompleted 仍产计数 delta、
+        // Completed 仍产 Terminal delta 并成功封口——不依赖任何上行连接。
+        let state = GatewayInnerState::default();
+        assert!(
+            !state.upstream_enabled_snapshot(),
+            "前置：GatewayInnerState::default() 的 gate 必须是关闭的"
+        );
+        let (tx, rx) = mpsc::sync_channel::<ActivitySummaryDelta>(8);
+        configure_activity_summary_writer_test_hook(&state, tx);
+        let (upstream_tx, _upstream_rx) = mpsc::sync_channel(4);
+        let (milestone_tx, _milestone_rx) = mpsc::sync_channel(4);
+
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            crate::event_transport::BatchPayload {
+                batches: vec![crate::event_transport::RunBatch {
+                    session_id: "sess-gate-closed".to_owned(),
+                    run_id: "run-gate-closed".to_owned(),
+                    dispatch: None,
+                    events: vec![crate::event_transport::SequencedEvent {
+                        seq: 1,
+                        event: crate::agent_event::AgentEvent::ToolStarted {
+                            id: "tool-1".to_owned(),
+                            tool: "shell".to_owned(),
+                            summary: "run command".to_owned(),
+                            card: crate::agent_event::CardKind::Command,
+                        },
+                    }],
+                }],
+            },
+        );
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            crate::event_transport::BatchPayload {
+                batches: vec![crate::event_transport::RunBatch {
+                    session_id: "sess-gate-closed".to_owned(),
+                    run_id: "run-gate-closed".to_owned(),
+                    dispatch: None,
+                    events: vec![crate::event_transport::SequencedEvent {
+                        seq: 2,
+                        event: crate::agent_event::AgentEvent::ToolCompleted {
+                            id: "tool-1".to_owned(),
+                            status: crate::agent_event::ToolStatus::Ok,
+                            exit_code: Some(0),
+                            output: None,
+                        },
+                    }],
+                }],
+            },
+        );
+        let counted = rx
+            .try_recv()
+            .expect("gate 关闭也必须产出 ToolCompleted 计数 delta——聚合器不该被上行连接门控");
+        assert!(matches!(
+            counted.kind,
+            ActivitySummaryDeltaKind::ToolCompleted { .. }
+        ));
+
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            crate::event_transport::BatchPayload {
+                batches: vec![crate::event_transport::RunBatch {
+                    session_id: "sess-gate-closed".to_owned(),
+                    run_id: "run-gate-closed".to_owned(),
+                    dispatch: None,
+                    events: vec![crate::event_transport::SequencedEvent {
+                        seq: 3,
+                        event: crate::agent_event::AgentEvent::Completed {
+                            cost_usd: None,
+                            input_tokens: None,
+                            output_tokens: None,
+                            final_text: None,
+                            result: None,
+                            run_id: None,
+                            commit_sha: None,
+                            files_changed: None,
+                            insertions: None,
+                            deletions: None,
+                            interrupted: None,
+                        },
+                    }],
+                }],
+            },
+        );
+        let terminal = rx
+            .try_recv()
+            .expect("gate 关闭也必须产出 Terminal delta——不能永久卡在 running");
+        assert!(matches!(
+            terminal.kind,
+            ActivitySummaryDeltaKind::Terminal { failed: false }
+        ));
     }
 
     #[test]
@@ -16883,6 +20863,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: test_session_repo_provider(),
             session_history_provider: test_session_history_provider(),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -16945,6 +20926,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: test_session_repo_provider(),
             session_history_provider: test_session_history_provider(),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -16992,6 +20974,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: test_session_repo_provider(),
             session_history_provider: test_session_history_provider(),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -17062,6 +21045,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: test_session_repo_provider_allowing_default_repo(),
             session_history_provider: test_session_history_provider(),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -17123,6 +21107,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: test_session_repo_provider(),
             session_history_provider: test_session_history_provider(),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -17172,6 +21157,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: test_session_repo_provider(),
             session_history_provider: test_session_history_provider(),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -17225,6 +21211,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: test_session_repo_provider(),
             session_history_provider: test_session_history_provider(),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -17266,6 +21253,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: test_session_repo_provider(),
             session_history_provider: test_session_history_provider(),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -17317,6 +21305,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: test_session_repo_provider_allowing_default_repo(),
             session_history_provider: test_session_history_provider(),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -17359,6 +21348,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: test_session_repo_provider_allowing_default_repo(),
             session_history_provider: test_session_history_provider(),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -17406,6 +21396,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: Box::new(session_repo_provider),
             session_history_provider: test_session_history_provider(),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -17453,6 +21444,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: Box::new(session_repo_provider),
             session_history_provider: test_session_history_provider(),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -17495,6 +21487,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: test_session_repo_provider(),
             session_history_provider: test_session_history_provider(),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -17541,6 +21534,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: test_session_repo_provider_allowing_default_repo(),
             session_history_provider: test_session_history_provider(),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -17589,6 +21583,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: Box::new(session_repo_provider),
             session_history_provider: Box::new(session_history_provider),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -17600,6 +21595,56 @@ mod tests {
             Some(TEST_DEFAULT_ACTIVE_REPO_ID.to_owned());
         inner.state.advance_generation_and_set_gate(true);
         (inner, upstream_rx)
+    }
+
+    /// msgfix1 T4：`handle_msg_fetch`/`handle_msg_fetch_at` 测试专用——`message_fetch_provider`
+    /// 可控，session 归属恒放行到 `TEST_DEFAULT_ACTIVE_REPO_ID`（同 `with_default_active_repo`
+    /// 既有姿势）。返回值带真实 `upstream_rx`/`milestone_rx`（虽然 msg.fetch 走的是
+    /// `reply_queue`、不经这两条队列，但保持跟其它 `test_inner_for_*` 同一返回形状，调用方不
+    /// 需要就直接 `_` 丢弃）。
+    fn test_inner_for_msg_fetch(
+        message_fetch_provider: impl Fn(&str, i64) -> Result<MessageForFetchResult, String>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Arc<Inner> {
+        let (upstream_tx, _upstream_rx) = mpsc::sync_channel(4);
+        let (milestone_tx, _milestone_rx) = mpsc::sync_channel(4);
+        let inner = Arc::new(Inner {
+            settings: Box::new(|_| None),
+            token_provider: Box::new(|| None),
+            desktop_credential_provider: test_desktop_credential_provider(),
+            claim_client: test_claim_client(),
+            active_device_provider: test_active_device_provider(),
+            active_room_resolver: test_active_room_resolver(),
+            k_room_provider: Box::new(|_| None),
+            session_index_snapshot_provider: Box::new(|| None),
+            milestone_replay_provider: Box::new(|| None),
+            session_runtime_replay_provider: Box::new(|| None),
+            pair_hello_handler: Box::new(|_| None),
+            pair_done_handler: Box::new(|_| PairDoneAction::Rejected),
+            registry: test_registry(),
+            refresh_handler: test_refresh_handler(),
+            registry_snapshot_provider: test_registry_snapshot_provider(),
+            registry_rebase_provider: test_registry_rebase_provider(),
+            registry_high_water_provider: test_registry_high_water_provider(),
+            input_send_handler: Box::new(|_| Some(AckOutcome::Failed)),
+            input_answer_handler: Box::new(|_| Some(AckOutcome::Failed)),
+            control_replay_handler: Box::new(|_, _| true),
+            control_stop_handler: Box::new(|_| AckOutcome::Failed),
+            upstream_tx,
+            milestone_tx,
+            session_repo_provider: test_session_repo_provider_allowing_default_repo(),
+            session_history_provider: test_session_history_provider(),
+            message_fetch_provider: Box::new(message_fetch_provider),
+            state: GatewayInnerState::default(),
+            shutdown: AtomicBool::new(false),
+            reload_requested: AtomicBool::new(false),
+            registry_publish_wake: AtomicBool::new(false),
+            active_token: Mutex::new(None),
+            liveness_interval: DEFAULT_LIVENESS_INTERVAL,
+        });
+        with_default_active_repo(inner)
     }
 
     fn test_inner_with_k_room_snapshot_and_replay_providers(
@@ -17643,6 +21688,7 @@ mod tests {
             milestone_tx,
             session_repo_provider: test_session_repo_provider(),
             session_history_provider: test_session_history_provider(),
+            message_fetch_provider: test_message_fetch_provider(),
             state: GatewayInnerState::default(),
             shutdown: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
@@ -19268,10 +23314,22 @@ mod tests {
     }
 
     fn history_row(message_id: i64, role: &str, text: String) -> SessionHistoryRow {
+        history_row_with_revision(message_id, role, text, 1)
+    }
+
+    fn history_row_with_revision(
+        message_id: i64,
+        role: &str,
+        text: String,
+        revision: i64,
+    ) -> SessionHistoryRow {
+        let content_json = serde_json::json!([{"type": "text", "text": text}]);
         SessionHistoryRow {
+            content_raw: serde_json::to_string(&content_json).unwrap(),
             message_id,
             role: role.to_owned(),
-            content_json: serde_json::json!([{"type": "text", "text": text}]),
+            content_json,
+            revision,
         }
     }
 
@@ -19322,44 +23380,78 @@ mod tests {
 
     #[test]
     fn history_tool_output_uses_existing_truncation_limit_without_rewriting_other_blocks() {
+        let content_json = serde_json::json!([
+            {"type": "text", "text": "keep verbatim"},
+            {
+                "type": "tool",
+                "id": "tool-1",
+                "tool": "shell",
+                "summary": "ran",
+                "card": "command",
+                "status": "ok",
+                "exit_code": 0,
+                "output": "x".repeat(OUTPUT_TRUNCATE_BYTES + 17),
+            }
+        ]);
         let page = build_history_page(
             "history-tool",
             None,
             vec![SessionHistoryRow {
                 message_id: 7,
                 role: "assistant".to_owned(),
-                content_json: serde_json::json!([
-                    {"type": "text", "text": "keep verbatim"},
-                    {
-                        "type": "tool",
-                        "id": "tool-1",
-                        "tool": "shell",
-                        "summary": "ran",
-                        "card": "command",
-                        "status": "ok",
-                        "exit_code": 0,
-                        "output": "x".repeat(OUTPUT_TRUNCATE_BYTES + 17),
-                    }
-                ]),
+                content_raw: serde_json::to_string(&content_json).unwrap(),
+                content_json,
+                revision: 1,
             }],
         );
         assert_eq!(
             page.payload["messages"][0]["blocks"][0]["text"],
             "keep verbatim"
         );
-        assert_eq!(
-            page.payload["messages"][0]["blocks"][1]["output"]
-                .as_str()
-                .unwrap()
-                .len(),
-            OUTPUT_TRUNCATE_BYTES
+        let truncated_output = page.payload["messages"][0]["blocks"][1]["output"]
+            .as_str()
+            .unwrap();
+        assert_eq!(truncated_output.len(), OUTPUT_TRUNCATE_BYTES);
+        // msgfix1 T7 B2：history 口截断同样必须带可见化标记（与 msg.completed 口共用
+        // truncate_history_tool_outputs/truncate_utf8_with_marker，两口同一份行为）。
+        assert!(
+            truncated_output.ends_with(TOOL_OUTPUT_TRUNCATION_MARKER),
+            "截断的工具输出必须带 {TOOL_OUTPUT_TRUNCATION_MARKER:?} 标记"
         );
     }
 
     #[test]
-    fn history_oversized_single_message_is_dropped_counted_and_acknowledged() {
+    fn truncate_history_tool_outputs_leaves_short_output_untouched_without_marker() {
+        // msgfix1 T7 B2：未真正发生截断时不该附加标记——短输出原样透传。
+        let content_json = serde_json::json!([{
+            "type": "tool",
+            "id": "tool-1",
+            "tool": "shell",
+            "summary": "ran",
+            "card": "command",
+            "status": "ok",
+            "exit_code": 0,
+            "output": "short output, well under the cap",
+        }]);
+        let result = truncate_history_tool_outputs(content_json);
+        assert_eq!(result[0]["output"], "short output, well under the cap");
+        assert!(
+            !result[0]["output"]
+                .as_str()
+                .unwrap()
+                .contains(TOOL_OUTPUT_TRUNCATION_MARKER),
+            "未截断的输出不该带截断标记"
+        );
+    }
+
+    #[test]
+    fn history_oversized_single_message_is_downgraded_to_preview_and_acknowledged() {
         let provider_calls = Arc::new(AtomicU64::new(0));
         let calls = Arc::clone(&provider_calls);
+        let oversized_text = "z".repeat(HISTORY_SEND_BUDGET_BYTES + 1024);
+        let expected_content_raw =
+            serde_json::to_string(&serde_json::json!([{"type": "text", "text": &oversized_text}]))
+                .unwrap();
         let (inner, upstream_rx) = test_inner_for_history(
             |_| Ok(Some(TEST_DEFAULT_ACTIVE_REPO_ID.to_owned())),
             move |session, before, max_rows| {
@@ -19367,10 +23459,11 @@ mod tests {
                 assert_eq!(before, None);
                 assert_eq!(max_rows, (HISTORY_PAGE_MAX_ROWS + 1) as i64);
                 calls.fetch_add(1, Ordering::Relaxed);
-                Ok(vec![history_row(
+                Ok(vec![history_row_with_revision(
                     9,
                     "assistant",
-                    "z".repeat(HISTORY_SEND_BUDGET_BYTES + 1024),
+                    oversized_text.clone(),
+                    4,
                 )])
             },
         );
@@ -19389,6 +23482,8 @@ mod tests {
             }),
         );
 
+        // msgfix1 T3（设计稿 §A）：超预算的单条 history 消息不再让页面变空——降级为
+        // preview + content_ref，`history_oversized_dropped` 计数语义改为"降级次数"。
         assert_eq!(
             handle_command_envelope(&inner, &envelope, Some(&k_room)),
             Some(input_ack_json("cmd-history-oversized", AckOutcome::Ok))
@@ -19407,7 +23502,28 @@ mod tests {
         };
         assert_eq!(item.session.as_deref(), Some("history-oversized"));
         assert_eq!(item.t, "history");
-        assert_eq!(item.payload["messages"], serde_json::json!([]));
+        let messages = item.payload["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "oversized row must survive as a preview");
+        assert_eq!(messages[0]["message_id"], 9);
+        assert!(messages[0]["blocks"][0]["text"]
+            .as_str()
+            .unwrap()
+            .ends_with(OVERSIZED_PREVIEW_TRUNCATION_NOTICE));
+        let content_ref = &messages[0]["content_ref"];
+        assert_eq!(content_ref["message_id"], 9);
+        assert_eq!(content_ref["revision"], 4);
+        assert_eq!(
+            content_ref["total_bytes"],
+            expected_content_raw.len() as u64
+        );
+        assert_eq!(
+            content_ref["content_sha256"],
+            sha256_hex_lower(expected_content_raw.as_bytes())
+        );
+        assert!(
+            serde_json::to_vec(&item.payload).unwrap().len() <= HISTORY_SEND_BUDGET_BYTES,
+            "downgraded page must itself pass the budget"
+        );
         assert_eq!(item.payload["next_before"], Value::Null);
         assert_eq!(
             item.client_msg_id,
@@ -19415,34 +23531,32 @@ mod tests {
         );
     }
 
+    /// msgfix1 T3（设计稿 §A）：一整窗全部由超限消息组成——旧行为是整页变空、逼着命令臂
+    /// 循环推进游标去够更老的一条可读消息（该机制的旧版本见本文件历史）；新行为是每一条都
+    /// 降级为 preview + content_ref，一页足以同时带回全部，不再需要多次查询。
     #[test]
-    fn history_full_oversized_window_advances_until_an_older_message_is_reachable() {
+    fn history_full_oversized_window_downgrades_every_row_to_preview_in_one_page() {
+        const OVERSIZED_ROW_COUNT: i64 = 5;
         let provider_calls = Arc::new(AtomicU64::new(0));
         let calls = Arc::clone(&provider_calls);
         let (inner, upstream_rx) = test_inner_for_history(
             |_| Ok(Some(TEST_DEFAULT_ACTIVE_REPO_ID.to_owned())),
             move |session, before, max_rows| {
                 assert_eq!(session, "history-many-oversized");
+                assert_eq!(before, None);
                 assert_eq!(max_rows, (HISTORY_PAGE_MAX_ROWS + 1) as i64);
                 calls.fetch_add(1, Ordering::Relaxed);
-                match before {
-                    None => {
-                        let mut rows: Vec<_> = (2..=51)
-                            .rev()
-                            .map(|id| {
-                                history_row(
-                                    id,
-                                    "assistant",
-                                    "z".repeat(HISTORY_SEND_BUDGET_BYTES + 1024),
-                                )
-                            })
-                            .collect();
-                        rows.push(history_row(1, "user", "reachable".to_owned()));
-                        Ok(rows)
-                    }
-                    Some(2) => Ok(vec![history_row(1, "user", "reachable".to_owned())]),
-                    other => panic!("unexpected internal history cursor: {other:?}"),
-                }
+                Ok((1..=OVERSIZED_ROW_COUNT)
+                    .rev()
+                    .map(|id| {
+                        history_row_with_revision(
+                            id,
+                            "assistant",
+                            "z".repeat(HISTORY_SEND_BUDGET_BYTES + 1024),
+                            id, // revision 与 message_id 同值，仅用于逐条核对没有串号。
+                        )
+                    })
+                    .collect())
             },
         );
         let k_room = Zeroizing::new([21_u8; 32]);
@@ -19464,25 +23578,76 @@ mod tests {
             handle_command_envelope(&inner, &envelope, Some(&k_room)),
             Some(input_ack_json("cmd-history-many-oversized", AckOutcome::Ok))
         );
-        assert_eq!(provider_calls.load(Ordering::Relaxed), 2);
+        // 一页已经把全部消息以 preview 形式带回，命令臂不需要再推进游标查下一窗。
+        assert_eq!(provider_calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             inner
                 .state
                 .history_oversized_dropped
                 .load(Ordering::Relaxed),
-            HISTORY_PAGE_MAX_ROWS as u64
+            OVERSIZED_ROW_COUNT as u64
         );
         let (_, LiveQueueItem::Prebuilt(item)) = upstream_rx.try_recv().unwrap() else {
             panic!("history response must use the prebuilt live queue path");
         };
         assert_eq!(item.payload["before_message_id"], Value::Null);
-        assert_eq!(item.payload["messages"].as_array().unwrap().len(), 1);
-        assert_eq!(item.payload["messages"][0]["message_id"], 1);
-        assert_eq!(
-            item.payload["messages"][0]["blocks"][0]["text"],
-            "reachable"
+        let messages = item.payload["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), OVERSIZED_ROW_COUNT as usize);
+        for (index, message) in messages.iter().enumerate() {
+            // wire 输出按 message_id 升序。
+            let expected_id = (index as i64) + 1;
+            assert_eq!(message["message_id"], expected_id);
+            assert!(message["blocks"][0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with(OVERSIZED_PREVIEW_TRUNCATION_NOTICE));
+            assert_eq!(message["content_ref"]["message_id"], expected_id);
+            assert_eq!(message["content_ref"]["revision"], expected_id);
+        }
+        assert!(
+            serde_json::to_vec(&item.payload).unwrap().len() <= HISTORY_SEND_BUDGET_BYTES,
+            "downgraded page must itself pass the budget"
         );
         assert_eq!(item.payload["next_before"], Value::Null);
+    }
+
+    /// msgfix1 T3（缺口①·M0 §10.9 同一姿势）：`control.history` 入队目标队列满时，此前会
+    /// 无条件回 `AckOutcome::Ok`（客户端以为帧已在路上，实际从未入队、永不会到达）。现在必须
+    /// 如实回 `Failed`，让客户端知道要重试。
+    #[test]
+    fn history_upstream_queue_full_returns_failed_ack_instead_of_fake_ok() {
+        let (inner, _upstream_rx) = test_inner_for_history(
+            |_| Ok(Some(TEST_DEFAULT_ACTIVE_REPO_ID.to_owned())),
+            |_, _, _| Ok(Vec::new()),
+        );
+        // `test_inner_for_history` 的 upstream_tx 容量固定为 4——先塞满，让随后 history
+        // 响应的 try_send 必然命中 `TrySendError::Full`。
+        for _ in 0..4 {
+            inner
+                .upstream_tx
+                .try_send((0, LiveQueueItem::Batch(text_delta_payload("filler"))))
+                .expect("filler sends must succeed before the queue is full");
+        }
+
+        let k_room = Zeroizing::new([23_u8; 32]);
+        let envelope = seal_command_envelope(
+            &k_room,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            0,
+            "control",
+            "history-queue-full",
+            "cmd-history-queue-full",
+            &serde_json::json!({
+                "t": "control.history",
+                "session": "history-queue-full",
+                "before_message_id": Value::Null,
+            }),
+        );
+
+        assert_eq!(
+            handle_command_envelope(&inner, &envelope, Some(&k_room)),
+            Some(input_ack_json("cmd-history-queue-full", AckOutcome::Failed))
+        );
     }
 
     #[test]
@@ -19857,13 +24022,120 @@ mod tests {
         ];
         let blocks_json = serde_json::to_value(&blocks).expect("blocks must serialize");
         // 显示当前 agent（MA1）：样张的 assistant case 带 "agent": "Claude"（Some 分支）。
+        // msgfix1 T3：revision/content_raw 只喂给内部私有 ref-source 键（供超预算降级消费），
+        // 正常大小消息的 wire 形状不受影响——比对前先剥掉它，同生产路径入队前必经的一步。
         let payload = milestone_payload(
             "msg.completed",
-            build_msg_completed_payload(101, "assistant", blocks_json, Some("Claude")),
+            strip_ref_source(build_msg_completed_payload(
+                101,
+                "assistant",
+                blocks_json,
+                Some("Claude"),
+                1,
+                "raw-content-not-part-of-fixture-shape",
+            )),
         );
         assert_eq!(
             payload,
             data_plane_v1_case(&fixture, "msg_completed")["frame"]
+        );
+    }
+
+    #[test]
+    fn data_plane_v1_activity_summary_matches_fixture_and_drives_upsert() {
+        // msgfix2 U1（M0 §10.11）：activity_summary 首发（revision=1）与改写重发（revision=2）
+        // 两张样张，驱动真实生产路径 db::upsert_activity_summary_and_publish 产出、经
+        // build_msg_completed_payload 序列化的 wire 形状——不是手打 JSON 自证。
+        let fixture = load_data_plane_v1_fixture();
+        let c = crate::test_support::mem_db();
+        crate::db::create_session(&c, "s-dp1-activity", "x", "local-default", "local").unwrap();
+
+        // 样张的 message_id（501）是自包含 illustrative 常量，与 DB 真实自增 id 无关——同
+        // data_plane_v1_msg_completed_matches_fixture_and_drives_builder 既有惯例（那个测试
+        // 也是给 build_msg_completed_payload 传字面量 101，不读任何真实 DB id）。这里既要证明
+        // "db::upsert_activity_summary_and_publish 产出的 content/revision 是对的"，也要证明
+        // "build_msg_completed_payload 拿着这份 content 包出来的 wire 形状与样张一致"——两件事
+        // 分别验证：content/revision 直接读 DB 断言；wire 形状用样张同款字面量 message_id 驱动
+        // 同一个生产 builder。
+        crate::remote_gateway::test_take_publish_log();
+        crate::db::upsert_activity_summary_and_publish(
+            &c,
+            "s-dp1-activity",
+            "run-9",
+            3,
+            0,
+            1,
+            0,
+            "running",
+        )
+        .unwrap();
+        let (revision, content_raw): (i64, String) = c
+            .query_row(
+                "SELECT revision, content FROM messages WHERE session_id = ?1",
+                ["s-dp1-activity"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(revision, 1);
+        let blocks_json: Value = serde_json::from_str(&content_raw).unwrap();
+        let first_send_payload = milestone_payload(
+            "msg.completed",
+            strip_ref_source(build_msg_completed_payload(
+                501,
+                "assistant",
+                blocks_json,
+                None,
+                revision,
+                &content_raw,
+            )),
+        );
+        assert_eq!(
+            first_send_payload,
+            data_plane_v1_case(&fixture, "activity_summary_first_send")["frame"]
+        );
+
+        crate::db::upsert_activity_summary_and_publish(
+            &c,
+            "s-dp1-activity",
+            "run-9",
+            5,
+            1,
+            1,
+            1,
+            "done",
+        )
+        .unwrap();
+        let row_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                ["s-dp1-activity"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1, "同一条消息原地改写，不是新插一条");
+        let (revision_2, content_raw_2): (i64, String) = c
+            .query_row(
+                "SELECT revision, content FROM messages WHERE session_id = ?1",
+                ["s-dp1-activity"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(revision_2, 2);
+        let blocks_json_2: Value = serde_json::from_str(&content_raw_2).unwrap();
+        let revision_update_payload = milestone_payload(
+            "msg.completed",
+            strip_ref_source(build_msg_completed_payload(
+                501,
+                "assistant",
+                blocks_json_2,
+                None,
+                revision_2,
+                &content_raw_2,
+            )),
+        );
+        assert_eq!(
+            revision_update_payload,
+            data_plane_v1_case(&fixture, "activity_summary_revision_update")["frame"]
         );
     }
 
@@ -19962,6 +24234,1784 @@ mod tests {
             milestone_payload(&item.t, item.payload.clone()),
             data_plane_v1_case(&fixture, "tool_completed")["frame"]
         );
+    }
+
+    // ========================================================================================
+    // msgfix2 U1（设计稿 v4.1 §4.1）：L1 活动摘要聚合器。
+    // ========================================================================================
+
+    #[test]
+    fn activity_summary_logical_run_id_uses_dispatch_run_id_when_present_else_batch_run_id() {
+        // member lane：RunBatch.run_id 是传输层复合 lane id，dispatch.run_id 才是真正的逻辑
+        // （lead）run。
+        let member_batch = crate::event_transport::RunBatch {
+            session_id: "s".to_owned(),
+            run_id: "member:lead-run-1:assignment-1".to_owned(),
+            dispatch: Some(crate::agent_event::DispatchMeta {
+                run_id: Some("lead-run-1".to_owned()),
+                ..Default::default()
+            }),
+            events: vec![],
+        };
+        assert_eq!(activity_summary_logical_run_id(&member_batch), "lead-run-1");
+
+        // lead/solo 自己的 lane：不带 dispatch，batch.run_id 本身就是真实 run_id。
+        let lead_batch = crate::event_transport::RunBatch {
+            session_id: "s".to_owned(),
+            run_id: "lead-run-1".to_owned(),
+            dispatch: None,
+            events: vec![],
+        };
+        assert_eq!(activity_summary_logical_run_id(&lead_batch), "lead-run-1");
+    }
+
+    #[test]
+    fn apply_activity_summary_delta_accumulates_counts_and_flags_dirty_without_flushing() {
+        let mut state = ActivitySummaryAggregatorState::default();
+        let flush = apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::ToolCompleted {
+                    mcp: true,
+                    failed: false,
+                },
+            },
+        );
+        assert_eq!(flush, None, "非终态 delta 本身不触发立即写——节流留给 tick");
+        let entry = &state.runs["r1"];
+        assert_eq!(entry.counters.tool_calls, 1);
+        assert_eq!(entry.counters.mcp_calls, 1);
+        assert_eq!(entry.counters.failed, 0);
+        assert!(entry.dirty);
+        assert_eq!(entry.state, "running");
+
+        apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::ToolCompleted {
+                    mcp: false,
+                    failed: true,
+                },
+            },
+        );
+        apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::PermissionPrompt,
+            },
+        );
+        let entry = &state.runs["r1"];
+        assert_eq!(entry.counters.tool_calls, 2);
+        assert_eq!(entry.counters.failed, 1);
+        assert_eq!(entry.counters.mcp_calls, 1);
+        assert_eq!(entry.counters.permission_prompts, 1);
+    }
+
+    #[test]
+    fn apply_activity_summary_delta_terminal_seals_immediately_and_ignores_later_deltas() {
+        let mut state = ActivitySummaryAggregatorState::default();
+        apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::ToolCompleted {
+                    mcp: false,
+                    failed: false,
+                },
+            },
+        );
+
+        let flush = apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::Terminal { failed: false },
+            },
+        )
+        .expect("终态 delta 必须立即返回待写快照——设计稿「终态写取消/压过排队中的节流更新」");
+        assert_eq!(flush.state, "done");
+        assert_eq!(flush.counters.tool_calls, 1);
+        assert!(state.runs["r1"].sealed);
+        assert!(
+            !state.runs["r1"].dirty,
+            "终态写不受节流约束，落地即清 dirty"
+        );
+
+        // 终态置位后到达的 running 更新一律丢弃——不是"忽略并保留旧终态"这么简单，是根本不
+        // 再累积计数（防止一个 run 已经报告完结后又冒出的迟到事件把摘要悄悄改回"进行中"）。
+        let ignored = apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::ToolCompleted {
+                    mcp: false,
+                    failed: false,
+                },
+            },
+        );
+        assert_eq!(ignored, None);
+        assert_eq!(
+            state.runs["r1"].counters.tool_calls, 1,
+            "sealed 后的 delta 不得再累积计数"
+        );
+
+        // 重复终态（例如同一 run 两个不同来源都上报了终态事件）同样被忽略，不重复触发写。
+        let duplicate_terminal = apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::Terminal { failed: true },
+            },
+        );
+        assert_eq!(
+            duplicate_terminal, None,
+            "已 sealed 的终态不得被覆盖/重复触发"
+        );
+        assert_eq!(
+            state.runs["r1"].state, "done",
+            "state 不能被后来的重复终态改写"
+        );
+    }
+
+    #[test]
+    fn apply_activity_summary_delta_terminal_error_seals_failed() {
+        let mut state = ActivitySummaryAggregatorState::default();
+        apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::PermissionPrompt,
+            },
+        );
+        let flush = apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::Terminal { failed: true },
+            },
+        )
+        .unwrap();
+        assert_eq!(flush.state, "failed");
+    }
+
+    #[test]
+    fn apply_activity_summary_delta_terminal_for_unknown_run_is_noop() {
+        // msgfix2 U1 修单 F3 裁决（M0 远程控制协议 §10.11）：
+        // 一个从未见过任何 ToolCompleted/ApprovalRequested 的 run（零活动）直接收到
+        // 终态（例如零工具调用的极短 run）——这不是"该丢的实现细节"，是 M0 §10.11 条文本身
+        // 的契约：activity_summary 只在该 run 有 ≥1 条被计数活动时才创建，零活动 run 不产生
+        // 摘要 = 正确行为，不是丢失。旧条文措辞「每个逻辑 run 恰好一条」与本实现矛盾——裁决
+        // 已把条文改向「每个有活动的逻辑 run 至多/恰好一条·零活动 run 不产生」，这个测试锁的
+        // 是修正后的条文语义，不是待修的 bug。
+        let mut state = ActivitySummaryAggregatorState::default();
+        let flush = apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "never-seen".to_owned(),
+                kind: ActivitySummaryDeltaKind::Terminal { failed: false },
+            },
+        );
+        assert_eq!(flush, None, "零活动 run 终态必须是 no-op，不产生摘要");
+        assert!(state.runs.is_empty());
+    }
+
+    #[test]
+    fn activity_summary_zero_activity_run_no_summary_versus_active_run_must_seal_m0_10_11() {
+        // msgfix2 U1 修单 F3：把裁决锁成正反一对（M0 §10.11 措辞修正版）——
+        // 反向：零活动 run 终态 = 无摘要无报错；正向：有过 ≥1 条计数活动的 run 终态必须恰好
+        // 封口一次。两条断言合在同一个测试里，直接对应设计裁决原文的两半，避免以后有人只
+        // 改了实现的一半就让测试悄悄绿掉。
+        let mut state = ActivitySummaryAggregatorState::default();
+
+        let noop = apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "zero-activity-run".to_owned(),
+                kind: ActivitySummaryDeltaKind::Terminal { failed: false },
+            },
+        );
+        assert_eq!(noop, None, "零活动 run 终态必须是 no-op，不产生摘要");
+        assert!(!state.runs.contains_key("zero-activity-run"));
+
+        apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "active-run".to_owned(),
+                kind: ActivitySummaryDeltaKind::PermissionPrompt,
+            },
+        );
+        let sealed = apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "active-run".to_owned(),
+                kind: ActivitySummaryDeltaKind::Terminal { failed: false },
+            },
+        )
+        .expect("有过 ≥1 条计数活动的 run 终态必须恰好封口一次");
+        assert_eq!(sealed.state, "done");
+        assert!(state.runs["active-run"].sealed);
+    }
+
+    #[test]
+    fn activity_summary_due_flushes_respects_two_second_throttle_and_never_publishes_first_time() {
+        let mut state = ActivitySummaryAggregatorState::default();
+        apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::ToolCompleted {
+                    mcp: false,
+                    failed: false,
+                },
+            },
+        );
+
+        // 从未尝试过写（last_attempt_at_ms=None）——即便 now_ms=0，也立即算"到期"，不必等 2s。
+        let due = activity_summary_due_flushes(&state, 0);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].run_id, "r1");
+
+        // 模拟刚刚成功写过一次：last_flushed_at_ms/last_attempt_at_ms = 1_000，无连续失败。
+        state.runs.get_mut("r1").unwrap().last_flushed_at_ms = Some(1_000);
+        state.runs.get_mut("r1").unwrap().last_attempt_at_ms = Some(1_000);
+        state.runs.get_mut("r1").unwrap().dirty = false;
+        apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::ToolCompleted {
+                    mcp: false,
+                    failed: false,
+                },
+            },
+        );
+        assert!(state.runs["r1"].dirty);
+
+        // 距上次发布仅 1.5s——节流窗口未到，不该出现在待写批次里。
+        assert!(activity_summary_due_flushes(&state, 2_500).is_empty());
+        // 距上次发布恰好 2.0s——到期。
+        assert_eq!(activity_summary_due_flushes(&state, 3_000).len(), 1);
+
+        // 不 dirty 的 run 即便节流窗口已过，也不该被收进待写批次（没有变化，没什么可发的）。
+        state.runs.get_mut("r1").unwrap().dirty = false;
+        assert!(activity_summary_due_flushes(&state, 10_000).is_empty());
+    }
+
+    #[test]
+    fn activity_summary_due_flushes_excludes_sealed_runs_once_terminal_write_confirmed() {
+        // msgfix2 U1 修单三（G1）修正版：旧版本断言"sealed 就绝不进 tick 扫描"——这句话在
+        // 终态**已经成功落库**之后才成立；终态刚到达、尚未确认写成功（`terminal_pending`
+        // 仍是 true）的窗口期，sealed 的条目必须能被 tick 扫描收进重试批次（见下一个测试
+        // `activity_summary_due_flushes_includes_sealed_run_with_pending_terminal_write`），
+        // 否则就是独立审查 G1 抓到的那个"终态写失败永不重试"缺口。本测试只锁"写已确认成功
+        // 后"这一半：即便手动把 dirty 重新标脏，也绝不再进 tick 扫描——终态只该被写一次。
+        let mut state = ActivitySummaryAggregatorState::default();
+        apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::ToolCompleted {
+                    mcp: false,
+                    failed: false,
+                },
+            },
+        );
+        apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::Terminal { failed: false },
+            },
+        );
+        // 模拟"终态写已经确认成功"（真实场景下由 `flush_activity_summary` 清掉）。
+        state.runs.get_mut("r1").unwrap().terminal_pending = false;
+        // Terminal 分支已经把 dirty 清掉，但即便手动重新标脏，已确认写成功的 sealed run 也
+        // 绝不再进 tick 扫描——终态只该被写一次。
+        state.runs.get_mut("r1").unwrap().dirty = true;
+        assert!(activity_summary_due_flushes(&state, 999_999).is_empty());
+    }
+
+    #[test]
+    fn activity_summary_due_flushes_includes_sealed_run_with_pending_terminal_write() {
+        // msgfix2 U1 修单三（G1·独立审查 P1）：终态一到达就 sealed，但如果这次落库还没有
+        // 被确认成功（`terminal_pending` 仍是 true——例如 immediate attempt 刚失败过），
+        // tick 扫描必须仍然把它收进待写批次，否则该 run 永远停在"内存已 sealed、DB 仍是
+        // running"的状态，违反 M0「有活动 run 终态必封口恰好一次」。
+        let mut state = ActivitySummaryAggregatorState::default();
+        apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::ToolCompleted {
+                    mcp: false,
+                    failed: false,
+                },
+            },
+        );
+        apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::Terminal { failed: false },
+            },
+        );
+        assert!(state.runs["r1"].sealed);
+        assert!(
+            state.runs["r1"].terminal_pending,
+            "终态到达即置 pending，直到写成功才清"
+        );
+        let due = activity_summary_due_flushes(&state, 999_999);
+        assert_eq!(
+            due.len(),
+            1,
+            "sealed 但 terminal_pending 的条目必须被 tick 扫描收进重试批次"
+        );
+        assert_eq!(due[0].run_id, "r1");
+        assert_eq!(due[0].state, "done");
+    }
+
+    #[test]
+    fn activity_summary_due_flushes_backs_off_exponentially_after_repeated_failures_and_caps_at_30s(
+    ) {
+        // R6③（msgfix2 整盘审 P2 顺手）：旧实现只看 `last_flushed_at_ms`（只在成功时推进）——
+        // 一个从未成功过的条目（比如目标 DB 一直忙）该字段恒 `None`，`activity_summary_due_
+        // flushes` 的节流过滤 `last_flushed_at_ms.map_or(true, ..)` 让它每个 tick
+        // （`ACTIVITY_SUMMARY_TICK_MS`=250ms，4Hz）都判定"到期"，写线程对着注定失败的目标
+        // 原地空转重试。修复后退避窗口按 `ACTIVITY_SUMMARY_THROTTLE_MS * 2^consecutive_
+        // failures` 增长、以 `last_attempt_at_ms`（每次真正尝试写都推进，无论成败）为起点，
+        // 上限 `ACTIVITY_SUMMARY_MAX_BACKOFF_MS`（30s）。
+        let mut state = ActivitySummaryAggregatorState::default();
+        state.runs.insert(
+            "r1".to_owned(),
+            RunActivityEntry {
+                session_id: "s1".to_owned(),
+                counters: ActivityCounters::default(),
+                state: "running",
+                sealed: false,
+                terminal_pending: false,
+                dirty: true,
+                last_flushed_at_ms: None,
+                consecutive_failures: 3,
+                last_attempt_at_ms: Some(10_000),
+            },
+        );
+
+        // 第 3 次连续失败后的退避窗口 = 2000 * 2^3 = 16_000ms，起点 10_000。
+        assert!(
+            activity_summary_due_flushes(&state, 10_000 + 15_999)
+                .iter()
+                .all(|f| f.run_id != "r1"),
+            "退避窗口内（<16s）不该被再次收进待写批次"
+        );
+        assert_eq!(
+            activity_summary_due_flushes(&state, 10_000 + 16_000).len(),
+            1,
+            "退避窗口恰好到期必须重新被收进待写批次"
+        );
+
+        // 大量连续失败必须封顶在 ACTIVITY_SUMMARY_MAX_BACKOFF_MS（30s），不会因为失败次数
+        // 继续攀升就无限拉长下一次重试的等待时间。
+        state.runs.get_mut("r1").unwrap().consecutive_failures = 20;
+        state.runs.get_mut("r1").unwrap().last_attempt_at_ms = Some(10_000);
+        assert!(
+            activity_summary_due_flushes(&state, 10_000 + ACTIVITY_SUMMARY_MAX_BACKOFF_MS - 1)
+                .is_empty(),
+            "退避窗口封顶前一毫秒仍不该到期"
+        );
+        assert_eq!(
+            activity_summary_due_flushes(&state, 10_000 + ACTIVITY_SUMMARY_MAX_BACKOFF_MS).len(),
+            1,
+            "退避窗口必须封顶在 30s，不会因为失败次数继续无限增长"
+        );
+
+        // 从未失败过（consecutive_failures==0）仍沿用既有 2s 常规节流，不受本次改动影响。
+        state.runs.get_mut("r1").unwrap().consecutive_failures = 0;
+        state.runs.get_mut("r1").unwrap().last_attempt_at_ms = Some(10_000);
+        assert!(
+            activity_summary_due_flushes(&state, 10_000 + ACTIVITY_SUMMARY_THROTTLE_MS - 1)
+                .is_empty(),
+            "无失败时仍是 2s 常规节流，不该提前到期"
+        );
+        assert_eq!(
+            activity_summary_due_flushes(&state, 10_000 + ACTIVITY_SUMMARY_THROTTLE_MS).len(),
+            1,
+            "无失败时 2s 节流窗口到期必须正常收进待写批次"
+        );
+    }
+
+    #[test]
+    fn flush_activity_summary_success_clears_dirty_and_advances_throttle_clock_for_running() {
+        let mut state = ActivitySummaryAggregatorState::default();
+        state.runs.insert(
+            "r1".to_owned(),
+            RunActivityEntry {
+                session_id: "s1".to_owned(),
+                counters: ActivityCounters {
+                    tool_calls: 2,
+                    ..Default::default()
+                },
+                state: "running",
+                sealed: false,
+                terminal_pending: false,
+                dirty: true,
+                last_flushed_at_ms: None,
+                consecutive_failures: 2,
+                last_attempt_at_ms: Some(1_000),
+            },
+        );
+        let calls: Arc<Mutex<Vec<(String, String, i64, i64, i64, i64, String)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = Arc::clone(&calls);
+        let writer: ActivitySummaryWriter = Box::new(move |session, run, tc, f, mc, pp, st| {
+            calls_clone.lock().unwrap().push((
+                session.to_owned(),
+                run.to_owned(),
+                tc,
+                f,
+                mc,
+                pp,
+                st.to_owned(),
+            ));
+            Ok(())
+        });
+        let failures = AtomicU64::new(0);
+        let flush = ActivitySummaryFlush {
+            run_id: "r1".to_owned(),
+            session_id: "s1".to_owned(),
+            counters: ActivityCounters {
+                tool_calls: 2,
+                ..Default::default()
+            },
+            state: "running",
+        };
+        flush_activity_summary(&mut state, &writer, &failures, flush, 5_000);
+
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            calls.lock().unwrap()[0].2,
+            2,
+            "tool_calls 必须原样传给 writer"
+        );
+        let entry = &state.runs["r1"];
+        assert!(!entry.dirty, "写成功必须清 dirty");
+        assert!(entry.last_flushed_at_ms.is_some(), "写成功必须推进节流时钟");
+        assert_eq!(
+            entry.last_flushed_at_ms,
+            Some(5_000),
+            "推进的时钟必须是调用方传入的 now_ms，不是内部另取的系统时钟"
+        );
+        assert_eq!(
+            entry.last_attempt_at_ms,
+            Some(5_000),
+            "写成功也要推进 last_attempt_at_ms（R6③退避窗口的计时起点）"
+        );
+        assert_eq!(
+            entry.consecutive_failures, 0,
+            "写成功必须把此前累积的连续失败计数清零（R6③）——之前 2 次失败不该继续拖累退避"
+        );
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn flush_activity_summary_success_for_sealed_run_keeps_persistent_tombstone_and_blocks_late_running_delta(
+    ) {
+        // msgfix2 U1 修单 F2②：过去终态写成功后会把条目从内存表移除，导致「迟到 200ms 的
+        // running」在 `apply_activity_summary_delta` 里因为 entry 不存在而被 `or_insert_with`
+        // 重新造出一个未 sealed 的新条目——run 被悄悄"复活"成 running 重新发布。修法是终态写
+        // 成功后条目**永久留在** `state.runs`（sealed=true 的持久 tombstone），本测试正反两段
+        // 锁死：① 写成功后条目仍在、仍 sealed；② 之后到达的 ToolCompleted delta 必须被直接
+        // 丢弃（`apply_activity_summary_delta` 返回 `None`、计数不累加、不产生新 flush），不
+        // 会重新变成 "running"。
+        // msgfix2 U1 修单三（G1）追加：初始 `terminal_pending: true`（模拟"终态已到达但这次
+        // 写才第一次真正成功落库"——例如之前重试过若干次），断言写成功后必须清成 false，不
+        // 再被 `activity_summary_due_flushes` 收进任何批次。
+        let mut state = ActivitySummaryAggregatorState::default();
+        state.runs.insert(
+            "r1".to_owned(),
+            RunActivityEntry {
+                session_id: "s1".to_owned(),
+                counters: ActivityCounters::default(),
+                state: "done",
+                sealed: true,
+                terminal_pending: true,
+                dirty: false,
+                last_flushed_at_ms: None,
+                consecutive_failures: 0,
+                last_attempt_at_ms: None,
+            },
+        );
+        let writer: ActivitySummaryWriter = Box::new(|_, _, _, _, _, _, _| Ok(()));
+        let failures = AtomicU64::new(0);
+        flush_activity_summary(
+            &mut state,
+            &writer,
+            &failures,
+            ActivitySummaryFlush {
+                run_id: "r1".to_owned(),
+                session_id: "s1".to_owned(),
+                counters: ActivityCounters::default(),
+                state: "done",
+            },
+            0,
+        );
+        assert!(
+            state.runs.contains_key("r1"),
+            "终态写成功后必须保留持久 tombstone，不能从内存表移除"
+        );
+        assert!(state.runs["r1"].sealed, "tombstone 必须保持 sealed=true");
+        assert!(
+            !state.runs["r1"].terminal_pending,
+            "终态写成功后必须清 terminal_pending，不再被 tick 扫描收进重试批次（G1）"
+        );
+        assert!(
+            activity_summary_due_flushes(&state, 999_999).is_empty(),
+            "写成功后的 tombstone 既不 dirty 也不再 pending，不得再出现在待写批次里"
+        );
+
+        // 迟到的 running delta——不得复活这个 run。
+        let late = apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::ToolCompleted {
+                    mcp: false,
+                    failed: false,
+                },
+            },
+        );
+        assert_eq!(late, None, "sealed 后到达的 running delta 必须被直接丢弃");
+        assert_eq!(
+            state.runs["r1"].counters.tool_calls, 0,
+            "迟到 delta 不得累加计数——tombstone 必须挡住复活"
+        );
+        assert_eq!(
+            state.runs["r1"].state, "done",
+            "迟到 delta 不得把 state 改回 running"
+        );
+    }
+
+    #[test]
+    fn flush_activity_summary_write_failure_keeps_dirty_for_retry_and_counts_failure() {
+        let mut state = ActivitySummaryAggregatorState::default();
+        state.runs.insert(
+            "r1".to_owned(),
+            RunActivityEntry {
+                session_id: "s1".to_owned(),
+                counters: ActivityCounters::default(),
+                state: "running",
+                sealed: false,
+                terminal_pending: false,
+                dirty: true,
+                last_flushed_at_ms: None,
+                consecutive_failures: 0,
+                last_attempt_at_ms: None,
+            },
+        );
+        let writer: ActivitySummaryWriter = Box::new(|_, _, _, _, _, _, _| Err("db busy".into()));
+        let failures = AtomicU64::new(0);
+        flush_activity_summary(
+            &mut state,
+            &writer,
+            &failures,
+            ActivitySummaryFlush {
+                run_id: "r1".to_owned(),
+                session_id: "s1".to_owned(),
+                counters: ActivityCounters::default(),
+                state: "running",
+            },
+            7_000,
+        );
+        assert!(
+            state.runs["r1"].dirty,
+            "写失败必须保留 dirty 供下轮 tick 重试"
+        );
+        assert!(state.runs["r1"].last_flushed_at_ms.is_none());
+        assert_eq!(failures.load(Ordering::Relaxed), 1);
+        // R6③：写失败也必须推进 last_attempt_at_ms 并累加 consecutive_failures——旧实现完全
+        // 不碰这两个字段，`activity_summary_due_flushes` 只能靠 `last_flushed_at_ms` 恒 None
+        // 判定"到期"，原地空转重试。
+        assert_eq!(
+            state.runs["r1"].last_attempt_at_ms,
+            Some(7_000),
+            "写失败也要记录本次尝试的时刻，退避窗口据此计时"
+        );
+        assert_eq!(
+            state.runs["r1"].consecutive_failures, 1,
+            "第一次写失败，连续失败计数必须从 0 变成 1"
+        );
+    }
+
+    #[test]
+    fn terminal_write_failure_is_retried_until_success_exactly_once_while_late_running_stays_blocked(
+    ) {
+        // msgfix2 U1 修单三（G1·独立审查 P1）：终态写失败永不重试 = 永久漏封。修复前 terminal
+        // 在写库前就置 `sealed=true, dirty=false`，writer 失败直接 `return`，tick 扫描又把
+        // sealed 一律排除在待写批次外——该 run 从此永远停在"内存已 sealed、DB 仍是 running"
+        // 的状态，违反 M0「有活动 run 终态必封口恰好一次」。
+        //
+        // 本测试锁死完整轨迹：immediate attempt 失败（第 1 次）→ 期间迟到的 running delta
+        // 仍必须被挡（sealed 语义不受 pending 影响，计数不累加）→ tick 扫描重试第 2 次仍失败
+        // → writer 恢复后第 3 次重试成功，terminal_pending 清掉、不再被任何后续 tick 收进
+        // 批次——终态最终恰好落库一次，不多不少。R6③ 之后重试之间要满足指数退避窗口
+        // （`activity_summary_retry_due`：第 1 次失败后退避 = THROTTLE_MS(2000) * 2^1 =
+        // 4000ms，第 2 次失败后退避 = THROTTLE_MS * 2^2 = 8000ms），下面每次 `flush_activity_
+        // summary`/`activity_summary_due_flushes` 调用显式推进模拟时钟满足这个窗口——不是
+        // 为了测退避本身（那是 `activity_summary_due_flushes_backs_off_exponentially_
+        // after_repeated_failures_and_caps_at_30s` 的职责），只是让这条既有的"最终恰好落库
+        // 一次"轨迹在退避生效后依然成立。
+        let mut state = ActivitySummaryAggregatorState::default();
+        apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::ToolCompleted {
+                    mcp: false,
+                    failed: false,
+                },
+            },
+        );
+        let terminal_flush = apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::Terminal { failed: false },
+            },
+        )
+        .expect("终态 delta 必须立即返回待写快照");
+        assert!(state.runs["r1"].sealed);
+        assert!(
+            state.runs["r1"].terminal_pending,
+            "终态到达即置 pending——尚未成功落库前必须保持待重试"
+        );
+
+        let writer: ActivitySummaryWriter = Box::new({
+            let attempts = AtomicU64::new(0);
+            move |_, _, _, _, _, _, _| {
+                let n = attempts.fetch_add(1, Ordering::Relaxed);
+                if n < 2 {
+                    Err("db busy".into())
+                } else {
+                    Ok(())
+                }
+            }
+        });
+        let failures = AtomicU64::new(0);
+
+        // 第 1 次：immediate attempt（调用方紧接着 Terminal delta 触发的那次写）失败，模拟
+        // 时刻 t=0。
+        flush_activity_summary(&mut state, &writer, &failures, terminal_flush, 0);
+        assert!(
+            state.runs["r1"].sealed,
+            "sealed 不受写失败影响，继续挡迟到 running"
+        );
+        assert!(
+            state.runs["r1"].terminal_pending,
+            "写失败必须保留 pending 供下轮 tick 重试"
+        );
+        assert_eq!(failures.load(Ordering::Relaxed), 1);
+
+        // 期间迟到的 running delta——sealed 语义不受 pending 影响，必须继续被挡，不累加计数。
+        let late = apply_activity_summary_delta(
+            &mut state,
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::ToolCompleted {
+                    mcp: false,
+                    failed: false,
+                },
+            },
+        );
+        assert_eq!(
+            late, None,
+            "终态写失败重试期间，迟到的 running delta 仍必须被挡"
+        );
+        assert_eq!(
+            state.runs["r1"].counters.tool_calls, 1,
+            "迟到 delta 不得累加计数——sealed tombstone 必须挡住复活"
+        );
+
+        // 第 2 次：tick 扫描必须把 sealed && terminal_pending 的条目重新收进待写批次；退避
+        // 窗口未到（第 1 次失败后退避 4000ms）时不该被收进，恰好到期（t=4_000）才收进；
+        // writer 仍未恢复，再次失败。
+        assert!(
+            activity_summary_due_flushes(&state, 3_999).is_empty(),
+            "第 1 次失败后的退避窗口（4000ms）未到，不该被收进重试批次"
+        );
+        let due = activity_summary_due_flushes(&state, 4_000);
+        assert_eq!(
+            due.len(),
+            1,
+            "sealed 但 terminal_pending 的条目，退避窗口到期后必须被 tick 扫描收进重试批次"
+        );
+        flush_activity_summary(
+            &mut state,
+            &writer,
+            &failures,
+            due.into_iter().next().unwrap(),
+            4_000,
+        );
+        assert!(
+            state.runs["r1"].terminal_pending,
+            "第二次仍失败，pending 必须保留供下一轮重试"
+        );
+        assert_eq!(failures.load(Ordering::Relaxed), 2);
+
+        // 第 3 次：writer 恢复——退避窗口到期（第 2 次失败后退避 8000ms，起点 t=4_000，
+        // 到期 t=12_000）后 tick 扫描再次收进批次，这次写成功。
+        assert!(
+            activity_summary_due_flushes(&state, 11_999).is_empty(),
+            "第 2 次失败后的退避窗口（8000ms，起点 4_000）未到，不该被收进重试批次"
+        );
+        let due2 = activity_summary_due_flushes(&state, 12_000);
+        assert_eq!(due2.len(), 1, "退避窗口到期后必须持续被扫进重试批次");
+        flush_activity_summary(
+            &mut state,
+            &writer,
+            &failures,
+            due2.into_iter().next().unwrap(),
+            12_000,
+        );
+        assert!(
+            !state.runs["r1"].terminal_pending,
+            "写成功后必须清 terminal_pending，不再重试"
+        );
+        assert!(
+            state.runs["r1"].sealed,
+            "sealed 必须保持——已成功落库的终态不能被复活"
+        );
+        assert_eq!(
+            state.runs["r1"].state, "done",
+            "最终落库状态必须是 done，不能因为中途重试被改写"
+        );
+
+        // 终态成功落库后，due_flushes 不得再把它收进任何批次。
+        assert!(
+            activity_summary_due_flushes(&state, 999_999).is_empty(),
+            "终态成功落库后不得再被扫进任何待写批次"
+        );
+        assert_eq!(
+            failures.load(Ordering::Relaxed),
+            2,
+            "写失败计数必须恰好 2（第 1、2 次失败，第 3 次成功）"
+        );
+    }
+
+    #[test]
+    fn drain_activity_summary_deltas_terminal_supersedes_queued_running_in_same_batch() {
+        // msgfix2 U1 修单 F2①：过去 worker 主循环每收一条 delta 就单独检查一次节流到期——
+        // 如果 channel 里已经排着 `[running, terminal]`（同一个 run），处理完 running 后
+        // 立即扫描 `activity_summary_due_flushes` 会先把 running 发布出去（`last_flushed_at_ms`
+        // 是 `None`，首次发布恒判到期），terminal 还没被看到。`drain_activity_summary_deltas`
+        // 把一批已经排队的 delta 整批喂给聚合态、批内只在结尾统一交给调用方决定要不要再扫
+        // 一次节流窗口——本测试断言"同 run 的 running+terminal 同批到达"时，只产生一次
+        // flush，且是 terminal（state=="done"），不会有单独的 running 快照被发布出去。
+        let mut state = ActivitySummaryAggregatorState::default();
+        let batch = vec![
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::ToolCompleted {
+                    mcp: false,
+                    failed: false,
+                },
+            },
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::Terminal { failed: false },
+            },
+        ];
+        let flushes = drain_activity_summary_deltas(&mut state, batch);
+        assert_eq!(
+            flushes.len(),
+            1,
+            "同批 running+terminal 只应产生一次 flush，不能先发一次 running 再发一次 terminal"
+        );
+        assert_eq!(flushes[0].state, "done");
+        assert_eq!(flushes[0].counters.tool_calls, 1);
+        assert!(state.runs["r1"].sealed);
+    }
+
+    #[test]
+    fn drain_activity_summary_deltas_running_only_batch_never_flushes_here() {
+        // 对照组：批里只有非终态 delta 时，本函数本身不产生任何 flush——节流到期的判断是
+        // `activity_summary_due_flushes` 的职责（worker 循环末尾单独调用），不是本函数的。
+        let mut state = ActivitySummaryAggregatorState::default();
+        let batch = vec![
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::ToolCompleted {
+                    mcp: true,
+                    failed: false,
+                },
+            },
+            ActivitySummaryDelta {
+                session_id: "s1".to_owned(),
+                run_id: "r1".to_owned(),
+                kind: ActivitySummaryDeltaKind::PermissionPrompt,
+            },
+        ];
+        let flushes = drain_activity_summary_deltas(&mut state, batch);
+        assert!(flushes.is_empty());
+        assert!(state.runs["r1"].dirty);
+        assert_eq!(state.runs["r1"].counters.tool_calls, 1);
+        assert_eq!(state.runs["r1"].counters.mcp_calls, 1);
+        assert_eq!(state.runs["r1"].counters.permission_prompts, 1);
+    }
+
+    #[test]
+    fn extract_tool_milestones_l0_protection_permission_prompt_never_carries_approval_content() {
+        // L0 保护（设计稿 §4.1）：permission prompt 只贡献计数，approval 事件的实际内容
+        // （approval_id/command/summary 等）绝不进入 activity_summary delta——反向锁死。
+        let state = GatewayInnerState::default();
+        state.advance_generation_and_set_gate(true);
+        let (tx, rx) = mpsc::sync_channel::<ActivitySummaryDelta>(8);
+        configure_activity_summary_writer_test_hook(&state, tx);
+        let (upstream_tx, _upstream_rx) = mpsc::sync_channel(4);
+        let (milestone_tx, _milestone_rx) = mpsc::sync_channel(4);
+
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            single_event_payload(
+                "run-l0",
+                "sess-l0",
+                crate::agent_event::AgentEvent::ApprovalRequested {
+                    approval_id: "appr-1".to_owned(),
+                    run_id: "run-l0".to_owned(),
+                    tool: "shell".to_owned(),
+                    command: "rm -rf /".to_owned(),
+                    summary: "danger".to_owned(),
+                    cwd: "/".to_owned(),
+                    request_kind: None,
+                    proposal_id: None,
+                },
+            ),
+        );
+
+        let delta = rx.try_recv().expect("ApprovalRequested must emit a delta");
+        assert_eq!(delta.kind, ActivitySummaryDeltaKind::PermissionPrompt);
+        // ActivitySummaryDeltaKind::PermissionPrompt 是无字段的枚举变体——approval_id/command/
+        // summary/cwd 这些字段在类型层面就没有位置可以泄漏进来，编译期即锁死（不是运行时字符串
+        // 扫描断言）。
+    }
+
+    /// 测试专用直连——绕开 `configure_activity_summary_writer`（需要真实 writer + 起线程），
+    /// 只把 `state.activity_summary_tx` 设成测试自己持有的 tx 端，这样 `extract_tool_milestones`
+    /// 就会走"聚合器已启用"分支产 delta，测试直接在 `rx` 端断言，不需要真的跑写线程。
+    fn configure_activity_summary_writer_test_hook(
+        state: &GatewayInnerState,
+        tx: SyncSender<ActivitySummaryDelta>,
+    ) {
+        state
+            .activity_summary_tx
+            .set(tx)
+            .expect("test hook must only be called once per state");
+    }
+
+    #[test]
+    fn extract_tool_milestones_emits_activity_summary_deltas_for_tool_completed_and_terminal() {
+        let state = GatewayInnerState::default();
+        state.advance_generation_and_set_gate(true);
+        let (tx, rx) = mpsc::sync_channel::<ActivitySummaryDelta>(8);
+        configure_activity_summary_writer_test_hook(&state, tx);
+        remember_tool_name(&state, "run-agg", "tool-1", "mcp__agentloom__commit");
+        let (upstream_tx, _upstream_rx) = mpsc::sync_channel(4);
+        let (milestone_tx, _milestone_rx) = mpsc::sync_channel(4);
+
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            single_event_payload(
+                "run-agg",
+                "sess-agg",
+                crate::agent_event::AgentEvent::ToolCompleted {
+                    id: "tool-1".to_owned(),
+                    status: crate::agent_event::ToolStatus::Failed,
+                    exit_code: Some(1),
+                    output: None,
+                },
+            ),
+        );
+        let delta = rx.try_recv().expect("ToolCompleted must emit a delta");
+        assert_eq!(delta.session_id, "sess-agg");
+        assert_eq!(delta.run_id, "run-agg");
+        assert_eq!(
+            delta.kind,
+            ActivitySummaryDeltaKind::ToolCompleted {
+                mcp: true,
+                failed: true,
+            },
+            "mcp__ 前缀工具名必须判 mcp=true，ToolStatus::Failed 必须判 failed=true"
+        );
+
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            single_event_payload(
+                "run-agg",
+                "sess-agg",
+                crate::agent_event::AgentEvent::RunCloseout {
+                    run_id: "run-agg".to_owned(),
+                    commit_sha: None,
+                    files_changed: None,
+                    insertions: None,
+                    deletions: None,
+                    interrupted: None,
+                },
+            ),
+        );
+        let terminal_delta = rx
+            .try_recv()
+            .expect("RunCloseout must emit a terminal delta");
+        assert_eq!(
+            terminal_delta.kind,
+            ActivitySummaryDeltaKind::Terminal { failed: false },
+            "RunCloseout 是正常终态，不是失败终态"
+        );
+    }
+
+    #[test]
+    fn extract_tool_milestones_error_event_emits_failed_terminal_delta() {
+        let state = GatewayInnerState::default();
+        state.advance_generation_and_set_gate(true);
+        let (tx, rx) = mpsc::sync_channel::<ActivitySummaryDelta>(8);
+        configure_activity_summary_writer_test_hook(&state, tx);
+        let (upstream_tx, _upstream_rx) = mpsc::sync_channel(4);
+        let (milestone_tx, _milestone_rx) = mpsc::sync_channel(4);
+
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            single_event_payload(
+                "run-err",
+                "sess-err",
+                crate::agent_event::AgentEvent::Error {
+                    message: "boom".to_owned(),
+                },
+            ),
+        );
+        let delta = rx.try_recv().expect("Error must emit a terminal delta");
+        assert_eq!(
+            delta.kind,
+            ActivitySummaryDeltaKind::Terminal { failed: true }
+        );
+    }
+
+    #[test]
+    fn extract_tool_milestones_member_lane_rolls_up_into_dispatch_run_id_not_lane_run_id() {
+        let state = GatewayInnerState::default();
+        state.advance_generation_and_set_gate(true);
+        let (tx, rx) = mpsc::sync_channel::<ActivitySummaryDelta>(8);
+        configure_activity_summary_writer_test_hook(&state, tx);
+        remember_tool_name(&state, "member:lead-run-9:assignment-1", "tool-1", "shell");
+        let (upstream_tx, _upstream_rx) = mpsc::sync_channel(4);
+        let (milestone_tx, _milestone_rx) = mpsc::sync_channel(4);
+
+        let payload = crate::event_transport::BatchPayload {
+            batches: vec![crate::event_transport::RunBatch {
+                session_id: "sess-team".to_owned(),
+                run_id: "member:lead-run-9:assignment-1".to_owned(),
+                dispatch: Some(crate::agent_event::DispatchMeta {
+                    run_id: Some("lead-run-9".to_owned()),
+                    assignment_id: Some("assignment-1".to_owned()),
+                    ..Default::default()
+                }),
+                events: vec![crate::event_transport::SequencedEvent {
+                    seq: 1,
+                    event: crate::agent_event::AgentEvent::ToolCompleted {
+                        id: "tool-1".to_owned(),
+                        status: crate::agent_event::ToolStatus::Ok,
+                        exit_code: Some(0),
+                        output: None,
+                    },
+                }],
+            }],
+        };
+        enqueue_batch_payload_for_upstream(&state, &upstream_tx, &milestone_tx, payload);
+
+        let delta = rx
+            .try_recv()
+            .expect("member lane ToolCompleted must emit a delta");
+        assert_eq!(
+            delta.run_id, "lead-run-9",
+            "member lane 计数必须并入父（lead）run，不能用传输层复合 lane id"
+        );
+    }
+
+    #[test]
+    fn extract_tool_milestones_member_lane_terminal_does_not_seal_parent_run() {
+        // msgfix2 U1 修单 F1（spec §4.1「粒度=逻辑 run」）：team 会话 lead+2 member——member1
+        // 先完成（自己的 RunCloseout）绝不能把父（lead）run 判成终态；摘要必须继续吃
+        // member2/lead 自己的计数，直到 lead 自己的 batch（不带 dispatch）真正到达终态才封口
+        // 一次。修复前：member 的 Completed/RunCloseout 被 `activity_summary_logical_run_id`
+        // 映射成父 run 的 Terminal delta，member1 一完成就把父 run sealed，之后 member2/lead
+        // 的计数被 sealed tombstone 全部丢弃。
+        let state = GatewayInnerState::default();
+        state.advance_generation_and_set_gate(true);
+        let (tx, rx) = mpsc::sync_channel::<ActivitySummaryDelta>(16);
+        configure_activity_summary_writer_test_hook(&state, tx);
+        let (upstream_tx, _upstream_rx) = mpsc::sync_channel(8);
+        let (milestone_tx, _milestone_rx) = mpsc::sync_channel(8);
+
+        fn member_batch(
+            assignment: &str,
+            event: crate::agent_event::AgentEvent,
+        ) -> crate::event_transport::BatchPayload {
+            crate::event_transport::BatchPayload {
+                batches: vec![crate::event_transport::RunBatch {
+                    session_id: "sess-team".to_owned(),
+                    run_id: format!("member:lead-run-1:{assignment}"),
+                    dispatch: Some(crate::agent_event::DispatchMeta {
+                        run_id: Some("lead-run-1".to_owned()),
+                        assignment_id: Some(assignment.to_owned()),
+                        ..Default::default()
+                    }),
+                    events: vec![crate::event_transport::SequencedEvent { seq: 1, event }],
+                }],
+            }
+        }
+
+        // ① member1 ToolCompleted——计数并入父 run。
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            member_batch(
+                "assignment-1",
+                crate::agent_event::AgentEvent::ToolCompleted {
+                    id: "tool-1".to_owned(),
+                    status: crate::agent_event::ToolStatus::Ok,
+                    exit_code: Some(0),
+                    output: None,
+                },
+            ),
+        );
+        let d1 = rx
+            .try_recv()
+            .expect("member1 ToolCompleted must emit a delta");
+        assert_eq!(d1.run_id, "lead-run-1");
+        assert_eq!(
+            d1.kind,
+            ActivitySummaryDeltaKind::ToolCompleted {
+                mcp: false,
+                failed: false,
+            }
+        );
+
+        // ② member1 自己的 RunCloseout（这条 member lane 结束）——核心断言：绝不能给父 run
+        //    产生 Terminal delta（修复前会把父 run 提前 sealed）。
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            member_batch(
+                "assignment-1",
+                crate::agent_event::AgentEvent::RunCloseout {
+                    run_id: "member:lead-run-1:assignment-1".to_owned(),
+                    commit_sha: None,
+                    files_changed: None,
+                    insertions: None,
+                    deletions: None,
+                    interrupted: None,
+                },
+            ),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "member lane 自己的 RunCloseout 不得给父 run 产生任何 delta（尤其不能是 Terminal）"
+        );
+
+        // ③ member2 ToolCompleted——父 run 摘要仍是 running，没有被 member1 提前封死，继续吃
+        //    计数。
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            member_batch(
+                "assignment-2",
+                crate::agent_event::AgentEvent::ToolCompleted {
+                    id: "tool-2".to_owned(),
+                    status: crate::agent_event::ToolStatus::Ok,
+                    exit_code: Some(0),
+                    output: None,
+                },
+            ),
+        );
+        let d3 = rx.try_recv().expect(
+            "member2 ToolCompleted must still emit a delta after member1's own RunCloseout",
+        );
+        assert_eq!(d3.run_id, "lead-run-1");
+
+        // ④ lead 自己的 batch（不带 dispatch）到达终态——现在才允许封父 run。
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            crate::event_transport::BatchPayload {
+                batches: vec![crate::event_transport::RunBatch {
+                    session_id: "sess-team".to_owned(),
+                    run_id: "lead-run-1".to_owned(),
+                    dispatch: None,
+                    events: vec![crate::event_transport::SequencedEvent {
+                        seq: 1,
+                        event: crate::agent_event::AgentEvent::Completed {
+                            cost_usd: None,
+                            input_tokens: None,
+                            output_tokens: None,
+                            final_text: None,
+                            result: None,
+                            run_id: Some("lead-run-1".to_owned()),
+                            commit_sha: None,
+                            files_changed: None,
+                            insertions: None,
+                            deletions: None,
+                            interrupted: None,
+                        },
+                    }],
+                }],
+            },
+        );
+        let terminal = rx
+            .try_recv()
+            .expect("lead 自己的 Completed 必须产生 Terminal delta 封父 run");
+        assert_eq!(terminal.run_id, "lead-run-1");
+        assert_eq!(
+            terminal.kind,
+            ActivitySummaryDeltaKind::Terminal { failed: false }
+        );
+
+        // 把以上四条 delta 按顺序喂进真实聚合态，进一步锁死"摘要仍 running 且继续吃计数、
+        // 直到 lead 终态才封口一次"这条完整状态轨迹（不只是"有没有 delta"，是"状态演化对
+        // 不对"）。
+        let mut agg_state = ActivitySummaryAggregatorState::default();
+        apply_activity_summary_delta(&mut agg_state, d1);
+        assert!(!agg_state.runs["lead-run-1"].sealed);
+        assert_eq!(agg_state.runs["lead-run-1"].counters.tool_calls, 1);
+        apply_activity_summary_delta(&mut agg_state, d3);
+        assert!(
+            !agg_state.runs["lead-run-1"].sealed,
+            "member1 RunCloseout 之后父 run 仍必须是 running"
+        );
+        assert_eq!(agg_state.runs["lead-run-1"].counters.tool_calls, 2);
+        let flush = apply_activity_summary_delta(&mut agg_state, terminal)
+            .expect("lead 终态必须触发一次封口 flush");
+        assert_eq!(flush.state, "done");
+        assert_eq!(
+            flush.counters.tool_calls, 2,
+            "封口摘要必须带上 member1+member2 的累计计数"
+        );
+        assert!(agg_state.runs["lead-run-1"].sealed);
+    }
+
+    #[test]
+    fn extract_tool_milestones_member_lane_error_does_not_seal_parent_run() {
+        // msgfix2 U1 修单三（G3·独立审查残余 P2）：F1 只在 `extract_tool_milestones_member_
+        // lane_terminal_does_not_seal_parent_run` 里覆盖了 `RunCloseout` 这一条终态路径——
+        // `AgentEvent::Error` 是另一条独立的终态分支（见 F1 分支代码，`Completed`/
+        // `RunCloseout` 和 `Error` 各自都判了一次 `batch.dispatch.is_none()`），此前没有测试
+        // 直接锁死 member lane 自己的 Error 同样不得封父 run。逻辑上两个分支目前是对称实现
+        // 的（都判同一个门槛），但没有测试就没有回归保护——本测试补上这条独立于 RunCloseout
+        // 的红线：member1 自己的 Error 结束一条 lane，不得给父（lead）run 产生任何 delta，
+        // 摘要必须继续吃 member2 的计数直到 lead 自己终态才封口。
+        let state = GatewayInnerState::default();
+        state.advance_generation_and_set_gate(true);
+        let (tx, rx) = mpsc::sync_channel::<ActivitySummaryDelta>(16);
+        configure_activity_summary_writer_test_hook(&state, tx);
+        let (upstream_tx, _upstream_rx) = mpsc::sync_channel(8);
+        let (milestone_tx, _milestone_rx) = mpsc::sync_channel(8);
+
+        fn member_batch(
+            assignment: &str,
+            event: crate::agent_event::AgentEvent,
+        ) -> crate::event_transport::BatchPayload {
+            crate::event_transport::BatchPayload {
+                batches: vec![crate::event_transport::RunBatch {
+                    session_id: "sess-team-err".to_owned(),
+                    run_id: format!("member:lead-run-err:{assignment}"),
+                    dispatch: Some(crate::agent_event::DispatchMeta {
+                        run_id: Some("lead-run-err".to_owned()),
+                        assignment_id: Some(assignment.to_owned()),
+                        ..Default::default()
+                    }),
+                    events: vec![crate::event_transport::SequencedEvent { seq: 1, event }],
+                }],
+            }
+        }
+
+        // ① member1 ToolCompleted——计数并入父 run（先给 run 建立"有活动"的前提，见 M0
+        //    §10.11 零活动 run 不产生摘要的裁决）。
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            member_batch(
+                "assignment-1",
+                crate::agent_event::AgentEvent::ToolCompleted {
+                    id: "tool-1".to_owned(),
+                    status: crate::agent_event::ToolStatus::Ok,
+                    exit_code: Some(0),
+                    output: None,
+                },
+            ),
+        );
+        let d1 = rx
+            .try_recv()
+            .expect("member1 ToolCompleted must emit a delta");
+        assert_eq!(d1.run_id, "lead-run-err");
+
+        // ② member1 自己的 Error（这条 member lane 异常结束）——核心断言：绝不能给父 run
+        //    产生任何 delta（尤其不能是 Terminal），也不能因为它是"失败"就把父 run 判 failed。
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            member_batch(
+                "assignment-1",
+                crate::agent_event::AgentEvent::Error {
+                    message: "member1 boom".to_owned(),
+                },
+            ),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "member lane 自己的 Error 不得给父 run 产生任何 delta（尤其不能是 Terminal）"
+        );
+
+        // ③ member2 ToolCompleted——父 run 摘要仍是 running，没有被 member1 的 Error 提前
+        //    封死（不管 sealed 还是 failed），继续吃计数。
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            member_batch(
+                "assignment-2",
+                crate::agent_event::AgentEvent::ToolCompleted {
+                    id: "tool-2".to_owned(),
+                    status: crate::agent_event::ToolStatus::Ok,
+                    exit_code: Some(0),
+                    output: None,
+                },
+            ),
+        );
+        let d3 = rx
+            .try_recv()
+            .expect("member2 ToolCompleted must still emit a delta after member1's own Error");
+        assert_eq!(d3.run_id, "lead-run-err");
+
+        // ④ lead 自己的 batch（不带 dispatch）到达终态——现在才允许封父 run，且是正常终态
+        //    （不是被 member1 的 Error 拖成 failed）。
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            crate::event_transport::BatchPayload {
+                batches: vec![crate::event_transport::RunBatch {
+                    session_id: "sess-team-err".to_owned(),
+                    run_id: "lead-run-err".to_owned(),
+                    dispatch: None,
+                    events: vec![crate::event_transport::SequencedEvent {
+                        seq: 1,
+                        event: crate::agent_event::AgentEvent::Completed {
+                            cost_usd: None,
+                            input_tokens: None,
+                            output_tokens: None,
+                            final_text: None,
+                            result: None,
+                            run_id: Some("lead-run-err".to_owned()),
+                            commit_sha: None,
+                            files_changed: None,
+                            insertions: None,
+                            deletions: None,
+                            interrupted: None,
+                        },
+                    }],
+                }],
+            },
+        );
+        let terminal = rx
+            .try_recv()
+            .expect("lead 自己的 Completed 必须产生 Terminal delta 封父 run");
+        assert_eq!(terminal.run_id, "lead-run-err");
+        assert_eq!(
+            terminal.kind,
+            ActivitySummaryDeltaKind::Terminal { failed: false },
+            "member1 的 Error 不得把父 run 的最终状态拖成 failed——父 run 的终态只看 lead 自己"
+        );
+
+        // 把以上三条 delta 按顺序喂进真实聚合态，锁死"计数继续累计、直到 lead 终态才封口一次"
+        // 这条完整状态轨迹。
+        let mut agg_state = ActivitySummaryAggregatorState::default();
+        apply_activity_summary_delta(&mut agg_state, d1);
+        apply_activity_summary_delta(&mut agg_state, d3);
+        assert!(
+            !agg_state.runs["lead-run-err"].sealed,
+            "member1 Error 之后父 run 仍必须是 running"
+        );
+        assert_eq!(agg_state.runs["lead-run-err"].counters.tool_calls, 2);
+        let flush = apply_activity_summary_delta(&mut agg_state, terminal)
+            .expect("lead 终态必须触发一次封口 flush");
+        assert_eq!(flush.state, "done");
+        assert_eq!(flush.counters.tool_calls, 2);
+        assert!(agg_state.runs["lead-run-err"].sealed);
+    }
+
+    #[test]
+    fn extract_tool_milestones_l0_single_source_of_truth_actionable_events_never_join_l1() {
+        // msgfix2 U1 修单 F4（spec §4.1「L0 分级保护」）：聚合器对"哪些块/事件永不折进 L1"的
+        // 判定改走单点函数 `is_actionable_block_type`（复用刀 1 白名单），不是另写一份隔离
+        // 逻辑。反向锁死：approval/decision_card/scope_change 三个 actionable 块型都在这个
+        // 单点名单里；其中 scope_change 对应的 `AgentEvent::NeedsDecision` 走聚合路径时必须
+        // 零计数贡献（decision_card 本身不经过 `extract_tool_milestones`——它走
+        // `lead_step::build_decision_card_block` 独立卡片路径，不是这里要挡的对象，但仍在
+        // 单点名单里一并断言，保持"三个 actionable 类型是同一份名单"这件事可见）。
+        assert!(is_actionable_block_type("approval"));
+        assert!(is_actionable_block_type("decision_card"));
+        assert!(is_actionable_block_type("scope_change"));
+
+        let state = GatewayInnerState::default();
+        state.advance_generation_and_set_gate(true);
+        let (tx, rx) = mpsc::sync_channel::<ActivitySummaryDelta>(8);
+        configure_activity_summary_writer_test_hook(&state, tx);
+        let (upstream_tx, _upstream_rx) = mpsc::sync_channel(4);
+        let (milestone_tx, _milestone_rx) = mpsc::sync_channel(4);
+
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            single_event_payload(
+                "run-scope",
+                "sess-scope",
+                crate::agent_event::AgentEvent::NeedsDecision {
+                    run_id: "run-scope".to_owned(),
+                    reason: "scope_change".to_owned(),
+                    changes: vec![crate::agent_event::ScopeChange {
+                        proposal_id: "prop-1".to_owned(),
+                        kind: "expand".to_owned(),
+                        detail_text: "add feature X".to_owned(),
+                        detail_summary: None,
+                    }],
+                },
+            ),
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "scope_change 事件（NeedsDecision）绝不能给聚合器产生任何 delta——原卡走既有独立\
+             通道下发，L1 摘要不是它的替代通道"
+        );
+    }
+
+    #[test]
+    fn extract_tool_milestones_without_configured_writer_is_pure_noop_for_activity_summary() {
+        // 未调用 configure_activity_summary_writer——activity_summary_tx 是 None，整套聚合器
+        // 功能应完全不产生任何 delta（不是"产了但没人收也不报错"——是根本不产），同时既有
+        // tool.completed 里程碑路径必须继续正常工作（回归保护）。
+        let state = GatewayInnerState::default();
+        let generation = state.advance_generation_and_set_gate(true);
+        remember_tool_name(&state, "run-noagg", "tool-1", "shell");
+        let (upstream_tx, _upstream_rx) = mpsc::sync_channel(4);
+        let (milestone_tx, milestone_rx) = mpsc::sync_channel(4);
+
+        enqueue_batch_payload_for_upstream(
+            &state,
+            &upstream_tx,
+            &milestone_tx,
+            single_event_payload(
+                "run-noagg",
+                "sess-noagg",
+                crate::agent_event::AgentEvent::ToolCompleted {
+                    id: "tool-1".to_owned(),
+                    status: crate::agent_event::ToolStatus::Ok,
+                    exit_code: Some(0),
+                    output: None,
+                },
+            ),
+        );
+        let (item_generation, item) = milestone_rx
+            .try_recv()
+            .expect("tool.completed 里程碑必须不受影响照常发出");
+        assert_eq!(item_generation, generation);
+        assert_eq!(item.t, "tool.completed");
+        assert_eq!(state.activity_summary_dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn run_activity_summary_worker_end_to_end_first_delta_flushes_promptly() {
+        // 真正起线程的端到端接线冒烟测试：channel → 独立写线程 → 注入 writer。首次 dirty 不需要
+        // 等 2s 节流窗口（activity_summary_due_flushes/activity_summary_retry_due 对
+        // last_attempt_at_ms=None 恒判"到期"），只需等 tick 周期（250ms）追上，真实 sleep
+        // 保持在亚秒级。
+        let (tx, rx) = mpsc::sync_channel::<ActivitySummaryDelta>(8);
+        let calls: Arc<Mutex<Vec<(String, String, i64, String)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = Arc::clone(&calls);
+        let writer: ActivitySummaryWriter = Box::new(move |session, run, tc, _f, _mc, _pp, st| {
+            calls_clone.lock().unwrap().push((
+                session.to_owned(),
+                run.to_owned(),
+                tc,
+                st.to_owned(),
+            ));
+            Ok(())
+        });
+        let handle = thread::spawn(move || run_activity_summary_worker(rx, writer));
+
+        tx.send(ActivitySummaryDelta {
+            session_id: "s-e2e".to_owned(),
+            run_id: "r-e2e".to_owned(),
+            kind: ActivitySummaryDeltaKind::ToolCompleted {
+                mcp: false,
+                failed: false,
+            },
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if !calls.lock().unwrap().is_empty() || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "首次 dirty 必须在一个 tick 周期内落库");
+        assert_eq!(
+            recorded[0],
+            (
+                "s-e2e".to_owned(),
+                "r-e2e".to_owned(),
+                1,
+                "running".to_owned()
+            )
+        );
+
+        drop(tx);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn run_activity_summary_worker_end_to_end_multi_delta_sequence_throttle_and_terminal_suppression(
+    ) {
+        // msgfix2 U1 修单 F5：真正起线程的端到端整链测试，覆盖"多 delta 序列 + 节流窗口 +
+        // 终态压制"三件事在同一条真实 worker 生命周期里都对——不只是各自独立的纯函数单测。
+        // 时序：① 首条 ToolCompleted 首次 dirty 立即（下一个 tick 内）落库为 running；
+        // ② 紧接着再来一条 ToolCompleted——2s 节流窗口内不得重复发布（F2 节流仍然有效，
+        // drain-then-check 的改动不能误伤正常节流）；③ Terminal 到达——不受节流约束，立即
+        // 落库为 done；④ Terminal 写库成功之后再来的 ToolCompleted（"迟到的 running"）——
+        // 必须被 sealed tombstone 挡住，不产生第三次写（F2②整链验证）。
+        let (tx, rx) = mpsc::sync_channel::<ActivitySummaryDelta>(8);
+        let calls: Arc<Mutex<Vec<(String, String, i64, String)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = Arc::clone(&calls);
+        let writer: ActivitySummaryWriter = Box::new(move |session, run, tc, _f, _mc, _pp, st| {
+            calls_clone.lock().unwrap().push((
+                session.to_owned(),
+                run.to_owned(),
+                tc,
+                st.to_owned(),
+            ));
+            Ok(())
+        });
+        let handle = thread::spawn(move || run_activity_summary_worker(rx, writer));
+
+        let wait_for_len = |n: usize, budget: Duration| -> bool {
+            let deadline = Instant::now() + budget;
+            loop {
+                if calls.lock().unwrap().len() >= n {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+
+        // ① 首条 ToolCompleted——首次 dirty 立即落库（running, tool_calls=1）。
+        tx.send(ActivitySummaryDelta {
+            session_id: "s-e2e2".to_owned(),
+            run_id: "r-e2e2".to_owned(),
+            kind: ActivitySummaryDeltaKind::ToolCompleted {
+                mcp: false,
+                failed: false,
+            },
+        })
+        .unwrap();
+        assert!(
+            wait_for_len(1, Duration::from_secs(2)),
+            "首次 dirty 必须在一个 tick 周期内落库"
+        );
+        {
+            let recorded = calls.lock().unwrap();
+            assert_eq!(
+                recorded[0],
+                (
+                    "s-e2e2".to_owned(),
+                    "r-e2e2".to_owned(),
+                    1,
+                    "running".to_owned()
+                )
+            );
+        }
+
+        // ② 紧接着再来一条 ToolCompleted——2s 节流窗口内不得重复发布。只等一小段（远小于
+        //    ACTIVITY_SUMMARY_THROTTLE_MS=2000ms）确认没有过早发布，不真的等满 2s。
+        tx.send(ActivitySummaryDelta {
+            session_id: "s-e2e2".to_owned(),
+            run_id: "r-e2e2".to_owned(),
+            kind: ActivitySummaryDeltaKind::ToolCompleted {
+                mcp: false,
+                failed: false,
+            },
+        })
+        .unwrap();
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "节流窗口内不得对同一 run 重复发布 running 快照"
+        );
+
+        // ③ Terminal 到达——不受节流约束，立即落库为 done，tool_calls 累计到 2。
+        // msgfix2 U1 修单三（G3·独立审查残余 P2）：这里的等待预算必须**远小于**
+        // `ACTIVITY_SUMMARY_THROTTLE_MS`(2000ms)，否则"终态立即落库"和"终态被误按节流窗口
+        // 排队、凑巧在窗口关闭前也到期了"这两种情况在断言层面无法区分——旧版本这里等的也是
+        // 2s，等于把"立即"和"最迟 2s 内"混为一谈。tick 周期是 250ms，600ms 预算足够覆盖
+        // 调度抖动，同时严格小于节流窗口，真正证明了"不等节流"。
+        tx.send(ActivitySummaryDelta {
+            session_id: "s-e2e2".to_owned(),
+            run_id: "r-e2e2".to_owned(),
+            kind: ActivitySummaryDeltaKind::Terminal { failed: false },
+        })
+        .unwrap();
+        assert!(
+            wait_for_len(2, Duration::from_millis(600)),
+            "终态必须立即（远早于 2s 节流窗口）落库，不是恰好卡着节流窗口到期"
+        );
+        {
+            let recorded = calls.lock().unwrap();
+            assert_eq!(
+                recorded[1],
+                (
+                    "s-e2e2".to_owned(),
+                    "r-e2e2".to_owned(),
+                    2,
+                    "done".to_owned()
+                )
+            );
+        }
+
+        // ④ Terminal 写库成功之后再来的 ToolCompleted（"迟到的 running"）——sealed tombstone
+        //    必须挡住它，不产生第三次写。
+        // msgfix2 U1 修单三（G3·独立审查残余 P2）：断言必须在 worker 线程仍存活时验证（本
+        // 测试确实如此——`drop(tx)`/`handle.join()` 在最后才调用），而不是先 drop/join 让
+        // worker 退出、再检查一个"反正不会再变"的静态快照，那样测不出"worker 活着的时候会
+        // 不会自己触发第三次写"。且等待窗口刻意跨过一整个 `ACTIVITY_SUMMARY_THROTTLE_MS`
+        // (2000ms) 节流周期（本刀 G1 把 `activity_summary_due_flushes` 的过滤条件从"未 sealed"
+        // 改成了"未 sealed || (sealed && terminal_pending)"——如果这个改动有回归、误把已经
+        // 成功落库的 sealed 条目也收进重试批次，只等 400ms 未必能在下一个节流窗口到期前捕捉
+        // 到多余的第三次写；跨过整个窗口才是真正的回归保护）。全程断言写库次数恰好 2（首条
+        // running + 终态），不再增长。
+        tx.send(ActivitySummaryDelta {
+            session_id: "s-e2e2".to_owned(),
+            run_id: "r-e2e2".to_owned(),
+            kind: ActivitySummaryDeltaKind::ToolCompleted {
+                mcp: false,
+                failed: false,
+            },
+        })
+        .unwrap();
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "终态写库成功后到达的迟到 running delta 不得复活该 run 或触发新的写（worker 仍存活时验证）"
+        );
+        thread::sleep(Duration::from_millis(ACTIVITY_SUMMARY_THROTTLE_MS + 300));
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "跨过一整个节流窗口后，写库次数仍必须恰好 2——不能因为 G1 的 sealed&&pending 重试\
+             路径误把已成功落库的 tombstone 又收进批次"
+        );
+
+        drop(tx);
+        handle.join().unwrap();
+    }
+
+    /// msgfix2 U1b Task A：装配级接线证明——本文件（乃至整个测试二进制）里唯一一处真正调用
+    /// 生产入口 `setup()` 的测试（`GATEWAY` 是进程级 `OnceLock`，其余全部测试要么直接构造
+    /// `Inner{..}`、要么用 `configure_activity_summary_writer_test_hook` 绕开它，都刻意不碰
+    /// 这个单例；本测试反过来专门验证单例这条真实装配路径）。settings 恒 `|_| None` →
+    /// `connect_loop` 线程永远停在 `Disabled`（`upstream_state` 永不置位，见
+    /// `enqueue_milestone_for_upstream`/`publish_milestone` 文档"gate 关闭时是 no-op"），因此
+    /// 这条后台线程不会对其余测试产生任何可观察副作用，可以安全地让它随进程活到测试结束
+    /// （同 `run_session_index_snapshot_worker` 既有"随 Inner 生命周期自然收尾"惯例）。
+    ///
+    /// 证明的不是"聚合器纯函数本身对不对"（那些已经有专门单测），是"`setup()` → 唯一跨模块
+    /// 入口 `install_activity_summary_writer` → `configure_activity_summary_writer` → 独立写
+    /// 线程 → 注入的 writer"这条**装配链路**本身接得上——writer 落的是一个真实
+    /// `db::upsert_activity_summary_and_publish` 调用（内容签名与 lib.rs 生产 provider 完全
+    /// 一致，唯一区别是生产版本从 `AppHandle`/`Db` state 拿连接、这里直接捕获测试 DB 连接），
+    /// 不是一个只返回 `Ok(())` 的假 writer。
+    #[test]
+    fn setup_wires_real_activity_summary_writer_through_test_db_not_a_mock() {
+        use rusqlite::OptionalExtension;
+
+        assert!(
+            GATEWAY.get().is_none(),
+            "GATEWAY 已被其它测试设置过——本测试要求是本进程内唯一调用 setup() 的测试，\
+             否则下面的 idempotent get_or_init 会直接短路、测不出真实装配链路"
+        );
+
+        let conn = Arc::new(Mutex::new(crate::test_support::mem_db()));
+        crate::db::create_session(
+            &lock(&conn),
+            "s-u1b-setup-wire",
+            "x",
+            "local-default",
+            "local",
+        )
+        .unwrap();
+
+        let writer_conn = Arc::clone(&conn);
+        let writer: ActivitySummaryWriter = Box::new(
+            move |session_id, run_id, tool_calls, failed, mcp_calls, permission_prompts, state| {
+                let guard = lock(&writer_conn);
+                crate::db::upsert_activity_summary_and_publish(
+                    &guard,
+                    session_id,
+                    run_id,
+                    tool_calls,
+                    failed,
+                    mcp_calls,
+                    permission_prompts,
+                    state,
+                )
+                .map_err(|e| e.to_string())
+            },
+        );
+
+        setup(
+            Box::new(|_| None),
+            Box::new(|| None),
+            test_desktop_credential_provider(),
+            test_claim_client(),
+            test_active_device_provider(),
+            test_active_room_resolver(),
+            Box::new(|_| None),
+            Box::new(|| None),
+            Box::new(|| None),
+            Box::new(|| None),
+            Box::new(|_| None),
+            Box::new(|_| PairDoneAction::Rejected),
+            test_registry(),
+            test_registry_snapshot_provider(),
+            test_registry_rebase_provider(),
+            test_registry_high_water_provider(),
+            test_refresh_handler(),
+            Box::new(|_| Some(AckOutcome::Failed)),
+            Box::new(|_| Some(AckOutcome::Failed)),
+            Box::new(|_, _| true),
+            Box::new(|_| AckOutcome::Failed),
+            test_session_repo_provider(),
+            test_session_history_provider(),
+            test_message_fetch_provider(),
+        );
+        assert!(GATEWAY.get().is_some(), "setup() 必须建立 GATEWAY 单例");
+
+        // Task A 验收点①：真实 setup() 之后，install_activity_summary_writer 是唯一能配置
+        // writer 的跨模块入口——直接调它，不绕开。
+        install_activity_summary_writer(writer);
+        let inner = GATEWAY.get().expect("checked above");
+        assert!(
+            inner.state.activity_summary_tx.get().is_some(),
+            "install_activity_summary_writer 之后 activity_summary_tx 必须已配置——这正是\
+             `extract_tool_milestones` 判断'聚合器是否启用'的唯一依据"
+        );
+
+        // B3（G3）时序锚：记录 delta 发出时刻，断言"真实落库时刻"严格早于节流窗口
+        // （ACTIVITY_SUMMARY_THROTTLE_MS=2000ms）到期——不是"反正等到 3s 兜底超时就算过"的
+        // 平凡实现（那样测不出写线程是不是绕了一圈节流才凑巧赶上宽松 deadline）。
+        let sent_at = Instant::now();
+        inner
+            .state
+            .activity_summary_tx
+            .get()
+            .unwrap()
+            .send(ActivitySummaryDelta {
+                session_id: "s-u1b-setup-wire".to_owned(),
+                run_id: "run-u1b-setup-wire".to_owned(),
+                kind: ActivitySummaryDeltaKind::ToolCompleted {
+                    mcp: false,
+                    failed: false,
+                },
+            })
+            .unwrap();
+
+        let poll_deadline = sent_at + Duration::from_secs(3);
+        let mut landed_at = None;
+        while Instant::now() < poll_deadline {
+            let row: Option<String> = lock(&conn)
+                .query_row(
+                    "SELECT content FROM messages WHERE session_id = ?1 AND dedup_key = ?2",
+                    ("s-u1b-setup-wire", "activity_summary:run-u1b-setup-wire"),
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap();
+            if row.is_some() {
+                landed_at = row.map(|content| (Instant::now(), content));
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let (landed_at, content_raw) = landed_at.expect(
+            "真实 setup() 装配出的 writer 必须把聚合器产出的写真正落到测试 DB——不是靠聚合器\
+             自身单测已绿就假定生产装配链路也接得上",
+        );
+        assert!(
+            landed_at.duration_since(sent_at) < Duration::from_millis(ACTIVITY_SUMMARY_THROTTLE_MS),
+            "首次 delta 落库必须严格早于节流窗口（{ACTIVITY_SUMMARY_THROTTLE_MS}ms）到期，\
+             证明走的是 tick 周期立即写，不是凑巧撞在一个宽松 deadline 里"
+        );
+        let content: serde_json::Value = serde_json::from_str(&content_raw).unwrap();
+        assert_eq!(content[0]["run_id"], "run-u1b-setup-wire");
+        assert_eq!(content[0]["tool_calls"], 1);
+        assert_eq!(content[0]["state"], "running");
     }
 
     #[test]
@@ -20232,17 +26282,111 @@ mod tests {
     // ----------------------------------------------------------------------------------------
 
     #[test]
-    fn build_snapshot_payload_shrinks_oversized_blocks_and_truncates_tool_output() {
-        // 一条远超 OUTPUT_TRUNCATE_BYTES 的工具输出 + 一串长叙述块，逼真帧越过
-        // SNAPSHOT_PAYLOAD_BUDGET_BYTES（32KiB）。工具块放最后（最新），验证它在丢老块的过程
-        // 中存活并被截到 OUTPUT_TRUNCATE_BYTES。
+    fn build_snapshot_payload_evicts_tool_blocks_before_older_text_blocks_and_keeps_order() {
+        // 缺口②：一条较老的叙述块 + 20 个（截断后仍占相当字节数的）工具块 + 一条较新的叙述
+        // 块，逼真帧越过 SNAPSHOT_PAYLOAD_BUDGET_BYTES（32KiB）。20 个工具块总字节量远超单独
+        // 靠丢工具块能腾出的量，但两条叙述块合计只有几十字节——预算宽裕到足以让"丢掉一部分
+        // 工具块"就收敛，不需要动叙述块。验证点：① 折叠计数只可能来自工具类块（不超过 20）；
+        // ② 两条叙述块——即便 `oldest_text` 排在所有工具块之前——必须原样存活；③ 存活的工具
+        // 块必须是原始顺序中最新的那一段连续后缀（同类型内仍按旧实现"越老越先丢"淘汰）；
+        // ④ 整体渲染顺序原样保留（notice, oldest_text, 存活工具块..., newer_text），不按
+        // 淘汰候选顺序重排。
+        let oldest_text = crate::db::Block::Text {
+            text: "oldest narrative survives".to_owned(),
+        };
+        let newer_text = crate::db::Block::Text {
+            text: "newer narrative survives".to_owned(),
+        };
+        let tool_blocks: Vec<crate::db::Block> = (0..20)
+            .map(|i| crate::db::Block::Tool {
+                id: format!("tool-{i}"),
+                tool: "Bash".to_owned(),
+                summary: "big output".to_owned(),
+                card: crate::db::BlockCardKind::Command,
+                status: crate::db::BlockToolStatus::Ok,
+                exit_code: Some(0),
+                output: Some("y".repeat(OUTPUT_TRUNCATE_BYTES * 2)),
+            })
+            .collect();
+        let mut blocks = vec![oldest_text.clone()];
+        blocks.extend(tool_blocks.iter().cloned());
+        blocks.push(newer_text.clone());
+
+        let payload = build_snapshot_payload("s-1", Some(("run-x", 99)), &blocks);
+        let frame_bytes = serde_json::to_string(&payload).unwrap().len();
+        assert!(
+            frame_bytes < SNAPSHOT_PAYLOAD_BUDGET_BYTES,
+            "收敛后帧必须落回预算内，实际 {frame_bytes} 字节"
+        );
+
+        let partial_blocks = payload["partial_msg"]["blocks"].as_array().unwrap();
+        assert_eq!(
+            partial_blocks[0]["type"], "text",
+            "截断提示块必须在 blocks 首位"
+        );
+        let notice_text = partial_blocks[0]["text"].as_str().unwrap().to_owned();
+        assert!(notice_text.contains("截断"), "首块必须是截断提示文案");
+        let folded_count: usize = notice_text
+            .rsplit('(')
+            .next()
+            .and_then(|tail| tail.split(' ').next())
+            .and_then(|digits| digits.parse().ok())
+            .expect("提示文案必须以 (N 块折叠) 收尾，且 N 可解析");
+        assert!(
+            folded_count >= 1 && folded_count <= tool_blocks.len(),
+            "本场景预算只需要淘汰工具类块就能收敛，折叠计数必须落在 1..={} 区间，实际 {folded_count}",
+            tool_blocks.len()
+        );
+
+        // 两条叙述块必须都存活，且相对顺序不变——类型优先必须保护它们，不因为工具块更新
+        // 或数量更多就被牺牲。
+        let survivor_texts: Vec<&str> = partial_blocks[1..]
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .map(|block| block["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            survivor_texts,
+            vec!["oldest narrative survives", "newer narrative survives"],
+            "两条叙述块必须都存活，且顺序保持 oldest 在前、newer 在后"
+        );
+
+        // 存活的工具块必须恰好是原始顺序中最新的 (20 - folded_count) 个（同类型内仍旧越老越
+        // 先丢），且整条 partial_blocks 的顺序必须与原始块序一致（不重排）。
+        let expected_order: Vec<String> =
+            std::iter::once("text:oldest narrative survives".to_owned())
+                .chain(tool_blocks[folded_count..].iter().map(|block| match block {
+                    crate::db::Block::Tool { id, .. } => format!("tool:{id}"),
+                    _ => unreachable!(),
+                }))
+                .chain(std::iter::once("text:newer narrative survives".to_owned()))
+                .collect();
+        let actual_order: Vec<String> = partial_blocks[1..]
+            .iter()
+            .map(|block| {
+                if block["type"] == "text" {
+                    format!("text:{}", block["text"].as_str().unwrap())
+                } else {
+                    format!("tool:{}", block["id"].as_str().unwrap())
+                }
+            })
+            .collect();
+        assert_eq!(
+            actual_order, expected_order,
+            "存活块的渲染顺序必须与原始块序一致——存活工具块必须是最新的连续后缀"
+        );
+    }
+
+    #[test]
+    fn build_snapshot_payload_falls_back_to_evicting_oldest_text_after_tool_blocks_exhausted() {
+        // 缺口②：工具类块全部淘汰后仍超预算时，必须继续淘汰叙述块（由旧到新）——工具块不
+        // 得因为"最后动"就被保留到反而挤掉叙述块的地步。
         let filler_text = "z".repeat(6 * 1024);
         let mut blocks: Vec<crate::db::Block> = (0..8)
             .map(|i| crate::db::Block::Text {
                 text: format!("{filler_text}-{i}"),
             })
             .collect();
-        let oversized_output = "y".repeat(OUTPUT_TRUNCATE_BYTES * 4);
         blocks.push(crate::db::Block::Tool {
             id: "tool-oversized".to_owned(),
             tool: "Bash".to_owned(),
@@ -20250,7 +26394,7 @@ mod tests {
             card: crate::db::BlockCardKind::Command,
             status: crate::db::BlockToolStatus::Ok,
             exit_code: Some(0),
-            output: Some(oversized_output),
+            output: Some("y".repeat(OUTPUT_TRUNCATE_BYTES * 4)),
         });
 
         let payload = build_snapshot_payload("s-1", Some(("run-x", 99)), &blocks);
@@ -20269,15 +26413,96 @@ mod tests {
             partial_blocks[0]["text"].as_str().unwrap().contains("截断"),
             "首块必须是截断提示文案"
         );
-
-        let tool_block = partial_blocks
+        assert!(
+            !partial_blocks.iter().any(|block| block["type"] == "tool"),
+            "唯一的工具块必须先于任何叙述块被淘汰（即便它比大多数叙述块更新）"
+        );
+        // 剩下的业务块必须是原始叙述块的一段连续后缀（越老越先被继续丢），且保持原始顺序。
+        let survivors: Vec<&str> = partial_blocks[1..]
             .iter()
-            .find(|block| block["type"] == "tool")
-            .expect("最新的工具块必须在丢老块过程中存活");
+            .map(|block| block["text"].as_str().unwrap())
+            .collect();
+        assert!(
+            !survivors.is_empty(),
+            "8 条叙述块不应被全部淘汰——工具块淘汰后应已腾出足够预算"
+        );
         assert_eq!(
-            tool_block["output"].as_str().unwrap().len(),
-            OUTPUT_TRUNCATE_BYTES,
-            "工具输出必须被截到 OUTPUT_TRUNCATE_BYTES"
+            survivors.last().copied(),
+            Some(format!("{filler_text}-7").as_str()),
+            "最新的叙述块必须存活到最后"
+        );
+        let expected_suffix_len = survivors.len();
+        let expected: Vec<String> = (8 - expected_suffix_len..8)
+            .map(|i| format!("{filler_text}-{i}"))
+            .collect();
+        assert_eq!(
+            survivors,
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "存活的叙述块必须是由旧到新连续丢弃后剩下的最新后缀，且原顺序不变"
+        );
+    }
+
+    #[test]
+    fn build_snapshot_payload_never_evicts_actionable_block_even_when_it_must_evict_all_text_too() {
+        // R2（msgfix2 整盘审 P1）：一条超预算快照——1 张最旧的 approval 卡（actionable，L0
+        // 保护）排在最前面，后面跟 20 个（截断后仍占相当字节数的）工具块 + 大量 text 叙述
+        // 块。旧实现是二元判据："非 text" 一律最先淘汰、同档内越老越先丢——approval 卡恰好
+        // 不是 `Block::Text`，会被并进"工具类块"那一档，且是这一档里最旧的一个：淘汰只要
+        // 触发（本例总字节数远超预算，一定会触发），它必定在真正的工具块之前第一个被丢，
+        // approval 内容永久消失，用户再也看不到这张等待批准的卡。修复后 actionable 块必须
+        // 无论预算多紧都存活。
+        let approval = crate::db::Block::Approval {
+            approval_id: "appr-1".to_owned(),
+            run_id: "run-x".to_owned(),
+            tool: "Bash".to_owned(),
+            command: "rm -rf /tmp/x".to_owned(),
+            summary: "delete tmp dir".to_owned(),
+            cwd: "/tmp".to_owned(),
+            request_kind: None,
+            status: "pending".to_owned(),
+        };
+        let tool_blocks: Vec<crate::db::Block> = (0..20)
+            .map(|i| crate::db::Block::Tool {
+                id: format!("tool-{i}"),
+                tool: "Bash".to_owned(),
+                summary: "big output".to_owned(),
+                card: crate::db::BlockCardKind::Command,
+                status: crate::db::BlockToolStatus::Ok,
+                exit_code: Some(0),
+                output: Some("y".repeat(OUTPUT_TRUNCATE_BYTES * 2)),
+            })
+            .collect();
+        let text_blocks: Vec<crate::db::Block> = (0..8)
+            .map(|i| crate::db::Block::Text {
+                text: "z".repeat(6 * 1024) + &format!("-{i}"),
+            })
+            .collect();
+
+        let mut blocks = vec![approval.clone()];
+        blocks.extend(tool_blocks.iter().cloned());
+        blocks.extend(text_blocks.iter().cloned());
+
+        let payload = build_snapshot_payload("s-1", Some(("run-x", 99)), &blocks);
+        let frame_bytes = serde_json::to_string(&payload).unwrap().len();
+        assert!(
+            frame_bytes < SNAPSHOT_PAYLOAD_BUDGET_BYTES,
+            "收敛后帧必须落回预算内，实际 {frame_bytes} 字节"
+        );
+
+        let partial_blocks = payload["partial_msg"]["blocks"].as_array().unwrap();
+        let approval_survivors: Vec<&Value> = partial_blocks
+            .iter()
+            .filter(|block| block["type"] == "approval")
+            .collect();
+        assert_eq!(
+            approval_survivors.len(),
+            1,
+            "approval 卡必须存活——不管预算多紧都不能被淘汰"
+        );
+        assert_eq!(approval_survivors[0]["approval_id"], "appr-1");
+        assert_eq!(
+            approval_survivors[0]["command"], "rm -rf /tmp/x",
+            "actionable 块内容必须原样保留，不能被降级/截断"
         );
     }
 

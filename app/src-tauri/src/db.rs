@@ -321,6 +321,8 @@ pub struct Message {
     pub engine: Option<String>,
     pub agent_id: Option<String>,
     pub agent_name_snapshot: Option<String>,
+    /// msgfix1 T2（M0 §10.7）：该消息内容版本唯一真相源，新建行默认 1。
+    pub revision: i64,
 }
 
 #[allow(dead_code)]
@@ -1036,6 +1038,10 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             agent_name_snapshot TEXT,
             -- 刀 R P0-2：防重复写键（可空·NULL 不参与下方部分唯一索引）。
             dedup_key TEXT,
+            -- msgfix1 T2（M0 §10.7）：该消息内容版本唯一真相源。新建行默认 1，
+            -- 每次 content 原地更新点原子 +1（见 update_dispatch_card_terminal /
+            -- update_decision_card_status）。
+            revision INTEGER NOT NULL DEFAULT 1,
             created_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
@@ -1863,6 +1869,23 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
          ON messages(session_id, dedup_key) WHERE dedup_key IS NOT NULL",
         [],
     )?;
+
+    // msgfix1 T2（M0 §10.7）：给 messages 表加 revision 列（旧库 migration，幂等）。
+    // 新库走上方 CREATE TABLE 里的列定义（DEFAULT 1）；这里补旧库缺列的路——
+    // ADD COLUMN ... DEFAULT 1 对存量行同样回填为 1，无需额外 UPDATE 回填。
+    let has_revision = {
+        let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        cols.iter().any(|c| c == "revision")
+    };
+    if !has_revision {
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
 
     // M1-T1（remote control M0 §4c）：会话运行态独立表——不加列到 sessions（实勘裁决：
     // 加列不如独立表），不做数据迁移（新表天然从空开始）。四咽喉（solo 占槽/释放 · team
@@ -3874,6 +3897,16 @@ pub struct MsgCompletedMilestone {
     role: String,
     blocks_value: serde_json::Value,
     agent_name_snapshot: Option<String>,
+    /// msgfix1 T3（M0 §10.6）：该消息落库时 `messages.content` 列的原始 JSON 字符串——
+    /// content_ref 的 `content_sha256`/`total_bytes` 必须对这份原文字节计算，不能用
+    /// `serde_json::to_value` 重序列化后的 `blocks_value`（`Value`→`Map` 默认按 key 排序，
+    /// 字节不保证与原文相同）。
+    content_raw: String,
+    /// msgfix1 T3（M0 §10.7）：`append_message_dedup` 是本结构体唯一构造点，且只在紧随
+    /// 这一次 INSERT 成功之后构造——新插入的行 revision 恒为 schema `DEFAULT 1`（T2
+    /// migration），不存在"插入后又在同一调用内被别处 UPDATE"的路径，因此这里是结构性
+    /// 事实而非猜测值。
+    revision: i64,
 }
 
 impl MsgCompletedMilestone {
@@ -3887,6 +3920,8 @@ impl MsgCompletedMilestone {
             &self.role,
             self.blocks_value,
             self.agent_name_snapshot.as_deref(),
+            self.revision,
+            &self.content_raw,
         );
     }
 }
@@ -3907,7 +3942,7 @@ pub fn append_message_dedup(
         (
             session_id,
             role,
-            json,
+            json.as_str(),
             engine,
             agent_id,
             agent_name_snapshot,
@@ -3924,6 +3959,8 @@ pub fn append_message_dedup(
             role: role.to_string(),
             blocks_value,
             agent_name_snapshot: agent_name_snapshot.map(str::to_string),
+            content_raw: json,
+            revision: 1,
         }))
     } else {
         Ok(None)
@@ -4020,13 +4057,36 @@ where
             (session_id, milestone.message_id, assignment_id),
         )?;
     }
-    if let (Some(assignment_id), Some((status, report_text))) = (assignment_id, dispatch_terminal) {
-        update_dispatch_card_terminal(&tx, session_id, assignment_id, status, report_text)?;
-    }
+    let dispatch_card_changed_ids = if let (Some(assignment_id), Some((status, report_text))) =
+        (assignment_id, dispatch_terminal)
+    {
+        update_dispatch_card_terminal_ids(&tx, session_id, assignment_id, status, report_text)?
+    } else {
+        Vec::new()
+    };
     let inserted = milestone.is_some();
     tx.commit()?;
     if let Some(milestone) = milestone {
         publish(milestone);
+    }
+    // msgfix1 T5（缺口④）：dispatch_card 终态改写已经提交——重读该消息、以新 revision 重发
+    // msg.completed（client_msg_id 带 revision，relay 视为新事件必广播），让远端知道这张卡
+    // 翻成了终态。重发失败不回滚上面已经成功的 DB 改写（best-effort：漏发靠补发批/history
+    // 兜底），只记日志。
+    for message_id in dispatch_card_changed_ids {
+        match get_message_for_republish(conn, session_id, message_id) {
+            Ok(Some(republish)) => republish.publish(),
+            Ok(None) => {
+                eprintln!(
+                    "persist_member_report_atomic: dispatch_card terminal rewrite republish skipped — message {message_id} has no dedup_key or was not found"
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "persist_member_report_atomic: dispatch_card terminal rewrite republish read failed for message {message_id}: {error}"
+                );
+            }
+        }
     }
     Ok(inserted)
 }
@@ -4080,8 +4140,26 @@ pub fn update_dispatch_card_terminal(
     status: &str,
     report_text: &str,
 ) -> rusqlite::Result<bool> {
+    Ok(
+        !update_dispatch_card_terminal_ids(conn, session_id, assignment_id, status, report_text)?
+            .is_empty(),
+    )
+}
+
+/// msgfix1 T5（缺口④）：`update_dispatch_card_terminal` 的内核——与该函数逐字节同一份逻辑，
+/// 唯一差异是把"是否改写过"从 `bool` 换成"改写了哪些 message_id"，供调用方
+/// （`persist_member_report_atomic_with_publish`）在提交后拿着这些 id 重读消息、以新
+/// revision 重发 msg.completed（M0 §10.7）。`update_dispatch_card_terminal` 是这里的薄壳，
+/// 对外行为逐字节不变。
+fn update_dispatch_card_terminal_ids(
+    conn: &Connection,
+    session_id: &str,
+    assignment_id: &str,
+    status: &str,
+    report_text: &str,
+) -> rusqlite::Result<Vec<i64>> {
     if status == "running" {
-        return Ok(false);
+        return Ok(Vec::new());
     }
 
     let escaped_assignment_id = assignment_id
@@ -4104,7 +4182,7 @@ pub fn update_dispatch_card_terminal(
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    let mut changed = false;
+    let mut changed_ids = Vec::new();
     for (message_id, content_json) in candidates {
         let Ok(mut content) = serde_json::from_str::<serde_json::Value>(&content_json) else {
             continue;
@@ -4149,12 +4227,196 @@ pub fn update_dispatch_card_terminal(
             continue;
         };
         conn.execute(
-            "UPDATE messages SET content = ?2 WHERE id = ?1",
+            "UPDATE messages SET content = ?2, revision = revision + 1 WHERE id = ?1",
             (message_id, json),
         )?;
-        changed = true;
+        changed_ids.push(message_id);
     }
-    Ok(changed)
+    Ok(changed_ids)
+}
+
+/// msgfix1 T5（缺口④）：按 (session_id, message_id) 重读一条消息，供终态改写
+/// （`update_dispatch_card_terminal`/`update_decision_card_status`）提交后以新 revision
+/// 重发 msg.completed。要求该行 `dedup_key` 非空——能被这两个函数命中改写的消息，落库时
+/// 必然经 `append_message_dedup*` 系列写入（带 dedup_key），理论不可达"命中改写但
+/// dedup_key 为空"；防御性地返回 `Ok(None)`（调用方按"无法重发"静默跳过，不 panic）。
+pub(crate) fn get_message_for_republish(
+    conn: &Connection,
+    session_id: &str,
+    message_id: i64,
+) -> rusqlite::Result<Option<MsgCompletedMilestone>> {
+    let row: Option<(String, String, Option<String>, Option<String>, i64)> = conn
+        .query_row(
+            "SELECT role, content, dedup_key, agent_name_snapshot, revision \
+             FROM messages WHERE session_id = ?1 AND id = ?2",
+            (session_id, message_id),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    let Some((role, content_raw, dedup_key, agent_name_snapshot, revision)) = row else {
+        return Ok(None);
+    };
+    let Some(dedup_key) = dedup_key else {
+        return Ok(None);
+    };
+    let blocks_value = serde_json::from_str(&content_raw).unwrap_or(serde_json::Value::Null);
+    Ok(Some(MsgCompletedMilestone {
+        session_id: session_id.to_string(),
+        dedup_key,
+        message_id,
+        role,
+        blocks_value,
+        agent_name_snapshot,
+        content_raw,
+        revision,
+    }))
+}
+
+/// msgfix2 U1（设计稿 v4.1 §4.1·M0 §10.11）：L1 活动摘要聚合器专用的原子 upsert + republish——
+/// 单条 SQL 覆盖两态（`idx_messages_dedup` 首次未命中 = INSERT，`revision` 走 schema
+/// `DEFAULT 1`；命中已存在的 `(session_id, dedup_key)` = 原地 UPDATE content 且
+/// `revision = revision + 1`），与既有 `upsert_memory_block`（本文件）同一 `ON CONFLICT ...
+/// DO UPDATE` 惯例。写完后重读该行、复用缺口④姿势（`get_message_for_republish` +
+/// `MsgCompletedMilestone::publish`）以新 revision 重发 `msg.completed`——两态在客户端看来都是
+/// 同一个函数：`derive_msg_completed_client_msg_id` 已经按 `revision==1`/`revision>1` 分派好
+/// 派生规则，这里不需要自己区分"这次到底是插入还是更新"。
+///
+/// `content` 不是 `db::Block` 类型化卡片——`activity_summary` 是聚合器私有 JSON 形状（单元素
+/// blocks 数组，`type: "activity_summary"`，与既有 8 类卡同一 tagged-union 惯例但不进
+/// `Block` 枚举本身），避免为了这一个用途牵动全仓对 `Block` 的穷尽 match
+/// （member_runner.rs/lead_tools.rs/display_reduce.rs/continuation.rs/memory_tools.rs/lib.rs
+/// 等，超出本刀 remote_gateway.rs+db.rs 的 SCOPE）。
+///
+/// `last_insert_rowid()` 在 upsert 命中 UPDATE 分支时不会更新（SQLite 语义：只有真正 INSERT
+/// 才推进它），因此不能靠它判断 message_id，写完必须显式按 `(session_id, dedup_key)` 重查。
+///
+/// msgfix2 U1b（第三轮审查 B1/G1-b）：UPDATE 分支的 `revision` 只在 `content` 真的变化时才
+/// bump——写线程失败重试（见 `flush_activity_summary` 文档）不保证"上一次真的没落库"：如果失败
+/// 发生在这条 SQL 之后、`get_message_for_republish_by_dedup_key` 重查之前（例如那次 SELECT 报
+/// 错），内容其实已经提交，下一轮 tick 用同样的计数重试就会在这里对同一份内容再 bump 一次
+/// revision——纯噪音跳变，客户端看到的是"内容没变但 revision 涨了"。用 `CASE` 比较
+/// `messages.content = excluded.content` 让"内容相同的重放"原地不动 revision，真正的内容变化
+/// （计数/状态推进）依旧照常 +1，不改变既有两态语义。
+pub fn upsert_activity_summary_and_publish(
+    conn: &Connection,
+    session_id: &str,
+    run_id: &str,
+    tool_calls: i64,
+    failed: i64,
+    mcp_calls: i64,
+    permission_prompts: i64,
+    state: &str,
+) -> rusqlite::Result<()> {
+    let dedup_key = format!("activity_summary:{run_id}");
+    let content_json = serde_json::to_string(&serde_json::json!([{
+        "type": "activity_summary",
+        "run_id": run_id,
+        "tool_calls": tool_calls,
+        "failed": failed,
+        "mcp_calls": mcp_calls,
+        "permission_prompts": permission_prompts,
+        "state": state,
+    }]))
+    .expect("activity_summary content must serialize");
+
+    conn.execute(
+        "INSERT INTO messages (session_id, role, content, dedup_key, created_at) \
+         VALUES (?1, 'assistant', ?2, ?3, strftime('%s','now')) \
+         ON CONFLICT(session_id, dedup_key) WHERE dedup_key IS NOT NULL DO UPDATE SET \
+           content = excluded.content, \
+           revision = CASE WHEN messages.content = excluded.content \
+                            THEN messages.revision ELSE messages.revision + 1 END",
+        rusqlite::params![session_id, content_json, dedup_key],
+    )?;
+
+    let Some(republish) = get_message_for_republish_by_dedup_key(conn, session_id, &dedup_key)?
+    else {
+        // 理论不可达：上面这条语句要么真插入、要么命中它自己刚创建的冲突键，紧随其后按
+        // (session_id, dedup_key) 重查必然命中。防御性地静默跳过而不是 panic，与
+        // `get_message_for_republish` 既有的"查不到就不发"姿势一致。
+        return Ok(());
+    };
+    republish.publish();
+    Ok(())
+}
+
+/// `get_message_for_republish` 按 message_id 查；这里按 dedup_key 查——upsert 写完之后调用方
+/// 只知道 dedup_key（`activity_summary:<run_id>`），不知道这次到底落在哪个 message_id 上
+/// （insert 分支是新 id，update 分支是已有 id），必须先按 dedup_key 找回 message_id 再复用
+/// 既有的按 id 查询路径。
+fn get_message_for_republish_by_dedup_key(
+    conn: &Connection,
+    session_id: &str,
+    dedup_key: &str,
+) -> rusqlite::Result<Option<MsgCompletedMilestone>> {
+    let message_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM messages WHERE session_id = ?1 AND dedup_key = ?2",
+            (session_id, dedup_key),
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(message_id) = message_id else {
+        return Ok(None);
+    };
+    get_message_for_republish(conn, session_id, message_id)
+}
+
+/// msgfix2 U1（设计稿 v4.1 §4.1「revision 保留」段·重启恢复规则）：桌面启动时调用——扫描全部
+/// `activity_summary:*` 消息，`state=="running"` 且其 `run_id` 不在调用方给出的
+/// `active_run_ids`（当前仍在跑的逻辑 run 集合）里，一律原地改写为 `state=="failed"` 并按
+/// 缺口④姿势重发——不然一个在桌面异常重启/崩溃时仍处于 running 的 run，它的活动摘要会在手机端
+/// 永远卡在"进行中"，没有任何后续事件能把它翻转。
+///
+/// `active_run_ids` 由调用方给（db.rs 不掌握"run 是否还活着"这件事，那是运行时状态，不是存储
+/// 层状态）；本函数是纯粹的"给我当前活着的 run 集合，我来对账"，实际在桌面启动序列里接入
+/// 调用（供给真实的 active_run_ids）留后续刀（lib.rs 侧接线，超出本刀 SCOPE）。
+///
+/// 返回值 = 实际被封口的消息条数（供调用方记日志/断言，不是错误信号）。
+pub fn reconcile_stale_running_activity_summaries(
+    conn: &Connection,
+    active_run_ids: &std::collections::HashSet<String>,
+) -> rusqlite::Result<u64> {
+    let candidates: Vec<(i64, String, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, dedup_key, content FROM messages \
+             WHERE dedup_key LIKE 'activity_summary:%'",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+
+    let mut sealed = 0_u64;
+    for (message_id, session_id, dedup_key, content_json) in candidates {
+        let Some(run_id) = dedup_key.strip_prefix("activity_summary:") else {
+            continue;
+        };
+        if active_run_ids.contains(run_id) {
+            continue;
+        }
+        let Ok(mut content) = serde_json::from_str::<serde_json::Value>(&content_json) else {
+            continue;
+        };
+        let Some(block) = content.as_array_mut().and_then(|arr| arr.get_mut(0)) else {
+            continue;
+        };
+        if block.get("state").and_then(serde_json::Value::as_str) != Some("running") {
+            continue;
+        }
+        block["state"] = serde_json::Value::String("failed".to_owned());
+        let Ok(json) = serde_json::to_string(&content) else {
+            continue;
+        };
+        conn.execute(
+            "UPDATE messages SET content = ?2, revision = revision + 1 WHERE id = ?1",
+            (message_id, json),
+        )?;
+        if let Some(republish) = get_message_for_republish(conn, &session_id, message_id)? {
+            republish.publish();
+            sealed += 1;
+        }
+    }
+    Ok(sealed)
 }
 
 pub fn session_has_live_children(conn: &Connection, parent: &str) -> rusqlite::Result<bool> {
@@ -4375,23 +4637,47 @@ pub fn delete_session(conn: &Connection, id: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// R1（msgfix2 整盘审）：`content` 反序列化失败不再静默吞——`activity_summary` 私有 JSON 形状
+/// （见 `upsert_activity_summary_and_publish` 文档）本就不属于 `Vec<Block>` 的任何 tagged
+/// variant，历史上会在这里 `unwrap_or_default()` 悄悄变成空 blocks，桌面据此渲染出空白
+/// assistant 气泡——真正的口子已经在 `get_messages`/`list_session_index_snapshot_rows` 两处
+/// SQL 层把 `activity_summary:*` 消息整条排除（见各自函数文档），这里的 `unwrap_or_else` 只是
+/// 兜底防线：万一未来出现别的解析失败（脏数据/新块型漏加变体），至少留一条可查日志，不再是
+/// 纯粹的"错误吞掉、内容清空、无人知道"。
 fn map_message_row(r: &rusqlite::Row) -> rusqlite::Result<Message> {
+    let id: i64 = r.get(0)?;
     let content_json: String = r.get(2)?;
-    let content: Vec<Block> = serde_json::from_str(&content_json).unwrap_or_default();
+    let content: Vec<Block> = serde_json::from_str(&content_json).unwrap_or_else(|error| {
+        eprintln!("map_message_row: message {id} content 解析失败，回退为空 blocks: {error}");
+        Vec::new()
+    });
     Ok(Message {
-        id: r.get(0)?,
+        id,
         role: r.get(1)?,
         content,
         engine: r.get(3)?,
         agent_id: r.get(4)?,
         agent_name_snapshot: r.get(5)?,
         created_at: r.get(6)?,
+        revision: r.get(7)?,
     })
 }
 
+/// R1（msgfix2 整盘审）：`activity_summary:*`（`dedup_key` 前缀，见
+/// `upsert_activity_summary_and_publish`）消息不进这条读路径——它的 `content` 是聚合器私有
+/// JSON 形状（不是 `Vec<Block>` 的任何 tagged variant），旧实现让它流进
+/// `map_message_row`、解析失败被 `unwrap_or_default()` 悄悄清成空 blocks，污染三条下游：
+/// 桌面会话流出空白 assistant 气泡、`build_agent_prompt`（lib.rs，history 直接取自本函数）
+/// 往 LLM prompt 注入空「助手：」行、`continuation.rs` 交接窗口（同样直接取自本函数）被空行
+/// 占掉本该留给真实消息的窗口名额。三条下游共用同一个 history 来源，在 SQL 层单点排除即可
+/// 同时堵住——不需要给 `db::Block` 加变体牵动全仓穷尽 match（那样会波及
+/// member_runner.rs/lead_tools.rs/lead_step.rs/memory_tools.rs 等超出本刀 SCOPE 的文件）。
 pub fn get_messages(conn: &Connection, session_id: &str) -> rusqlite::Result<Vec<Message>> {
     let mut stmt = conn.prepare(
-        "SELECT id, role, content, engine, agent_id, agent_name_snapshot, created_at FROM messages WHERE session_id = ?1 ORDER BY id ASC",
+        "SELECT id, role, content, engine, agent_id, agent_name_snapshot, created_at, revision \
+         FROM messages \
+         WHERE session_id = ?1 AND (dedup_key IS NULL OR dedup_key NOT LIKE 'activity_summary:%') \
+         ORDER BY id ASC",
     )?;
     let rows = stmt.query_map([session_id], map_message_row)?;
     rows.collect()
@@ -4399,7 +4685,7 @@ pub fn get_messages(conn: &Connection, session_id: &str) -> rusqlite::Result<Vec
 
 pub fn get_message_by_id(conn: &Connection, id: i64) -> rusqlite::Result<Option<Message>> {
     conn.query_row(
-        "SELECT id, role, content, engine, agent_id, agent_name_snapshot, created_at FROM messages WHERE id = ?1",
+        "SELECT id, role, content, engine, agent_id, agent_name_snapshot, created_at, revision FROM messages WHERE id = ?1",
         [id],
         map_message_row,
     )
@@ -4412,7 +4698,7 @@ pub fn get_message_by_session_and_dedup_key(
     dedup_key: &str,
 ) -> rusqlite::Result<Option<Message>> {
     conn.query_row(
-        "SELECT id, role, content, engine, agent_id, agent_name_snapshot, created_at \
+        "SELECT id, role, content, engine, agent_id, agent_name_snapshot, created_at, revision \
          FROM messages WHERE session_id = ?1 AND dedup_key = ?2",
         (session_id, dedup_key),
         map_message_row,
@@ -4544,6 +4830,31 @@ pub fn update_decision_card_status(
     next_status: &str,
     chosen_option: Option<&str>,
 ) -> rusqlite::Result<bool> {
+    Ok(update_decision_card_status_message_id(
+        conn,
+        session_id,
+        decision_id,
+        expect_status,
+        next_status,
+        chosen_option,
+    )?
+    .is_some())
+}
+
+/// msgfix1 T5（缺口④）：`update_decision_card_status` 的内核——与该函数逐字节同一份逻辑，
+/// 唯一差异是把"是否改写过"从 `bool` 换成"改写了哪个 message_id"（decision_id 会话内唯一，
+/// 命中即停，至多一个），供调用方（`prompt_user`/`commit_late_answer`/`choose_decision_card`）
+/// 在改写提交后拿着这个 id 重读消息、以新 revision 重发 msg.completed（M0 §10.7）。
+/// `update_decision_card_status` 是这里的薄壳，对外行为逐字节不变（含内部既有的
+/// `publish_card_resolved_milestone` 调用，位置/条件都未挪动）。
+pub(crate) fn update_decision_card_status_message_id(
+    conn: &Connection,
+    session_id: &str,
+    decision_id: &str,
+    expect_status: &str,
+    next_status: &str,
+    chosen_option: Option<&str>,
+) -> rusqlite::Result<Option<i64>> {
     let tx = conn.unchecked_transaction()?;
     let rows: Vec<(i64, String)> = {
         let mut stmt =
@@ -4597,7 +4908,7 @@ pub fn update_decision_card_status(
                 let new_json =
                     serde_json::to_string(&content).expect("decision_card content 序列化失败");
                 tx.execute(
-                    "UPDATE messages SET content = ?1 WHERE id = ?2",
+                    "UPDATE messages SET content = ?1, revision = revision + 1 WHERE id = ?2",
                     rusqlite::params![new_json, msg_id],
                 )?;
             }
@@ -4610,11 +4921,11 @@ pub fn update_decision_card_status(
                     chosen_option,
                 );
             }
-            return Ok(changed);
+            return Ok(if changed { Some(msg_id) } else { None });
         }
     }
     tx.commit()?;
-    Ok(false) // 没找到该 decision_id
+    Ok(None) // 没找到该 decision_id
 }
 
 /// 决策打扰收敛刀 T1：按 decision_id 找卡的 (question, status)（不改任何状态·只读）。
@@ -6271,6 +6582,7 @@ pub fn list_session_index_snapshot_rows(
          LEFT JOIN messages latest_message ON latest_message.id = ( \
              SELECT m.id FROM messages m \
              WHERE m.session_id = s.id AND m.role IN ('user', 'assistant') \
+               AND (m.dedup_key IS NULL OR m.dedup_key NOT LIKE 'activity_summary:%') \
              ORDER BY m.id DESC LIMIT 1 \
          ) \
          WHERE s.deleted_at IS NULL \
@@ -6310,7 +6622,13 @@ pub struct MilestoneReplayRow {
     pub message_id: i64,
     pub role: String,
     pub content_json: serde_json::Value,
+    /// msgfix1 T3（M0 §10.6）：`content_json` 之外原样保留的原始 DB `content` 字符串——
+    /// content_ref 的 sha256/total_bytes 必须对这份原文字节计算，不能用重新序列化过的
+    /// `content_json`（`Value`→`Map` 默认按 key 排序，字节不保证与原文相同）。
+    pub content: String,
     pub dedup_key: String,
+    /// msgfix1 T3（M0 §10.7）：该消息当前的 `messages.revision`。
+    pub revision: i64,
 }
 
 /// `control.history` 的短锁 DB 读取结果。这里只搬运 SQLite 原始列；`content` 的 JSON 解析
@@ -6320,6 +6638,8 @@ pub struct SessionHistoryRow {
     pub message_id: i64,
     pub role: String,
     pub content: String,
+    /// msgfix1 T3（M0 §10.7）：该消息当前的 `messages.revision`。
+    pub revision: i64,
 }
 
 pub fn list_session_history_rows(
@@ -6329,7 +6649,7 @@ pub fn list_session_history_rows(
     max_rows: i64,
 ) -> rusqlite::Result<Vec<SessionHistoryRow>> {
     let mut stmt = conn.prepare(
-        "SELECT m.id, m.role, m.content FROM messages m \
+        "SELECT m.id, m.role, m.content, m.revision FROM messages m \
          JOIN sessions s ON s.id = m.session_id \
          WHERE m.session_id = ?1 AND m.role IN ('user','assistant') \
            AND (?2 IS NULL OR m.id < ?2) AND s.deleted_at IS NULL \
@@ -6340,9 +6660,92 @@ pub fn list_session_history_rows(
             message_id: r.get(0)?,
             role: r.get(1)?,
             content: r.get(2)?,
+            revision: r.get(3)?,
         })
     })?;
     rows.collect()
+}
+
+/// msgfix1 T4（M0 §10.9 联合授权闸）：按精确 `(session_id, message_id)` 查一条消息用于 `msg.fetch`
+/// 全文拉取——与 `list_session_history_rows` 不同，那条查询把 `JOIN sessions ... deleted_at IS
+/// NULL` 直接写进 WHERE，会把「消息不存在」与「消息存在但所属 session 已软删」在 SQL 层面合并成
+/// 同一个空结果，调用方拿不到区分 `not_found`/`soft_deleted` 所需的信息；`get_message_by_id` 又
+/// 不带 `session_id`（`Message` 结构体本就没有这个字段）、且 `content` 已被解析成 `Vec<Block>`
+/// 丢失原始字符串——都不能满足 `msg.fetch` 三态判定 + `content_ref` sha256 必须按原文字节计算
+/// 的双重要求（同一顾虑见 `MilestoneReplayRow`/`SessionHistoryRow` 文档段落）。
+///
+/// 两段查询：先按 `(session_id, message_id)` 联表查——命中即该消息确属这个 session，随手带出
+/// `sessions.deleted_at` 判断会话软删；未命中时不能直接判 `not_found`（可能只是不属于这个
+/// session），需要第二段全局存在性探测区分「越权」与「真不存在」。
+#[derive(Clone, Debug, PartialEq)]
+pub enum MessageForFetch {
+    /// 消息确属该 session；`session_deleted` = 其所属 session 是否已软删
+    /// （`sessions.deleted_at IS NOT NULL`）。`content` 是原始 DB 字符串，未经任何反序列化/
+    /// 重序列化——调用方计算 `content_sha256`/切片必须用这份原文，不能用解析后的 `Value`。
+    Found {
+        content: String,
+        revision: i64,
+        session_deleted: bool,
+    },
+    /// `message_id` 在 `messages` 表里存在，但不属于调用方声称的 `session_id`（越权）。
+    WrongSession,
+    /// `message_id` 在整个 `messages` 表里都不存在。
+    NotFound,
+}
+
+pub fn get_message_for_fetch(
+    conn: &Connection,
+    session_id: &str,
+    message_id: i64,
+) -> rusqlite::Result<MessageForFetch> {
+    let owned: Option<(String, i64, Option<i64>)> = conn
+        .query_row(
+            "SELECT m.content, m.revision, s.deleted_at \
+             FROM messages m JOIN sessions s ON s.id = m.session_id \
+             WHERE m.session_id = ?1 AND m.id = ?2",
+            (session_id, message_id),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    if let Some((content, revision, session_deleted_at)) = owned {
+        return Ok(MessageForFetch::Found {
+            content,
+            revision,
+            session_deleted: session_deleted_at.is_some(),
+        });
+    }
+    // msgfix1 T4 返修①（存在性 oracle）：兜底探测原先是 `SELECT 1 FROM messages WHERE id=?1`
+    // ——不限定归属，等于把「这个 message_id 在全库任何 repo 下是否存在」暴露成一个可探测的
+    // 全局 oracle（他 repo 的合法 id 回 `forbidden`，纯捏造的 id 回 `not_found`，二者响应不同
+    // 即可枚举）。收紧为**同 repo 维度**：只有当 `message_id` 存在，且它所属 session 与调用方
+    // 声称的 `session_id` 属于**同一个 repo**（`sessions.repo_id` 相同）时才回 `WrongSession`
+    // （越权但同域，回 `forbidden` 是合理的——攻击者本就有权访问同 repo 内的其它会话列表，
+    // 泄露"这条 id 在你能看到的项目里"不构成新的越权信息）；跨 repo 存在 或 完全不存在，两者
+    // **同响应** `NotFound`，回 `not_found`，不给攻击者留下二值判据。
+    //
+    // `s.repo_id IS (SELECT repo_id FROM sessions WHERE id = ?2)` 用 SQLite 的 `IS`（NULL-safe
+    // 相等）而不是 `=`——`repo_id` 可空（本地默认会话无项目，`ALTER TABLE sessions ADD COLUMN
+    // repo_id TEXT REFERENCES repos(id) ON DELETE SET NULL`）；用 `=` 时 `NULL = NULL` 求值为
+    // NULL（假），会把"两条都是无项目默认会话"误判成"不同 repo"，反而把这类会话之间的越权
+    // 探测错误地降级成 `not_found`（本该是 `forbidden`）。子查询命中不存在的 `session_id`
+    // 时返回 NULL，`s.repo_id IS NULL` 只在这个 session 本身也是默认会话时才为真——不会因为
+    // 调用方声称的 session 不存在而意外放宽判定（`command_session_allowed` 早已在更前一步挡掉
+    // 不存在的 session，这里是纵深防御，不是唯一防线）。
+    let exists_in_same_repo: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM messages m \
+             JOIN sessions s ON s.id = m.session_id \
+             WHERE m.id = ?1 \
+               AND s.repo_id IS (SELECT repo_id FROM sessions WHERE id = ?2)",
+            (message_id, session_id),
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(if exists_in_same_repo.is_some() {
+        MessageForFetch::WrongSession
+    } else {
+        MessageForFetch::NotFound
+    })
 }
 
 /// 对齐 relay 保留窗（7 天 / 1 万条，M0 §6）——重发集有界常量。
@@ -6353,30 +6756,41 @@ pub fn list_recent_milestone_replay_rows(
     limit: i64,
 ) -> rusqlite::Result<Vec<MilestoneReplayRow>> {
     let mut stmt = conn.prepare(
-        "SELECT m.id, m.session_id, m.role, m.content, m.dedup_key \
+        "SELECT m.id, m.session_id, m.role, m.content, m.dedup_key, m.revision \
          FROM messages m \
          JOIN sessions s ON s.id = m.session_id \
          WHERE m.role IN ('assistant', 'user') AND m.dedup_key IS NOT NULL AND s.deleted_at IS NULL \
          ORDER BY m.id DESC \
          LIMIT ?1",
     )?;
-    let raw_rows: Vec<(i64, String, String, String, String)> = stmt
+    let raw_rows: Vec<(i64, String, String, String, String, i64)> = stmt
         .query_map([limit], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut rows: Vec<MilestoneReplayRow> = raw_rows
         .into_iter()
-        .filter_map(|(message_id, session_id, role, content_text, dedup_key)| {
-            let content_json = serde_json::from_str(&content_text).ok()?;
-            Some(MilestoneReplayRow {
-                session_id,
-                message_id,
-                role,
-                content_json,
-                dedup_key,
-            })
-        })
+        .filter_map(
+            |(message_id, session_id, role, content_text, dedup_key, revision)| {
+                let content_json = serde_json::from_str(&content_text).ok()?;
+                Some(MilestoneReplayRow {
+                    session_id,
+                    message_id,
+                    role,
+                    content_json,
+                    content: content_text,
+                    dedup_key,
+                    revision,
+                })
+            },
+        )
         .collect();
     rows.reverse();
     Ok(rows)
@@ -9391,6 +9805,166 @@ mod tests {
         assert!(rows.is_empty());
     }
 
+    /// msgfix1 T4：`get_message_for_fetch` 四态钉死——命中未删/命中已软删/存在但属他 session/
+    /// 完全不存在。这四态是 `msg.fetch` 校验链第①步（forbidden/soft_deleted/not_found 三 code）
+    /// 唯一的数据来源，任何一态判错都会导致 wire 层泄露越权/不存在的区分或漏挡越权读取。
+    #[test]
+    fn get_message_for_fetch_returns_found_with_original_bytes_when_session_is_live() {
+        let c = mem();
+        create_session(&c, "fetch-live", "Fetch", "local-default", "local").unwrap();
+        append_message(
+            &c,
+            "fetch-live",
+            "assistant",
+            &[Block::Text {
+                text: "hello fetch".into(),
+            }],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let message_id = c.last_insert_rowid();
+
+        let raw_content: String = c
+            .query_row(
+                "SELECT content FROM messages WHERE id = ?1",
+                [message_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        match get_message_for_fetch(&c, "fetch-live", message_id).unwrap() {
+            MessageForFetch::Found {
+                content,
+                revision,
+                session_deleted,
+            } => {
+                assert_eq!(
+                    content, raw_content,
+                    "必须原样返回 DB content 字符串，不能重新序列化——sha256/切片按原文字节计算"
+                );
+                assert_eq!(revision, 1, "新建消息默认 revision = 1");
+                assert!(!session_deleted, "session 未软删");
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_message_for_fetch_flags_session_deleted_without_hiding_the_message() {
+        let c = mem();
+        create_session(&c, "fetch-soft-deleted", "Fetch", "local-default", "local").unwrap();
+        append_message(
+            &c,
+            "fetch-soft-deleted",
+            "assistant",
+            &[Block::Text {
+                text: "still readable content".into(),
+            }],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let message_id = c.last_insert_rowid();
+        set_session_deleted(&c, "fetch-soft-deleted").unwrap();
+
+        match get_message_for_fetch(&c, "fetch-soft-deleted", message_id).unwrap() {
+            MessageForFetch::Found {
+                session_deleted, ..
+            } => {
+                assert!(
+                    session_deleted,
+                    "会话软删后仍要能拿到内容——由调用方决定回 soft_deleted，而不是让查询本身消失"
+                );
+            }
+            other => panic!("expected Found{{session_deleted:true}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_message_for_fetch_reports_wrong_session_for_a_message_owned_elsewhere() {
+        let c = mem();
+        create_session(&c, "fetch-owner", "Fetch", "local-default", "local").unwrap();
+        create_session(&c, "fetch-intruder", "Fetch", "local-default", "local").unwrap();
+        append_message(
+            &c,
+            "fetch-owner",
+            "assistant",
+            &[Block::Text {
+                text: "owned by fetch-owner".into(),
+            }],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let message_id = c.last_insert_rowid();
+
+        assert_eq!(
+            get_message_for_fetch(&c, "fetch-intruder", message_id).unwrap(),
+            MessageForFetch::WrongSession,
+            "message_id 存在但归属别的 session——不得当 not_found 处理（会跟真不存在混为一谈）"
+        );
+    }
+
+    #[test]
+    fn get_message_for_fetch_reports_not_found_for_an_unknown_message_id() {
+        let c = mem();
+        create_session(&c, "fetch-empty", "Fetch", "local-default", "local").unwrap();
+
+        assert_eq!(
+            get_message_for_fetch(&c, "fetch-empty", 999_999).unwrap(),
+            MessageForFetch::NotFound
+        );
+    }
+
+    /// msgfix1 T4 返修①（存在性 oracle）：全局 `SELECT 1 FROM messages WHERE id=?1` 兜底会让
+    /// "他 repo 的合法 message_id"（回 forbidden）与"纯捏造的 id"（回 not_found）产生不同响应
+    /// ——攻击者据此可枚举全库 message_id 是否存在，与仓库归属无关。收紧后跨 repo 存在必须与
+    /// 完全不存在**同响应** `NotFound`；只有同 repo 内存在但属别的 session 才回 `WrongSession`
+    /// （见 `get_message_for_fetch_reports_wrong_session_for_a_message_owned_elsewhere` 那条同
+    /// repo 正例）。
+    #[test]
+    fn get_message_for_fetch_reports_not_found_not_wrong_session_for_a_message_in_another_repo() {
+        let c = mem();
+        c.execute(
+            "INSERT INTO repos (id, namespace_id, source, name, path, status, added_at) \
+             VALUES ('other-repo', 'local', 'local', '别的项目', '/tmp/agentloom-mem-other-repo', 'active', 0)",
+            [],
+        )
+        .unwrap();
+        create_session(&c, "fetch-owner-other-repo", "Fetch", "other-repo", "local").unwrap();
+        create_session(
+            &c,
+            "fetch-intruder-cross-repo",
+            "Fetch",
+            "local-default",
+            "local",
+        )
+        .unwrap();
+        append_message(
+            &c,
+            "fetch-owner-other-repo",
+            "assistant",
+            &[Block::Text {
+                text: "owned by a session in a different repo".into(),
+            }],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let message_id = c.last_insert_rowid();
+
+        assert_eq!(
+            get_message_for_fetch(&c, "fetch-intruder-cross-repo", message_id).unwrap(),
+            MessageForFetch::NotFound,
+            "跨 repo 存在必须与真不存在同响应，不能通过响应差异探测全局 message_id 是否存在"
+        );
+    }
+
     #[test]
     fn history_init_schema_creates_role_filtered_pagination_index() {
         let c = mem();
@@ -11283,6 +11857,61 @@ mod tests {
     }
 
     #[test]
+    fn update_decision_card_status_bumps_revision_and_noop_cas_loss_does_not() {
+        let c = mem();
+        create_session(&c, "s1", "x", "local-default", "local").unwrap();
+        let blocks = vec![Block::DecisionCard {
+            decision_id: "dc-rev-1".into(),
+            kind: "ask".into(),
+            question: "?".into(),
+            options: vec!["A".into(), "B".into()],
+            recommended: None,
+            rationale: None,
+            payload: serde_json::Value::Null,
+            source_run_id: "r-1".into(),
+            status: "pending".into(),
+            chosen_option: None,
+            created_at: 1,
+        }];
+        append_message(&c, "s1", "assistant", &blocks, None, None, None).unwrap();
+        assert_eq!(get_messages(&c, "s1").unwrap()[0].revision, 1);
+
+        // 第一次成功 CAS：pending → submitting，原子 +1。
+        assert!(
+            update_decision_card_status(&c, "s1", "dc-rev-1", "pending", "submitting", None)
+                .unwrap()
+        );
+        assert_eq!(get_messages(&c, "s1").unwrap()[0].revision, 2);
+
+        // CAS 落败（expect 已不是 pending）：不改内容 → revision 不动。
+        assert!(
+            !update_decision_card_status(&c, "s1", "dc-rev-1", "pending", "submitting", None)
+                .unwrap()
+        );
+        assert_eq!(
+            get_messages(&c, "s1").unwrap()[0].revision,
+            2,
+            "CAS 落败不应递增 revision"
+        );
+
+        // 第二次成功 CAS：submitting → chosen，连续两次成功更新 revision 应为 3。
+        assert!(update_decision_card_status(
+            &c,
+            "s1",
+            "dc-rev-1",
+            "submitting",
+            "chosen",
+            Some("A"),
+        )
+        .unwrap());
+        assert_eq!(
+            get_messages(&c, "s1").unwrap()[0].revision,
+            3,
+            "连续两次原子更新后 revision 应为 3"
+        );
+    }
+
+    #[test]
     fn find_decision_card_returns_question_and_status() {
         let c = mem();
         create_session(&c, "s1", "x", "local-default", "local").unwrap();
@@ -11907,6 +12536,109 @@ mod tests {
             vec![Block::Text {
                 text: "target report".into()
             }]
+        );
+    }
+
+    // msgfix1 T2（M0 §10.7）：messages.revision 是内容版本唯一真相源。
+
+    #[test]
+    fn messages_revision_migration_backfills_existing_rows_to_one() {
+        let c = mem();
+        // 模拟旧库：先重建一个没有 revision 列（也没有 dedup_key 列）的旧版 messages 表，
+        // 插入一行存量数据，再跑 init_schema 走 ALTER TABLE 迁移路径补列。
+        c.execute_batch(
+            "DROP TABLE messages;
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id TEXT NOT NULL,
+                 role TEXT NOT NULL,
+                 content TEXT NOT NULL CHECK (json_valid(content)),
+                 engine TEXT,
+                 agent_id TEXT,
+                 agent_name_snapshot TEXT,
+                 created_at INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO messages (session_id, role, content, created_at) \
+             VALUES ('legacy-session', 'user', '[]', 1)",
+            [],
+        )
+        .unwrap();
+
+        init_schema(&c).unwrap();
+
+        let revision: i64 = c
+            .query_row(
+                "SELECT revision FROM messages WHERE session_id = 'legacy-session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision, 1, "旧库存量行迁移后 revision 应自然回填为 1");
+
+        // 迁移是幂等的：再跑一次 init_schema 不应报错、不应改变已有值。
+        init_schema(&c).unwrap();
+        let revision_again: i64 = c
+            .query_row(
+                "SELECT revision FROM messages WHERE session_id = 'legacy-session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision_again, 1);
+    }
+
+    #[test]
+    fn append_message_new_row_starts_at_revision_one() {
+        let c = mem();
+        create_session(&c, "s1", "x", "local-default", "local").unwrap();
+        append_message(
+            &c,
+            "s1",
+            "user",
+            &[Block::Text { text: "hi".into() }],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let messages = get_messages(&c, "s1").unwrap();
+        assert_eq!(messages[0].revision, 1);
+    }
+
+    #[test]
+    fn update_dispatch_card_terminal_bumps_revision_on_change_and_not_on_noop() {
+        let c = mem();
+        create_session(&c, "s1", "x", "local-default", "local").unwrap();
+        append_message(
+            &c,
+            "s1",
+            "assistant",
+            &[running_dispatch_card("assignment-1")],
+            Some("agent-team"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(get_messages(&c, "s1").unwrap()[0].revision, 1);
+
+        assert!(update_dispatch_card_terminal(&c, "s1", "assignment-1", "done", "first").unwrap());
+        assert_eq!(
+            get_messages(&c, "s1").unwrap()[0].revision,
+            2,
+            "首次原地更新原子 +1"
+        );
+
+        // 幂等：卡已终态，再次调用不命中 running 分支 → 不改内容 → revision 不动。
+        assert!(
+            !update_dispatch_card_terminal(&c, "s1", "assignment-1", "failed", "second").unwrap()
+        );
+        assert_eq!(
+            get_messages(&c, "s1").unwrap()[0].revision,
+            2,
+            "幂等 no-op 更新不应额外递增 revision"
         );
     }
 
@@ -13656,6 +14388,520 @@ mod agents {
         assert!(
             crate::remote_gateway::test_take_publish_log().is_empty(),
             "rollback 路径不得发布 msg.completed 幽灵事件"
+        );
+    }
+
+    #[test]
+    fn persist_member_report_atomic_republishes_dispatch_card_terminal_rewrite_with_new_revision() {
+        // msgfix1 T5（缺口④）：running dispatch_card 终态改写提交后，必须重读该消息、以新
+        // revision 重发 msg.completed——revision 从 1（running）bump 到 2（done），
+        // derive_msg_completed_client_msg_id 随 revision 变化，relay 才会把这次改写当"新事件"
+        // 广播，不会被幂等去重吞掉。
+        let c = crate::test_support::mem_db();
+        create_session(&c, "s-dispatch-republish", "x", "local-default", "local").unwrap();
+
+        // 先落一条带 running dispatch_card 的 lead 消息（真实生产路径：lead 自己 flush 走
+        // append_message_dedup*，dedup_key 用 run_flush 风格）。
+        let dispatch_card = member_report_delivery_running_card("assignment-republish");
+        let inserted = append_message_dedup(
+            &c,
+            "s-dispatch-republish",
+            "assistant",
+            &[dispatch_card],
+            Some("agent-team"),
+            None,
+            None,
+            "run_flush:lead-run-republish",
+        )
+        .unwrap()
+        .expect("首次落库应产出 milestone");
+        let dispatch_message_id = inserted.message_id;
+        assert_eq!(
+            c.query_row(
+                "SELECT revision FROM messages WHERE id = ?1",
+                [dispatch_message_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "新插入行 revision 应为 schema 默认值 1"
+        );
+
+        crate::remote_gateway::test_take_publish_log();
+
+        let inserted_report = persist_member_report_atomic(
+            &c,
+            "s-dispatch-republish",
+            &[Block::Text {
+                text: "[Worker report]\nstatus: done".into(),
+            }],
+            Some("worker-agent"),
+            Some("Worker"),
+            "member_result:run-republish:assignment-republish",
+            Some("assignment-republish"),
+            Some(("done", "[Worker report]\nstatus: done")),
+        )
+        .unwrap();
+        assert!(inserted_report, "新报告消息应真插入");
+
+        // DB 侧：dispatch_card 消息 revision 必须 +1（原有不变量，未受影响）。
+        let bumped_revision: i64 = c
+            .query_row(
+                "SELECT revision FROM messages WHERE id = ?1",
+                [dispatch_message_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bumped_revision, 2,
+            "终态改写必须把 dispatch_card 消息 revision 从 1 bump 到 2"
+        );
+
+        // publish 侧：一次是新报告消息本身的 msg.completed，一次是 dispatch_card 终态改写的
+        // 重发——不是只发了新报告那一条就完事。
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["msg.completed", "msg.completed"],
+            "缺口④：终态改写必须额外重发一次 msg.completed"
+        );
+
+        // 重读侧：get_message_for_republish 必须能读到 bump 后的 revision 与改写后的内容，
+        // dedup_key 与首发时一致（否则 client_msg_id 对不上同一条消息）。
+        let republish = get_message_for_republish(&c, "s-dispatch-republish", dispatch_message_id)
+            .unwrap()
+            .expect("dispatch_card 消息应可重读用于重发");
+        assert_eq!(republish.dedup_key, "run_flush:lead-run-republish");
+        assert_eq!(republish.revision, 2);
+        assert!(
+            republish.content_raw.contains("\"status\":\"done\""),
+            "重读内容必须是终态改写后的内容: {}",
+            republish.content_raw
+        );
+
+        // client_msg_id 必须随 revision 变化——旧 revision(1) 与新 revision(2) 派生出不同
+        // id，relay 才会把这次改写当"新事件"广播、不被幂等去重吞掉。
+        assert_ne!(
+            crate::remote_gateway::derive_msg_completed_client_msg_id(
+                "s-dispatch-republish",
+                &republish.dedup_key,
+                1,
+            ),
+            crate::remote_gateway::derive_msg_completed_client_msg_id(
+                "s-dispatch-republish",
+                &republish.dedup_key,
+                republish.revision,
+            ),
+            "revision 改变后 client_msg_id 必须跟着变"
+        );
+    }
+
+    #[test]
+    fn upsert_activity_summary_and_publish_first_call_inserts_revision_one_and_publishes() {
+        // msgfix2 U1（设计稿 v4.1 §4.1）：首次出现某 run 的 activity_summary——新 INSERT，
+        // revision 走 schema DEFAULT 1，content 是单元素 blocks 数组、type="activity_summary"，
+        // 六个计数/状态字段齐全，且首发就走 publish（不是只落库不发）。
+        let c = crate::test_support::mem_db();
+        create_session(&c, "s-activity-summary", "x", "local-default", "local").unwrap();
+        crate::remote_gateway::test_take_publish_log();
+
+        upsert_activity_summary_and_publish(
+            &c,
+            "s-activity-summary",
+            "run-1",
+            3,
+            0,
+            1,
+            0,
+            "running",
+        )
+        .unwrap();
+
+        let (dedup_key, content_raw, revision): (String, String, i64) = c
+            .query_row(
+                "SELECT dedup_key, content, revision FROM messages WHERE session_id = ?1",
+                ["s-activity-summary"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(dedup_key, "activity_summary:run-1");
+        assert_eq!(revision, 1, "首次插入 revision 必须走 schema DEFAULT 1");
+
+        let content: serde_json::Value = serde_json::from_str(&content_raw).unwrap();
+        let block = &content[0];
+        assert_eq!(block["type"], "activity_summary");
+        assert_eq!(block["run_id"], "run-1");
+        assert_eq!(block["tool_calls"], 3);
+        assert_eq!(block["failed"], 0);
+        assert_eq!(block["mcp_calls"], 1);
+        assert_eq!(block["permission_prompts"], 0);
+        assert_eq!(block["state"], "running");
+
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["msg.completed"],
+            "首次 upsert 必须发布一次 msg.completed"
+        );
+    }
+
+    #[test]
+    fn get_messages_excludes_activity_summary_rows() {
+        // R1（msgfix2 整盘审）：`activity_summary:*` 消息落共享 messages 表，但它不是一条
+        // 真实的助手消息——`get_messages` 是桌面消息流 + `build_agent_prompt`（lib.rs）+
+        // `continuation.rs` 交接窗口共用的唯一 history 来源，三条下游都不该看到它。
+        let c = crate::test_support::mem_db();
+        create_session(&c, "s-r1-get-messages", "x", "local-default", "local").unwrap();
+        append_message(
+            &c,
+            "s-r1-get-messages",
+            "user",
+            &[Block::Text {
+                text: "第一条真实消息".to_owned(),
+            }],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        upsert_activity_summary_and_publish(
+            &c,
+            "s-r1-get-messages",
+            "run-1",
+            2,
+            0,
+            0,
+            0,
+            "running",
+        )
+        .unwrap();
+        append_message(
+            &c,
+            "s-r1-get-messages",
+            "assistant",
+            &[Block::Text {
+                text: "第二条真实消息".to_owned(),
+            }],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let messages = get_messages(&c, "s-r1-get-messages").unwrap();
+        assert_eq!(
+            messages.len(),
+            2,
+            "activity_summary 消息必须被排除在外，只剩两条真实消息"
+        );
+        for message in &messages {
+            assert_ne!(
+                blocks_to_text(&message.content),
+                "",
+                "真实消息不该有空 content（activity_summary 混进来才会解析成空 blocks）"
+            );
+        }
+    }
+
+    #[test]
+    fn session_index_preview_skips_activity_summary_falls_back_to_real_message() {
+        // R1（msgfix2 整盘审）：db.rs:6559 附近——latest_message 子查询如果选中了
+        // `activity_summary:*` 那条（它没有 type=="text" 的块），`session_index_message_
+        // preview` 找不到文本块只能返回 None，会话预览被顶成空白。修复后子查询必须跳过
+        // activity_summary、回退到更早的那条真实文本消息。
+        let c = crate::test_support::mem_db();
+        create_session(&c, "s-r1-preview", "预览会话", "local-default", "local").unwrap();
+        append_message(
+            &c,
+            "s-r1-preview",
+            "assistant",
+            &[Block::Text {
+                text: "这是真正的最后一条消息内容".to_owned(),
+            }],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // activity_summary 在真实消息之后写入——成为该 session 在 messages 表里 id 最大的行。
+        upsert_activity_summary_and_publish(&c, "s-r1-preview", "run-1", 1, 0, 0, 0, "running")
+            .unwrap();
+
+        let rows = list_session_index_snapshot_rows(&c).unwrap();
+        let row = rows
+            .into_iter()
+            .find(|r| r.id == "s-r1-preview")
+            .expect("会话必须出现在快照行里");
+        assert_eq!(
+            row.last_msg_preview.as_deref(),
+            Some("这是真正的最后一条消息内容"),
+            "预览必须回退到真实文本消息，不能因为最新一行是 activity_summary 就顶成 None"
+        );
+    }
+
+    #[test]
+    fn upsert_activity_summary_content_shape_is_exactly_seven_keys_no_actionable_leak() {
+        // L0 保护反向测试（设计稿 v4.1 §4.1）：activity_summary 块必须**只**含七个键（type +
+        // 六个计数/状态字段）——不管调用方传了什么，这条写入路径在结构上就没有任何字段能装下
+        // approval/decision_card/scope_change 之类需要用户行动的块内容，锁死"L1 摘要永不携带
+        // actionable 块"这条不变量。
+        let c = crate::test_support::mem_db();
+        create_session(
+            &c,
+            "s-activity-summary-shape",
+            "x",
+            "local-default",
+            "local",
+        )
+        .unwrap();
+        upsert_activity_summary_and_publish(
+            &c,
+            "s-activity-summary-shape",
+            "run-shape",
+            1,
+            0,
+            0,
+            0,
+            "running",
+        )
+        .unwrap();
+        let content_raw: String = c
+            .query_row(
+                "SELECT content FROM messages WHERE session_id = ?1",
+                ["s-activity-summary-shape"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let content: serde_json::Value = serde_json::from_str(&content_raw).unwrap();
+        let blocks = content.as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "activity_summary 恒为单元素 blocks 数组");
+        let mut keys: Vec<&str> = blocks[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "failed",
+                "mcp_calls",
+                "permission_prompts",
+                "run_id",
+                "state",
+                "tool_calls",
+                "type",
+            ],
+            "只许这七个键——多一个键就是某种内容泄漏进了 L1 摘要"
+        );
+    }
+
+    #[test]
+    fn upsert_activity_summary_and_publish_second_call_updates_in_place_bumps_revision_and_republishes(
+    ) {
+        // msgfix2 U1：同一 run 第二次调用（计数变化/终态翻转）——同一 message_id 原地
+        // UPDATE，revision 从 1 bump 到 2，不产生第二行；重发走缺口④同一姿势。
+        let c = crate::test_support::mem_db();
+        create_session(&c, "s-activity-summary-2", "x", "local-default", "local").unwrap();
+
+        upsert_activity_summary_and_publish(
+            &c,
+            "s-activity-summary-2",
+            "run-2",
+            1,
+            0,
+            0,
+            0,
+            "running",
+        )
+        .unwrap();
+        let first_id: i64 = c
+            .query_row(
+                "SELECT id FROM messages WHERE session_id = ?1",
+                ["s-activity-summary-2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        crate::remote_gateway::test_take_publish_log();
+        upsert_activity_summary_and_publish(
+            &c,
+            "s-activity-summary-2",
+            "run-2",
+            5,
+            1,
+            1,
+            1,
+            "done",
+        )
+        .unwrap();
+
+        let row_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                ["s-activity-summary-2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1, "第二次 upsert 不得插出第二行");
+
+        let (id, content_raw, revision): (i64, String, i64) = c
+            .query_row(
+                "SELECT id, content, revision FROM messages WHERE session_id = ?1",
+                ["s-activity-summary-2"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(id, first_id, "必须原地改写同一 message_id");
+        assert_eq!(revision, 2, "第二次 upsert 必须把 revision 从 1 bump 到 2");
+        let content: serde_json::Value = serde_json::from_str(&content_raw).unwrap();
+        assert_eq!(content[0]["tool_calls"], 5);
+        assert_eq!(content[0]["failed"], 1);
+        assert_eq!(content[0]["state"], "done");
+
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["msg.completed"],
+            "第二次 upsert 必须重发一次 msg.completed（revision=2）"
+        );
+    }
+
+    #[test]
+    fn upsert_activity_summary_and_publish_retry_with_unchanged_content_does_not_bump_revision() {
+        // msgfix2 U1b（第三轮审查 B1/G1-b）：模拟写线程重试——同一份内容（同计数/同状态）被
+        // 第二次调用（`flush_activity_summary` 失败重试语义，见该函数文档），必须原地不动
+        // revision，不能把"内容相同的重放"误判成一次真正的内容推进。
+        let c = crate::test_support::mem_db();
+        create_session(
+            &c,
+            "s-activity-summary-retry",
+            "x",
+            "local-default",
+            "local",
+        )
+        .unwrap();
+
+        upsert_activity_summary_and_publish(
+            &c,
+            "s-activity-summary-retry",
+            "run-retry",
+            3,
+            0,
+            1,
+            0,
+            "running",
+        )
+        .unwrap();
+        let revision_after_first: i64 = c
+            .query_row(
+                "SELECT revision FROM messages WHERE session_id = ?1",
+                ["s-activity-summary-retry"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision_after_first, 1);
+
+        // 完全相同的六个字段再调一次——同 dedup_key 命中 UPDATE 分支，但 content 序列化结果
+        // 逐字节相同。
+        upsert_activity_summary_and_publish(
+            &c,
+            "s-activity-summary-retry",
+            "run-retry",
+            3,
+            0,
+            1,
+            0,
+            "running",
+        )
+        .unwrap();
+
+        let (row_count, revision_after_retry): (i64, i64) = c
+            .query_row(
+                "SELECT COUNT(*), MAX(revision) FROM messages WHERE session_id = ?1",
+                ["s-activity-summary-retry"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1, "重试不得插出第二行");
+        assert_eq!(
+            revision_after_retry, 1,
+            "内容未变的重试必须保持 revision=1，不能因为一次 best-effort 重试就把 revision 推到 2"
+        );
+
+        // 紧接着一次真正的内容变化（计数推进）——revision 必须照常 +1，证明幂等判断没有
+        // 误伤真实的内容推进路径。
+        upsert_activity_summary_and_publish(
+            &c,
+            "s-activity-summary-retry",
+            "run-retry",
+            4,
+            0,
+            1,
+            0,
+            "running",
+        )
+        .unwrap();
+        let revision_after_real_change: i64 = c
+            .query_row(
+                "SELECT revision FROM messages WHERE session_id = ?1",
+                ["s-activity-summary-retry"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            revision_after_real_change, 2,
+            "真正的内容变化必须照常把 revision 从 1 bump 到 2"
+        );
+    }
+
+    #[test]
+    fn reconcile_stale_running_activity_summaries_seals_orphans_and_skips_active_and_non_running() {
+        // msgfix2 U1（设计稿 v4.1 §4.1「revision 保留」重启恢复规则）：state=running 且
+        // run_id 不在 active_run_ids 里的一律封口为 failed 并 republish；仍在 active 集合里的
+        // 不动；本就已经是终态（done）的也不动（不能把已经正常完结的 run 篡改成 failed）。
+        let c = crate::test_support::mem_db();
+        create_session(&c, "s-reconcile", "x", "local-default", "local").unwrap();
+
+        upsert_activity_summary_and_publish(&c, "s-reconcile", "orphan-run", 2, 0, 0, 0, "running")
+            .unwrap();
+        upsert_activity_summary_and_publish(&c, "s-reconcile", "active-run", 4, 0, 0, 0, "running")
+            .unwrap();
+        upsert_activity_summary_and_publish(&c, "s-reconcile", "finished-run", 1, 0, 0, 0, "done")
+            .unwrap();
+        crate::remote_gateway::test_take_publish_log();
+
+        let mut active = std::collections::HashSet::new();
+        active.insert("active-run".to_string());
+        let sealed = reconcile_stale_running_activity_summaries(&c, &active).unwrap();
+        assert_eq!(sealed, 1, "只有 orphan-run 应被封口");
+
+        let state_of = |run_id: &str| -> String {
+            let content_raw: String = c
+                .query_row(
+                    "SELECT content FROM messages WHERE session_id = ?1 AND dedup_key = ?2",
+                    ("s-reconcile", format!("activity_summary:{run_id}")),
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let content: serde_json::Value = serde_json::from_str(&content_raw).unwrap();
+            content[0]["state"].as_str().unwrap().to_string()
+        };
+        assert_eq!(state_of("orphan-run"), "failed");
+        assert_eq!(state_of("active-run"), "running");
+        assert_eq!(state_of("finished-run"), "done");
+
+        let orphan_revision: i64 = c
+            .query_row(
+                "SELECT revision FROM messages WHERE session_id = ?1 AND dedup_key = 'activity_summary:orphan-run'",
+                ["s-reconcile"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_revision, 2, "封口必须 revision+1");
+
+        assert_eq!(
+            crate::remote_gateway::test_take_publish_log(),
+            vec!["msg.completed"],
+            "只应重发被封口的那一条"
         );
     }
 

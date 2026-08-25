@@ -30,6 +30,7 @@ import {
 } from "../lib/sessionUsage";
 import { WorkingClock } from "./WorkingClock";
 import { PendingDecisionBar } from "./PendingDecisionBar";
+import type { QueuedMessage } from "../lib/composerQueue";
 
 type Props = {
   composerBusy: boolean;
@@ -44,6 +45,12 @@ type Props = {
   onSend: (text: string, mode: Mode, config?: ComposerRuntimeConfig) => void;
   onMemberIdle?: () => void;
   onStop: () => void;
+  /**
+   * msgfix2 Q1：后端复核证实「member 真在跑」（recoverableMemberBlock 分支）时，
+   * 改把 composed 文本入队而非拒发。只在这条分支用到——`running`=true 的整体
+   * busy 早退改走 onSend 本身（App 层的 onSend 已识别 running 并入队）。
+   */
+  onQueueMessage?: (text: string, mode: Mode) => void;
   quoted?: ChatMessage | null;
   quoteKey?: string | null;
   onClearQuote?: () => void;
@@ -66,6 +73,15 @@ type Props = {
   sessionId?: string | null;
   /** 状态行派单归因（UX②）：等哪个 worker——存在时替换「Silent for Ns · Long-running…」两段。 */
   activeWorker?: { name: string; sub: string; count: number } | null;
+  /** msgfix2 Q1：本会话运行中排队的消息（chip 列表，FIFO 顺序）。 */
+  queuedMessages?: QueuedMessage[];
+  /** 显式停止后暂停自动递送——chip 呈现「待手动发送」态 + 单条发送按钮。 */
+  queuePaused?: boolean;
+  /** 把队列条目移出队列并把其文本回填给调用方（App 层实际执行移除，回填由这里拿到的文本做）。 */
+  onEditQueuedMessage?: (id: string) => string | null;
+  onRemoveQueuedMessage?: (id: string) => void;
+  /** queuePaused 态下单条手动递送。 */
+  onSendQueuedMessage?: (id: string) => void;
 };
 
 const MAX_H = 160;
@@ -76,6 +92,7 @@ const AUTOSIZE_MAX_CHARS = 20000;
 // 超长粘贴转附件根治：粘贴文本超此阈值时不进输入框，落盘转成附件 chip。
 const PASTE_TO_ATTACHMENT_CHARS = 10_000;
 const EMPTY_STREAM_MESSAGES: ChatMessage[] = [];
+const EMPTY_QUEUE: QueuedMessage[] = [];
 
 type RunningStatusDetailsProps = {
   running: boolean;
@@ -250,6 +267,12 @@ export function InputArea({
   streamMessages = EMPTY_STREAM_MESSAGES,
   sessionId = null,
   activeWorker = null,
+  queuedMessages = EMPTY_QUEUE,
+  queuePaused = false,
+  onEditQueuedMessage,
+  onRemoveQueuedMessage,
+  onSendQueuedMessage,
+  onQueueMessage,
 }: Props) {
   const { t } = useI18n();
   const [draft, setDraft] = useState("");
@@ -386,34 +409,7 @@ export function InputArea({
     }
   }
 
-  async function submit() {
-    const text = draft.trim();
-    const recoverableMemberBlock =
-      memberRunning && !running && !loading && sessionId !== null;
-    if (
-      (!text && attachments.length === 0) ||
-      (composerBusy && !recoverableMemberBlock) ||
-      !canSend ||
-      readonly
-    )
-      return;
-
-    if (recoverableMemberBlock) {
-      try {
-        const stillRunning = await invoke<boolean>("is_team_session_running", {
-          sessionId,
-        });
-        if (stillRunning) {
-          setGuardHint(t("composer.memberActiveHint"));
-          return;
-        }
-        onMemberIdle?.();
-      } catch {
-        setGuardHint(t("composer.memberRecheckFailedHint"));
-        return;
-      }
-    }
-
+  async function composeText(rawText: string): Promise<string> {
     const blocks: string[] = [];
     for (const attachment of attachments) {
       try {
@@ -439,18 +435,65 @@ export function InputArea({
         );
       }
     }
+    return [rawText, ...blocks].filter(Boolean).join("\n\n");
+  }
 
-    const composed = [text, ...blocks].filter(Boolean).join("\n\n");
-    onSend(composed, activeMode);
+  function resetComposerAfterSubmit() {
     setGuardHint(null);
     setDraft("");
     setAttachments([]);
-
     const el = taRef.current;
     if (el) {
       el.style.height = "auto";
       el.style.overflowY = "hidden";
     }
+  }
+
+  async function submit() {
+    const text = draft.trim();
+    // loading（agents/messages 还没就绪）仍整段拒发——排队只对「已就绪但正忙」有意义。
+    if (
+      (!text && attachments.length === 0) ||
+      !canSend ||
+      readonly ||
+      loading
+    ) {
+      return;
+    }
+
+    // memberRunning 是前端派生、可能陈旧（dispatch_card 状态）：lead 自己的 run 已经
+    // 收尾（!running）但 member 卡还没来得及收敛时，先问后端复核一次再决定。
+    const recoverableMemberBlock =
+      memberRunning && !running && sessionId !== null;
+    if (recoverableMemberBlock) {
+      try {
+        const stillRunning = await invoke<boolean>("is_team_session_running", {
+          sessionId,
+        });
+        if (stillRunning) {
+          // msgfix2 Q1：member 真在跑——不再拒发，改投队列（完成后自动递送）。
+          const composed =
+            attachments.length > 0 ? await composeText(text) : text;
+          onQueueMessage?.(composed, activeMode);
+          resetComposerAfterSubmit();
+          return;
+        }
+        onMemberIdle?.();
+        // 复核证实已 idle：往下走正常发送路径（不入队，直接发）。
+      } catch {
+        setGuardHint(t("composer.memberRecheckFailedHint"));
+        return;
+      }
+    }
+
+    // running=true（solo 在跑 / lead 在跑）且非 recoverableMemberBlock：不再在这里拒发，
+    // 直接交给 onSend——App 层的 onSend 会识别「该 session 已在跑」并改投队列。
+    // 无附件时不 await（composeText 本身是 async 函数，await 一定会让出一个 microtask
+    // tick）——保住「Enter 发送后同步调用 onSend」这条既有语义，别让排队特性引入
+    // 一个全局性的多余异步跳变，坑到一堆同步 fireEvent 断言。
+    const composed = attachments.length > 0 ? await composeText(text) : text;
+    onSend(composed, activeMode);
+    resetComposerAfterSubmit();
   }
 
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
@@ -462,6 +505,19 @@ export function InputArea({
 
     e.preventDefault();
     void submit();
+  }
+
+  // 队列条目「编辑」：移出队列（App 层实际删除并把文本吐回来），回填 textarea。
+  // 非空则把当前内容前置拼接（选最简且不丢内容的实现——不弹确认、不覆盖用户已敲的字）。
+  function handleEditQueuedMessage(id: string) {
+    const text = onEditQueuedMessage?.(id);
+    if (text == null) return;
+    setDraft((prev) => (prev.trim().length > 0 ? `${prev}\n\n${text}` : text));
+    const el = taRef.current;
+    if (el) {
+      el.focus();
+      requestAnimationFrame(() => autosize(el));
+    }
   }
 
   const handleSetLead = (id: string | null, memberIds?: string[]) => {
@@ -517,6 +573,61 @@ export function InputArea({
               <path d="M18 6L6 18M6 6l12 12" />
             </svg>
           </button>
+        </div>
+      )}
+      {queuedMessages.length > 0 && (
+        <div className="composer__queue" data-testid="composer-queue">
+          <div className="composer__queue-label">
+            {t("composer.queued.count", { count: queuedMessages.length })}
+            {queuePaused && (
+              <span className="composer__queue-paused-hint">
+                {" "}
+                · {t("composer.queued.pausedHint")}
+              </span>
+            )}
+          </div>
+          {queuedMessages.map((qm) => (
+            <div
+              key={qm.id}
+              className="composer__queue-item"
+              data-testid="composer-queue-item"
+            >
+              <span className="composer__queue-text" title={qm.text}>
+                {qm.text.length > 80 ? `${qm.text.slice(0, 80)}…` : qm.text}
+              </span>
+              <div className="composer__queue-actions">
+                {queuePaused && (
+                  <button
+                    type="button"
+                    className="composer__queue-btn composer__queue-btn--send"
+                    onClick={() => onSendQueuedMessage?.(qm.id)}
+                    aria-label={t("composer.queued.send")}
+                    title={t("composer.queued.send")}
+                  >
+                    {t("composer.queued.send")}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="composer__queue-btn"
+                  onClick={() => handleEditQueuedMessage(qm.id)}
+                  aria-label={t("composer.queued.edit")}
+                  title={t("composer.queued.edit")}
+                >
+                  {t("composer.queued.edit")}
+                </button>
+                <button
+                  type="button"
+                  className="composer__queue-btn composer__queue-btn--remove"
+                  onClick={() => onRemoveQueuedMessage?.(qm.id)}
+                  aria-label={t("composer.queued.remove")}
+                  title={t("composer.queued.remove")}
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+          ))}
         </div>
       )}
       <div className="composer__box">
@@ -652,29 +763,30 @@ export function InputArea({
             loading={loading}
             saving={teamSaving}
           />
-          {!running && (
-            <button
-              type="button"
-              className="composer__send"
-              aria-label={t("composer.send")}
-              onClick={() => void submit()}
-              disabled={
-                (!draft.trim() && attachments.length === 0) ||
-                (composerBusy &&
-                  !(memberRunning && !running && !loading && sessionId)) ||
-                !canSend ||
-                readonly
-              }
+          {
+            // msgfix2 Q1：不再因 running/memberRunning 隐藏发送——运行中点它是「排队」
+            // 而非「发送」，只有 loading（还没就绪）/ canSend=false / readonly 才禁用。
+          }
+          <button
+            type="button"
+            className="composer__send"
+            aria-label={t("composer.send")}
+            onClick={() => void submit()}
+            disabled={
+              (!draft.trim() && attachments.length === 0) ||
+              !canSend ||
+              readonly ||
+              loading
+            }
+          >
+            <svg
+              viewBox="0 0 24 24"
+              strokeLinecap="round"
+              strokeLinejoin="round"
             >
-              <svg
-                viewBox="0 0 24 24"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" />
-              </svg>
-            </button>
-          )}
+              <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" />
+            </svg>
+          </button>
           {(running || memberRunning) && (
             <button
               type="button"

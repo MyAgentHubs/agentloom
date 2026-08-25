@@ -773,6 +773,57 @@ mod tests {
     }
 
     #[test]
+    fn build_handoff_doc_prompt_window_does_not_let_activity_summary_occupy_a_slot() {
+        // R1（msgfix2 整盘审）：交接窗口最多 40 条消息，`messages.len() > 40` 才截断。
+        // 40 条真实消息之后再插一条 activity_summary（同 session 内 messages 表最新一行），
+        // 修复前 `get_messages` 会把它一并读回（内容因解析失败被 unwrap_or_default 清空），
+        // 总行数变 41 触发截断，窗口切片挤掉最旧的 msg-0、把本该属于它的名额让给一条空白
+        // assistant 行。修复后 activity_summary 在 `get_messages` 层就被排除，真实消息总数
+        // 仍是 40，不触发截断，msg-0..msg-39 全部原样在窗口内。
+        let c = mem();
+        crate::db::create_session(&c, "t3doc-noslot", "NoSlot", "local-default", "local").unwrap();
+
+        for i in 0..40_u32 {
+            crate::db::append_message(
+                &c,
+                "t3doc-noslot",
+                "user",
+                &[crate::db::Block::Text {
+                    text: format!("msg-{i}"),
+                }],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        crate::db::upsert_activity_summary_and_publish(
+            &c,
+            "t3doc-noslot",
+            "run-1",
+            1,
+            0,
+            0,
+            0,
+            "running",
+        )
+        .unwrap();
+
+        let (prompt, truncated) =
+            super::build_handoff_doc_prompt(crate::Locale::Zh, &c, "t3doc-noslot", &[]).unwrap();
+
+        assert!(
+            !truncated,
+            "40 条真实消息 + 1 条 activity_summary 不该被算成 41 条触发截断"
+        );
+        assert!(
+            prompt.contains("msg-0"),
+            "activity_summary 不该顶掉窗口最旧的一条真实消息"
+        );
+        assert!(prompt.contains("msg-39"));
+    }
+
+    #[test]
     fn assemble_handoff_draft_appends_git_section() {
         let narrative = "建议会话名: 测试分支\n正文内容";
         let files = vec!["a.rs".to_string(), "b.rs".to_string()];

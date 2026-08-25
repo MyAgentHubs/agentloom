@@ -24,6 +24,7 @@ import {
 import { useI18n } from "../i18n";
 import { summarizeLastStep } from "../lib/runningStatus";
 import { activeDispatchWorker } from "../lib/dispatchCards";
+import type { QueuedMessage } from "../lib/composerQueue";
 
 type Done = {
   cost_usd: number | null;
@@ -52,6 +53,13 @@ type Props = {
   onSend: (text: string, mode: Mode, config?: ComposerRuntimeConfig) => void;
   onMemberIdle?: () => void;
   onStop: () => void;
+  /** msgfix2 Q1：本会话运行中排队的消息 + 停止后的暂停态（仅 prop 透传给 InputArea）。 */
+  queuedMessages?: QueuedMessage[];
+  queuePaused?: boolean;
+  onQueueMessage?: (text: string, mode: Mode) => void;
+  onEditQueuedMessage?: (id: string) => string | null;
+  onRemoveQueuedMessage?: (id: string) => void;
+  onSendQueuedMessage?: (id: string) => void;
   onViewRun?: (runId?: string) => void;
   onUndoRun?: (runId: string) => void;
   onOpenMember?: (runId: string, assignmentId: string) => void;
@@ -122,6 +130,12 @@ export const SessionMain = React.memo(function SessionMain({
   onSend,
   onMemberIdle,
   onStop,
+  queuedMessages,
+  queuePaused,
+  onQueueMessage,
+  onEditQueuedMessage,
+  onRemoveQueuedMessage,
+  onSendQueuedMessage,
   onViewRun,
   onUndoRun,
   onOpenMember,
@@ -208,6 +222,14 @@ export const SessionMain = React.memo(function SessionMain({
       setQuoteRef(null);
     },
     [onSend, quoted],
+  );
+  const handleQueueMessage = useCallback(
+    (text: string, mode: Mode) => {
+      const nextText = quoted ? quoteBlock(quoted) + text : text;
+      onQueueMessage?.(nextText, mode);
+      setQuoteRef(null);
+    },
+    [onQueueMessage, quoted],
   );
   const handleLeadChoose = useCallback(
     (opt: string) => onLeadChoose?.(opt),
@@ -296,6 +318,12 @@ export const SessionMain = React.memo(function SessionMain({
         onSend={handleSend}
         onMemberIdle={onMemberIdle}
         onStop={onStop}
+        queuedMessages={queuedMessages}
+        queuePaused={queuePaused}
+        onQueueMessage={handleQueueMessage}
+        onEditQueuedMessage={onEditQueuedMessage}
+        onRemoveQueuedMessage={onRemoveQueuedMessage}
+        onSendQueuedMessage={onSendQueuedMessage}
         quoted={quoted}
         quoteKey={quoteKey}
         onClearQuote={handleClearQuote}

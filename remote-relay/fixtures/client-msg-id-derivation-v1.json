@@ -4,6 +4,16 @@
     { "name": "msg.completed|s-1|dk-1", "expect": "73996db9-9424-5e73-acb6-965bf87bfb80" },
     { "name": "card.created|decision-1", "expect": "d158145f-8ee9-58aa-a45e-77c5f364a596" },
     { "name": "card.resolved|decision-1|resolved", "expect": "6ac580b3-1b88-5198-b7f5-27808dc027e3" },
-    { "name": "tool.completed|run-1|tool-1", "expect": "d0c166ac-91e7-53b3-a992-73d8f4246a0e" }
+    { "name": "tool.completed|run-1|tool-1", "expect": "d0c166ac-91e7-53b3-a992-73d8f4246a0e" },
+    {
+      "name": "msg.completed|s-1|dk-1|2",
+      "expect": "d4d27c2b-e6dd-53b3-b789-e5e747ae9e15",
+      "desc": "revision==2 新用例：在现行派生 name（\"msg.completed|s-1|dk-1\"）末尾追加 `|2`，即 \"msg.completed|s-1|dk-1|2\"，再走同一 UUIDv5 命名空间派生（M0 §10.7）。"
+    },
+    {
+      "name": "msg.completed|s-1|dk-1|3",
+      "expect": "5585d9d6-5d34-5023-997c-86ea84dec1b9",
+      "desc": "revision==3 新用例：同上规则，不同 revision 值产生不同 client_msg_id（每个 revision 是新事件，天然过 relay 幂等去重）。"
+    }
   ]
 }

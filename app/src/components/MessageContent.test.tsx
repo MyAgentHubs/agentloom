@@ -1596,6 +1596,22 @@ describe("MessageContent 巨型文本块折叠（T7）", () => {
   });
 });
 
+describe("MessageContent · 未知块类型守卫（msgfix2 F2 S1，兑现 M0 §10.11「不识别的块类型不崩溃」）", () => {
+  it("未知块类型（如后端新发的 activity_summary_v99）不抛异常，降级渲染一行提示，且不影响同消息内其它块正常渲染", () => {
+    const blocks: Block[] = [
+      { type: "text", text: "before" },
+      { type: "activity_summary_v99", foo: "bar" } as unknown as Block,
+      { type: "text", text: "after" },
+    ];
+
+    expect(() => render(<MessageContent blocks={blocks} />)).not.toThrow();
+
+    expect(screen.getByText("before")).toBeInTheDocument();
+    expect(screen.getByText("after")).toBeInTheDocument();
+    expect(screen.getByText("[未知内容块]")).toBeInTheDocument();
+  });
+});
+
 const teamRunBlocks: Block[] = [
   {
     type: "team_run",

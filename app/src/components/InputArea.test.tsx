@@ -759,21 +759,30 @@ describe("InputArea", () => {
     expect(onSend).toHaveBeenCalledWith("中", "normal");
   });
 
-  it("空白 Enter / composerBusy Enter 不发送", () => {
+  it("空白 Enter / loading 中 Enter 不发送（msgfix2 Q1：composerBusy 因 running/memberRunning 已不再拒发，只有 loading 整段拒）", () => {
     const onSend = vi.fn();
     const { rerender } = render(<InputArea {...base({ onSend })} />);
     const ta = screen.getByPlaceholderText(/输入消息/);
     fireEvent.change(ta, { target: { value: "   " } });
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).not.toHaveBeenCalled();
-    rerender(<InputArea {...base({ onSend, composerBusy: true })} />);
+    rerender(
+      <InputArea {...base({ onSend, composerBusy: true, loading: true })} />,
+    );
     fireEvent.change(ta, { target: { value: "hi" } });
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).not.toHaveBeenCalled();
   });
 
   it("loading（composerBusy 但非 running）：发送禁用且不显停止", () => {
-    render(<InputArea {...base({ composerBusy: true, running: false })} />);
+    render(
+      <InputArea
+        {...base({ composerBusy: true, running: false, loading: true })}
+      />,
+    );
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), {
+      target: { value: "hi" },
+    });
     expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
     expect(screen.queryByRole("button", { name: "停止" })).toBeNull();
   });
@@ -797,7 +806,7 @@ describe("InputArea", () => {
     expect(onStop).toHaveBeenCalledTimes(1);
   });
 
-  it("running：显停止且点 onStop（发送位被替换）", () => {
+  it("running：停止 + 发送并存（msgfix2 Q1：运行中发送=排队，不再隐藏发送位），点 onStop 生效", () => {
     const onStop = vi.fn();
     render(
       <InputArea
@@ -805,7 +814,8 @@ describe("InputArea", () => {
         onStop={onStop}
       />,
     );
-    expect(screen.queryByRole("button", { name: "发送" })).toBeNull();
+    // 运行中发送不再拒发（改投队列，由 App 层 onSend 判定）——发送位不再被停止替换。
+    expect(screen.getByRole("button", { name: "发送" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "停止" }));
     expect(onStop).toHaveBeenCalledTimes(1);
   });
@@ -982,12 +992,13 @@ describe("InputArea", () => {
     );
   });
 
-  it("member running 点击重查仍 busy → 维持闸与草稿", async () => {
+  it("member running 点击重查仍 busy → 改投队列（msgfix2 Q1：不再拒发，清空草稿、不设 guardHint）", async () => {
     invokeMock.mockImplementation((command: string) =>
       Promise.resolve(command === "is_team_session_running"),
     );
     const onMemberIdle = vi.fn();
     const onSend = vi.fn();
+    const onQueueMessage = vi.fn();
     render(
       <InputArea
         {...base({
@@ -996,6 +1007,7 @@ describe("InputArea", () => {
           sessionId: "s1",
           onMemberIdle,
           onSend,
+          onQueueMessage,
         })}
       />,
     );
@@ -1011,11 +1023,14 @@ describe("InputArea", () => {
     );
     expect(onMemberIdle).not.toHaveBeenCalled();
     expect(onSend).not.toHaveBeenCalled();
-    expect(input).toHaveValue("keep me");
+    await waitFor(() =>
+      expect(onQueueMessage).toHaveBeenCalledWith("keep me", "normal"),
+    );
+    expect(input).toHaveValue("");
     expect(document.querySelector(".composer__hint-cost")).toBeNull();
     expect(
-      screen.getByText("成员任务仍在运行，等它完成或在卡片上停止后再发送"),
-    ).toBeInTheDocument();
+      screen.queryByText("成员任务仍在运行，等它完成或在卡片上停止后再发送"),
+    ).not.toBeInTheDocument();
   });
 
   it("member running 点击重查失败 → 显示可见提示且不发送", async () => {
@@ -1043,8 +1058,10 @@ describe("InputArea", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it("guard 提示在输入变化后清除", async () => {
-    invokeMock.mockResolvedValueOnce(true);
+  it("guard 提示（复核失败态）在输入变化后清除", async () => {
+    // msgfix2 Q1：stillRunning=true 那条不再设 guardHint（改投队列）——
+    // 这条断言改用「复核本身失败」这个仍会设 guardHint 的分支来验证清除行为。
+    invokeMock.mockRejectedValueOnce(new Error("recheck failed"));
     render(
       <InputArea
         {...base({
@@ -1058,15 +1075,13 @@ describe("InputArea", () => {
     fireEvent.change(input, { target: { value: "first draft" } });
     fireEvent.click(screen.getByLabelText("发送"));
     expect(
-      await screen.findByText(
-        "成员任务仍在运行，等它完成或在卡片上停止后再发送",
-      ),
+      await screen.findByText("无法确认成员任务状态，请稍后重试"),
     ).toBeInTheDocument();
 
     fireEvent.change(input, { target: { value: "changed draft" } });
 
     expect(
-      screen.queryByText("成员任务仍在运行，等它完成或在卡片上停止后再发送"),
+      screen.queryByText("无法确认成员任务状态，请稍后重试"),
     ).not.toBeInTheDocument();
   });
 
