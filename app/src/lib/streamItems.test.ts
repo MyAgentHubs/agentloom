@@ -1,5 +1,11 @@
 import { describe, expect, it, test } from "vitest";
-import { groupToolBlocks, isHiddenTool } from "./streamItems";
+import {
+  blockTier,
+  foldByVerbosity,
+  groupToolBlocks,
+  isHiddenTool,
+  type Segment,
+} from "./streamItems";
 import type { Block } from "../types/agent";
 
 const tool = (
@@ -382,5 +388,499 @@ describe("isHiddenTool — 交付四件套从隐藏名单里拎出来显示（F1
     expect(isHiddenTool("mcp__agentloom__ask_user")).toBe(true);
     expect(isHiddenTool("mcp__agentloom__memory_set")).toBe(true);
     expect(isHiddenTool("ToolSearch")).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// V1：blockTier — Block 类型逐型锁定 + approval 按状态分层 + 未知类型默认 l0
+// ─────────────────────────────────────────────────────────────────────────
+
+// blockTier 只读 block.type 分支，样张只需带对齐真实类型的 type 字面量
+// （其余字段与本函数无关，用最小样张即可锁定分类，其它测试再造带真实字段的样张）。
+const minimalOfType = (type: Block["type"]): Block =>
+  ({ type }) as unknown as Block;
+
+describe("blockTier — thinking/tool 与已处理 approval 属于过程层", () => {
+  it.each<Block["type"]>(["thinking"])("%s → process", (type) => {
+    expect(blockTier(minimalOfType(type))).toBe("process");
+  });
+
+  it("tool → process（真实样张）", () => {
+    const toolBlock: Block = {
+      type: "tool",
+      id: "t1",
+      tool: "Bash",
+      summary: "ls",
+      card: "command",
+      status: "ok",
+      exit_code: 0,
+      output: null,
+    };
+    expect(blockTier(toolBlock)).toBe("process");
+  });
+
+  it.each(["pending", "approved", "rejected", "cancelled"] as const)(
+    "approval status=%s 按是否待操作分层",
+    (status) => {
+      expect(blockTier(mkApproval(status))).toBe(
+        status === "pending" ? "l0" : "process",
+      );
+    },
+  );
+
+  it.each<Block["type"]>([
+    "text",
+    "image",
+    "coding_task",
+    "team_run",
+    "run_card",
+    "lead_summary",
+    "gate_card",
+    "draft_failed",
+    "decision_card",
+    "dispatch_card",
+    "scope_change",
+    "context_compacted",
+    "context_truncated",
+    "run_terminal",
+  ])("%s → l0", (type) => {
+    expect(blockTier(minimalOfType(type))).toBe("l0");
+  });
+
+  it("未知类型（as any 造）默认 l0——宁多显不误藏", () => {
+    const unknown = { type: "some_future_block_type" } as unknown as Block;
+    expect(blockTier(unknown)).toBe("l0");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// V1：foldByVerbosity
+// ─────────────────────────────────────────────────────────────────────────
+
+type FailureCase = "none" | "failed" | "interrupted" | "both";
+
+function mkTool(
+  overrides: Partial<Extract<Block, { type: "tool" }>>,
+): Extract<Block, { type: "tool" }> {
+  return {
+    type: "tool",
+    id: overrides.id ?? "t",
+    tool: overrides.tool ?? "Bash",
+    summary: overrides.summary ?? "",
+    card: overrides.card ?? "command",
+    status: overrides.status ?? "ok",
+    exit_code: overrides.exit_code ?? 0,
+    output: overrides.output ?? null,
+  };
+}
+
+function mkApproval(
+  status: Extract<Block, { type: "approval" }>["status"],
+  approvalId = `approval-${status}`,
+): Extract<Block, { type: "approval" }> {
+  return {
+    type: "approval",
+    approval_id: approvalId,
+    run_id: "run-1",
+    tool: "Bash",
+    command: "npm test",
+    summary: "运行测试",
+    cwd: "/repo",
+    status,
+  };
+}
+
+// 单个过程段：thinking + （failed/interrupted 视 failureCase 而定）+ 1 个成功 tool，
+// streamingTail=true 时段尾再追一个 status="running" 的 tool——代表"当前正在跑"。
+function processSegment(
+  failureCase: FailureCase,
+  streamingTail: boolean,
+): Extract<Block, { type: "thinking" | "tool" }>[] {
+  const blocks: Extract<Block, { type: "thinking" | "tool" }>[] = [
+    { type: "thinking", text: "思考中" },
+  ];
+  if (failureCase === "failed" || failureCase === "both") {
+    blocks.push(mkTool({ id: "f1", status: "failed", summary: "run tests" }));
+  }
+  if (failureCase === "interrupted" || failureCase === "both") {
+    blocks.push(
+      mkTool({ id: "i1", status: "interrupted", summary: "long build" }),
+    );
+  }
+  blocks.push(mkTool({ id: "ok1", status: "ok", summary: "ls" }));
+  if (streamingTail) {
+    blocks.push(
+      mkTool({ id: "run1", status: "running", summary: "compiling now" }),
+    );
+  }
+  return blocks;
+}
+
+function buildMessage(
+  failureCase: FailureCase,
+  streamingTail: boolean,
+): Block[] {
+  return [
+    { type: "text", text: "开始处理" },
+    ...processSegment(failureCase, streamingTail),
+  ];
+}
+
+function expectedCounts(failureCase: FailureCase, streamingTail: boolean) {
+  let tools = 1; // ok1
+  let failed = 0;
+  let interrupted = 0;
+  if (failureCase === "failed" || failureCase === "both") {
+    tools += 1;
+    failed = 1;
+  }
+  if (failureCase === "interrupted" || failureCase === "both") {
+    tools += 1;
+    interrupted = 1;
+  }
+  if (streamingTail) tools += 1;
+  return { tools, failed, interrupted, rejected: 0, thinking: 1 };
+}
+
+const FAILURE_CASES: FailureCase[] = ["none", "failed", "interrupted", "both"];
+
+describe("foldByVerbosity — full 档：任意输入 → 单 pass 段，无 artifacts", () => {
+  it.each(FAILURE_CASES)(
+    "failureCase=%s、streaming=true 也是单 pass 段",
+    (fc) => {
+      const blocks = buildMessage(fc, true);
+      const segments = foldByVerbosity(blocks, "full", true);
+      expect(segments).toEqual([{ kind: "pass", blocks, sourceStartIndex: 0 }]);
+      expect(segments.some((s) => s.kind === "artifacts")).toBe(false);
+    },
+  );
+
+  // P3（codex 整盘审）：补 full × streaming=false 四格——之前矩阵只有 streaming=true
+  // 那一列，凑齐三档 × 4 失败态 × 2 streaming = 24 格全齐。full 恒返回单个 pass 段
+  // 与 streaming/failureCase 都无关，这里显式锁住 streaming=false 那一半不是靠
+  // streaming=true 那组顺带覆盖的。
+  it.each(FAILURE_CASES)(
+    "failureCase=%s、streaming=false 也是单 pass 段",
+    (fc) => {
+      const blocks = buildMessage(fc, false);
+      const segments = foldByVerbosity(blocks, "full", false);
+      expect(segments).toEqual([{ kind: "pass", blocks, sourceStartIndex: 0 }]);
+      expect(segments.some((s) => s.kind === "artifacts")).toBe(false);
+    },
+  );
+
+  it("空 blocks → 单个空 pass 段（锁定：full 恒返回单段，不因空输入变 []）", () => {
+    const segments = foldByVerbosity([], "full", false);
+    expect(segments).toEqual([
+      { kind: "pass", blocks: [], sourceStartIndex: 0 },
+    ]);
+  });
+});
+
+describe("foldByVerbosity — summary/minimal × {无失败/failed/interrupted/两者} × streaming{true,false}", () => {
+  for (const verbosity of ["summary", "minimal"] as const) {
+    for (const failureCase of FAILURE_CASES) {
+      for (const streaming of [true, false]) {
+        it(`${verbosity} / ${failureCase} / streaming=${streaming}`, () => {
+          const blocks = buildMessage(failureCase, streaming);
+          const segments = foldByVerbosity(blocks, verbosity, streaming);
+          const kinds = segments.map((s) => s.kind);
+
+          if (streaming) {
+            // 最后一个过程段不论档位、不论有没有失败块，整段保留并带 live。
+            expect(kinds).toEqual(["pass", "activity_fold"]);
+            const fold = segments[1] as Extract<
+              Segment,
+              { kind: "activity_fold" }
+            >;
+            expect(fold.counts).toEqual(expectedCounts(failureCase, true));
+            expect(fold.blocks).toEqual(processSegment(failureCase, true));
+            expect(fold.live).toEqual({
+              tool: "Bash",
+              summary: "compiling now",
+            });
+            return;
+          }
+
+          if (verbosity === "summary") {
+            expect(kinds).toEqual(["pass", "activity_fold"]);
+            const fold = segments[1] as Extract<
+              Segment,
+              { kind: "activity_fold" }
+            >;
+            expect(fold.counts).toEqual(expectedCounts(failureCase, false));
+            expect(fold.blocks).toEqual(processSegment(failureCase, false));
+            expect("live" in fold).toBe(false);
+            return;
+          }
+
+          // minimal & 不在流中：无失败/中断 → 过程段整段丢弃；否则只留这两类块。
+          if (failureCase === "none") {
+            expect(kinds).toEqual(["pass"]);
+            return;
+          }
+          expect(kinds).toEqual(["pass", "activity_fold"]);
+          const fold = segments[1] as Extract<
+            Segment,
+            { kind: "activity_fold" }
+          >;
+          const expectedKept = processSegment(failureCase, false).filter(
+            (b) =>
+              b.type === "tool" &&
+              (b.status === "failed" || b.status === "interrupted"),
+          );
+          expect(fold.blocks).toEqual(expectedKept);
+          expect(fold.counts).toEqual({
+            tools: expectedKept.length,
+            failed: failureCase === "failed" || failureCase === "both" ? 1 : 0,
+            interrupted:
+              failureCase === "interrupted" || failureCase === "both" ? 1 : 0,
+            rejected: 0,
+            thinking: 0,
+          });
+          expect("live" in fold).toBe(false);
+        });
+      }
+    }
+  }
+});
+
+describe("foldByVerbosity — live 取值细节", () => {
+  it("streaming=true 但段尾不是 running 的 tool → live: null（段仍保留）", () => {
+    const blocks: Block[] = [
+      { type: "thinking", text: "思考中" },
+      mkTool({ id: "ok1", status: "ok", summary: "ls" }),
+    ];
+    const segments = foldByVerbosity(blocks, "summary", true);
+    expect(segments).toEqual([
+      {
+        kind: "activity_fold",
+        blocks,
+        sourceStartIndex: 0,
+        counts: {
+          tools: 1,
+          failed: 0,
+          interrupted: 0,
+          rejected: 0,
+          thinking: 1,
+        },
+        live: null,
+      },
+    ]);
+  });
+});
+
+describe("foldByVerbosity — 成功图片工具 + minimal + 无失败 + streaming=false", () => {
+  it("过程段没了，但 artifacts 段仍在且路径正确", () => {
+    const blocks: Block[] = [
+      mkTool({ id: "t1", status: "ok", output: "saved to /abs/moon.png" }),
+    ];
+    const segments = foldByVerbosity(blocks, "minimal", false);
+    expect(segments).toEqual([
+      { kind: "artifacts", imagePaths: ["/abs/moon.png"], sourceStartIndex: 0 },
+    ]);
+  });
+});
+
+describe("foldByVerbosity — tool → text → tool 同图，只有第一段后有 artifacts", () => {
+  it("第二个过程段之后不再重复出 artifacts 段", () => {
+    const blocks: Block[] = [
+      mkTool({ id: "t1", status: "ok", output: "/abs/moon.png" }),
+      { type: "text", text: "中间正文" },
+      mkTool({ id: "t2", status: "ok", output: "/abs/moon.png" }),
+    ];
+    const segments = foldByVerbosity(blocks, "summary", false);
+    expect(segments.map((s) => s.kind)).toEqual([
+      "activity_fold",
+      "artifacts",
+      "pass",
+      "activity_fold",
+    ]);
+    const artifacts = segments[1] as Extract<Segment, { kind: "artifacts" }>;
+    expect(artifacts.imagePaths).toEqual(["/abs/moon.png"]);
+    expect(artifacts.sourceStartIndex).toBe(0);
+    const secondFold = segments[3] as Extract<
+      Segment,
+      { kind: "activity_fold" }
+    >;
+    expect(secondFold.blocks).toEqual([blocks[2]]);
+  });
+});
+
+describe("foldByVerbosity — isHiddenTool 命中的块不计数、不进段", () => {
+  it("隐藏的编排工具被整块跳过，可见工具照常计数", () => {
+    const blocks: Block[] = [
+      mkTool({ id: "h1", tool: "ToolSearch", status: "ok" }),
+      mkTool({
+        id: "h2",
+        tool: "mcp__agentloom__memory_set",
+        status: "failed",
+      }),
+      mkTool({ id: "v1", tool: "Bash", status: "ok", summary: "ls" }),
+    ];
+    const segments = foldByVerbosity(blocks, "summary", false);
+    expect(segments).toEqual([
+      {
+        kind: "activity_fold",
+        blocks: [blocks[2]],
+        sourceStartIndex: 2,
+        counts: {
+          tools: 1,
+          failed: 0,
+          interrupted: 0,
+          rejected: 0,
+          thinking: 0,
+        },
+      },
+    ]);
+  });
+});
+
+describe("foldByVerbosity — approval 四状态 × 三档", () => {
+  const cases = [
+    ["pending", "full", "pass"],
+    ["pending", "summary", "pass"],
+    ["pending", "minimal", "pass"],
+    ["approved", "full", "pass"],
+    ["approved", "summary", "activity_fold"],
+    ["approved", "minimal", "hidden"],
+    ["rejected", "full", "pass"],
+    ["rejected", "summary", "activity_fold"],
+    ["rejected", "minimal", "activity_fold"],
+    ["cancelled", "full", "pass"],
+    ["cancelled", "summary", "activity_fold"],
+    ["cancelled", "minimal", "activity_fold"],
+  ] as const;
+
+  it.each(cases)("status=%s / %s → %s", (status, verbosity, expected) => {
+    const approval = mkApproval(status);
+    const segments = foldByVerbosity([approval], verbosity, false);
+
+    if (expected === "hidden") {
+      expect(segments).toEqual([]);
+      return;
+    }
+
+    expect(segments).toHaveLength(1);
+    const segment = segments[0];
+    expect(segment.kind).toBe(expected);
+    if (segment.kind === "artifacts") {
+      throw new Error("approval 不应生成 artifacts 段");
+    }
+    expect(segment.blocks).toEqual([approval]);
+    expect(
+      segments.some(
+        (segment) =>
+          segment.kind === "pass" && segment.blocks.includes(approval),
+      ),
+    ).toBe(expected === "pass");
+  });
+
+  it("approved approval + 对应 tool 只计为 1 工具，不把 approval 重复计数", () => {
+    const approval = mkApproval("approved", "approval-for-tool-1");
+    const matchingTool = mkTool({
+      id: "tool-1",
+      status: "ok",
+      summary: approval.summary,
+    });
+    const segments = foldByVerbosity(
+      [approval, matchingTool],
+      "summary",
+      false,
+    );
+
+    expect(segments).toEqual([
+      {
+        kind: "activity_fold",
+        blocks: [approval, matchingTool],
+        sourceStartIndex: 0,
+        counts: {
+          tools: 1,
+          failed: 0,
+          interrupted: 0,
+          rejected: 0,
+          thinking: 0,
+        },
+      },
+    ]);
+  });
+
+  it.each(["rejected", "cancelled"] as const)(
+    "%s 在 minimal 只保留 approval，合并计入 rejected",
+    (status) => {
+      const approval = mkApproval(status);
+      const successfulTool = mkTool({ id: `tool-${status}`, status: "ok" });
+      const segments = foldByVerbosity(
+        [approval, successfulTool],
+        "minimal",
+        false,
+      );
+
+      expect(segments).toEqual([
+        {
+          kind: "activity_fold",
+          blocks: [approval],
+          sourceStartIndex: 0,
+          counts: {
+            tools: 0,
+            failed: 0,
+            interrupted: 0,
+            rejected: 1,
+            thinking: 0,
+          },
+        },
+      ]);
+    },
+  );
+
+  it("pending 在 streaming 直播消息中仍是 L0 pass，不被最后过程段吞掉", () => {
+    const runningTool = mkTool({
+      id: "running-tool",
+      status: "running",
+      summary: "执行中",
+    });
+    const pending = mkApproval("pending");
+    const segments = foldByVerbosity([runningTool, pending], "minimal", true);
+
+    expect(segments.map((segment) => segment.kind)).toEqual([
+      "activity_fold",
+      "pass",
+    ]);
+    expect(segments[1]).toEqual({
+      kind: "pass",
+      blocks: [pending],
+      sourceStartIndex: 1,
+    });
+  });
+
+  it("pending → approved → tool 按层切段并保持原顺序", () => {
+    const pending = mkApproval("pending", "approval-pending");
+    const approved = mkApproval("approved", "approval-approved");
+    const matchingTool = mkTool({ id: "tool-approved", status: "ok" });
+    const segments = foldByVerbosity(
+      [pending, approved, matchingTool],
+      "summary",
+      false,
+    );
+
+    expect(segments.map((segment) => segment.kind)).toEqual([
+      "pass",
+      "activity_fold",
+    ]);
+    if (segments[0]?.kind !== "pass" || segments[1]?.kind !== "activity_fold") {
+      throw new Error("pending → approved → tool 段类型错误");
+    }
+    expect(segments[0].blocks).toEqual([pending]);
+    expect(segments[1].blocks).toEqual([approved, matchingTool]);
+    expect(segments.map((segment) => segment.sourceStartIndex)).toEqual([0, 1]);
+  });
+});
+
+describe("foldByVerbosity — 空 blocks（summary/minimal）", () => {
+  it("summary 档空输入 → 空段列表", () => {
+    expect(foldByVerbosity([], "summary", false)).toEqual([]);
+  });
+  it("minimal 档空输入 + streaming=true → 空段列表", () => {
+    expect(foldByVerbosity([], "minimal", true)).toEqual([]);
   });
 });

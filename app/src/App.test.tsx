@@ -26,12 +26,15 @@ const { invokeMock, listenMock, openMock, sessionMainProps } = vi.hoisted(
     openMock: vi.fn(),
     sessionMainProps: [] as Array<{
       onOpenPreview?: (path: string) => void;
+      busy?: boolean;
       messages?: Array<{
         role: "user" | "assistant";
         content: unknown[];
         engine?: string;
         agent_id?: string | null;
         agent_name_snapshot?: string | null;
+        // V3a：活尾唯一不变量断言需要读这个字段。
+        stream_live?: boolean;
       }>;
     }>,
   }),
@@ -74,12 +77,17 @@ import type { CodingState } from "./lib/codingLoop";
 import * as codingLoopDriver from "./lib/codingLoopDriver";
 import type { Block, ChatMessage } from "./types/agent";
 import { clearTeamConfigCache } from "./lib/useTeamConfig";
+import { setChatVerbosity } from "./lib/chatVerbosity";
 
 declare const process: { env: Record<string, string | undefined> };
 
 describe("App", () => {
   beforeEach(() => {
     localStorage.clear();
+    // V3b：这份文件里的既有用例都写在「过程细节全量可见」的心智模型下（早于
+    // verbosity 概念）——默认档实际是「摘要」（V2 决策点 1），会把工具/思考块折算成
+    // chip 改变既有断言。这里重置回 full，让既有断言继续验证原本要验证的东西。
+    setChatVerbosity("full");
     invokeMock.mockReset();
     listenMock.mockReset();
     openMock.mockReset();
@@ -5185,7 +5193,12 @@ describe("App", () => {
     expect(assistantTurns[assistantTurns.length - 1]).toHaveTextContent(
       "旧流起点",
     );
-    expect(container.querySelector(".turn__working")).not.toBeNull();
+    // V3b §2B ③ 改了 streaming 判据（busy && (stream_live===true ‖ 未打标且是
+    // 末条消息且 role===assistant)）：旧判据按「末条 assistant」找到「旧流起点」误标
+    // working；这里末条消息其实是用户刚发的 "test"（旧判据的 v1 病灶同款场景），
+    // 新判据不再误标——下面 text_delta 断言也证实续写落进一条全新 assistant 消息、
+    // 不是「旧流起点」，说明它本就不是真正在流的那条。busy 仍为 true（停止按钮仍在）。
+    expect(container.querySelector(".turn__working")).toBeNull();
     expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument();
 
     act(() => {
@@ -15030,6 +15043,704 @@ describe("App", () => {
       expect(
         inlineDecisionCard().getByRole("button", { name: /继续/ }),
       ).not.toBeDisabled();
+    });
+  });
+
+  // V3a：`stream_live` 三处补标 + 活尾唯一不变量（设计稿 §2B「进行中判据」①②）。
+  // 这些断言必须落在 App.test.tsx——三处造空 assistant 与决策卡/答卡续写全在 App
+  // 内部发送路径上，streamBlocks.test.ts 只能证明纯函数本身，证明不了生产路径真的
+  // 接上了这些纯函数。
+  describe("V3a：stream_live 活尾唯一不变量", () => {
+    function liveTailCount(): number {
+      const last = sessionMainProps[sessionMainProps.length - 1];
+      return (last?.messages ?? []).filter((m) => m.stream_live === true)
+        .length;
+    }
+
+    it("新建会话 solo 首发：末条 assistant 打活标，completed 后清零", async () => {
+      // 启动引导会自动开一个空会话（bootstrap 的「0 会话则建一个」兜底）——要真的
+      // 走 createSessionAndSend（新建会话 solo 首发）这条目标代码路径，得像既有
+      // 「intro 新会话 Team 发送」模板那样先经「项目简介」显式回到 intro composer
+      // 再发送（此时 currentId 仍指着旧会话，但发送会另建一个全新 sid）。
+      mockBasicApp(agentProfiles);
+      render(<App />);
+      await screen.findByText("Claude Code");
+
+      fireEvent.click(screen.getByText("项目简介"));
+      await screen.findByRole("heading", { name: "Local 默认" });
+
+      fireEvent.change(screen.getByPlaceholderText(/输入消息/), {
+        target: { value: "solo 新建首发" },
+      });
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "发送" })).not.toBeDisabled(),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+      await waitFor(() =>
+        expect(
+          invokeMock.mock.calls.some(
+            ([cmd, args]) => cmd === "create_session" && args?.id,
+          ),
+        ).toBe(true),
+      );
+      const createCalls = invokeMock.mock.calls.filter(
+        ([cmd]) => cmd === "create_session",
+      );
+      const sid = createCalls[createCalls.length - 1]?.[1]?.id as string;
+      expect(sid).toBeTruthy();
+
+      await waitFor(() => expect(liveTailCount()).toBe(1));
+      const last1 = sessionMainProps[sessionMainProps.length - 1]!;
+      const tail1 = last1.messages![last1.messages!.length - 1];
+      expect(tail1.role).toBe("assistant");
+      expect(tail1.stream_live).toBe(true);
+
+      const handler = agentEventCb();
+      act(() => {
+        handler({
+          payload: {
+            session_id: sid,
+            kind: "completed",
+            cost_usd: null,
+            input_tokens: null,
+            output_tokens: 1,
+            final_text: "已完成",
+            run_id: "run-solo-new-1",
+            commit_sha: null,
+            files_changed: null,
+            insertions: 0,
+            deletions: 0,
+            interrupted: false,
+          },
+        });
+      });
+
+      await waitFor(() => expect(liveTailCount()).toBe(0));
+    });
+
+    it("team 首发：末条 assistant 打活标，completed 后清零", async () => {
+      mockBasicApp([
+        agentProfile({
+          cap_lead: "planner",
+          provider: "claude",
+          access: "native",
+        }),
+        agentProfile({
+          id: "deepseek",
+          name: "DeepSeek",
+          provider: "deepseek",
+          sort_order: 1,
+        }),
+      ]);
+      render(<App />);
+      await screen.findByText("Claude Code");
+      await configureTeamLead();
+
+      fireEvent.change(screen.getByPlaceholderText(/输入消息/), {
+        target: { value: "team 首发" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith(
+          "start_lead_session",
+          expect.objectContaining({ sessionId: "s1" }),
+        ),
+      );
+
+      await waitFor(() => expect(liveTailCount()).toBe(1));
+      const last1 = sessionMainProps[sessionMainProps.length - 1]!;
+      const tail1 = last1.messages![last1.messages!.length - 1];
+      expect(tail1.role).toBe("assistant");
+      expect(tail1.stream_live).toBe(true);
+
+      const handler = agentEventCb();
+      act(() => {
+        handler({
+          payload: {
+            session_id: "s1",
+            kind: "completed",
+            cost_usd: null,
+            input_tokens: null,
+            output_tokens: 1,
+            final_text: "队长完成",
+            run_id: "run-team-first-1",
+            commit_sha: null,
+            files_changed: null,
+            insertions: 0,
+            deletions: 0,
+            interrupted: false,
+          },
+        });
+      });
+
+      await waitFor(() => expect(liveTailCount()).toBe(0));
+    });
+
+    it("lead reply：末条 assistant 打活标，completed 后清零", async () => {
+      mockBasicApp(
+        [
+          agentProfile({
+            cap_lead: "planner",
+            provider: "claude",
+            access: "native",
+          }),
+          agentProfile({
+            id: "deepseek",
+            name: "DeepSeek",
+            provider: "deepseek",
+            sort_order: 1,
+          }),
+        ],
+        {
+          messages: [
+            decisionCardMessage(["开跑", "先停下"], {
+              decision_id: "v3a-legacy-dc-1",
+              kind: "ask",
+              question: "继续吗？",
+              recommended: "开跑",
+              source_run_id: "run-v3a-legacy-1",
+            }),
+          ],
+        },
+      );
+
+      const defaultInvoke = invokeMock.getMockImplementation();
+      invokeMock.mockImplementation((cmd: string, args?: any) => {
+        if (cmd === "answer_lead_question")
+          return Promise.reject("NO_PENDING_QUESTION:v3a-legacy-dc-1");
+        if (cmd === "choose_decision_card") return Promise.resolve(true);
+        if (cmd === "lead_step")
+          return Promise.resolve({
+            status: "decided",
+            action: { action: "reply", rationale: "ok" },
+            decisionCard: null,
+          });
+        if (cmd === "get_lead_loop_state")
+          return Promise.resolve({
+            sessionId: "s1",
+            autonomy: "cautious",
+            activeRunId: null,
+            activeTaskId: null,
+            lastEventCursor: null,
+          });
+        return defaultInvoke?.(cmd, args);
+      });
+
+      render(<App />);
+      await screen.findByText("Claude Code");
+      await configureTeamLead();
+
+      expect(inlineDecisionCard().getByText(/继续吗？/)).toBeInTheDocument();
+      fireEvent.click(
+        inlineDecisionCard().getByRole("button", { name: /开跑/ }),
+      );
+
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith(
+          "send_message",
+          expect.objectContaining({ message: "开跑" }),
+        ),
+      );
+
+      await waitFor(() => expect(liveTailCount()).toBe(1));
+      const last1 = sessionMainProps[sessionMainProps.length - 1]!;
+      const tail1 = last1.messages![last1.messages!.length - 1];
+      expect(tail1.role).toBe("assistant");
+      expect(tail1.stream_live).toBe(true);
+
+      const handler = agentEventCb();
+      act(() => {
+        handler({
+          payload: {
+            session_id: "s1",
+            kind: "completed",
+            cost_usd: null,
+            input_tokens: null,
+            output_tokens: 1,
+            final_text: "回答完成",
+            run_id: "run-lead-reply-1",
+            commit_sha: null,
+            files_changed: null,
+            insertions: 0,
+            deletions: 0,
+            interrupted: false,
+          },
+        });
+      });
+
+      await waitFor(() => expect(liveTailCount()).toBe(0));
+    });
+
+    it("发起失败（team 首发 start_lead_session 抛错）：活标即时封口，计数 0", async () => {
+      mockBasicApp([
+        agentProfile({
+          cap_lead: "planner",
+          provider: "claude",
+          access: "native",
+        }),
+        agentProfile({
+          id: "deepseek",
+          name: "DeepSeek",
+          provider: "deepseek",
+          sort_order: 1,
+        }),
+      ]);
+      const defaultInvoke = invokeMock.getMockImplementation();
+      invokeMock.mockImplementation((cmd: string, args?: any) => {
+        if (cmd === "start_lead_session") return Promise.reject("BACKEND_DOWN");
+        return defaultInvoke?.(cmd, args);
+      });
+
+      render(<App />);
+      await screen.findByText("Claude Code");
+      await configureTeamLead();
+
+      fireEvent.change(screen.getByPlaceholderText(/输入消息/), {
+        target: { value: "发起即失败" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+      // 乐观占位在发送那一刻就打了活标；start_lead_session 随后失败——这条失败路径
+      // 只弹 showLeadError（不重建消息数组），必须显式经 sealStreamTail 封口，
+      // 否则活尾会永远悬空（会话空闲后仍显示「工作中」）。
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith(
+          "start_lead_session",
+          expect.objectContaining({ sessionId: "s1" }),
+        ),
+      );
+      await waitFor(() => expect(liveTailCount()).toBe(0));
+    });
+
+    it("过程尾 → MCP 决策卡插入 → 答卡续写 → completed：全程活标 ≤1，终态清零", async () => {
+      mockBasicApp([
+        agentProfile({
+          cap_lead: "planner",
+          provider: "claude",
+          access: "native",
+        }),
+        agentProfile({
+          id: "deepseek",
+          name: "DeepSeek",
+          provider: "deepseek",
+          sort_order: 1,
+        }),
+      ]);
+      const defaultInvoke = invokeMock.getMockImplementation();
+      invokeMock.mockImplementation((cmd: string, args?: any) => {
+        if (cmd === "answer_lead_question")
+          return Promise.resolve({
+            resumed: false,
+            lead_agent_id: null,
+            resume_error: null,
+          });
+        return defaultInvoke?.(cmd, args);
+      });
+
+      render(<App />);
+      await screen.findByText("Claude Code");
+      await configureTeamLead();
+
+      fireEvent.change(screen.getByPlaceholderText(/输入消息/), {
+        target: { value: "全程链路" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith(
+          "start_lead_session",
+          expect.objectContaining({ sessionId: "s1" }),
+        ),
+      );
+      await waitFor(() => expect(liveTailCount()).toBe(1));
+
+      // 过程块：一次工具调用挂在同一条活尾上（不新增活标）。
+      const agentEvent = agentEventCb();
+      act(() => {
+        agentEvent({
+          payload: {
+            session_id: "s1",
+            kind: "tool_started",
+            id: "tc-v3a-1",
+            tool: "Bash",
+            summary: "ls",
+            card: "command",
+          },
+        });
+      });
+      expect(liveTailCount()).toBeLessThanOrEqual(1);
+      expect(liveTailCount()).toBe(1);
+
+      // MCP 决策卡插入：追加一条未打标消息前先封掉活尾（活尾唯一不变量）。
+      const decisionCard: Extract<Block, { type: "decision_card" }> = {
+        type: "decision_card",
+        decision_id: "v3a-mcp-dc-1",
+        kind: "ask",
+        question: "要不要继续？",
+        options: ["继续", "先停下"],
+        recommended: "继续",
+        rationale: "需要用户确认",
+        payload: null,
+        source_run_id: "mcp-lead-v3a-1",
+        status: "pending",
+        chosen_option: null,
+        created_at: 1000,
+      };
+      await act(async () => {
+        leadDecisionCardCb()({
+          payload: { session_id: "s1", block: decisionCard },
+        });
+      });
+      await waitFor(() => {
+        expect(document.querySelectorAll(".decision-card")).toHaveLength(1);
+      });
+      expect(liveTailCount()).toBeLessThanOrEqual(1);
+      expect(liveTailCount()).toBe(0);
+
+      // 答卡：点击推荐项 → answer_lead_question 成功 → 队长仍在跑 → 另起新活尾续写。
+      fireEvent.click(
+        inlineDecisionCard().getByRole("button", { name: /继续/ }),
+      );
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith("answer_lead_question", {
+          sessionId: "s1",
+          decisionId: "v3a-mcp-dc-1",
+          answer: "继续",
+        }),
+      );
+      await waitFor(() => expect(liveTailCount()).toBe(1));
+
+      // 答卡后续写（text_delta）灌进同一条新活尾，不产生第二条活标。
+      act(() => {
+        agentEvent({
+          payload: { session_id: "s1", kind: "text_delta", text: "继续处理中" },
+        });
+      });
+      await screen.findByText("继续处理中");
+      expect(liveTailCount()).toBeLessThanOrEqual(1);
+      expect(liveTailCount()).toBe(1);
+
+      // completed：终态清零。
+      act(() => {
+        agentEvent({
+          payload: {
+            session_id: "s1",
+            kind: "completed",
+            cost_usd: null,
+            input_tokens: null,
+            output_tokens: 1,
+            final_text: null,
+            run_id: "run-v3a-full-1",
+            commit_sha: null,
+            files_changed: null,
+            insertions: 0,
+            deletions: 0,
+            interrupted: false,
+          },
+        });
+      });
+      await waitFor(() => expect(liveTailCount()).toBe(0));
+    });
+
+    // F9（如实断言现状，不修）：A 轮迟到的 run_closeout 到达时，若 B 轮已经开跑，会把
+    // B 轮活尾误封、并把 busy 清假——设计稿
+    // desktop-verbose-design §2B「进行中判据」F9
+    // 记的已知局限；决策点 7 已定「不纳入本刀」，真正的 run 级闸门需要契约扩展（后端
+    // 在 run 起点带 run_id + 前端 RunInfo.runId 比对），记 BACKLOG 单独小刀——这里只
+    // 如实断言现状，不修它。
+    it("documents current behavior: A 轮迟到 run_closeout 到达时误封已开跑的 B 轮活尾并清 busy", async () => {
+      const { sendCalls } = mockBasicApp();
+      render(<App />);
+      await screen.findByText("Claude Code");
+
+      fireEvent.change(screen.getByPlaceholderText(/输入消息/), {
+        target: { value: "A 轮" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "发送" }));
+      await waitFor(() => expect(sendCalls).toHaveLength(1));
+      await waitFor(() => expect(liveTailCount()).toBe(1));
+
+      const handler = agentEventCb();
+      // A 轮正常收工：completed 先到，封口 + 清 run。
+      act(() => {
+        handler({
+          payload: {
+            session_id: "s1",
+            kind: "completed",
+            cost_usd: null,
+            input_tokens: null,
+            output_tokens: 1,
+            final_text: "A 轮完成",
+            run_id: "run-A",
+            commit_sha: null,
+            files_changed: null,
+            insertions: 0,
+            deletions: 0,
+            interrupted: false,
+          },
+        });
+      });
+      await waitFor(() => expect(liveTailCount()).toBe(0));
+      expect(
+        screen.queryByRole("button", { name: "停止" }),
+      ).not.toBeInTheDocument();
+
+      // B 轮开跑（此刻不在忙 → 直接发，不进队列）。
+      fireEvent.change(screen.getByPlaceholderText(/输入消息/), {
+        target: { value: "B 轮" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "发送" }));
+      await waitFor(() => expect(sendCalls).toHaveLength(2));
+      await waitFor(() => expect(liveTailCount()).toBe(1));
+      expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument();
+
+      // A 轮迟到的 run_closeout 现在才到——run_id 是 A 的，但当前活尾已经是 B 轮的。
+      act(() => {
+        handler({
+          payload: {
+            session_id: "s1",
+            kind: "run_closeout",
+            run_id: "run-A",
+            commit_sha: null,
+            files_changed: null,
+            insertions: null,
+            deletions: null,
+            interrupted: false,
+          },
+        });
+      });
+
+      // 现状（F9 已知局限，本 task 不修）：B 轮活尾被无条件误封，busy 随之清假。
+      await waitFor(() => expect(liveTailCount()).toBe(0));
+      expect(
+        screen.queryByRole("button", { name: "停止" }),
+      ).not.toBeInTheDocument();
+    });
+  });
+
+  // P1（codex 整盘审·整盘返工）：三条发起路径收到 SESSION_ALREADY_RUNNING/
+  // SESSION_BUSY 时，提前 return 曾发生在 setRun/封口之前——幽灵竞态（这期间没有
+  // 任何真实事件到达）会永远留下 busy=false 但 stream_live=true 的死尾巴（或反过
+  // 来 busy 该清而没清），摘要/精简档下会显示一条永远「正在运行」的实时线。修法
+  // 是抽出 `convergeAlreadyRunningConflict` helper（判据抄自 sendSoloForSession
+  // 早就有的 event-epoch 冲突收敛），三条路径统一调用；真实并发（这期间已经有
+  // 真实 agent-event 到达）时原样保留 run/活尾，不收敛。
+  describe("P1：SESSION_ALREADY_RUNNING/SESSION_BUSY 冲突收敛", () => {
+    function liveTailCount(): number {
+      const last = sessionMainProps[sessionMainProps.length - 1];
+      return (last?.messages ?? []).filter((m) => m.stream_live === true)
+        .length;
+    }
+
+    it("team 首发：SESSION_ALREADY_RUNNING 无真实事件到达 → 活标清零、停止按钮不在", async () => {
+      mockBasicApp([
+        agentProfile({
+          cap_lead: "planner",
+          provider: "claude",
+          access: "native",
+        }),
+        agentProfile({
+          id: "deepseek",
+          name: "DeepSeek",
+          provider: "deepseek",
+          sort_order: 1,
+        }),
+      ]);
+      const defaultInvoke = invokeMock.getMockImplementation();
+      invokeMock.mockImplementation((cmd: string, args?: any) => {
+        if (cmd === "start_lead_session")
+          return Promise.reject("SESSION_ALREADY_RUNNING:s1");
+        return defaultInvoke?.(cmd, args);
+      });
+
+      render(<App />);
+      await screen.findByText("Claude Code");
+      await configureTeamLead();
+
+      fireEvent.change(screen.getByPlaceholderText(/输入消息/), {
+        target: { value: "team 首发撞占槽" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith(
+          "start_lead_session",
+          expect.objectContaining({ sessionId: "s1" }),
+        ),
+      );
+      await waitFor(() => expect(liveTailCount()).toBe(0));
+      expect(
+        screen.queryByRole("button", { name: "停止" }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("lead reply：SESSION_ALREADY_RUNNING 无真实事件到达 → 活标清零、停止按钮不在", async () => {
+      mockBasicApp(
+        [
+          agentProfile({
+            cap_lead: "planner",
+            provider: "claude",
+            access: "native",
+          }),
+          agentProfile({
+            id: "deepseek",
+            name: "DeepSeek",
+            provider: "deepseek",
+            sort_order: 1,
+          }),
+        ],
+        {
+          messages: [
+            decisionCardMessage(["开跑", "先停下"], {
+              decision_id: "p1-legacy-dc-1",
+              kind: "ask",
+              question: "继续吗？",
+              recommended: "开跑",
+              source_run_id: "run-p1-legacy-1",
+            }),
+          ],
+        },
+      );
+      const defaultInvoke = invokeMock.getMockImplementation();
+      invokeMock.mockImplementation((cmd: string, args?: any) => {
+        if (cmd === "answer_lead_question")
+          return Promise.reject("NO_PENDING_QUESTION:p1-legacy-dc-1");
+        if (cmd === "choose_decision_card") return Promise.resolve(true);
+        if (cmd === "lead_step")
+          return Promise.resolve({
+            status: "decided",
+            action: { action: "reply", rationale: "ok" },
+            decisionCard: null,
+          });
+        if (cmd === "get_lead_loop_state")
+          return Promise.resolve({
+            sessionId: "s1",
+            autonomy: "cautious",
+            activeRunId: null,
+            activeTaskId: null,
+            lastEventCursor: null,
+          });
+        if (cmd === "send_message")
+          return Promise.reject("SESSION_ALREADY_RUNNING:s1");
+        return defaultInvoke?.(cmd, args);
+      });
+
+      render(<App />);
+      await screen.findByText("Claude Code");
+      await configureTeamLead();
+
+      expect(inlineDecisionCard().getByText(/继续吗？/)).toBeInTheDocument();
+      fireEvent.click(
+        inlineDecisionCard().getByRole("button", { name: /开跑/ }),
+      );
+
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith(
+          "send_message",
+          expect.objectContaining({ message: "开跑" }),
+        ),
+      );
+      await waitFor(() => expect(liveTailCount()).toBe(0));
+      expect(
+        screen.queryByRole("button", { name: "停止" }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("新建会话 solo 首发：SESSION_ALREADY_RUNNING 无真实事件到达 → 活标清零、停止按钮不在", async () => {
+      mockBasicApp(agentProfiles);
+      const defaultInvoke = invokeMock.getMockImplementation();
+      invokeMock.mockImplementation((cmd: string, args?: any) => {
+        if (cmd === "send_message")
+          return Promise.reject("SESSION_ALREADY_RUNNING:new-sid");
+        return defaultInvoke?.(cmd, args);
+      });
+
+      render(<App />);
+      await screen.findByText("Claude Code");
+
+      fireEvent.click(screen.getByText("项目简介"));
+      await screen.findByRole("heading", { name: "Local 默认" });
+
+      fireEvent.change(screen.getByPlaceholderText(/输入消息/), {
+        target: { value: "solo 新建首发撞占槽" },
+      });
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "发送" })).not.toBeDisabled(),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+      await waitFor(() =>
+        expect(
+          invokeMock.mock.calls.some(([cmd]) => cmd === "send_message"),
+        ).toBe(true),
+      );
+      await waitFor(() => expect(liveTailCount()).toBe(0));
+      expect(
+        screen.queryByRole("button", { name: "停止" }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("team 首发：SESSION_ALREADY_RUNNING 但期间已有真实事件到达 → run/活尾原样保留（不收敛）", async () => {
+      mockBasicApp([
+        agentProfile({
+          cap_lead: "planner",
+          provider: "claude",
+          access: "native",
+        }),
+        agentProfile({
+          id: "deepseek",
+          name: "DeepSeek",
+          provider: "deepseek",
+          sort_order: 1,
+        }),
+      ]);
+      const startLeadDeferred = deferred<unknown>();
+      const defaultInvoke = invokeMock.getMockImplementation();
+      invokeMock.mockImplementation((cmd: string, args?: any) => {
+        if (cmd === "start_lead_session") return startLeadDeferred.promise;
+        return defaultInvoke?.(cmd, args);
+      });
+
+      render(<App />);
+      await screen.findByText("Claude Code");
+      await configureTeamLead();
+
+      fireEvent.change(screen.getByPlaceholderText(/输入消息/), {
+        target: { value: "team 首发真实并发" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith(
+          "start_lead_session",
+          expect.objectContaining({ sessionId: "s1" }),
+        ),
+      );
+      expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument();
+      expect(liveTailCount()).toBe(1);
+
+      // 真实事件先到——同一会话收到一条 agent-event（epoch 涨了），证明另一头真的在跑。
+      act(() => {
+        agentEventCb()({
+          payload: {
+            session_id: "s1",
+            kind: "text_delta",
+            text: "真实并发内容",
+          },
+        });
+      });
+      await screen.findByText("真实并发内容");
+
+      // 随后这次占位请求才被后端拒绝——真实并发，不该收敛（run/活尾原样保留）。
+      await act(async () => {
+        startLeadDeferred.reject("SESSION_ALREADY_RUNNING:s1");
+        await startLeadDeferred.promise.catch(() => {});
+      });
+
+      expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument();
+      expect(liveTailCount()).toBe(1);
     });
   });
 });

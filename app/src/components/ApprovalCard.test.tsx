@@ -2,6 +2,7 @@ import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { ApprovalCard } from "./ApprovalCard";
 import type { Block } from "../types/agent";
+import { I18nProvider } from "../i18n";
 
 type ApprovalBlock = Extract<Block, { type: "approval" }>;
 
@@ -37,7 +38,8 @@ describe("ApprovalCard 普通工具放行（request_kind 缺省）", () => {
     const { rerender } = render(
       <ApprovalCard block={approval({ status: "approved" })} sessionId="s1" />,
     );
-    expect(screen.getByText("你放行了此命令 · 执行中")).toBeInTheDocument();
+    expect(screen.getByText("你放行了此命令")).toBeInTheDocument();
+    expect(screen.queryByText(/执行中/)).not.toBeInTheDocument();
 
     rerender(
       <ApprovalCard block={approval({ status: "rejected" })} sessionId="s1" />,
@@ -45,6 +47,17 @@ describe("ApprovalCard 普通工具放行（request_kind 缺省）", () => {
     expect(
       screen.getByText("你拒绝了此命令 · 工具失败已回喂 agent"),
     ).toBeInTheDocument();
+  });
+
+  it("英文 approved 文案不伪报 running", () => {
+    render(
+      <I18nProvider initialLocale="en">
+        <ApprovalCard block={approval({ status: "approved" })} sessionId="s1" />
+      </I18nProvider>,
+    );
+
+    expect(screen.getByText("You allowed this command")).toBeInTheDocument();
+    expect(screen.queryByText(/running/i)).not.toBeInTheDocument();
   });
 });
 

@@ -178,16 +178,18 @@ export function sweepRunning(msgs: ChatMessage[]): ChatMessage[] {
  * scope 卡 / 停止文案…）全部追加完之后，最后一步调用——把末条 assistant 消息的
  * `stream_live` 封为 false。这是「已终结尾」的唯一权威落点：插入位计算（App.tsx
  * 的 lead-message-appended 处理）与 ensureStreamTail 的 needsTail 判据都靠这个
- * 标记区分「真在流的尾巴」与「已经封口的尾巴」。找不到末条 assistant，或它已经是
- * false，原样返回（不产生新数组引用）。
+ * 标记区分「真在流的尾巴」与「已经封口的尾巴」。
+ *
+ * V3a·活尾唯一不变量：清掉**全部** `stream_live === true` 的消息（不止末条
+ * assistant）——正常情况下至多一条，但用于兜底任何未来路径不慎留下的多条活标。
+ * 一条都没有（包括从未被打过标的历史消息）时原样返回同一数组引用，不产生不必要
+ * 的克隆。
  */
 export function sealStreamTail(msgs: ChatMessage[]): ChatMessage[] {
-  const i = lastAssistantIndex(msgs);
-  if (i < 0) return msgs;
-  if (msgs[i].stream_live === false) return msgs;
-  const next = [...msgs];
-  next[i] = { ...next[i], stream_live: false };
-  return next;
+  if (!msgs.some((m) => m.stream_live === true)) return msgs;
+  return msgs.map((m) =>
+    m.stream_live === true ? { ...m, stream_live: false } : m,
+  );
 }
 
 /** plan B3：把 run_card block 接到最后一条 assistant 消息 content 末尾（不可变 · 不改原数组）。 */
@@ -227,6 +229,14 @@ const LEAD_TURN_BLOCK_TYPES = new Set([
  * run_closeout 追加 run_card）：它是同一 run 的收尾内容，不是新一轮 delta，
  * 不该因为前一个终态分支（error/blocked/needs_decision）已经封过口就被劈成
  * 另一条孤儿消息。默认 false，既有全部调用点行为不变。
+ *
+ * V3a·活尾唯一不变量：
+ * - 复用未标记（`stream_live == null`）的尾巴时，不可变地补 `stream_live: true`
+ *   （返回新数组，不 mutate 原对象）——覆盖 App.tsx 里几处直接造空 assistant、
+ *   之后靠这里续写的路径，让它们的尾巴也纳入「活尾」判据。已经是 `true` 的尾巴
+ *   原样返回（同引用，幂等）。
+ * - 新造尾巴前，先不可变地把会话内所有 `stream_live === true` 的旧消息封为
+ *   `false`（每会话至多一个活尾）。
  */
 export function ensureStreamTail(
   msgs: ChatMessage[],
@@ -250,8 +260,17 @@ export function ensureStreamTail(
     // U6 修复轮 2：allowSealedTail 时跳过这条——收尾续写允许灌进已封口的尾巴。
     (!opts?.allowSealedTail && last.stream_live === false);
   if (!needsTail) {
+    // V3a：复用一条从未打过标的尾巴（undefined/null）——不可变补活标。
+    if (last.stream_live == null) {
+      const next = [...msgs];
+      next[msgs.length - 1] = { ...last, stream_live: true };
+      return next;
+    }
     return msgs;
   }
+  // V3a·活尾唯一不变量：新造尾巴前先封掉所有旧活标。没有旧活标时 sealStreamTail
+  // 原样返回同一引用，不产生多余克隆。
+  const sealedMsgs = sealStreamTail(msgs);
   const tail: ChatMessage & { id: string } = {
     id: crypto.randomUUID(),
     role: "assistant",
@@ -261,7 +280,7 @@ export function ensureStreamTail(
     agent_name_snapshot: identity.agent_name_snapshot ?? null,
     stream_live: true,
   };
-  return [...msgs, tail];
+  return [...sealedMsgs, tail];
 }
 
 export function assistantText(msgs: ChatMessage[]): string {

@@ -1,0 +1,126 @@
+{
+  "snapshots": [
+    {
+      "revision": 0,
+      "state": {
+        "kind": "disabled",
+        "reason": "dev"
+      }
+    },
+    {
+      "revision": 1,
+      "state": {
+        "kind": "disabled",
+        "reason": "platform"
+      }
+    },
+    {
+      "revision": 2,
+      "state": {
+        "kind": "disabled",
+        "reason": "unsigned"
+      }
+    },
+    {
+      "revision": 3,
+      "state": {
+        "kind": "idle"
+      }
+    },
+    {
+      "revision": 4,
+      "state": {
+        "kind": "checking"
+      }
+    },
+    {
+      "revision": 5,
+      "state": {
+        "kind": "up_to_date",
+        "checked_at": 1755000000000
+      }
+    },
+    {
+      "revision": 6,
+      "state": {
+        "kind": "available",
+        "version": "0.2.9",
+        "notes": "Bug fixes and stability improvements.",
+        "pub_date": "2026-08-20T00:00:00Z"
+      }
+    },
+    {
+      "revision": 7,
+      "state": {
+        "kind": "downloading",
+        "downloaded": 1048576,
+        "total": 41943040
+      }
+    },
+    {
+      "revision": 8,
+      "state": {
+        "kind": "staging"
+      }
+    },
+    {
+      "revision": 9,
+      "state": {
+        "kind": "ready",
+        "version": "0.2.9",
+        "staged_path": "/Applications/.agentloom-update-abc123/AgentLoom.app"
+      }
+    },
+    {
+      "revision": 10,
+      "state": {
+        "kind": "ready",
+        "version": "0.2.9",
+        "staged_path": "/Applications/.agentloom-update-abc123/AgentLoom.app",
+        "last_error": "AL_ERR:updater.swap_failed:{\"detail\":\"renameatx_np(RENAME_SWAP) failed: Operation not permitted (os error 1)\"}"
+      }
+    },
+    {
+      "revision": 11,
+      "state": {
+        "kind": "swapping"
+      }
+    },
+    {
+      "revision": 12,
+      "state": {
+        "kind": "recovery_offered",
+        "bundle_path": "/Applications/AgentLoom.app",
+        "staged_path": "/Applications/.agentloom-update-abc123/AgentLoom.app",
+        "target_version": "0.2.9"
+      }
+    },
+    {
+      "revision": 13,
+      "state": {
+        "kind": "recovery_offered",
+        "bundle_path": "/Applications/AgentLoom.app",
+        "staged_path": "/Applications/.agentloom-update-abc123/AgentLoom.app",
+        "target_version": "0.2.9",
+        "last_error": "AL_ERR:updater.swap_failed:{\"detail\":\"renameatx_np(RENAME_SWAP) failed: Operation not permitted (os error 1)\"}"
+      }
+    },
+    {
+      "revision": 14,
+      "state": {
+        "kind": "error",
+        "msg": "AL_ERR:updater.check_failed:{\"detail\":\"network unreachable\"}",
+        "checked_at": 1755000010000
+      }
+    },
+    {
+      "revision": 15,
+      "state": {
+        "kind": "error",
+        "msg": "AL_ERR:updater.relaunch_failed:{\"detail\":\"LaunchServices unavailable\"}",
+        "checked_at": 1755000015000,
+        "retry": "reopen"
+      }
+    }
+  ]
+}

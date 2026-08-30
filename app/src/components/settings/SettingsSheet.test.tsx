@@ -56,6 +56,21 @@ describe("SettingsSheet", () => {
     expect(screen.queryByText("AGENTS_CONTENT")).toBeNull();
   });
 
+  it("page=chat 命中 SettingsChat 而不是落 repos", () => {
+    render(<SettingsSheet open={true} {...base} page="chat" />);
+    expect(screen.getByRole("radiogroup")).toBeInTheDocument();
+    expect(screen.queryByText("REPOS_CONTENT")).toBeNull();
+    expect(screen.queryByText("AGENTS_CONTENT")).toBeNull();
+  });
+
+  it("nav 出现「对话」项·点击触发 onPageChange(chat)", () => {
+    const onPageChange = vi.fn();
+    render(<SettingsSheet open={true} {...base} onPageChange={onPageChange} />);
+    expect(screen.getByText("对话")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("对话"));
+    expect(onPageChange).toHaveBeenCalledWith("chat");
+  });
+
   it("点 nav「联网搜索」触发 onPageChange(search)", () => {
     const onPageChange = vi.fn();
     render(<SettingsSheet open={true} {...base} onPageChange={onPageChange} />);

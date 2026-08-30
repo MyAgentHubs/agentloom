@@ -13,8 +13,16 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import type { Block } from "../types/agent";
-import { groupToolBlocks } from "../lib/streamItems";
+import {
+  foldByVerbosity,
+  groupToolBlocks,
+  type Segment,
+  type StreamItem,
+  type Verbosity,
+} from "../lib/streamItems";
+import { imagePathsFromTool } from "../lib/imageArtifacts";
 import { useMarkdown } from "../lib/useMarkdown";
+import { ActivityFold } from "./ActivityFold";
 import { LeadSummaryBlock } from "./LeadSummaryBlock";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolCard } from "./ToolCard";
@@ -39,6 +47,10 @@ import { renderBackendError } from "../lib/backendMsg";
 type Props = {
   blocks: Block[];
   streaming?: boolean;
+  /** V3b：过程细节显示级别（设计稿 §2B）；默认 full = 现状零变化。 */
+  verbosity?: Verbosity;
+  /** V3b：ActivityFold 展开态递归渲染时抑制内部图片抽取——产物已由外层 artifacts 段渲染。 */
+  suppressArtifacts?: boolean;
   onViewRun?: (runId?: string) => void;
   onUndoRun?: (runId: string) => void;
   onOpenPreview?: (path: string) => void;
@@ -72,82 +84,23 @@ type AttachmentContent = {
   mediaType?: string;
 };
 
+// V3b：pass 段沿用 groupToolBlocks 输出 + 路径级去重后的图片列表；
+// activity_fold / artifacts 段原样透传（原始 Segment，渲染层各自处理）。
+type PassEntry = { item: StreamItem; imagePaths: string[] };
+type RenderSegment =
+  | { kind: "pass"; keyPrefix: string; entries: PassEntry[] }
+  | {
+      kind: "activity_fold";
+      segment: Extract<Segment, { kind: "activity_fold" }>;
+    }
+  | { kind: "artifacts"; segment: Extract<Segment, { kind: "artifacts" }> };
+
 // 超过阈值的文本块整体走 markdown 同步解析会阻塞主线程数秒·折叠默认（T7）。
 // 阈值降到 5 万（D3 整盘审 P2①）：实测 remark 解析 99k≈205ms、50k≈25ms，
 // 流式场景每个 chunk 都会重解析一次，WKWebView 比桌面 Chrome 更慢，原 10 万阈值偏松。
 const HUGE_TEXT_BLOCK_CHARS = 50_000;
 // 折叠态预览字符数——够看清粘贴的是什么内容，不整段渲染。
 const HUGE_TEXT_PREVIEW_CHARS = 4000;
-
-const IMAGE_PATH_TOKEN_BOUNDARY = /[\s"'`<>|]+/u;
-const IMAGE_PATH_EXTENSION = /\.(?:png|jpe?g|gif|webp|bmp|svg)$/i;
-const IMAGE_PATH_LEADING_PUNCTUATION = /^[([{<“”‘’「」『』]+/u;
-const IMAGE_PATH_TRAILING_PUNCTUATION =
-  /[.,;:!?)\]}>。，；：！？）】」』》〉…“”‘’]+$/u;
-// 单个工具块最多触发 8 次附件读取，避免路径枚举输出造成缩略图洪泛。
-const MAX_IMAGE_PATHS_PER_TOOL_BLOCK = 8;
-
-// 搜索/列举类工具的输出是「路径列表」，不是「图片产物」——命中一堆 .png/.svg
-// 路径不代表 agent 生成/保存了图片，别当图片附件渲染成缩略图卡。名单核对自
-// lib/toolLabel.ts 的工具名映射表（claude 原名 / myagent 名，2026-07-27）。
-const SEARCH_TOOLS: ReadonlySet<string> = new Set([
-  "Grep",
-  "Glob",
-  "grep",
-  "glob",
-  "ls",
-  "WebSearch",
-  "web_search",
-]);
-
-// read/write/edit 类工具的输出是「文件内容/改动回执」，verifier 是「测试日志」；
-// 里面出现的图片路径是被引用的字符串（如 import、补丁、日志里的截图路径），
-// 不是这次工具调用产出的图片工件，同样不该渲染成图片附件卡。
-const CONTENT_TOOLS: ReadonlySet<string> = new Set([
-  "Read",
-  "fs_read",
-  "verifier",
-  "Write",
-  "write",
-  "Edit",
-  "edit",
-  "fs_write",
-  "fs_edit",
-  "apply_patch",
-  "file",
-]);
-
-function imagePathsFromTool(block: Extract<Block, { type: "tool" }>): string[] {
-  if (SEARCH_TOOLS.has(block.tool) || CONTENT_TOOLS.has(block.tool)) return [];
-  const tokens = `${block.summary}\n${block.output ?? ""}`.split(
-    IMAGE_PATH_TOKEN_BOUNDARY,
-  );
-  const paths = tokens
-    .map((token) =>
-      token
-        .replace(IMAGE_PATH_LEADING_PUNCTUATION, "")
-        .replace(/^[^=]*=(?=\/)/u, "")
-        .replace(IMAGE_PATH_TRAILING_PUNCTUATION, ""),
-    )
-    .filter((token) => {
-      const isDrivePath = /^[A-Za-z]:[\\/]/.test(token);
-      const hasUrlScheme = /^[A-Za-z][A-Za-z\d+.-]*:/.test(token);
-      if (
-        !IMAGE_PATH_EXTENSION.test(token) ||
-        token.startsWith("//") ||
-        (hasUrlScheme && !isDrivePath)
-      ) {
-        return false;
-      }
-      return (
-        token.startsWith("/") ||
-        token.startsWith("~/") ||
-        isDrivePath ||
-        token.includes("/")
-      );
-    });
-  return [...new Set(paths)].slice(0, MAX_IMAGE_PATHS_PER_TOOL_BLOCK);
-}
 
 function fileName(path: string): string {
   return path.split(/[\\/]/).pop() || path;
@@ -798,6 +751,8 @@ function HugeTextBlock({ text }: { text: string }) {
 function MessageContentImpl({
   blocks,
   streaming = false,
+  verbosity = "full",
+  suppressArtifacts = false,
   onViewRun,
   onUndoRun,
   onOpenPreview,
@@ -830,31 +785,49 @@ function MessageContentImpl({
     null,
   );
   const readonly = readonlyReason != null;
-  const grouped = useMemo(() => {
-    const items = groupToolBlocks(blocks);
-    const pathsByItem = items.map((item) => {
-      if (item.kind === "toolgroup") {
-        return item.blocks.flatMap(imagePathsFromTool);
+
+  // V3b：折算位置（设计稿 §2B）——先按 verbosity 把 blocks 切成 Segment[]，
+  // pass 段沿用现状 groupToolBlocks + 路径级图片抽取/去重（full 档恒单 pass 段
+  // = 现状路径零变化）；activity_fold / artifacts 段原样透传给渲染层。
+  const renderSegments = useMemo<RenderSegment[]>(() => {
+    const segments = foldByVerbosity(blocks, verbosity, !!streaming);
+    return segments.map((segment): RenderSegment => {
+      if (segment.kind === "activity_fold") {
+        return { kind: "activity_fold", segment };
       }
-      return item.block.type === "tool" ? imagePathsFromTool(item.block) : [];
-    });
-    const allPaths = [...new Set(pathsByItem.flat())];
-    const preferredPaths = new Set(
-      allPaths.filter(
-        (path) => !allPaths.some((other) => other.endsWith(`/${path}`)),
-      ),
-    );
-    const seen = new Set<string>();
-    return items.map((item, index) => {
-      const fresh: string[] = [];
-      pathsByItem[index].forEach((path) => {
-        if (!preferredPaths.has(path) || seen.has(path)) return;
-        seen.add(path);
-        fresh.push(path);
+      if (segment.kind === "artifacts") {
+        return { kind: "artifacts", segment };
+      }
+      const items = groupToolBlocks(segment.blocks);
+      const pathsByItem = items.map((item) => {
+        if (item.kind === "toolgroup") {
+          return item.blocks.flatMap(imagePathsFromTool);
+        }
+        return item.block.type === "tool" ? imagePathsFromTool(item.block) : [];
       });
-      return { item, imagePaths: fresh };
+      const allPaths = [...new Set(pathsByItem.flat())];
+      const preferredPaths = new Set(
+        allPaths.filter(
+          (path) => !allPaths.some((other) => other.endsWith(`/${path}`)),
+        ),
+      );
+      const seen = new Set<string>();
+      const entries = items.map((item, index) => {
+        const fresh: string[] = [];
+        pathsByItem[index].forEach((path) => {
+          if (!preferredPaths.has(path) || seen.has(path)) return;
+          seen.add(path);
+          fresh.push(path);
+        });
+        return { item, imagePaths: fresh };
+      });
+      return {
+        kind: "pass",
+        keyPrefix: `seg${segment.sourceStartIndex}`,
+        entries,
+      };
     });
-  }, [blocks]);
+  }, [blocks, verbosity, streaming]);
 
   useEffect(() => {
     const buttons = contentRef.current?.querySelectorAll<HTMLElement>(
@@ -873,7 +846,7 @@ function MessageContentImpl({
       button.setAttribute("aria-label", label);
       button.setAttribute("title", label);
     });
-  }, [MarkdownBody, grouped, t]);
+  }, [MarkdownBody, renderSegments, t]);
 
   useEffect(() => {
     if (!attachmentOpenError) return;
@@ -896,207 +869,259 @@ function MessageContentImpl({
       }
     : undefined;
 
+  // 原始逐类型分发表（full 档零改）：抽成具名函数以便按 pass 段分别调用，
+  // key 前缀 keyPrefix 区分 summary/minimal 档下同一消息内的多个 pass 段。
+  const renderPassEntry = (
+    item: StreamItem,
+    imagePaths: string[],
+    i: number,
+    keyPrefix: string,
+  ): ReactNode => {
+    if (item.kind === "toolgroup") {
+      const groupKey = item.blocks[0]?.id ?? `toolgroup-${i}`;
+      return (
+        <Fragment key={`${keyPrefix}-toolgroup-${groupKey}`}>
+          <ToolStepsFold blocks={item.blocks} />
+          {!suppressArtifacts &&
+            onOpenPreview &&
+            onOpenLightbox &&
+            imagePaths.length > 0 && (
+              <ImageArtifactChips
+                paths={imagePaths}
+                sessionId={sessionId}
+                onOpenPreview={onOpenPreview}
+                onOpenLightbox={onOpenLightbox}
+              />
+            )}
+        </Fragment>
+      );
+    }
+    const block = item.block;
+    if (block.type === "image")
+      return (
+        <ImageBlockContent
+          key={`${keyPrefix}-b-${i}`}
+          path={block.attachment_id}
+          mediaType={block.media_type}
+          sessionId={sessionId}
+          onOpenPreview={onOpenPreview}
+          onOpenLightbox={onOpenLightbox}
+        />
+      );
+    if (block.type === "tool") {
+      return (
+        <Fragment key={`${keyPrefix}-b-${i}`}>
+          <ToolCard block={block} compact />
+          {!suppressArtifacts &&
+            onOpenPreview &&
+            onOpenLightbox &&
+            imagePaths.length > 0 && (
+              <ImageArtifactChips
+                paths={imagePaths}
+                sessionId={sessionId}
+                onOpenPreview={onOpenPreview}
+                onOpenLightbox={onOpenLightbox}
+              />
+            )}
+        </Fragment>
+      );
+    }
+    if (block.type === "approval")
+      return (
+        <ApprovalCard
+          key={`${keyPrefix}-b-${i}`}
+          block={block}
+          sessionId={sessionId ?? ""}
+        />
+      );
+    if (block.type === "thinking")
+      return <ThinkingBlock key={`${keyPrefix}-b-${i}`} text={block.text} />;
+    if (block.type === "team_run")
+      return (
+        <BackgroundTaskStack
+          key={`${keyPrefix}-b-${i}`}
+          runId={block.run_id}
+          lead={block.lead}
+          members={block.members}
+          onOpenMember={onOpenMember}
+          onUndoRun={onUndoRun}
+        />
+      );
+    if (block.type === "gate_card" && gateView?.kind === "proposing")
+      return (
+        <div className="gate-proposing" key={`${keyPrefix}-b-${i}`}>
+          <span className="gate-proposing__dot" aria-hidden />
+          {t("messageContent.gate.proposing")}
+        </div>
+      );
+    if (block.type === "gate_card" && gateView?.kind === "draft")
+      return (
+        <GateCard
+          key={`${keyPrefix}-b-${i}`}
+          draft={gateView.draft}
+          leadName={leadName ?? "Lead"}
+          enabledAgents={enabledAgents ?? []}
+          onAction={(a) => onGateAction?.(a)}
+          onFreeze={() => onGateFreeze?.()}
+          onRedraft={() => onGateRedraft?.()}
+          freezing={gateFreezing}
+          readonlyReason={readonlyReason}
+        />
+      );
+    if (block.type === "draft_failed" && gateView?.kind === "failed")
+      return (
+        <DraftFailedCard
+          key={`${keyPrefix}-b-${i}`}
+          failure={gateView.failure}
+          onRetry={() => onGateRetry?.()}
+          onManual={() => onGateManual?.()}
+          onBackToNormal={() => onGateBackToNormal?.()}
+          disabled={readonly}
+        />
+      );
+    if (block.type === "gate_card" || block.type === "draft_failed")
+      return null; // gateView 不匹配（已清）→ 不渲
+    // plan B3：内联变更卡——「查看」透传 onViewRun（App 里开右面板 Review tab）。
+    if (block.type === "run_card")
+      return (
+        <RunCard
+          key={`${keyPrefix}-b-${i}`}
+          block={block}
+          onView={() => onViewRun?.()}
+          onUndo={onUndoRun ? () => onUndoRun(block.run_id) : undefined}
+        />
+      );
+
+    if (block.type === "lead_summary")
+      return (
+        <LeadSummaryBlock
+          key={`${keyPrefix}-b-${i}`}
+          block={block}
+          sessionId={sessionId}
+          onViewRun={onViewRun}
+          onOpenPreview={onOpenPreview}
+          onOpenLightbox={onOpenLightbox}
+          onTakeOver={readonly ? undefined : onTakeOver}
+          onCleanRedispatch={
+            readonly ? undefined : () => onCleanRedispatch?.(block.run_id)
+          }
+        />
+      );
+
+    if (block.type === "coding_task")
+      return (
+        <CodingTaskBar
+          key={`${keyPrefix}-b-${i}`}
+          block={block}
+          onOpenMember={onOpenMember}
+          onConfirmVerify={readonly ? undefined : onConfirmVerify}
+          onShelve={readonly ? undefined : onShelve}
+          onRetryVerify={readonly ? undefined : onRetryVerify}
+        />
+      );
+
+    if (block.type === "dispatch_card")
+      return (
+        <DispatchCard
+          key={`${keyPrefix}-b-${i}`}
+          member={block.member}
+          onOpenInspector={onOpenInspector}
+        />
+      );
+
+    if (block.type === "scope_change")
+      return (
+        <ScopeChangeCard
+          key={`${keyPrefix}-b-${i}`}
+          block={block}
+          onContinue={onContinueScope ?? (() => {})}
+        />
+      );
+
+    if (block.type === "run_terminal")
+      return <RunTerminalCard key={`${keyPrefix}-b-${i}`} block={block} />;
+
+    if (
+      block.type === "context_compacted" ||
+      block.type === "context_truncated"
+    )
+      return (
+        <ContextCompactedChip
+          key={`${keyPrefix}-b-${i}`}
+          blockType={block.type}
+        />
+      );
+
+    if (block.type === "decision_card") return null; // 决策卡经 lead-turn 路径渲·不走 raw block 循环
+
+    const key = `${keyPrefix}-b-${i}${streaming ? "-streaming" : ""}`;
+    // msgfix2 F2 S1（M0 §10.11「不识别的块类型不崩溃」）：走到这里的块理论上只剩 `text`——
+    // 但这个联合类型只是前端已知的形状，后端可能发出一个这里没有任何 `if` 分支认识的新块
+    // 类型（如未来新增的 `activity_summary_v99`），运行时它照样落到这里，`block.text` 实际是
+    // `undefined`，不是类型标注承诺的 `string`。原先直接 `block.text.length` 对 undefined
+    // 取 `.length` 会抛 TypeError，且 remote-web 当时没有任何 ErrorBoundary 兜底，会整页白屏。
+    // 这里加运行时守卫（类型层面看似恒假，但这就是防的正是"类型跟运行时对不上"这件事本身）：
+    // 不是字符串就降级渲染一行提示，不再往下访问 `.length`。
+    if (typeof block.text !== "string")
+      return (
+        <div key={key} className="turn__unknown-block">
+          {t("messageContent.unknownBlock")}
+        </div>
+      );
+    if (block.text.length > HUGE_TEXT_BLOCK_CHARS)
+      return <HugeTextBlock key={key} text={block.text} />;
+    if (!MarkdownBody)
+      return (
+        <div key={key} style={{ whiteSpace: "pre-wrap" }}>
+          {block.text}
+        </div>
+      );
+    return (
+      <MarkdownBody
+        key={key}
+        streaming={streaming}
+        onOpenPreview={openPreviewOrExternal}
+        onOpenLightbox={onOpenLightbox}
+        sessionId={sessionId}
+      >
+        {block.text}
+      </MarkdownBody>
+    );
+  };
+
   return (
     <div className="turn__text" ref={contentRef}>
-      {grouped.map(({ item, imagePaths }, i) => {
-        if (item.kind === "toolgroup") {
-          const groupKey = item.blocks[0]?.id ?? `toolgroup-${i}`;
+      {renderSegments.map((rs) => {
+        if (rs.kind === "pass") {
           return (
-            <Fragment key={`toolgroup-${groupKey}`}>
-              <ToolStepsFold blocks={item.blocks} />
-              {onOpenPreview && onOpenLightbox && imagePaths.length > 0 && (
-                <ImageArtifactChips
-                  paths={imagePaths}
-                  sessionId={sessionId}
-                  onOpenPreview={onOpenPreview}
-                  onOpenLightbox={onOpenLightbox}
-                />
+            <Fragment key={`${rs.keyPrefix}-pass`}>
+              {rs.entries.map(({ item, imagePaths }, i) =>
+                renderPassEntry(item, imagePaths, i, rs.keyPrefix),
               )}
             </Fragment>
           );
         }
-        const block = item.block;
-        if (block.type === "image")
+        if (rs.kind === "activity_fold") {
           return (
-            <ImageBlockContent
-              key={`b-${i}`}
-              path={block.attachment_id}
-              mediaType={block.media_type}
+            <ActivityFold
+              key={`${rs.segment.sourceStartIndex}:${verbosity}`}
+              fold={rs.segment}
+              verbosity={verbosity}
               sessionId={sessionId}
               onOpenPreview={onOpenPreview}
               onOpenLightbox={onOpenLightbox}
             />
           );
-        if (block.type === "tool") {
-          return (
-            <Fragment key={`b-${i}`}>
-              <ToolCard block={block} compact />
-              {onOpenPreview && onOpenLightbox && imagePaths.length > 0 && (
-                <ImageArtifactChips
-                  paths={imagePaths}
-                  sessionId={sessionId}
-                  onOpenPreview={onOpenPreview}
-                  onOpenLightbox={onOpenLightbox}
-                />
-              )}
-            </Fragment>
-          );
         }
-        if (block.type === "approval")
-          return (
-            <ApprovalCard
-              key={`b-${i}`}
-              block={block}
-              sessionId={sessionId ?? ""}
-            />
-          );
-        if (block.type === "thinking")
-          return <ThinkingBlock key={`b-${i}`} text={block.text} />;
-        if (block.type === "team_run")
-          return (
-            <BackgroundTaskStack
-              key={`b-${i}`}
-              runId={block.run_id}
-              lead={block.lead}
-              members={block.members}
-              onOpenMember={onOpenMember}
-              onUndoRun={onUndoRun}
-            />
-          );
-        if (block.type === "gate_card" && gateView?.kind === "proposing")
-          return (
-            <div className="gate-proposing" key={`b-${i}`}>
-              <span className="gate-proposing__dot" aria-hidden />
-              {t("messageContent.gate.proposing")}
-            </div>
-          );
-        if (block.type === "gate_card" && gateView?.kind === "draft")
-          return (
-            <GateCard
-              key={`b-${i}`}
-              draft={gateView.draft}
-              leadName={leadName ?? "Lead"}
-              enabledAgents={enabledAgents ?? []}
-              onAction={(a) => onGateAction?.(a)}
-              onFreeze={() => onGateFreeze?.()}
-              onRedraft={() => onGateRedraft?.()}
-              freezing={gateFreezing}
-              readonlyReason={readonlyReason}
-            />
-          );
-        if (block.type === "draft_failed" && gateView?.kind === "failed")
-          return (
-            <DraftFailedCard
-              key={`b-${i}`}
-              failure={gateView.failure}
-              onRetry={() => onGateRetry?.()}
-              onManual={() => onGateManual?.()}
-              onBackToNormal={() => onGateBackToNormal?.()}
-              disabled={readonly}
-            />
-          );
-        if (block.type === "gate_card" || block.type === "draft_failed")
-          return null; // gateView 不匹配（已清）→ 不渲
-        // plan B3：内联变更卡——「查看」透传 onViewRun（App 里开右面板 Review tab）。
-        if (block.type === "run_card")
-          return (
-            <RunCard
-              key={`b-${i}`}
-              block={block}
-              onView={() => onViewRun?.()}
-              onUndo={onUndoRun ? () => onUndoRun(block.run_id) : undefined}
-            />
-          );
-
-        if (block.type === "lead_summary")
-          return (
-            <LeadSummaryBlock
-              key={`b-${i}`}
-              block={block}
-              sessionId={sessionId}
-              onViewRun={onViewRun}
-              onOpenPreview={onOpenPreview}
-              onOpenLightbox={onOpenLightbox}
-              onTakeOver={readonly ? undefined : onTakeOver}
-              onCleanRedispatch={
-                readonly ? undefined : () => onCleanRedispatch?.(block.run_id)
-              }
-            />
-          );
-
-        if (block.type === "coding_task")
-          return (
-            <CodingTaskBar
-              key={`b-${i}`}
-              block={block}
-              onOpenMember={onOpenMember}
-              onConfirmVerify={readonly ? undefined : onConfirmVerify}
-              onShelve={readonly ? undefined : onShelve}
-              onRetryVerify={readonly ? undefined : onRetryVerify}
-            />
-          );
-
-        if (block.type === "dispatch_card")
-          return (
-            <DispatchCard
-              key={`b-${i}`}
-              member={block.member}
-              onOpenInspector={onOpenInspector}
-            />
-          );
-
-        if (block.type === "scope_change")
-          return (
-            <ScopeChangeCard
-              key={`b-${i}`}
-              block={block}
-              onContinue={onContinueScope ?? (() => {})}
-            />
-          );
-
-        if (block.type === "run_terminal")
-          return <RunTerminalCard key={`b-${i}`} block={block} />;
-
-        if (
-          block.type === "context_compacted" ||
-          block.type === "context_truncated"
-        )
-          return <ContextCompactedChip key={`b-${i}`} blockType={block.type} />;
-
-        if (block.type === "decision_card") return null; // 决策卡经 lead-turn 路径渲·不走 raw block 循环
-
-        const key = `b-${i}${streaming ? "-streaming" : ""}`;
-        // msgfix2 F2 S1（M0 §10.11「不识别的块类型不崩溃」）：走到这里的块理论上只剩 `text`——
-        // 但这个联合类型只是前端已知的形状，后端可能发出一个这里没有任何 `if` 分支认识的新块
-        // 类型（如未来新增的 `activity_summary_v99`），运行时它照样落到这里，`block.text` 实际是
-        // `undefined`，不是类型标注承诺的 `string`。原先直接 `block.text.length` 对 undefined
-        // 取 `.length` 会抛 TypeError，且 remote-web 当时没有任何 ErrorBoundary 兜底，会整页白屏。
-        // 这里加运行时守卫（类型层面看似恒假，但这就是防的正是"类型跟运行时对不上"这件事本身）：
-        // 不是字符串就降级渲染一行提示，不再往下访问 `.length`。
-        if (typeof block.text !== "string")
-          return (
-            <div key={key} className="turn__unknown-block">
-              {t("messageContent.unknownBlock")}
-            </div>
-          );
-        if (block.text.length > HUGE_TEXT_BLOCK_CHARS)
-          return <HugeTextBlock key={key} text={block.text} />;
-        if (!MarkdownBody)
-          return (
-            <div key={key} style={{ whiteSpace: "pre-wrap" }}>
-              {block.text}
-            </div>
-          );
+        if (suppressArtifacts || !onOpenPreview || !onOpenLightbox) return null;
         return (
-          <MarkdownBody
-            key={key}
-            streaming={streaming}
-            onOpenPreview={openPreviewOrExternal}
-            onOpenLightbox={onOpenLightbox}
+          <ImageArtifactChips
+            key={`${rs.segment.sourceStartIndex}:artifacts`}
+            paths={rs.segment.imagePaths}
             sessionId={sessionId}
-          >
-            {block.text}
-          </MarkdownBody>
+            onOpenPreview={onOpenPreview}
+            onOpenLightbox={onOpenLightbox}
+          />
         );
       })}
       {attachmentOpenError &&

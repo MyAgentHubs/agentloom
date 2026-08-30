@@ -2,6 +2,7 @@ import { useEffect, useRef, type ReactNode } from "react";
 import { SettingsShell, type SettingsPage } from "./SettingsShell";
 import { useI18n } from "../../i18n";
 import { SettingsAbout } from "./SettingsAbout";
+import { SettingsChat } from "./SettingsChat";
 import { SettingsRemoteControl } from "./SettingsRemoteControl";
 
 type Props = {
@@ -75,6 +76,8 @@ export function SettingsSheet(props: Props) {
               props.searchContent
             ) : props.page === "language" ? (
               props.languageContent
+            ) : props.page === "chat" ? (
+              <SettingsChat />
             ) : props.page === "remoteControl" ? (
               <SettingsRemoteControl currentRepoId={props.currentRepoId} />
             ) : props.page === "archivedProjects" ? (

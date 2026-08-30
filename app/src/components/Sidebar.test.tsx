@@ -1,6 +1,13 @@
-import { act, render, screen, fireEvent } from "@testing-library/react";
+import {
+  act,
+  render,
+  screen,
+  fireEvent,
+  waitFor,
+} from "@testing-library/react";
 import { useState } from "react";
-import { describe, it, expect, vi } from "vitest";
+import { beforeEach, describe, it, expect, vi } from "vitest";
+import { I18nProvider, type Locale } from "../i18n";
 import { Sidebar } from "./Sidebar";
 import type {
   Session,
@@ -9,6 +16,20 @@ import type {
   NamespaceMeta,
 } from "../types/agent";
 import { makeSession } from "../test/factories";
+import type { UpdaterSnapshot } from "../types/updater";
+
+const { invokeMock, listenMock } = vi.hoisted(() => ({
+  invokeMock: vi.fn(),
+  listenMock: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: listenMock }));
+
+import {
+  __resetForTests as __resetUpdaterStoreForTests,
+  getUpdaterSnapshot,
+} from "../lib/updaterStore";
 
 const localNamespace: NamespaceMeta = {
   id: "local",
@@ -646,5 +667,611 @@ describe("Sidebar · 全高列 sb-top + footer selector（阶段1 Task1.3）", (
     ).not.toBeNull();
     fireEvent.click(screen.getByLabelText("设置"));
     expect(onMenuAgents).toHaveBeenCalledOnce();
+  });
+});
+
+describe("UpdateButton — 左侧栏 footer 常驻胶囊", () => {
+  let eventHandler: ((event: { payload: unknown }) => void) | null;
+  // 按命令名路由的响应表——不用 mockResolvedValueOnce 位置队列：
+  // `I18nProvider` 自己也会在挂载时 `invoke("set_ui_locale", …)`，与
+  // `UpdateButton` 的 `updater_get_state` 调用谁先谁后不是稳定顺序（前者是同步
+  // 调用、后者要等 `listen()` 先 resolve 一次微任务），位置队列会被错配。
+  const responses = new Map<string, unknown>();
+
+  function snap(
+    revision: number,
+    kind: string,
+    extra: object = {},
+  ): UpdaterSnapshot {
+    return { revision, state: { kind, ...extra } } as UpdaterSnapshot;
+  }
+
+  function emit(payload: unknown) {
+    eventHandler?.({ payload });
+  }
+
+  function renderSidebarWithUpdater(locale: Locale = "zh") {
+    return render(
+      <I18nProvider initialLocale={locale}>
+        <Sidebar {...makeSidebarProps()} />
+      </I18nProvider>,
+    );
+  }
+
+  beforeEach(() => {
+    __resetUpdaterStoreForTests();
+    eventHandler = null;
+    responses.clear();
+    responses.set("updater_get_state", snap(0, "idle"));
+    invokeMock.mockReset();
+    listenMock.mockReset();
+    listenMock.mockImplementation(
+      async (_channel: string, handler: typeof eventHandler) => {
+        eventHandler = handler;
+        return vi.fn();
+      },
+    );
+    invokeMock.mockImplementation(async (cmd: string) => responses.get(cmd));
+  });
+
+  it("idle/checking/up_to_date 等非更新态 → 不渲染 footer 胶囊", async () => {
+    for (const state of [
+      snap(1, "idle"),
+      snap(1, "checking"),
+      snap(1, "up_to_date", { checked_at: Date.now() }),
+      snap(1, "staging"),
+      snap(1, "swapping"),
+      snap(1, "disabled", { reason: "dev" }),
+    ]) {
+      // 每轮重置模块级单例——否则 start() 幂等短路，第二轮起不会再调 invoke。
+      __resetUpdaterStoreForTests();
+      responses.set("updater_get_state", state);
+      const { container, unmount } = renderSidebarWithUpdater();
+      // 等真正的迁移落地（revision 从 0 推进到 1），而不是只等 invoke 被调用过
+      // ——否则哪怕 invoke 的返回值从没被应用，这条断言也会假阳性通过。
+      await waitFor(() => expect(getUpdaterSnapshot().revision).toBe(1));
+      expect(container.querySelector(".updbtn")).toBeNull();
+      unmount();
+    }
+  });
+
+  it("up_to_date（已是最新）→ footer 不渲染胶囊", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "up_to_date", { checked_at: Date.now() }),
+    );
+    const { container } = renderSidebarWithUpdater();
+    await waitFor(() => expect(getUpdaterSnapshot().revision).toBe(1));
+    expect(container.querySelector(".sb-foot > .updbtn")).toBeNull();
+  });
+
+  it("自动检查失败落回 idle → footer 胶囊仍不渲染", async () => {
+    responses.set("updater_get_state", snap(1, "checking"));
+    const { container } = renderSidebarWithUpdater();
+    await waitFor(() => expect(getUpdaterSnapshot().revision).toBe(1));
+    expect(container.querySelector(".sb-foot > .updbtn")).toBeNull();
+
+    act(() => emit(snap(2, "idle")));
+    expect(getUpdaterSnapshot().revision).toBe(2);
+    expect(container.querySelector(".sb-foot > .updbtn")).toBeNull();
+  });
+
+  it.each([
+    [
+      "zh",
+      'AL_ERR:updater.swap_failed:{"detail":"extract archive failed: corrupt payload"}',
+      "更新失败 · 重试",
+      "版本切换失败：extract archive failed: corrupt payload",
+    ],
+    [
+      "en",
+      'AL_ERR:updater.swap_failed:{"detail":"signature verification failed: bad signature"}',
+      "Update failed · Retry",
+      "Version swap failed: signature verification failed: bad signature",
+    ],
+  ])(
+    "%s Error 态 → 渲染失败胶囊，tooltip 保留完整错误",
+    async (locale, msg, label, tooltip) => {
+      responses.set(
+        "updater_get_state",
+        snap(1, "error", { msg, checked_at: Date.now() }),
+      );
+      const { container } = renderSidebarWithUpdater(locale as Locale);
+      const pill = await screen.findByRole("button", { name: label });
+      expect(pill).toHaveAttribute("title", tooltip);
+      expect(pill).toHaveClass("updbtn--error");
+      expect(container.querySelector(".sb-foot > .updbtn")).toBe(pill);
+    },
+  );
+
+  it("Error 态点击 → 手动检查发现更新后立即继续下载，且命令顺序正确", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "error", { msg: "extract failed", checked_at: Date.now() }),
+    );
+    responses.set(
+      "updater_check",
+      snap(2, "available", {
+        version: "0.3.0",
+        notes: null,
+        pub_date: null,
+      }),
+    );
+    responses.set(
+      "updater_download_and_install",
+      snap(3, "downloading", { downloaded: 0, total: null }),
+    );
+    renderSidebarWithUpdater();
+    const retry = await screen.findByRole("button", {
+      name: "更新失败 · 重试",
+    });
+
+    fireEvent.click(retry);
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "下载中…" })).toBeDisabled(),
+    );
+    const updaterCommands = invokeMock.mock.calls
+      .map(([command]) => command)
+      .filter((command) =>
+        ["updater_check", "updater_download_and_install"].includes(command),
+      );
+    expect(invokeMock).toHaveBeenCalledWith("updater_check", { manual: true });
+    expect(updaterCommands).toEqual([
+      "updater_check",
+      "updater_download_and_install",
+    ]);
+  });
+
+  it("Error(reopen) 点击 → 只调用 updater_reopen，不检查也不下载", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "error", {
+        msg: "AL_ERR:updater.relaunch_failed",
+        checked_at: Date.now(),
+        retry: "reopen",
+      }),
+    );
+    responses.set("updater_reopen", undefined);
+    renderSidebarWithUpdater();
+    const retry = await screen.findByRole("button", {
+      name: "更新失败 · 重试",
+    });
+
+    fireEvent.click(retry);
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("updater_reopen"),
+    );
+    expect(invokeMock).not.toHaveBeenCalledWith("updater_check", {
+      manual: true,
+    });
+    expect(invokeMock).not.toHaveBeenCalledWith("updater_download_and_install");
+  });
+
+  it("Error 缺省 retry 点击 → 仍调用 updater_check，不误走 reopen", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "error", { msg: "extract failed", checked_at: Date.now() }),
+    );
+    responses.set(
+      "updater_check",
+      snap(2, "up_to_date", { checked_at: Date.now() }),
+    );
+    renderSidebarWithUpdater();
+    const retry = await screen.findByRole("button", {
+      name: "更新失败 · 重试",
+    });
+
+    fireEvent.click(retry);
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("updater_check", {
+        manual: true,
+      }),
+    );
+    expect(invokeMock).not.toHaveBeenCalledWith("updater_reopen");
+  });
+
+  it("Error 态点击 → 手动检查已是最新时不下载，胶囊消失", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "error", { msg: "extract failed", checked_at: Date.now() }),
+    );
+    responses.set(
+      "updater_check",
+      snap(2, "up_to_date", { checked_at: Date.now() }),
+    );
+    const { container } = renderSidebarWithUpdater();
+    const retry = await screen.findByRole("button", {
+      name: "更新失败 · 重试",
+    });
+
+    fireEvent.click(retry);
+
+    await waitFor(() =>
+      expect(container.querySelector(".sb-foot > .updbtn")).toBeNull(),
+    );
+    expect(invokeMock).toHaveBeenCalledWith("updater_check", { manual: true });
+    expect(invokeMock).not.toHaveBeenCalledWith("updater_download_and_install");
+  });
+
+  it.each([
+    [
+      "zh",
+      snap(1, "available", {
+        version: "0.3.0",
+        notes: null,
+        pub_date: null,
+      }),
+      "更新到 v0.3.0",
+    ],
+    [
+      "en",
+      snap(1, "available", {
+        version: "0.3.0",
+        notes: null,
+        pub_date: null,
+      }),
+      "Update to v0.3.0",
+    ],
+    ["zh", snap(1, "downloading", { downloaded: 19, total: 20 }), "下载中 95%"],
+    [
+      "en",
+      snap(1, "downloading", { downloaded: 19, total: 20 }),
+      "Downloading 95%",
+    ],
+    ["zh", snap(1, "downloading", { downloaded: 19, total: null }), "下载中…"],
+    [
+      "en",
+      snap(1, "downloading", { downloaded: 19, total: null }),
+      "Downloading…",
+    ],
+    [
+      "zh",
+      snap(1, "ready", { version: "0.3.0", staged_path: "/tmp/x.app" }),
+      "重启以更新",
+    ],
+    [
+      "en",
+      snap(1, "ready", { version: "0.3.0", staged_path: "/tmp/x.app" }),
+      "Restart to update",
+    ],
+    [
+      "zh",
+      snap(1, "ready", {
+        version: "0.3.0",
+        staged_path: "/tmp/x.app",
+        last_error: "AL_ERR:updater.swap_failed",
+      }),
+      "更新失败 · 重试",
+    ],
+    [
+      "en",
+      snap(1, "ready", {
+        version: "0.3.0",
+        staged_path: "/tmp/x.app",
+        last_error: "AL_ERR:updater.swap_failed",
+      }),
+      "Update failed · Retry",
+    ],
+  ])("%s 标签：%s → %s", async (locale, state, label) => {
+    responses.set("updater_get_state", state);
+    renderSidebarWithUpdater(locale as Locale);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: label })).toBeInTheDocument(),
+    );
+  });
+
+  it("available → 胶囊点击直接下载，不弹浮层；随后显示不可点击的下载进度", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "available", {
+        version: "0.3.0",
+        notes: "修了一些 bug",
+        pub_date: null,
+      }),
+    );
+    const { container } = renderSidebarWithUpdater();
+    await waitFor(() =>
+      expect(container.querySelector(".updbtn")).not.toBeNull(),
+    );
+    expect(container.querySelector(".sb-foot > .updbtn")).toHaveTextContent(
+      "更新到 v0.3.0",
+    );
+    expect(
+      container.querySelector(".sb-foot > .updbtn + .project-switcher"),
+    ).not.toBeNull();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByText("修了一些 bug")).not.toBeInTheDocument();
+
+    responses.set(
+      "updater_download_and_install",
+      snap(2, "downloading", { downloaded: 0, total: null }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "更新到 v0.3.0" }));
+    expect(invokeMock).toHaveBeenCalledWith("updater_download_and_install");
+    await waitFor(() => {
+      expect(container.querySelector(".updbtn__ring")).not.toBeNull();
+      expect(screen.getByRole("button", { name: "下载中…" })).toBeDisabled();
+    });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("available → 初次出现与版本事件更新都只更新胶囊，不自动弹层", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "available", { version: "0.3.0", notes: null, pub_date: null }),
+    );
+    renderSidebarWithUpdater();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "更新到 v0.3.0" }),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    act(() => {
+      emit(
+        snap(2, "available", {
+          version: "0.4.0",
+          notes: null,
+          pub_date: null,
+        }),
+      );
+    });
+    expect(
+      screen.getByRole("button", { name: "更新到 v0.4.0" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("downloading → 胶囊不可点，进度百分比随 updater 事件更新", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "downloading", { downloaded: 10, total: 100 }),
+    );
+    const { container } = renderSidebarWithUpdater();
+    await waitFor(() =>
+      expect(container.querySelector(".updbtn")).not.toBeNull(),
+    );
+    expect(container.querySelector(".updbtn__ring")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "下载中 10%" })).toBeDisabled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    act(() => {
+      emit(snap(2, "downloading", { downloaded: 73, total: 100 }));
+    });
+    expect(screen.getByRole("button", { name: "下载中 73%" })).toBeDisabled();
+  });
+
+  it("downloading 无总量 → 显示不定进度且胶囊不可点", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "downloading", { downloaded: 19, total: null }),
+    );
+    const { container } = renderSidebarWithUpdater();
+    const pill = await screen.findByRole("button", { name: "下载中…" });
+    expect(pill).toBeDisabled();
+    expect(container.querySelector(".updbtn__ring--spin")).not.toBeNull();
+  });
+
+  it("ready → 点击胶囊直接调用 updater_relaunch，全程无浮层", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "ready", { version: "0.3.0", staged_path: "/tmp/x.app" }),
+    );
+    const { container } = renderSidebarWithUpdater();
+    await waitFor(() =>
+      expect(container.querySelector(".updbtn")).not.toBeNull(),
+    );
+    expect(
+      screen.getByRole("button", { name: "重启以更新" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "重启以更新" }));
+    expect(invokeMock).toHaveBeenCalledWith("updater_relaunch");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("ready + last_error → 点击胶囊重跑交换，不调用下载命令", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "ready", {
+        version: "0.3.0",
+        staged_path: "/tmp/x.app",
+        last_error: "AL_ERR:updater.swap_failed",
+      }),
+    );
+    renderSidebarWithUpdater();
+    const retry = await screen.findByRole("button", {
+      name: "更新失败 · 重试",
+    });
+
+    fireEvent.click(retry);
+
+    expect(invokeMock).toHaveBeenCalledWith("updater_relaunch");
+    expect(invokeMock).not.toHaveBeenCalledWith("updater_download_and_install");
+  });
+
+  it("ready 不带 last_error → 胶囊保持正常文案，不渲染错误或重试提示", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "ready", { version: "0.3.0", staged_path: "/tmp/x.app" }),
+    );
+    renderSidebarWithUpdater();
+    const pill = await screen.findByRole("button", { name: "重启以更新" });
+    expect(pill).toHaveAttribute("title", "重启以更新");
+    expect(
+      screen.queryByRole("button", { name: "更新失败 · 重试" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/上次更新未完成/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("ready 重启失败 → 胶囊就地变为可重试，tooltip 显示完整错误", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "ready", { version: "0.3.0", staged_path: "/tmp/x.app" }),
+    );
+    const { container } = renderSidebarWithUpdater();
+    await waitFor(() =>
+      expect(container.querySelector(".updbtn")).not.toBeNull(),
+    );
+    invokeMock.mockRejectedValueOnce("AL_ERR:updater.relaunch_not_ready");
+    fireEvent.click(screen.getByRole("button", { name: "重启以更新" }));
+    const retry = await screen.findByRole("button", {
+      name: "更新失败 · 重试",
+    });
+    expect(retry).toHaveAttribute("title", "重启安装尚未就绪，请稍后重试");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    invokeMock.mockResolvedValueOnce(undefined);
+    fireEvent.click(retry);
+    expect(invokeMock).toHaveBeenLastCalledWith("updater_relaunch");
+    expect(
+      invokeMock.mock.calls.filter(
+        ([command]) => command === "updater_relaunch",
+      ),
+    ).toHaveLength(2);
+    expect(invokeMock).not.toHaveBeenCalledWith("updater_download_and_install");
+  });
+
+  it("ready 带 last_error → 失败胶囊 tooltip 显示完整错误，点击直接重跑交换", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "ready", {
+        version: "0.3.0",
+        staged_path: "/tmp/x.app",
+        last_error:
+          'AL_ERR:updater.swap_failed:{"detail":"renameatx_np(RENAME_SWAP) failed: Operation not permitted (os error 1)"}',
+      }),
+    );
+    renderSidebarWithUpdater();
+    const retry = await screen.findByRole("button", {
+      name: "更新失败 · 重试",
+    });
+    expect(retry).toHaveAttribute(
+      "title",
+      "版本切换失败：renameatx_np(RENAME_SWAP) failed: Operation not permitted (os error 1)",
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    fireEvent.click(retry);
+    expect(invokeMock).toHaveBeenCalledWith("updater_relaunch");
+    expect(invokeMock).not.toHaveBeenCalledWith("updater_download_and_install");
+  });
+
+  it("recovery_offered 带 last_error → 胶囊 tooltip 与确认层均显示完整错误", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "recovery_offered", {
+        bundle_path: "/Applications/AgentLoom.app",
+        staged_path: "/Applications/.agentloom-update-abc123/AgentLoom.app",
+        target_version: "0.3.0",
+        last_error:
+          'AL_ERR:updater.swap_failed:{"detail":"renameatx_np(RENAME_SWAP) failed: Operation not permitted (os error 1)"}',
+      }),
+    );
+    const { container } = renderSidebarWithUpdater();
+    await waitFor(() =>
+      expect(container.querySelector(".updbtn")).not.toBeNull(),
+    );
+    const pill = screen.getByRole("button", { name: "更新失败 · 重试" });
+    expect(pill).toHaveAttribute(
+      "title",
+      "版本切换失败：renameatx_np(RENAME_SWAP) failed: Operation not permitted (os error 1)",
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    fireEvent.click(pill);
+    expect(
+      screen.getByText(
+        "版本切换失败：renameatx_np(RENAME_SWAP) failed: Operation not permitted (os error 1)",
+      ),
+    ).toBeInTheDocument();
+    const swapBackBtn = screen.getByRole("button", {
+      name: "恢复旧版本并重启",
+    });
+    expect(swapBackBtn).not.toBeDisabled();
+  });
+
+  it("recovery_offered → 点击后先确认，确认后才调用 updater_swap_back", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "recovery_offered", {
+        bundle_path: "/Applications/AgentLoom.app",
+        staged_path: "/Applications/.agentloom-update-abc123/AgentLoom.app",
+        target_version: "0.3.0",
+      }),
+    );
+    const { container } = renderSidebarWithUpdater();
+    await waitFor(() =>
+      expect(container.querySelector(".updbtn")).not.toBeNull(),
+    );
+    expect(container.querySelector(".updbtn--warn")).not.toBeNull();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("updater_swap_back");
+
+    fireEvent.click(container.querySelector(".updbtn")!);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByText(/正在运行备份中的旧版/)).toBeInTheDocument();
+    expect(screen.getByText(/v0\.3\.0 安装后未能正常启动/)).toBeInTheDocument();
+    const swapBackBtn = screen.getByRole("button", {
+      name: "恢复旧版本并重启",
+    });
+    expect(swapBackBtn).not.toHaveTextContent("0.3.0");
+
+    responses.set("updater_swap_back", undefined);
+    fireEvent.click(swapBackBtn);
+    expect(invokeMock).toHaveBeenCalledWith("updater_swap_back");
+  });
+
+  it("recovery_offered → 确认换回失败时在确认层显示完整错误", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "recovery_offered", {
+        bundle_path: "/Applications/AgentLoom.app",
+        staged_path: "/Applications/.agentloom-update-abc123/AgentLoom.app",
+        target_version: "0.3.0",
+      }),
+    );
+    const { container } = renderSidebarWithUpdater();
+    await waitFor(() =>
+      expect(container.querySelector(".updbtn")).not.toBeNull(),
+    );
+    fireEvent.click(container.querySelector(".updbtn")!);
+
+    invokeMock.mockRejectedValueOnce(
+      'AL_ERR:updater.swap_failed:{"detail":"renameatx_np failed"}',
+    );
+    fireEvent.click(screen.getByRole("button", { name: "恢复旧版本并重启" }));
+    expect(
+      await screen.findByText("版本切换失败：renameatx_np failed"),
+    ).toBeInTheDocument();
+  });
+
+  it("recovery_offered → Esc 关闭确认层（胶囊仍在）", async () => {
+    responses.set(
+      "updater_get_state",
+      snap(1, "recovery_offered", {
+        bundle_path: "/Applications/AgentLoom.app",
+        staged_path: "/Applications/.agentloom-update-abc123/AgentLoom.app",
+        target_version: "0.3.0",
+      }),
+    );
+    const { container } = renderSidebarWithUpdater();
+    await waitFor(() =>
+      expect(container.querySelector(".updbtn")).not.toBeNull(),
+    );
+    fireEvent.click(container.querySelector(".updbtn")!);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+    expect(container.querySelector(".updbtn")).not.toBeNull();
   });
 });

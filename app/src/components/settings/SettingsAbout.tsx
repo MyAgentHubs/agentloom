@@ -9,6 +9,7 @@ import {
   WEBSITE_LABEL,
   WEBSITE_URL,
 } from "../../constants/about";
+import { UpdateSection } from "./UpdateSection";
 
 const styles: Record<string, CSSProperties> = {
   header: {
@@ -43,6 +44,11 @@ const styles: Record<string, CSSProperties> = {
     color: "var(--ink-3)",
     fontSize: 11,
     marginTop: 28,
+    paddingTop: 14,
+  },
+  updateSection: {
+    borderTop: "1px solid var(--line-soft)",
+    marginTop: 8,
     paddingTop: 14,
   },
 };
@@ -105,6 +111,9 @@ export function SettingsAbout() {
               {WEBSITE_LABEL}
             </a>
           </div>
+        </div>
+        <div style={styles.updateSection}>
+          <UpdateSection />
         </div>
         <div style={styles.copyright}>{COPYRIGHT}</div>
       </div>

@@ -12,7 +12,10 @@ type Translate = (
 
 const PREFIX = "AL_ERR:";
 const LOCAL_SESSION_UNSUPPORTED_PREFIX = "LOCAL_SESSION_UNSUPPORTED";
-const CODE_PATTERN = /^[a-zA-Z0-9.]+$/;
+// `updater.rs`（T3a）的 al_err 码是 snake_case（如 `updater.check_failed`）——
+// 与其余调用点的 camelCase 惯例不同；放宽正则加下划线，否则这批码会被判定为
+// 不合法格式、整段原样漏显成 `AL_ERR:...`（纯扩容不收窄，不影响既有 camelCase 码）。
+const CODE_PATTERN = /^[a-zA-Z0-9._]+$/;
 const TRANSIENT_LEAD_ERROR_CODES = new Set([
   "lead.spawnDriverFailed",
   "lead.spawnLeadFailed",

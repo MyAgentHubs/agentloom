@@ -10,6 +10,7 @@ import { useI18n } from "../i18n";
 import { ProjectSwitcherFooter } from "./ProjectSwitcherFooter";
 import { SessionGroupSection } from "./SessionGroupSection";
 import { SessionRow, type SessionDotStatus } from "./SessionRow";
+import { UpdateButton } from "./UpdateButton";
 
 type Props = {
   sessions: Session[];
@@ -496,6 +497,7 @@ export const Sidebar = React.memo(function Sidebar({
         })()}
       </div>
       <div className="sb-foot">
+        <UpdateButton />
         <ProjectSwitcherFooter
           activeNamespace={activeNamespace}
           activeRepo={activeRepo}

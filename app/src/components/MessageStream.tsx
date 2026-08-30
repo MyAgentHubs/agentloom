@@ -14,6 +14,8 @@ import type {
   TeamRun,
 } from "../types/agent";
 import { useAutoScroll } from "../hooks/useAutoScroll";
+import { useChatVerbosity } from "../lib/chatVerbosity";
+import type { Verbosity } from "../lib/streamItems";
 import { AgentAvatar } from "./AgentAvatar";
 import { MessageContent } from "./MessageContent";
 import { MessageActions } from "./MessageActions";
@@ -55,6 +57,8 @@ type Props = {
   liveRunsByRun?: Record<string, TeamRun>;
   liveCodingByRun?: Record<string, CodingTaskBlock>;
   readonlyReason?: string | null;
+  /** V3b 顺修既有断线：主对话流点「采纳并继续」需要一路传到 ScopeChangeCard。 */
+  onContinueScope?: (text: string) => void;
 };
 
 const EMPTY_LIVE_RUNS: Record<string, TeamRun> = {};
@@ -251,6 +255,9 @@ type MessageTurnProps = {
   showAuthorWorking: boolean;
   sessionId: string | null;
   teamLeadId?: string | null;
+  /** V3b：过程细节显示级别（chatVerbosity 偏好）——加入自定义 memo 比较，切档即重绘。 */
+  verbosity: Verbosity;
+  onContinueScope?: (text: string) => void;
   onHoverChange: (turnKey: string, hovered: boolean) => void;
   onQuoteTurn: (turnKey: string) => void;
   onViewRun?: (runId?: string) => void;
@@ -352,6 +359,8 @@ const MessageTurn = React.memo(function MessageTurn({
   showAuthorWorking,
   sessionId,
   teamLeadId,
+  verbosity,
+  onContinueScope,
   onHoverChange,
   onQuoteTurn,
   onViewRun,
@@ -426,6 +435,7 @@ const MessageTurn = React.memo(function MessageTurn({
       <MessageContent
         blocks={message.content}
         streaming={streaming}
+        verbosity={verbosity}
         sessionId={sessionId}
         onViewRun={onViewRun}
         onUndoRun={onUndoRun}
@@ -449,6 +459,7 @@ const MessageTurn = React.memo(function MessageTurn({
         onCleanRedispatch={onCleanRedispatch}
         onOpenInspector={onOpenInspector}
         readonlyReason={readonlyReason}
+        onContinueScope={onContinueScope}
       />
       <MessageActions
         message={message}
@@ -491,7 +502,9 @@ export const MessageStream = React.memo(function MessageStream({
   liveRunsByRun,
   liveCodingByRun,
   readonlyReason,
+  onContinueScope,
 }: Props) {
+  const [verbosity] = useChatVerbosity();
   const streamRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const pendingPrependScrollRef = useRef<{
@@ -625,12 +638,6 @@ export const MessageStream = React.memo(function MessageStream({
     const handle = window.setTimeout(prependChunk, 0);
     return () => window.clearTimeout(handle);
   }, [sessionId, stickRef, visibleStart]);
-  const lastAssistantIdx = (() => {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === "assistant") return i;
-    }
-    return -1;
-  })();
 
   const renderRunTurn = (turn: LeadTurnView) => (
     <RunLeadTurn
@@ -662,7 +669,15 @@ export const MessageStream = React.memo(function MessageStream({
       messageHasLeadTurnBlock(message);
     if (!consumed) {
       const turnKey = messageTurnKeys[i];
-      const streaming = busy && i === lastAssistantIdx;
+      // V3b §2B ③：busy 最外层短路（双保险）；stream_live 是权威封口——为真时信任，
+      // 为空（未打标）时兜底用「末条消息 × role===assistant」（不用「末条 assistant」，
+      // 避免 lead step 先追加 user 消息的窗口把旧 assistant 误标为流中，v1 病灶）。
+      const streaming =
+        busy &&
+        (message.stream_live === true ||
+          (message.stream_live == null &&
+            i === messages.length - 1 &&
+            message.role === "assistant"));
       // 块 B（T5·BLOCK-4·P1-3）：含 team_run/coding_task/decision_card 的消息继续用
       // 块内 run id 派 key；普通消息优先用 client id，否则用 role + 首块内容指纹 +
       // 同指纹序号。displayMessages 会克隆消息对象，故不能用 WeakMap 对象身份。
@@ -676,6 +691,8 @@ export const MessageStream = React.memo(function MessageStream({
           showAuthorWorking={streaming && message.role === "assistant"}
           sessionId={sessionId}
           teamLeadId={teamLeadId}
+          verbosity={verbosity}
+          onContinueScope={onContinueScope}
           onHoverChange={handleHoverChange}
           onQuoteTurn={handleQuoteTurn}
           onViewRun={onViewRun}

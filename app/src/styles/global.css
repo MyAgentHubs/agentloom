@@ -1493,7 +1493,7 @@ body {
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  gap: 0;
+  gap: 8px;
   position: relative;
   background: var(--panel);
 }
@@ -5026,6 +5026,9 @@ button.overview__usagerow:hover .overview__usagerepo {
   color: var(--ink);
   padding: 0 16px 10px;
 }
+.st-nav-separator {
+  margin: 6px 16px;
+}
 .st-nav-item {
   width: 100%;
   text-align: left;
@@ -5158,6 +5161,48 @@ button.overview__usagerow:hover .overview__usagerepo {
   color: var(--ink-3);
   font-size: 10px;
   font-weight: 600;
+}
+.st-chat__group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.st-chat__option {
+  align-items: flex-start;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  padding: 10px 12px;
+}
+.st-chat__option:hover {
+  border-color: var(--accent);
+  background: #fffcf7;
+}
+.st-chat__option--active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.st-chat__radio {
+  margin-top: 3px;
+}
+.st-chat__text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.st-chat__title {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+.st-chat__desc {
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.5;
 }
 .st-search-seg {
   display: grid;
@@ -10084,6 +10129,212 @@ html[data-os="macos"] {
   animation: pulse 1.6s ease-in-out infinite;
 }
 
+/* updbtn — 左侧栏 footer 在线更新胶囊（仅有更新或可恢复故障时渲染） */
+.updbtn {
+  align-self: flex-start;
+  width: auto;
+  max-width: 100%;
+  min-width: 0;
+  height: 30px;
+  padding: 0 11px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+}
+.updbtn:hover {
+  filter: brightness(0.96);
+}
+.updbtn--error {
+  border-color: var(--red);
+  background: var(--red);
+}
+.updbtn:disabled {
+  cursor: default;
+  filter: none;
+}
+.updbtn svg {
+  flex: 0 0 auto;
+}
+.updbtn__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.updbtn__ring {
+  stroke: currentColor;
+}
+.updbtn__ring--spin {
+  animation: spin 1.2s linear infinite;
+  transform-origin: center;
+}
+
+/* updpop — 更新 popover（createPortal 到 body·position:fixed 锚在 footer 胶囊上方） */
+.updpop {
+  position: fixed;
+  z-index: 1000;
+  width: 300px;
+  box-sizing: border-box;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel);
+  box-shadow: 0 8px 24px rgba(72, 54, 35, 0.16);
+}
+.updpop__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-1);
+  margin-bottom: 8px;
+}
+.updpop__notes {
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+.updpop__notes summary {
+  cursor: pointer;
+  color: var(--ink-2);
+}
+.updpop__notes-body {
+  margin-top: 6px;
+  color: var(--ink-2);
+  white-space: pre-wrap;
+}
+.updpop__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.updpop__primary {
+  flex: 1 1 auto;
+  height: 30px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+}
+.updpop__secondary {
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+.updpop__progress {
+  height: 5px;
+  border-radius: 3px;
+  background: rgba(28, 26, 23, 0.08);
+  overflow: hidden;
+  margin-bottom: 6px;
+}
+.updpop__progress-bar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 0.2s ease;
+}
+.updpop__progress-label {
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.updpop__error {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--danger, #c0392b);
+}
+
+/* updsec — 关于页在线更新区（SettingsAbout / AboutDialog 共用 UpdateSection） */
+.updsec__title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  color: var(--ink-3);
+  margin-bottom: 8px;
+}
+.updsec__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+.updsec__row--disabled {
+  color: var(--ink-3);
+}
+.updsec__check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.updsec__check:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+.updsec__spin {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 1.6px solid var(--ink-3);
+  border-top-color: transparent;
+  animation: spin 0.8s linear infinite;
+}
+.updsec__actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.updsec__notes {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.updsec__notes-title {
+  margin-bottom: 5px;
+  font-weight: 600;
+  color: var(--ink-1);
+}
+.updsec__notes-body {
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.updsec__error {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--danger, #c0392b);
+}
+
 /* New project sheet — project-first switcher screen 3 */
 .new-project-backdrop {
   position: fixed;
@@ -10519,4 +10770,73 @@ html[data-os="macos"] {
 .repo-doc__error div {
   display: flex;
   gap: 8px;
+}
+
+/* V3b（2026-08-26·刀②「桌面 chat verbose 分级」）：ActivityFold——摘要/精简档过程块
+   折算成的一枚活动 chip，尺寸/线性 SVG 风格参照 ContextCompactedChip（无 emoji）。 */
+.activity-fold {
+  margin: 5px 0;
+}
+.activity-fold__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--ink-3);
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.activity-fold__chip:hover {
+  border-color: var(--line-soft, var(--line));
+  color: var(--ink-2);
+}
+.activity-fold__chip--live {
+  color: var(--ink-2);
+}
+.activity-fold__chevron {
+  flex-shrink: 0;
+}
+.activity-fold__spinner {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+  animation: turn-working-pulse 0.9s ease-in-out infinite;
+}
+.activity-fold__count:not(:first-child)::before {
+  content: "·";
+  margin-right: 6px;
+  color: var(--ink-4);
+}
+.activity-fold__count--warn {
+  color: var(--amber-ink, var(--amber));
+  font-weight: 600;
+}
+.activity-fold__running {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.activity-fold__body {
+  margin-top: 4px;
+}
+
+/* U6：updbtn 故障语义类（仍使用产品 accent）+ updsec 恢复行 */
+.updbtn--warn {
+  border-color: var(--accent);
+}
+.updsec__row--recovery {
+  color: var(--danger, #c0392b);
+}
+
+/* U6 修正：updpop 正文行（recovery_offered 标题+正文两段·标题静态、正文带版本号） */
+.updpop__body {
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--ink-2);
 }

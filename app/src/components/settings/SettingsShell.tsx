@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { Fragment, type ReactNode } from "react";
 import { useI18n, type I18nKey } from "../../i18n";
 
 export type SettingsPage =
@@ -6,6 +6,7 @@ export type SettingsPage =
   | "repos"
   | "archivedProjects"
   | "language"
+  | "chat"
   | "search"
   | "remoteControl"
   | "about";
@@ -14,6 +15,7 @@ type NavKey =
   | "agents"
   | "search"
   | "language"
+  | "chat"
   | "remoteControl"
   | "defaults"
   | "repos"
@@ -40,6 +42,7 @@ const ICONS: Record<NavKey, ReactNode> = {
       <path d="M3 12h18M12 3a14 14 0 010 18M12 3a14 14 0 000 18" />
     </>
   ),
+  chat: <path d="M21 15a4 4 0 01-4 4H8l-5 3V7a4 4 0 014-4h10a4 4 0 014 4z" />,
   remoteControl: (
     <>
       <rect x="5" y="2" width="10" height="20" rx="2" />
@@ -92,71 +95,62 @@ const ICONS: Record<NavKey, ReactNode> = {
   ),
 };
 
-const NAV: {
+type NavItem = {
   key: NavKey;
   labelKey: I18nKey;
   enabled: boolean;
-}[] = [
-  {
-    key: "agents",
-    labelKey: "settings.nav.agents",
-    enabled: true,
-  },
-  {
-    key: "search",
-    labelKey: "settings.nav.search",
-    enabled: true,
-  },
-  {
-    key: "language",
-    labelKey: "settings.nav.language",
-    enabled: true,
-  },
-  {
-    key: "remoteControl",
-    labelKey: "settings.nav.remoteControl",
-    enabled: true,
-  },
-  {
-    key: "defaults",
-    labelKey: "settings.nav.defaults",
-    enabled: false,
-  },
-  {
-    key: "repos",
-    labelKey: "settings.nav.repos",
-    enabled: true,
-  },
-  {
-    key: "archivedProjects",
-    labelKey: "settings.nav.archivedProjects",
-    enabled: true,
-  },
-  {
-    key: "allowlist",
-    labelKey: "settings.nav.allowlist",
-    enabled: false,
-  },
-  {
-    key: "accounts",
-    labelKey: "settings.nav.accounts",
-    enabled: false,
-  },
-  {
-    key: "budget",
-    labelKey: "settings.nav.budget",
-    enabled: false,
-  },
-  {
-    key: "shortcuts",
-    labelKey: "settings.nav.shortcuts",
-    enabled: false,
-  },
-  {
-    key: "about",
-    labelKey: "settings.nav.about",
-    enabled: true,
-  },
+};
+
+const NAV_GROUPS: NavItem[][] = [
+  [
+    { key: "agents", labelKey: "settings.nav.agents", enabled: true },
+    { key: "search", labelKey: "settings.nav.search", enabled: true },
+    {
+      key: "defaults",
+      labelKey: "settings.nav.defaults",
+      enabled: false,
+    },
+    {
+      key: "accounts",
+      labelKey: "settings.nav.accounts",
+      enabled: false,
+    },
+    {
+      key: "budget",
+      labelKey: "settings.nav.budget",
+      enabled: false,
+    },
+  ],
+  [
+    { key: "repos", labelKey: "settings.nav.repos", enabled: true },
+    {
+      key: "archivedProjects",
+      labelKey: "settings.nav.archivedProjects",
+      enabled: true,
+    },
+    {
+      key: "allowlist",
+      labelKey: "settings.nav.allowlist",
+      enabled: false,
+    },
+  ],
+  [
+    { key: "chat", labelKey: "settings.nav.chat", enabled: true },
+    { key: "language", labelKey: "settings.nav.language", enabled: true },
+    {
+      key: "shortcuts",
+      labelKey: "settings.nav.shortcuts",
+      enabled: false,
+    },
+  ],
+  [
+    {
+      key: "remoteControl",
+      labelKey: "settings.nav.remoteControl",
+      enabled: true,
+    },
+  ],
+  [{ key: "about", labelKey: "settings.nav.about", enabled: true }],
 ];
 
 export function SettingsShell({
@@ -169,35 +163,46 @@ export function SettingsShell({
   children: ReactNode;
 }) {
   const { t } = useI18n();
-  const visibleNav = NAV.filter((item) => item.enabled);
+  const visibleNavGroups = NAV_GROUPS.map((group) =>
+    group.filter((item) => item.enabled),
+  ).filter((group) => group.length > 0);
 
   return (
     <div className="st-app">
       <div className="st-nav">
         <div className="st-nav-title">{t("settings.title")}</div>
-        {visibleNav.map((item) => (
-          <button
-            key={item.key}
-            type="button"
-            className={`st-nav-item${item.key === activeKey ? " active" : ""}`}
-            aria-disabled={!item.enabled}
-            aria-current={item.key === activeKey ? "page" : undefined}
-            tabIndex={item.enabled ? undefined : -1}
-            onClick={() => {
-              if (!item.enabled) return;
-              onNavigate?.(item.key as SettingsPage);
-            }}
-          >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth={2}
-            >
-              {ICONS[item.key]}
-            </svg>
-            {t(item.labelKey)}
-          </button>
+        {visibleNavGroups.map((group, groupIndex) => (
+          <Fragment key={group[0].key}>
+            {groupIndex > 0 && (
+              <div className="dd-div st-nav-separator" role="separator" />
+            )}
+            <div className="st-nav-group">
+              {group.map((item) => (
+                <button
+                  key={item.key}
+                  type="button"
+                  className={`st-nav-item${item.key === activeKey ? " active" : ""}`}
+                  aria-disabled={!item.enabled}
+                  aria-current={item.key === activeKey ? "page" : undefined}
+                  tabIndex={item.enabled ? undefined : -1}
+                  onClick={() => {
+                    if (!item.enabled) return;
+                    onNavigate?.(item.key as SettingsPage);
+                  }}
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth={2}
+                  >
+                    {ICONS[item.key]}
+                  </svg>
+                  {t(item.labelKey)}
+                </button>
+              ))}
+            </div>
+          </Fragment>
         ))}
       </div>
       <div className={`st-content${activeKey === "repos" ? " repo" : ""}`}>

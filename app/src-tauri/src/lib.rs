@@ -32,6 +32,8 @@ mod repos_repo;
 mod sandbox;
 mod test_support;
 mod ui_msg;
+mod updater;
+mod updater_install;
 mod winshim;
 mod worktree;
 
@@ -18272,10 +18274,13 @@ fn build_macos_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::W
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    install_rustls_crypto_provider();
     PROCESS_START.get_or_init(Instant::now);
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init());
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     #[cfg(target_os = "macos")]
     let builder = builder.menu(|app| match build_macos_menu(app) {
         Ok(menu) => Ok(menu),
@@ -18646,6 +18651,11 @@ pub fn run() {
                 }
             });
             tick!("drain pending remote_inbox on startup (spawned)");
+            // T3c：启动期恢复必须先于 `start()` 调用（内部立刻转独立线程，
+            // 不阻塞本函数——本仓有白屏血案前科，marker/Info.plist 文件 IO
+            // 绝不能卡在 setup 主线程上）。
+            updater::recover_on_startup(app.handle());
+            updater::start(app.handle());
             tick!("setup end");
             Ok(())
         })
@@ -18779,9 +18789,23 @@ pub fn run() {
             remote_control_get_settings,
             remote_control_set_settings,
             remote_set_active_project,
+            updater::updater_get_state,
+            updater::updater_mark_healthy,
+            updater::updater_check,
+            updater::updater_download_and_install,
+            updater::updater_discard_update,
+            updater::updater_relaunch,
+            updater::updater_reopen,
+            updater::updater_swap_back,
+            updater::updater_skip_version,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn install_rustls_crypto_provider() {
+    // updater 引入 ring 与 reqwest 既有 aws-lc-rs 并存，须在任何 TLS 客户端构造前显式选定后者。
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 #[cfg(test)]
@@ -18794,6 +18818,19 @@ mod tests {
     const PAIR_TEST_NOW: u64 = 1_700_000_000;
     const PAIR_TEST_NOW_MS: u64 = 1_700_000_000_000;
     const PAIR_TEST_ROOM: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn startup_installs_a_unique_rustls_crypto_provider() {
+        install_rustls_crypto_provider();
+
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        assert!(
+            rustls::crypto::aws_lc_rs::default_provider()
+                .install_default()
+                .is_err(),
+            "进程级 CryptoProvider 只能安装一次"
+        );
+    }
 
     fn pairing_gateway_hello(
         session: &remote_pairing::PairingSession,
@@ -22667,6 +22704,8 @@ mod tests {
             ("sandbox.rs", include_str!("sandbox.rs")),
             ("test_support.rs", include_str!("test_support.rs")),
             ("ui_msg.rs", include_str!("ui_msg.rs")),
+            ("updater.rs", include_str!("updater.rs")),
+            ("updater_install.rs", include_str!("updater_install.rs")),
             ("winshim.rs", include_str!("winshim.rs")),
             ("worktree.rs", include_str!("worktree.rs")),
         ];

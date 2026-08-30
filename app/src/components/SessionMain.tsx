@@ -236,6 +236,12 @@ export const SessionMain = React.memo(function SessionMain({
     [onLeadChoose],
   );
   const handleClearQuote = useCallback(() => setQuoteRef(null), []);
+  // V3b 顺修既有断线（设计稿 §1「既有缺陷」）：scope_change 卡「采纳并继续」此前
+  // 无路可通——onSend 是既有的通用发送入口，这里只做 wiring，不新造业务逻辑。
+  const handleContinueScope = useCallback(
+    (draft: string) => onSend(draft, mode),
+    [onSend, mode],
+  );
 
   return (
     <div className="session">
@@ -272,6 +278,7 @@ export const SessionMain = React.memo(function SessionMain({
         liveRunsByRun={liveRunsByRun}
         liveCodingByRun={liveCodingByRun}
         readonlyReason={readonlyReason}
+        onContinueScope={handleContinueScope}
       />
       {leadView &&
         (leadView.kind === "ask" || leadView.kind === "dispatch_confirm") && (

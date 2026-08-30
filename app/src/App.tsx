@@ -2231,8 +2231,9 @@ function AppContent() {
     const runtime = resolveRuntimeTeamConfig(sid);
     const leadId = runtime.effectiveLeadId;
     const leadName = agentNameSnapshotFor(leadId);
+    // V3a：新起团队首发前先封掉任何残留活标（活尾唯一不变量），新尾自己打活标。
     setSessionMessages(sid, [
-      ...arr,
+      ...sealStreamTail(arr),
       {
         id: crypto.randomUUID(),
         role: "user",
@@ -2245,8 +2246,10 @@ function AppContent() {
         engine: leadId,
         agent_id: leadId,
         agent_name_snapshot: leadName,
+        stream_live: true,
       },
     ]);
+    const epochBeforeSend = sessionEventEpochRef.current.get(sid) ?? 0;
     setRun(sid, {
       startedAt: Date.now(),
       workingTokens: null,
@@ -2261,18 +2264,27 @@ function AppContent() {
       memberIds: runtime.memberPoolIds,
       ...(config?.reasoningTier ? { reasoningTier: config.reasoningTier } : {}),
     }).catch((e) => {
-      setRun(sid, null);
       const msg = String(e);
-      if (
-        onQueueConflict &&
-        (msg.startsWith("SESSION_ALREADY_RUNNING") ||
-          msg.startsWith("SESSION_BUSY"))
-      ) {
-        // 撤回本次乐观占位（user msg + 空 assistant 占位），条目回队，不留悬空气泡。
+      const isConflict =
+        msg.startsWith("SESSION_ALREADY_RUNNING") ||
+        msg.startsWith("SESSION_BUSY");
+      if (isConflict && onQueueConflict) {
+        // 队列递送：无论真实并发还是幽灵竞态，这次发起本来就没能把消息真的送进去
+        // ——撤回本次乐观占位（user msg + 空 assistant 占位），条目回队，不留悬空
+        // 气泡（既有行为不变，不受 P1 收敛判定影响）。
+        setRun(sid, null);
         setSessionMessages(sid, arr);
         onQueueConflict();
         return;
       }
+      // P1：非队列路径的提前 return 必须发生在收敛判定之后——幽灵竞态（没有真实
+      // 事件到达）时收敛函数负责 setRun(null) + 封活尾；真实并发时原样保留，
+      // 什么都不做（同今天）。
+      if (isConflict) {
+        convergeAlreadyRunningConflict(sid, epochBeforeSend);
+        return;
+      }
+      setRun(sid, null);
       showLeadError(sid, msg);
     });
   }
@@ -2531,8 +2543,9 @@ function AppContent() {
       // team 模式 send_message 终态无「→叫 lead」回路（completed 事件只落消息+清 run）·故 reply 是终结动作·等用户下一句。
       const nameSnap = agentNameSnapshotFor(leadId);
       const arr = messagesRef.current.get(sid) ?? [];
+      // V3a：lead reply 前先封掉任何残留活标（活尾唯一不变量），新尾自己打活标。
       setSessionMessages(sid, [
-        ...arr,
+        ...sealStreamTail(arr),
         {
           id: crypto.randomUUID(),
           role: "assistant",
@@ -2540,8 +2553,10 @@ function AppContent() {
           engine: leadId,
           agent_id: leadId,
           agent_name_snapshot: nameSnap,
+          stream_live: true,
         },
       ]);
+      const epochBeforeSend = sessionEventEpochRef.current.get(sid) ?? 0;
       setRun(sid, {
         startedAt: Date.now(),
         workingTokens: null,
@@ -2553,9 +2568,22 @@ function AppContent() {
         "send_message",
         sendMessagePayload(sid, leadId, userText, config),
       ).catch((err) => {
-        if (String(err).startsWith("SESSION_ALREADY_RUNNING:")) return;
+        const msg = String(err);
+        // P1：SESSION_ALREADY_RUNNING/SESSION_BUSY 提前 return 必须发生在收敛判定
+        // 之后，不能发生在 setRun/封口之前——否则幽灵竞态会把 busy=true+活尾悬空
+        // 到永远（真实并发时收敛函数原样保留，什么都不做，同今天）。
+        if (
+          msg.startsWith("SESSION_ALREADY_RUNNING") ||
+          msg.startsWith("SESSION_BUSY")
+        ) {
+          convergeAlreadyRunningConflict(sid, epochBeforeSend);
+          return;
+        }
         setRun(sid, null);
-        setToast(renderBackendError(String(err), t));
+        setToast(renderBackendError(msg, t));
+        // V3a：这条失败路径不重建消息数组（只弹 toast），发起前打的活标必须显式
+        // 封口，否则会话空闲后活尾仍显示「工作中」。
+        mutateSession(sid, (m) => sealStreamTail(m));
       });
       return;
     }
@@ -2747,12 +2775,42 @@ function AppContent() {
     }
   }
 
+  /**
+   * P1（整盘审）：SESSION_ALREADY_RUNNING / SESSION_BUSY 冲突收敛——三条发起路径
+   * （team 首发、lead reply、新建会话 solo 首发）共用，逻辑抄自 sendSoloForSession
+   * 本来就有的判据（`sessionEventEpochRef` 事件纪元）。后端占槽竞争拒绝发起时要
+   * 分清两种情形：
+   * - 真实并发 run：这期间已经有真实 agent-event 到达同一会话（epoch 涨了）——
+   *   那个 run 是真的，run/活尾都不能碰，交给真实事件流继续渲染（调用方原样
+   *   保留现状，不做任何清理）。
+   * - 幽灵竞态：期间没有任何事件到达，说明这次发起根本没有真的抢到槽、也没有
+   *   任何东西在跑——本地乐观状态（run + 活尾）必须撤回，否则会话空闲后仍会
+   *   永远显示一条「正在运行」的死尾巴（摘要/精简档下尤其显眼）。
+   * 调用方必须在 invoke 之前用 `sessionEventEpochRef.current.get(sid) ?? 0`
+   * 记下 `epochBeforeSend` 传进来。返回 true = 已收敛（run 已清、活尾已封）；
+   * false = 真实并发（未做任何改动，调用方也不应该再做清理）。
+   */
+  function convergeAlreadyRunningConflict(
+    sid: string,
+    epochBeforeSend: number,
+  ): boolean {
+    const sessionReceivedEvent =
+      (sessionEventEpochRef.current.get(sid) ?? 0) !== epochBeforeSend;
+    if (sessionReceivedEvent) return false;
+    setRun(sid, null);
+    mutateSession(sid, (m) => sealStreamTail(m));
+    return true;
+  }
+
   function showLeadError(sid: string, msg: string) {
     if (
       msg.startsWith("SESSION_BUSY") ||
       msg.startsWith("SESSION_ALREADY_RUNNING")
     )
       return;
+    // V3a：这类失败不会再有后续事件来收尾——发起前打上的活标（乐观空 assistant）
+    // 必须在这里封口，否则活尾永远悬空（真正会话空闲后仍显示「工作中」）。
+    mutateSession(sid, (m) => sealStreamTail(m));
     // 失败态对齐原型：保留临时失败的柔性文案，但不要盖住队长硬闸的真实原因。
     const classification = classifyLeadError(msg);
     const claudeOnly = classification === "claudeOnly";
@@ -4005,8 +4063,10 @@ function AppContent() {
         ),
       );
       if (!alreadyHas) {
+        // V3a：决策卡在活尾后追加一条未打标的消息——先封掉活尾（活尾唯一不变量）；
+        // 决策卡消息本身是终态展示（不是流式尾巴），不打 stream_live。
         setSessionMessages(sid, [
-          ...arr,
+          ...sealStreamTail(arr),
           {
             id: crypto.randomUUID(),
             role: "assistant" as const,
@@ -4873,8 +4933,9 @@ function AppContent() {
       setDone(null);
       const selectedAgentId = agentId;
       const agentNameSnapshot = agentNameSnapshotFor(selectedAgentId);
+      // V3a：新建会话 solo 首发前先封掉任何残留活标（活尾唯一不变量），新尾自己打活标。
       setSessionMessages(sid, [
-        ...arr,
+        ...sealStreamTail(arr),
         {
           id: crypto.randomUUID(),
           role: "user",
@@ -4887,8 +4948,10 @@ function AppContent() {
           engine: selectedAgentId,
           agent_id: selectedAgentId,
           agent_name_snapshot: agentNameSnapshot,
+          stream_live: true,
         },
       ]);
+      const epochBeforeSend = sessionEventEpochRef.current.get(sid) ?? 0;
       setRun(sid, {
         startedAt: Date.now(),
         workingTokens: null,
@@ -4900,7 +4963,15 @@ function AppContent() {
         "send_message",
         sendMessagePayload(sid, selectedAgentId, text, config),
       ).catch((err) => {
-        if (String(err).startsWith("SESSION_ALREADY_RUNNING:")) return;
+        const msg = String(err);
+        // P1：同 lead reply / team 首发——提前 return 必须发生在收敛判定之后。
+        if (
+          msg.startsWith("SESSION_ALREADY_RUNNING") ||
+          msg.startsWith("SESSION_BUSY")
+        ) {
+          convergeAlreadyRunningConflict(sid, epochBeforeSend);
+          return;
+        }
         setRun(sid, null);
         if (handleProjectError(err)) {
           setSessionMessages(sid, arr);
@@ -4920,7 +4991,7 @@ function AppContent() {
               {
                 type: "text",
                 text: t("app.run.startFailed", {
-                  error: renderBackendError(String(err), t),
+                  error: renderBackendError(msg, t),
                 }),
               },
             ],

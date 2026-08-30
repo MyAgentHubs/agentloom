@@ -10,6 +10,7 @@ import {
   WEBSITE_URL,
 } from "../constants/about";
 import agentloomIcon from "../assets/agentloom-icon.svg";
+import { UpdateSection } from "./settings/UpdateSection";
 
 type Props = {
   open: boolean;
@@ -151,6 +152,16 @@ export function AboutDialog({ open, onClose }: Props) {
               </div>
             </div>
           ))}
+        </div>
+
+        <div
+          style={{
+            borderTop: "1px solid var(--line-soft)",
+            marginTop: 16,
+            paddingTop: 12,
+          }}
+        >
+          <UpdateSection />
         </div>
 
         <div

@@ -1,7 +1,7 @@
 {
   "name": "agentloom",
   "private": true,
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "AgentLoom is an open-source desktop workbench that turns many LLMs into one workforce you control.",
   "license": "AGPL-3.0-only",
   "repository": {
@@ -15,7 +15,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test": "vitest run",
+    "test": "vitest run && npm run test:scripts",
+    "test:scripts": "node --test scripts/updater-manifest.node-test.mjs",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\"",

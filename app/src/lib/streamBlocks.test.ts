@@ -328,8 +328,12 @@ describe("streamBlocks", () => {
 // 之后才调用，供插入位判据 / ensureStreamTail 的 needsTail 判据区分「真在流的
 // 尾巴」与「已经封口的尾巴」。
 describe("sealStreamTail", () => {
-  it("把末条 assistant 的 stream_live 封为 false，不动内容", () => {
+  // V3a：sealStreamTail 改为「清全部活标」——真实生产路径里尾巴在造出来那一刻就
+  // 打了 stream_live:true（三处空 assistant 补标 + ensureStreamTail），所以这里
+  // 先显式打活标再封口，贴合实际调用顺序（而不是 seed() 默认的从未打标状态）。
+  it("把打了活标的末条 assistant 封为 false，不动内容", () => {
     let m = seed();
+    m[1] = { ...m[1], stream_live: true };
     m = appendTextDelta(m, "已完成的回答");
     m = sealStreamTail(m);
     expect((m[1] as { stream_live?: boolean }).stream_live).toBe(false);
@@ -372,6 +376,51 @@ describe("sealStreamTail", () => {
 
   it("空列表原样返回", () => {
     expect(sealStreamTail([])).toEqual([]);
+  });
+
+  // V3a·活尾唯一不变量的兜底半边：正常情况下至多一条活标，但 sealStreamTail 本身
+  // 要能应付「不慎留下多条」——清掉全部，不只清末条。
+  it("清全部活标（含多条同时为 true），不只封末条", () => {
+    const msgs: ChatMessage[] = [
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "a" }],
+        engine: "claude",
+        stream_live: true,
+      },
+      { role: "user", content: [{ type: "text", text: "q" }] },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "b" }],
+        engine: "claude",
+        stream_live: true,
+      },
+    ];
+    const out = sealStreamTail(msgs);
+    expect((out[0] as { stream_live?: boolean }).stream_live).toBe(false);
+    expect((out[2] as { stream_live?: boolean }).stream_live).toBe(false);
+    // 不改原数组（引用安全）
+    expect((msgs[0] as { stream_live?: boolean }).stream_live).toBe(true);
+    expect((msgs[2] as { stream_live?: boolean }).stream_live).toBe(true);
+  });
+
+  // V3a：没有任何 stream_live===true 的消息（含从未打过标的历史消息）时原样返回
+  // 同一数组引用，不做不必要的克隆。
+  it("多条消息但无一活标时返回原数组引用", () => {
+    const msgs: ChatMessage[] = [
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "旧回答" }],
+        engine: "claude",
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "更早的回答" }],
+        engine: "claude",
+        stream_live: false,
+      },
+    ];
+    expect(sealStreamTail(msgs)).toBe(msgs);
   });
 });
 
@@ -554,13 +603,59 @@ describe("appendRunCard", () => {
     }
   });
 
-  it("ensureStreamTail：末条是普通文本消息→原样返回（不误开新消息）", () => {
+  it("ensureStreamTail：末条是普通文本消息→不误开新消息（消息数不变）", () => {
     const msgs: ChatMessage[] = [
       { role: "user", content: [{ type: "text", text: "hi" }] },
       {
         role: "assistant",
         content: [{ type: "text", text: "x" }],
         engine: "claude",
+      },
+    ];
+    const next = ensureStreamTail(msgs, {
+      engine: "claude",
+      agent_id: null,
+      agent_name_snapshot: null,
+    });
+    expect(next).toHaveLength(2);
+    expect(next[1].content).toEqual(msgs[1].content);
+  });
+
+  // V3a：复用一条从未打过标（stream_live undefined）的尾巴时，不可变地补
+  // stream_live:true——覆盖 App.tsx 里几处直接造空 assistant、事后靠这里续写的
+  // 路径，让它们的尾巴也纳入「活尾唯一不变量」判据。必须产生新对象/新数组，不
+  // mutate 原消息（下面显式核对原对象未变）。
+  it("ensureStreamTail：复用未标记尾巴时不可变补 stream_live:true（原对象不变）", () => {
+    const msgs: ChatMessage[] = [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "x" }],
+        engine: "claude",
+      },
+    ];
+    const next = ensureStreamTail(msgs, {
+      engine: "claude",
+      agent_id: null,
+      agent_name_snapshot: null,
+    });
+    expect(next).not.toBe(msgs);
+    expect(next[1]).not.toBe(msgs[1]);
+    expect((next[1] as { stream_live?: boolean }).stream_live).toBe(true);
+    expect(next[1].content).toEqual([{ type: "text", text: "x" }]);
+    // 不可变：原对象未被 mutate
+    expect((msgs[1] as { stream_live?: boolean }).stream_live).toBeUndefined();
+  });
+
+  // 幂等：已经打过活标（true）的尾巴再次复用时原样返回（同引用），不重复克隆。
+  it("ensureStreamTail：复用已是 stream_live:true 的尾巴时原样返回（同引用）", () => {
+    const msgs: ChatMessage[] = [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "x" }],
+        engine: "claude",
+        stream_live: true,
       },
     ];
     expect(
@@ -570,6 +665,36 @@ describe("appendRunCard", () => {
         agent_name_snapshot: null,
       }),
     ).toBe(msgs);
+  });
+
+  // V3a·活尾唯一不变量：新造尾巴（末条不是 assistant/是 lead-turn/已封口）前，
+  // 先把会话内所有旧的 stream_live===true 消息封为 false——每会话至多一个活尾。
+  it("ensureStreamTail：新造尾巴前封掉所有旧活标", () => {
+    const msgs: ChatMessage[] = [
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "旧回答" }],
+        engine: "claude",
+        stream_live: true,
+      },
+      { role: "user", content: [{ type: "text", text: "新提问" }] },
+    ];
+    const identity = {
+      engine: "codex",
+      agent_id: "codex",
+      agent_name_snapshot: "Codex",
+    };
+    const next = ensureStreamTail(msgs, identity);
+    expect(next).toHaveLength(3);
+    expect((next[0] as { stream_live?: boolean }).stream_live).toBe(false);
+    expect(next[2]).toMatchObject({
+      role: "assistant",
+      content: [],
+      stream_live: true,
+      ...identity,
+    });
+    // 不改原数组（引用安全）
+    expect((msgs[0] as { stream_live?: boolean }).stream_live).toBe(true);
   });
 
   // U6：新造的尾巴要带活跃标记，供插入位判据 / needsTail 判据识别「真在流」。
