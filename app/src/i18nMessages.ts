@@ -972,6 +972,7 @@ export const messages = {
     "globalSearch.noResultsHelp": "试试减少关键词，或检查是否有错别字。",
     "globalSearch.noMessages": "该会话还没有文本消息",
     "globalSearch.error": "搜索失败",
+    "globalSearch.messageNotFound": "消息位于更早的历史中，暂时无法定位。",
     "globalSearch.selectHint": "选择",
     "globalSearch.openHint": "打开",
     "globalSearch.quickOpenHint": "快速打开",
@@ -2601,6 +2602,8 @@ export const messages = {
     "globalSearch.noResultsHelp": "Try fewer keywords or check the spelling.",
     "globalSearch.noMessages": "This conversation has no text messages yet",
     "globalSearch.error": "Search failed",
+    "globalSearch.messageNotFound":
+      "This message is in earlier history and could not be located.",
     "globalSearch.selectHint": "Select",
     "globalSearch.openHint": "Open",
     "globalSearch.quickOpenHint": "Quick open",

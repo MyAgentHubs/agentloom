@@ -39769,6 +39769,20 @@ mod tests {
             r#"[{"type":"thinking","text":"needle-thinking"},{"type":"tool","id":"t","tool":"exec","summary":"x","card":"compact","status":"ok","exit_code":0,"output":"needle-tool"}]"#,
             50,
         );
+        c.execute(
+            "INSERT INTO messages (session_id, role, content, dedup_key, created_at) \
+             VALUES ('s-hidden', 'assistant', '[{\"type\":\"text\",\"text\":\"needle-activity\"}]', \
+                     'activity_summary:run-1', 51)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO messages (session_id, role, content, engine, created_at) \
+             VALUES ('s-hidden', 'assistant', '[{\"type\":\"text\",\"text\":\"needle-verifier\"}]', \
+                     'verifier-result', 52)",
+            [],
+        )
+        .unwrap();
         insert(
             "s-deleted",
             "user",
@@ -39794,6 +39808,12 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(search_sessions_inner(&c, "needle-tool", 20)
+            .unwrap()
+            .is_empty());
+        assert!(search_sessions_inner(&c, "needle-activity", 20)
+            .unwrap()
+            .is_empty());
+        assert!(search_sessions_inner(&c, "needle-verifier", 20)
             .unwrap()
             .is_empty());
     }

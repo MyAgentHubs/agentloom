@@ -46,6 +46,8 @@ type Props = {
   done: Done | null;
   sessionUsage?: SessionUsage;
   sessionId: string | null;
+  searchTargetMessageId?: number | null;
+  onSearchTargetResolved?: (found: boolean) => void;
   onAgentChange: (agentId: string) => void;
   onMenuAgents?: () => void;
   mode: Mode;
@@ -123,6 +125,8 @@ export const SessionMain = React.memo(function SessionMain({
   done,
   sessionUsage = { input: 0, output: 0 },
   sessionId,
+  searchTargetMessageId,
+  onSearchTargetResolved,
   onAgentChange,
   onMenuAgents,
   mode,
@@ -244,6 +248,8 @@ export const SessionMain = React.memo(function SessionMain({
         messages={messages}
         busy={busy}
         sessionId={sessionId}
+        searchTargetMessageId={searchTargetMessageId}
+        onSearchTargetResolved={onSearchTargetResolved}
         onQuote={handleQuote}
         quoteActive={quoteActive}
         onViewRun={onViewRun}

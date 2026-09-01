@@ -15,7 +15,10 @@ import { SessionMain } from "./components/SessionMain";
 import type { ContinuationDraftState } from "./components/ContinuationBriefPanel";
 import { OverviewHome } from "./components/OverviewHome";
 import { Sidebar } from "./components/Sidebar";
-import { GlobalSearch } from "./components/GlobalSearch";
+import {
+  GlobalSearch,
+  type GlobalSearchResult,
+} from "./components/GlobalSearch";
 import { RightPanel } from "./components/RightPanel";
 import type { RightPanelTab } from "./components/RightPanelTabs";
 import { GoalCriteriaPanel } from "./components/GoalCriteriaPanel";
@@ -744,6 +747,10 @@ function AppContent() {
   } | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [globalSearchTarget, setGlobalSearchTarget] = useState<{
+    sessionId: string;
+    messageId: number;
+  } | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [rightPanelOpen, setRightPanelOpen] = useState(false);
   const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab | null>(
@@ -6270,6 +6277,24 @@ function AppContent() {
     () => setGlobalSearchOpen(false),
     [],
   );
+  const handleGlobalSearchSelect = useCallback(
+    (result: GlobalSearchResult) => {
+      setGlobalSearchTarget(
+        result.message_id == null
+          ? null
+          : { sessionId: result.session_id, messageId: result.message_id },
+      );
+      handleSidebarSelect(result.session_id);
+    },
+    [handleSidebarSelect],
+  );
+  const handleGlobalSearchTargetResolved = useCallback(
+    (found: boolean) => {
+      setGlobalSearchTarget(null);
+      if (!found) setToast(t("globalSearch.messageNotFound"));
+    },
+    [t],
+  );
   // msgfix2 Q1：composer 上方 chip 的三个交互 + recoverableMemberBlock 入队，
   // 都是「resolve currentIdRef.current 再调 sid 显式核心函数」的薄壳——sid 只在
   // 这一层解析一次，核心函数（enqueueComposerMessage/editQueuedMessage/...）
@@ -6572,13 +6597,6 @@ function AppContent() {
           editingRepo !== null
         }
       >
-        <GlobalSearch
-          open={globalSearchOpen}
-          currentId={currentId}
-          onOpen={handleOpenGlobalSearch}
-          onClose={handleCloseGlobalSearch}
-          onSelect={handleSidebarSelect}
-        />
         {sidebarOpen && (
           <Sidebar
             sessions={sessions}
@@ -6752,6 +6770,12 @@ function AppContent() {
                   done={done}
                   sessionUsage={sessionUsage}
                   sessionId={currentId}
+                  searchTargetMessageId={
+                    globalSearchTarget?.sessionId === currentId && !loading
+                      ? globalSearchTarget.messageId
+                      : null
+                  }
+                  onSearchTargetResolved={handleGlobalSearchTargetResolved}
                   onAgentChange={handleUserSelectAgent}
                   onMenuAgents={handleMenuAgents}
                   mode={mode}
@@ -6877,6 +6901,25 @@ function AppContent() {
           </div>
         </div>
       </div>
+      <GlobalSearch
+        open={globalSearchOpen}
+        currentId={currentId}
+        shortcutEnabled={
+          !settingsOpen &&
+          !newProjectOpen &&
+          editingRepo === null &&
+          lightbox === null &&
+          !aboutOpen &&
+          !showInstallGuide &&
+          !invalidDialog &&
+          !deleteTarget &&
+          !groupDeleteTarget &&
+          removeProjectTarget === null
+        }
+        onOpen={handleOpenGlobalSearch}
+        onClose={handleCloseGlobalSearch}
+        onSelect={handleGlobalSearchSelect}
+      />
       {showInstallGuide && (
         <AgentInstallGuideDialog
           onClose={() => setInstallGuideDismissed(true)}

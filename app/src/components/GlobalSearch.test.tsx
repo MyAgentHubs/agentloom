@@ -57,18 +57,16 @@ describe("GlobalSearch", () => {
     );
   });
 
-  it("点击结果会打开对应会话并定位到命中的真实消息", async () => {
-    const target = document.createElement("div");
-    target.dataset.messageId = "42";
-    document.body.appendChild(target);
+  it("通过 portal 渲染到 body，点击结果把完整定位信息交给上层", async () => {
     const { props } = renderSearch();
 
+    expect(document.querySelector(".global-search__scrim")?.parentElement).toBe(
+      document.body,
+    );
     fireEvent.click(await screen.findByRole("option"));
 
-    expect(props.onSelect).toHaveBeenCalledWith("session-rust");
+    expect(props.onSelect).toHaveBeenCalledWith(result);
     expect(props.onClose).toHaveBeenCalledOnce();
-    await waitFor(() => expect(target).toHaveClass("turn--search-target"));
-    target.remove();
   });
 
   it("支持方向键、Enter、Esc、⌘数字和全局 ⌘K", async () => {
@@ -80,13 +78,21 @@ describe("GlobalSearch", () => {
 
     fireEvent.keyDown(input, { key: "ArrowDown" });
     fireEvent.keyDown(input, { key: "Enter" });
-    expect(props.onSelect).toHaveBeenCalledWith("session-2");
+    expect(props.onSelect).toHaveBeenCalledWith(second);
 
     fireEvent.keyDown(document, { key: "1", metaKey: true });
-    expect(props.onSelect).toHaveBeenCalledWith("session-rust");
+    expect(props.onSelect).toHaveBeenCalledWith(result);
     fireEvent.keyDown(document, { key: "Escape" });
     expect(props.onClose).toHaveBeenCalled();
     fireEvent.keyDown(document, { key: "k", metaKey: true });
     expect(props.onOpen).toHaveBeenCalledOnce();
+  });
+
+  it("其它 modal 打开时不响应 ⌘K", () => {
+    const { props } = renderSearch({ open: false, shortcutEnabled: false });
+
+    fireEvent.keyDown(document, { key: "k", metaKey: true });
+
+    expect(props.onOpen).not.toHaveBeenCalled();
   });
 });

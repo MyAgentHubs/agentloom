@@ -7,6 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
 
 export type GlobalSearchResult = {
@@ -22,9 +23,10 @@ export type GlobalSearchResult = {
 type Props = {
   open: boolean;
   currentId: string | null;
+  shortcutEnabled?: boolean;
   onOpen: () => void;
   onClose: () => void;
-  onSelect: (sessionId: string) => void;
+  onSelect: (result: GlobalSearchResult) => void;
 };
 
 const RECENT_STORAGE_KEY = "agentloom.globalSearch.recentSessionIds";
@@ -66,31 +68,10 @@ function HighlightedText({ text, query }: { text: string; query: string }) {
     );
 }
 
-function locateMessage(messageId: number) {
-  const startedAt = performance.now();
-  const tryLocate = () => {
-    const target = document.querySelector<HTMLElement>(
-      `[data-message-id="${messageId}"]`,
-    );
-    if (target) {
-      target.scrollIntoView({ behavior: "smooth", block: "center" });
-      target.classList.add("turn--search-target");
-      window.setTimeout(
-        () => target.classList.remove("turn--search-target"),
-        1600,
-      );
-      return;
-    }
-    if (performance.now() - startedAt < 5000) {
-      window.setTimeout(tryLocate, 50);
-    }
-  };
-  window.setTimeout(tryLocate, 0);
-}
-
 export function GlobalSearch({
   open,
   currentId,
+  shortcutEnabled = true,
   onOpen,
   onClose,
   onSelect,
@@ -173,26 +154,32 @@ export function GlobalSearch({
   useEffect(() => {
     const onShortcut = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        if (!shortcutEnabled) return;
         event.preventDefault();
         onOpen();
       }
     };
     document.addEventListener("keydown", onShortcut);
     return () => document.removeEventListener("keydown", onShortcut);
-  }, [onOpen]);
+  }, [onOpen, shortcutEnabled]);
 
   useEffect(() => {
     if (!open) return;
+    const previouslyFocused = document.activeElement as HTMLElement | null;
     inputRef.current?.focus();
+    return () => previouslyFocused?.focus();
   }, [open]);
+
+  useEffect(() => {
+    if (open && !shortcutEnabled) onClose();
+  }, [onClose, open, shortcutEnabled]);
 
   const openResult = useCallback(
     (index: number) => {
       const result = results[index];
       if (!result) return;
-      onSelect(result.session_id);
+      onSelect(result);
       onClose();
-      if (result.message_id != null) locateMessage(result.message_id);
     },
     [onClose, onSelect, results],
   );
@@ -280,7 +267,7 @@ export function GlobalSearch({
   }, [error, loading, openResult, query, results, selected, t]);
 
   if (!open) return null;
-  return (
+  return createPortal(
     <div
       className="global-search__scrim"
       onMouseDown={(event) => {
@@ -367,6 +354,7 @@ export function GlobalSearch({
           </span>
         </footer>
       </section>
-    </div>
+    </div>,
+    document.body,
   );
 }

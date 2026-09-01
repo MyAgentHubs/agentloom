@@ -632,6 +632,57 @@ describe("MessageStream", () => {
       expect(screen.getByText("history-0")).toBeInTheDocument();
     });
 
+    it("搜索命中早于初始 30 条的消息时立即扩展窗口并定位", () => {
+      vi.useFakeTimers();
+      const scrollIntoView = vi.fn();
+      Element.prototype.scrollIntoView = scrollIntoView;
+      const onResolved = vi.fn();
+      const longHistory = numberedMessages("search-history", 75).map(
+        (message, index) => ({ ...message, id: index + 1 }),
+      );
+
+      const { container } = render(
+        <MessageStream
+          messages={longHistory}
+          busy={false}
+          sessionId="session-search"
+          searchTargetMessageId={6}
+          onSearchTargetResolved={onResolved}
+        />,
+      );
+
+      expect(screen.getByText("search-history-5")).toBeInTheDocument();
+      expect(container.querySelector('[data-message-id="6"]')).toHaveClass(
+        "turn--search-target",
+      );
+      expect(scrollIntoView).toHaveBeenCalledWith({
+        behavior: "smooth",
+        block: "center",
+      });
+      expect(onResolved).toHaveBeenCalledWith(true);
+
+      act(() => vi.advanceTimersByTime(1600));
+      expect(container.querySelector('[data-message-id="6"]')).not.toHaveClass(
+        "turn--search-target",
+      );
+    });
+
+    it("搜索目标不在会话消息中时返回可见降级信号", () => {
+      const onResolved = vi.fn();
+
+      render(
+        <MessageStream
+          messages={numberedMessages("missing", 40)}
+          busy={false}
+          sessionId="session-search"
+          searchTargetMessageId={999}
+          onSearchTargetResolved={onResolved}
+        />,
+      );
+
+      expect(onResolved).toHaveBeenCalledWith(false);
+    });
+
     it("向前补渲一片时，已渲染消息零 remount 零重渲，仅渲染新片", () => {
       vi.useFakeTimers();
       mockIdleScheduler();

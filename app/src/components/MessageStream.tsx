@@ -27,6 +27,8 @@ type Props = {
   messages: ChatMessage[];
   busy: boolean;
   sessionId?: string | null;
+  searchTargetMessageId?: number | null;
+  onSearchTargetResolved?: (found: boolean) => void;
   onQuote?: (index: number) => void;
   quoteActive?: boolean;
   onViewRun?: (runId?: string) => void;
@@ -464,6 +466,8 @@ export const MessageStream = React.memo(function MessageStream({
   messages,
   busy,
   sessionId = null,
+  searchTargetMessageId = null,
+  onSearchTargetResolved,
   onQuote,
   quoteActive = false,
   onViewRun,
@@ -514,6 +518,17 @@ export const MessageStream = React.memo(function MessageStream({
     visibleStart = initialVisibleStart(messages.length);
     pendingPrependScrollRef.current = null;
     setRenderWindow({ sessionId, start: visibleStart });
+  }
+  const searchTargetIndex =
+    searchTargetMessageId == null
+      ? -1
+      : messages.findIndex(
+          (message) => messageId(message) === String(searchTargetMessageId),
+        );
+  if (searchTargetIndex >= 0 && visibleStart > searchTargetIndex) {
+    visibleStart = searchTargetIndex;
+    pendingPrependScrollRef.current = null;
+    setRenderWindow({ sessionId, start: searchTargetIndex });
   }
   const liveRuns = liveRunsByRun ?? EMPTY_LIVE_RUNS;
   const liveCoding = liveCodingByRun ?? EMPTY_LIVE_CODING;
@@ -596,6 +611,28 @@ export const MessageStream = React.memo(function MessageStream({
     target.scrollTop =
       pending.scrollTop + (target.scrollHeight - pending.scrollHeight);
   }, [visibleStart, stickRef]);
+
+  useLayoutEffect(() => {
+    if (searchTargetMessageId == null) return;
+    if (searchTargetIndex < 0) {
+      onSearchTargetResolved?.(false);
+      return;
+    }
+    const target = contentRef.current?.querySelector<HTMLElement>(
+      `[data-message-id="${searchTargetMessageId}"]`,
+    );
+    if (!target) {
+      onSearchTargetResolved?.(false);
+      return;
+    }
+    target.scrollIntoView({ behavior: "smooth", block: "center" });
+    target.classList.add("turn--search-target");
+    window.setTimeout(
+      () => target.classList.remove("turn--search-target"),
+      1600,
+    );
+    onSearchTargetResolved?.(true);
+  }, [onSearchTargetResolved, searchTargetIndex, searchTargetMessageId]);
 
   useEffect(() => {
     if (visibleStart === 0) return;
