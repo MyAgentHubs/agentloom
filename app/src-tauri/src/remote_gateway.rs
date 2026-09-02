@@ -12671,22 +12671,26 @@ mod tests {
         let (addr, server) = spawn_frame_pump_server();
         let relay_url = format!("ws://{addr}");
         let room_id = "0123456789abcdef0123456789abcdef".to_owned();
+        let active_repo_id = "pairing-reload-repo".to_owned();
         let settings_relay_url = relay_url.clone();
-        let settings_room_id = room_id.clone();
-        let inner = test_inner_with_interval(
+        let settings_active_repo_id = active_repo_id.clone();
+        let resolver_room_id = room_id.clone();
+        let inner = test_inner_with_interval_k_room_and_active_room_resolver(
             move |key| match key {
                 "remote_control_enabled" => Some("true".to_owned()),
                 "remote_relay_url" => Some(settings_relay_url.clone()),
-                "remote_room_id" => Some(settings_room_id.clone()),
+                "remote_active_repo_id" => Some(settings_active_repo_id.clone()),
                 _ => None,
             },
             || None,
+            |_| None,
+            move |_| Ok(resolver_room_id.clone()),
             Duration::from_millis(150),
         );
         let connected_config = GatewayConfig {
             relay_url,
             room_id,
-            active_repo_id: None,
+            active_repo_id: Some(active_repo_id),
         };
         let url = build_ws_url(&connected_config.relay_url, &connected_config.room_id);
         let connection_inner = Arc::clone(&inner);
