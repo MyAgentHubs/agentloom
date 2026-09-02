@@ -921,15 +921,22 @@ function makeDualPlatformManifest(version, signatureAarch64, signatureX86_64) {
   };
 }
 
-function makeGhIsLatestExec(isLatest = true) {
+function makeGhIsLatestExec(
+  isLatest = true,
+  releases = [{ tagName: "v0.2.8", isLatest }],
+) {
   return async (command, args) => {
     if (command !== "gh") throw new Error(`unexpected command: ${command}`);
-    assert.deepEqual(args.slice(0, 3), [
+    assert.deepEqual(args, [
       "-R",
       "MyAgentHubs/agentloom",
       "release",
+      "list",
+      "--exclude-drafts",
+      "--json",
+      "tagName,isLatest",
     ]);
-    return { stdout: JSON.stringify({ isLatest }) };
+    return { stdout: JSON.stringify(releases) };
   };
 }
 
@@ -1023,6 +1030,36 @@ test("verify-remote: isLatest !== true is rejected", async () => {
         fetch,
       }),
     /isLatest=false, expected true/,
+  );
+});
+
+test("verify-remote: release missing from gh release list is rejected", async () => {
+  const workDir = await mkdtemp(
+    path.join(os.tmpdir(), "updater-verify-remote-"),
+  );
+  const local = makeManifest("0.2.8", "signature-local");
+  const localPath = path.join(workDir, "local.json");
+  await writeFile(localPath, JSON.stringify(local));
+
+  const exec = makeGhIsLatestExec(true, [
+    { tagName: "v0.2.7", isLatest: true },
+  ]);
+  const fetch = async () => {
+    throw new Error("fetch must not be called when the release is missing");
+  };
+
+  const artifactsDir = await emptyArtifactsDir();
+  await assert.rejects(
+    () =>
+      verifyRemote({
+        manifestUrl: "https://example.com/latest.json",
+        localPath,
+        pubkey: "irrelevant",
+        artifactsDir,
+        exec,
+        fetch,
+      }),
+    /release v0\.2\.8 not found in gh release list/,
   );
 });
 
@@ -1259,7 +1296,10 @@ test("verify-remote: minisign verification failure (mocked exec) is rejected", a
   await writeFile(path.join(artifactsDir, filename), bytes);
 
   const exec = async (command, args) => {
-    if (command === "gh") return { stdout: JSON.stringify({ isLatest: true }) };
+    if (command === "gh")
+      return {
+        stdout: JSON.stringify([{ tagName: "v0.2.8", isLatest: true }]),
+      };
     if (command === "minisign")
       throw new Error("Signature verification failed");
     throw new Error(`unexpected command: ${command} ${(args ?? []).join(" ")}`);
@@ -1311,7 +1351,10 @@ test("verify-remote: both platforms matching passes end-to-end (mocked exec/fetc
   }
 
   const exec = async (command, args) => {
-    if (command === "gh") return { stdout: JSON.stringify({ isLatest: true }) };
+    if (command === "gh")
+      return {
+        stdout: JSON.stringify([{ tagName: "v0.2.8", isLatest: true }]),
+      };
     if (command === "minisign") return { stdout: "", stderr: "" };
     throw new Error(`unexpected command: ${command} ${(args ?? []).join(" ")}`);
   };

@@ -590,19 +590,25 @@ export async function verifyRemote({
   if (!version)
     throw new Error("verify-remote: local manifest is missing version");
 
-  const releaseView = await exec("gh", [
+  const releaseList = await exec("gh", [
     "-R",
     PUBLIC_REPO,
     "release",
-    "view",
-    `v${version}`,
+    "list",
+    "--exclude-drafts",
     "--json",
-    "isLatest",
+    "tagName,isLatest",
   ]);
-  const releaseInfo = JSON.parse(releaseView.stdout);
+  const releases = JSON.parse(releaseList.stdout);
+  const releaseInfo = releases.find(({ tagName }) => tagName === `v${version}`);
+  if (!releaseInfo) {
+    throw new Error(
+      `verify-remote: release v${version} not found in gh release list`,
+    );
+  }
   if (releaseInfo.isLatest !== true) {
     throw new Error(
-      `verify-remote: gh release view v${version} reports isLatest=${releaseInfo.isLatest}, ` +
+      `verify-remote: gh release list entry v${version} reports isLatest=${releaseInfo.isLatest}, ` +
         `expected true`,
     );
   }
