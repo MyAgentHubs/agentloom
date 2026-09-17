@@ -1,7 +1,9 @@
 import { Fragment, type ReactNode } from "react";
 import { useI18n, type I18nKey } from "../../i18n";
+import { getSessionLifecycleCopy } from "../../lib/sessionLifecycleCopy";
 
 export type SettingsPage =
+  | "general"
   | "agents"
   | "repos"
   | "archivedProjects"
@@ -12,6 +14,7 @@ export type SettingsPage =
   | "about";
 
 type NavKey =
+  | "general"
   | "agents"
   | "search"
   | "language"
@@ -27,6 +30,12 @@ type NavKey =
   | "about";
 
 const ICONS: Record<NavKey, ReactNode> = {
+  general: (
+    <>
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.7 1.7 0 00.34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0015 19.4a1.7 1.7 0 00-1 .6 1.7 1.7 0 00-.4 1.1V21H10.4v-.1A1.7 1.7 0 009 19.4a1.7 1.7 0 00-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 004.6 15a1.7 1.7 0 00-.6-1 1.7 1.7 0 00-1.1-.4H3v-3.2h.1A1.7 1.7 0 004.6 9a1.7 1.7 0 00-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 009 4.6a1.7 1.7 0 001-.6 1.7 1.7 0 00.4-1.1V3h3.2v.1A1.7 1.7 0 0015 4.6a1.7 1.7 0 001.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0019.4 9a1.7 1.7 0 00.6 1 1.7 1.7 0 001.1.4h.1v3.2h-.1A1.7 1.7 0 0020 14a1.7 1.7 0 00-.6 1z" />
+    </>
+  ),
   agents: (
     <path d="M12 2a4 4 0 100 8 4 4 0 000-8zM5 21v-2a4 4 0 014-4h6a4 4 0 014 4v2" />
   ),
@@ -103,6 +112,7 @@ type NavItem = {
 
 const NAV_GROUPS: NavItem[][] = [
   [
+    { key: "general", labelKey: "settings.nav.defaults", enabled: true },
     { key: "agents", labelKey: "settings.nav.agents", enabled: true },
     { key: "search", labelKey: "settings.nav.search", enabled: true },
     {
@@ -162,7 +172,8 @@ export function SettingsShell({
   onNavigate?: (key: SettingsPage) => void;
   children: ReactNode;
 }) {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
+  const lifecycleCopy = getSessionLifecycleCopy(locale);
   const visibleNavGroups = NAV_GROUPS.map((group) =>
     group.filter((item) => item.enabled),
   ).filter((group) => group.length > 0);
@@ -198,7 +209,7 @@ export function SettingsShell({
                   >
                     {ICONS[item.key]}
                   </svg>
-                  {t(item.labelKey)}
+                  {item.key === "general" ? lifecycleCopy.nav : t(item.labelKey)}
                 </button>
               ))}
             </div>
