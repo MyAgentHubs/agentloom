@@ -102,7 +102,9 @@ export function SettingsGeneral() {
                   aria-hidden="true"
                   style={{
                     ...styles.switchKnob,
-                    transform: policy.enabled ? "translateX(18px)" : "translateX(0)",
+                    transform: policy.enabled
+                      ? "translateX(18px)"
+                      : "translateX(0)",
                   }}
                 />
               </button>
