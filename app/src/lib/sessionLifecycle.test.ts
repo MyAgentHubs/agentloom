@@ -185,8 +185,12 @@ describe("session lifecycle sweep", () => {
 
     const calls = invokeMock.mock.calls.map(([command]) => command);
     expect(calls).toEqual(["list_sessions", "delete_session", "purge_session"]);
-    expect(invokeMock).toHaveBeenCalledWith("delete_session", { id: "expired" });
-    expect(invokeMock).toHaveBeenCalledWith("purge_session", { id: "expired" });
+    expect(invokeMock).toHaveBeenCalledWith("delete_session", {
+      id: "expired",
+    });
+    expect(invokeMock).toHaveBeenCalledWith("purge_session", {
+      id: "expired",
+    });
   });
 
   it("restores the tombstone when permanent purge fails", async () => {
