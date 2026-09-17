@@ -35,7 +35,10 @@ function hasLocalStorage(): boolean {
   return typeof localStorage !== "undefined";
 }
 
-export function normalizeLifecycleDays(value: unknown, fallback: number): number {
+export function normalizeLifecycleDays(
+  value: unknown,
+  fallback: number,
+): number {
   const parsed = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(MIN_SESSION_LIFECYCLE_DAYS, Math.floor(parsed));
@@ -74,7 +77,9 @@ export function getSessionLifecyclePolicy(): SessionLifecyclePolicy {
   return currentPolicy;
 }
 
-export function setSessionLifecyclePolicy(next: SessionLifecyclePolicy): void {
+export function setSessionLifecyclePolicy(
+  next: SessionLifecyclePolicy,
+): void {
   currentPolicy = normalizeSessionLifecyclePolicy(next);
   for (const listener of listeners) listener();
   if (!hasLocalStorage()) return;
@@ -176,7 +181,11 @@ async function runSessionLifecycleSweepOnce(nowSeconds: number): Promise<void> {
         try {
           await permanentlyDeleteArchivedSession(session.id);
         } catch (error) {
-          console.error("session lifecycle permanent purge failed", session.id, error);
+          console.error(
+            "session lifecycle permanent purge failed",
+            session.id,
+            error,
+          );
         }
       }
       continue;
