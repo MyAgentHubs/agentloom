@@ -93,9 +93,7 @@ describe("session lifecycle boundaries", () => {
   });
 
   it("purges at the archived retention threshold, not before", () => {
-    expect(shouldPurgeArchivedSession(now, now - 60 * DAY + 1, 60)).toBe(
-      false,
-    );
+    expect(shouldPurgeArchivedSession(now, now - 60 * DAY + 1, 60)).toBe(false);
     expect(shouldPurgeArchivedSession(now, now - 60 * DAY, 60)).toBe(true);
     expect(shouldPurgeArchivedSession(now, now - 61 * DAY, 60)).toBe(true);
   });
@@ -188,9 +186,7 @@ describe("session lifecycle sweep", () => {
     expect(invokeMock).toHaveBeenCalledWith("delete_session", {
       id: "expired",
     });
-    expect(invokeMock).toHaveBeenCalledWith("purge_session", {
-      id: "expired",
-    });
+    expect(invokeMock).toHaveBeenCalledWith("purge_session", { id: "expired" });
   });
 
   it("restores the tombstone when permanent purge fails", async () => {
