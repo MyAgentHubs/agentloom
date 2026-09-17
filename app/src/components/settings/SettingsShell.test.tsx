@@ -21,7 +21,7 @@ describe("SettingsShell", () => {
         ),
       ),
     ).toEqual([
-      ["Agent 池", "联网搜索"],
+      ["通用", "Agent 池", "联网搜索"],
       ["仓库", "已归档项目"],
       ["对话", "语言与区域"],
       ["远程控制"],
@@ -32,6 +32,7 @@ describe("SettingsShell", () => {
         item.textContent?.trim(),
       ),
     ).toEqual([
+      "通用",
       "Agent 池",
       "联网搜索",
       "仓库",
@@ -54,6 +55,7 @@ describe("SettingsShell", () => {
     }
 
     for (const label of [
+      "通用",
       "Agent 池",
       "联网搜索",
       "仓库",
@@ -74,6 +76,7 @@ describe("SettingsShell", () => {
         <div>content</div>
       </SettingsShell>,
     );
+    expect(screen.getByText("通用")).toBeInTheDocument();
     expect(screen.getByText("Agent 池")).toBeInTheDocument();
     expect(screen.getByText("联网搜索")).toBeInTheDocument();
     expect(screen.getByText("语言与区域")).toBeInTheDocument();
@@ -87,7 +90,7 @@ describe("SettingsShell", () => {
     expect(screen.queryByText("namespace 白名单")).toBeNull();
     expect(screen.queryByText("账户 & Git")).toBeNull();
     expect(screen.queryByText("成本 & 预算")).toBeNull();
-    expect(screen.getAllByRole("button")).toHaveLength(8);
+    expect(screen.getAllByRole("button")).toHaveLength(9);
     expect(screen.getByText("Agent 池").closest("button")).toHaveAttribute(
       "aria-current",
       "page",
@@ -100,7 +103,7 @@ describe("SettingsShell", () => {
       .getAllByRole("button")
       .filter((b) => b.getAttribute("aria-disabled") === "true");
     expect(disabled.length).toBe(0);
-    expect(container.querySelectorAll(".st-nav-item svg").length).toBe(8);
+    expect(container.querySelectorAll(".st-nav-item svg").length).toBe(9);
     expect(
       container.querySelector(
         ".st-nav-group:last-child .st-nav-item:last-child",
@@ -118,6 +121,17 @@ describe("SettingsShell", () => {
     );
     fireEvent.click(screen.getByText("仓库"));
     expect(onNavigate).toHaveBeenCalledWith("repos");
+  });
+
+  it("点「通用」nav 触发 onNavigate(general)", () => {
+    const onNavigate = vi.fn();
+    render(
+      <SettingsShell activeKey="agents" onNavigate={onNavigate}>
+        <div>content</div>
+      </SettingsShell>,
+    );
+    fireEvent.click(screen.getByText("通用"));
+    expect(onNavigate).toHaveBeenCalledWith("general");
   });
 
   it("点「联网搜索」nav 触发 onNavigate(search)·可切换到该页", () => {
