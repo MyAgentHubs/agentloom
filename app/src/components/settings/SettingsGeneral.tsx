@@ -16,7 +16,11 @@ export function SettingsGeneral() {
     value: string,
   ) => {
     const parsed = Number(value);
-    if (!Number.isFinite(parsed) || parsed < MIN_SESSION_LIFECYCLE_DAYS) return;
+    if (
+      !Number.isFinite(parsed) ||
+      parsed < MIN_SESSION_LIFECYCLE_DAYS
+    )
+      return;
     setSessionLifecyclePolicy({
       ...policy,
       [key]: Math.floor(parsed),
@@ -43,7 +47,9 @@ export function SettingsGeneral() {
                 min={MIN_SESSION_LIFECYCLE_DAYS}
                 step={1}
                 value={policy.archiveAfterDays}
-                onChange={(event) => update("archiveAfterDays", event.target.value)}
+                onChange={(event) =>
+                  update("archiveAfterDays", event.target.value)
+                }
                 aria-label={copy.archiveLabel}
                 style={{ width: 72 }}
               />{" "}
