@@ -25,7 +25,7 @@ describe("SettingsGeneral", () => {
     renderGeneral();
 
     const archive = screen.getByRole("spinbutton", {
-      name: "自动归档不活跃会话",
+      name: "自动归档未活动会话",
     });
     const purge = screen.getByRole("spinbutton", {
       name: "永久删除已归档会话",
@@ -41,7 +41,7 @@ describe("SettingsGeneral", () => {
     renderGeneral();
 
     fireEvent.change(
-      screen.getByRole("spinbutton", { name: "自动归档不活跃会话" }),
+      screen.getByRole("spinbutton", { name: "自动归档未活动会话" }),
       { target: { value: "7" } },
     );
     fireEvent.change(
