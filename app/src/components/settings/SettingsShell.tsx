@@ -209,7 +209,9 @@ export function SettingsShell({
                   >
                     {ICONS[item.key]}
                   </svg>
-                  {item.key === "general" ? lifecycleCopy.nav : t(item.labelKey)}
+                  {item.key === "general"
+                    ? lifecycleCopy.nav
+                    : t(item.labelKey)}
                 </button>
               ))}
             </div>
