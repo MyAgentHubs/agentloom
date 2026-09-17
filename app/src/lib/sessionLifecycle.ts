@@ -2,12 +2,16 @@ import { invoke } from "@tauri-apps/api/core";
 import { useSyncExternalStore } from "react";
 
 export type SessionLifecyclePolicy = {
+  enabled: boolean;
   archiveAfterDays: number;
   deleteArchivedAfterDays: number;
 };
 
 export const SESSION_LIFECYCLE_STORAGE_KEY = "agentloom.sessionLifecycle.v1";
+export const SESSION_LIFECYCLE_PURGE_CUTOFF_STORAGE_KEY =
+  "agentloom.sessionLifecycle.purgeEligibleSince.v1";
 export const DEFAULT_SESSION_LIFECYCLE_POLICY: SessionLifecyclePolicy = {
+  enabled: false,
   archiveAfterDays: 3,
   deleteArchivedAfterDays: 60,
 };
@@ -48,6 +52,7 @@ export function normalizeSessionLifecyclePolicy(
   value: Partial<SessionLifecyclePolicy> | null | undefined,
 ): SessionLifecyclePolicy {
   return {
+    enabled: value?.enabled === true,
     archiveAfterDays: normalizeLifecycleDays(
       value?.archiveAfterDays,
       DEFAULT_SESSION_LIFECYCLE_POLICY.archiveAfterDays,
@@ -70,25 +75,70 @@ function readInitialPolicy(): SessionLifecyclePolicy {
   }
 }
 
+function readInitialPurgeCutoff(): number | null {
+  if (!hasLocalStorage()) return null;
+  try {
+    const raw = localStorage.getItem(
+      SESSION_LIFECYCLE_PURGE_CUTOFF_STORAGE_KEY,
+    );
+    if (raw === null) return null;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed < 0) return null;
+    return Math.floor(parsed);
+  } catch {
+    return null;
+  }
+}
+
 let currentPolicy = readInitialPolicy();
+let currentPurgeCutoff = readInitialPurgeCutoff();
 const listeners = new Set<() => void>();
 
 export function getSessionLifecyclePolicy(): SessionLifecyclePolicy {
   return currentPolicy;
 }
 
-export function setSessionLifecyclePolicy(next: SessionLifecyclePolicy): void {
-  currentPolicy = normalizeSessionLifecyclePolicy(next);
-  for (const listener of listeners) listener();
-  if (!hasLocalStorage()) return;
-  try {
-    localStorage.setItem(
-      SESSION_LIFECYCLE_STORAGE_KEY,
-      JSON.stringify(currentPolicy),
-    );
-  } catch {
-    // Keep the setting usable when persistence is unavailable.
+function ensurePurgeCutoff(nowSeconds: number): number {
+  if (currentPurgeCutoff !== null) return currentPurgeCutoff;
+
+  currentPurgeCutoff = Math.max(0, Math.floor(nowSeconds));
+  if (hasLocalStorage()) {
+    try {
+      localStorage.setItem(
+        SESSION_LIFECYCLE_PURGE_CUTOFF_STORAGE_KEY,
+        String(currentPurgeCutoff),
+      );
+    } catch {
+      // Keep the in-memory protection even when persistence is unavailable.
+    }
   }
+  return currentPurgeCutoff;
+}
+
+export function setSessionLifecyclePolicy(
+  next: SessionLifecyclePolicy,
+  nowSeconds = Math.floor(Date.now() / 1000),
+): void {
+  const normalized = normalizeSessionLifecyclePolicy(next);
+
+  // First opt-in establishes a permanent safety boundary: archives that already
+  // existed before automation was enabled never become automatic purge targets.
+  if (normalized.enabled && !currentPolicy.enabled) {
+    ensurePurgeCutoff(nowSeconds);
+  }
+
+  currentPolicy = normalized;
+  if (hasLocalStorage()) {
+    try {
+      localStorage.setItem(
+        SESSION_LIFECYCLE_STORAGE_KEY,
+        JSON.stringify(currentPolicy),
+      );
+    } catch {
+      // Keep the setting usable when persistence is unavailable.
+    }
+  }
+  for (const listener of listeners) listener();
 }
 
 function subscribeSessionLifecyclePolicy(listener: () => void): () => void {
@@ -165,11 +215,23 @@ async function permanentlyDeleteArchivedSession(id: string): Promise<void> {
 
 async function runSessionLifecycleSweepOnce(nowSeconds: number): Promise<void> {
   const policy = getSessionLifecyclePolicy();
+  if (!policy.enabled) return;
+
+  // Fail safe if an enabled policy is restored without the migration marker:
+  // establish the boundary before reading or mutating any sessions.
+  const purgeCutoff = ensurePurgeCutoff(nowSeconds);
   const sessions = await invoke<LifecycleSession[]>("list_sessions");
 
   for (const session of sessions) {
+    // Honor a user disabling automation while a sweep is already in progress.
+    if (!getSessionLifecyclePolicy().enabled) return;
+
     if (session.archived) {
+      const archiveIsEligibleForAutomaticPurge =
+        session.archived_at !== null && session.archived_at >= purgeCutoff;
+
       if (
+        archiveIsEligibleForAutomaticPurge &&
         shouldPurgeArchivedSession(
           nowSeconds,
           session.archived_at,
@@ -231,20 +293,44 @@ export function runSessionLifecycleSweep(
 }
 
 export function installSessionLifecycleMaintenance(): () => void {
+  let timer: number | null = null;
+
   const run = () => {
     void runSessionLifecycleSweep().catch((error) => {
       console.error("session lifecycle sweep failed", error);
     });
   };
 
-  run();
-  const timer = window.setInterval(run, SESSION_LIFECYCLE_SWEEP_INTERVAL_MS);
-  return () => window.clearInterval(timer);
+  const stopTimer = () => {
+    if (timer === null) return;
+    window.clearInterval(timer);
+    timer = null;
+  };
+
+  const syncEnabledState = () => {
+    if (!getSessionLifecyclePolicy().enabled) {
+      stopTimer();
+      return;
+    }
+    if (timer !== null) return;
+
+    run();
+    timer = window.setInterval(run, SESSION_LIFECYCLE_SWEEP_INTERVAL_MS);
+  };
+
+  const unsubscribe = subscribeSessionLifecyclePolicy(syncEnabledState);
+  syncEnabledState();
+
+  return () => {
+    unsubscribe();
+    stopTimer();
+  };
 }
 
 /** Test-only: reload module-level preference state from storage. */
 export function __resetSessionLifecycleForTests(): void {
   currentPolicy = readInitialPolicy();
+  currentPurgeCutoff = readInitialPurgeCutoff();
   sweepInFlight = null;
   listeners.clear();
 }

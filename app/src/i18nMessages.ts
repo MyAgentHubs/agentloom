@@ -19,6 +19,24 @@ export const messages = {
     "settings.nav.budget": "成本 & 预算",
     "settings.nav.shortcuts": "快捷键",
     "settings.nav.about": "关于",
+    "settings.nav.general": "通用",
+    "settings.general.title": "通用",
+    "settings.general.subtitle": "管理会话的自动归档和永久清理策略。",
+    "settings.general.groupLabel": "会话生命周期",
+    "settings.general.enableLabel": "启用自动会话生命周期",
+    "settings.general.enableDesc":
+      "开启后按下方规则自动归档和清理会话。默认关闭。",
+    "settings.general.enabled": "已开启",
+    "settings.general.disabled": "已关闭",
+    "settings.general.archiveLabel": "自动归档未活动会话",
+    "settings.general.archiveDesc": "会话连续未活动达到此天数后自动归档。",
+    "settings.general.purgeLabel": "永久删除已归档会话",
+    "settings.general.purgeDesc":
+      "会话归档达到此天数后永久删除并清理其持久化资源。此操作不可恢复。",
+    "settings.general.protectionHint":
+      "首次开启前已经存在的归档不会被自动永久删除；如需删除请手动处理。",
+    "settings.general.days": "天",
+    "settings.general.minHint": "最少 1 天",
     "settings.about.support": "支持",
     "settings.about.feedback": "问题反馈",
     "settings.about.website": "官网",
@@ -1635,6 +1653,26 @@ export const messages = {
     "settings.nav.budget": "Cost & Budget",
     "settings.nav.shortcuts": "Keyboard Shortcuts",
     "settings.nav.about": "About",
+    "settings.nav.general": "General",
+    "settings.general.title": "General",
+    "settings.general.subtitle":
+      "Manage automatic session archiving and permanent cleanup.",
+    "settings.general.groupLabel": "Session lifecycle",
+    "settings.general.enableLabel": "Enable automatic session lifecycle",
+    "settings.general.enableDesc":
+      "When enabled, sessions are archived and cleaned up using the rules below. Off by default.",
+    "settings.general.enabled": "Enabled",
+    "settings.general.disabled": "Disabled",
+    "settings.general.archiveLabel": "Auto-archive inactive sessions",
+    "settings.general.archiveDesc":
+      "Archive sessions after they have been inactive for this many days.",
+    "settings.general.purgeLabel": "Permanently delete archived sessions",
+    "settings.general.purgeDesc":
+      "Permanently delete archived sessions and clean up their persistent resources after this many days. This cannot be undone.",
+    "settings.general.protectionHint":
+      "Archives that existed before lifecycle automation was first enabled are never permanently deleted automatically; delete them manually if needed.",
+    "settings.general.days": "days",
+    "settings.general.minHint": "Minimum 1 day",
     "settings.about.support": "Support",
     "settings.about.feedback": "Feedback",
     "settings.about.website": "Website",

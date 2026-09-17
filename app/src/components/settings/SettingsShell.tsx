@@ -1,6 +1,5 @@
 import { Fragment, type ReactNode } from "react";
 import { useI18n, type I18nKey } from "../../i18n";
-import { getSessionLifecycleCopy } from "../../lib/sessionLifecycleCopy";
 
 export type SettingsPage =
   | "general"
@@ -112,7 +111,7 @@ type NavItem = {
 
 const NAV_GROUPS: NavItem[][] = [
   [
-    { key: "general", labelKey: "settings.nav.defaults", enabled: true },
+    { key: "general", labelKey: "settings.nav.general", enabled: true },
     { key: "agents", labelKey: "settings.nav.agents", enabled: true },
     { key: "search", labelKey: "settings.nav.search", enabled: true },
     {
@@ -172,8 +171,7 @@ export function SettingsShell({
   onNavigate?: (key: SettingsPage) => void;
   children: ReactNode;
 }) {
-  const { locale, t } = useI18n();
-  const lifecycleCopy = getSessionLifecycleCopy(locale);
+  const { t } = useI18n();
   const visibleNavGroups = NAV_GROUPS.map((group) =>
     group.filter((item) => item.enabled),
   ).filter((group) => group.length > 0);
@@ -209,9 +207,7 @@ export function SettingsShell({
                   >
                     {ICONS[item.key]}
                   </svg>
-                  {item.key === "general"
-                    ? lifecycleCopy.nav
-                    : t(item.labelKey)}
+                  {t(item.labelKey)}
                 </button>
               ))}
             </div>

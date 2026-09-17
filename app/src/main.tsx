@@ -75,8 +75,8 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
 );
 traceBoot("createRoot.render returned");
 
-// Session retention is day-granularity maintenance. Run once per app launch and
-// then hourly; the runner is single-flight and each mutation is idempotent.
+// Install the lifecycle controller. Automation defaults off; enabling it in
+// Settings starts a startup sweep plus hourly single-flight maintenance.
 installSessionLifecycleMaintenance();
 
 async function prepareAndShowAppWindow() {

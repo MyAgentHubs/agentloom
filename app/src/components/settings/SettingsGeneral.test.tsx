@@ -21,8 +21,12 @@ describe("SettingsGeneral", () => {
     __resetSessionLifecycleForTests();
   });
 
-  it("shows the default 3/60 day lifecycle policy with a one-day minimum", () => {
+  it("defaults lifecycle automation off with the 3/60 day policy", () => {
     renderGeneral();
+
+    expect(
+      screen.getByRole("switch", { name: "启用自动会话生命周期" }),
+    ).not.toBeChecked();
 
     const archive = screen.getByRole("spinbutton", {
       name: "自动归档未活动会话",
@@ -37,9 +41,12 @@ describe("SettingsGeneral", () => {
     expect(purge).toHaveAttribute("min", "1");
   });
 
-  it("persists edited thresholds", () => {
+  it("persists the master switch and edited thresholds", () => {
     renderGeneral();
 
+    fireEvent.click(
+      screen.getByRole("switch", { name: "启用自动会话生命周期" }),
+    );
     fireEvent.change(
       screen.getByRole("spinbutton", { name: "自动归档未活动会话" }),
       { target: { value: "7" } },
@@ -50,6 +57,7 @@ describe("SettingsGeneral", () => {
     );
 
     expect(getSessionLifecyclePolicy()).toEqual({
+      enabled: true,
       archiveAfterDays: 7,
       deleteArchivedAfterDays: 90,
     });
@@ -61,6 +69,11 @@ describe("SettingsGeneral", () => {
     expect(
       screen.getByRole("heading", { name: "General" }),
     ).toBeInTheDocument();
+    expect(
+      screen.getByRole("switch", {
+        name: "Enable automatic session lifecycle",
+      }),
+    ).not.toBeChecked();
     expect(
       screen.getByRole("spinbutton", {
         name: "Auto-archive inactive sessions",

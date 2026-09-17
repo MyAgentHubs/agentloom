@@ -8,6 +8,7 @@ import {
   normalizeLifecycleDays,
   normalizeSessionLifecyclePolicy,
   runSessionLifecycleSweep,
+  SESSION_LIFECYCLE_PURGE_CUTOFF_STORAGE_KEY,
   SESSION_LIFECYCLE_STORAGE_KEY,
   setSessionLifecyclePolicy,
   shouldArchiveSession,
@@ -19,6 +20,17 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const invokeMock = vi.mocked(invoke);
 const DAY = 24 * 60 * 60;
 
+function enableLifecycle(nowSeconds: number) {
+  setSessionLifecyclePolicy(
+    {
+      enabled: true,
+      archiveAfterDays: 3,
+      deleteArchivedAfterDays: 60,
+    },
+    nowSeconds,
+  );
+}
+
 describe("session lifecycle policy", () => {
   beforeEach(() => {
     localStorage.clear();
@@ -26,8 +38,9 @@ describe("session lifecycle policy", () => {
     __resetSessionLifecycleForTests();
   });
 
-  it("uses 3/60 defaults", () => {
+  it("defaults automation off with 3/60 thresholds", () => {
     expect(getSessionLifecyclePolicy()).toEqual({
+      enabled: false,
       archiveAfterDays: 3,
       deleteArchivedAfterDays: 60,
     });
@@ -50,21 +63,45 @@ describe("session lifecycle policy", () => {
 
   it("persists normalized values across reload", () => {
     setSessionLifecyclePolicy({
+      enabled: true,
       archiveAfterDays: 7,
       deleteArchivedAfterDays: 90,
     });
     __resetSessionLifecycleForTests();
     expect(getSessionLifecyclePolicy()).toEqual({
+      enabled: true,
       archiveAfterDays: 7,
       deleteArchivedAfterDays: 90,
     });
   });
 
-  it("normalizes partial policies", () => {
+  it("normalizes old partial policies to disabled", () => {
     expect(normalizeSessionLifecyclePolicy({ archiveAfterDays: 4 })).toEqual({
+      enabled: false,
       archiveAfterDays: 4,
       deleteArchivedAfterDays: 60,
     });
+  });
+
+  it("records the automatic purge cutoff only on first enable", () => {
+    enableLifecycle(10 * DAY);
+    expect(
+      localStorage.getItem(SESSION_LIFECYCLE_PURGE_CUTOFF_STORAGE_KEY),
+    ).toBe(String(10 * DAY));
+
+    setSessionLifecyclePolicy(
+      {
+        enabled: false,
+        archiveAfterDays: 3,
+        deleteArchivedAfterDays: 60,
+      },
+      20 * DAY,
+    );
+    enableLifecycle(30 * DAY);
+
+    expect(
+      localStorage.getItem(SESSION_LIFECYCLE_PURGE_CUTOFF_STORAGE_KEY),
+    ).toBe(String(10 * DAY));
   });
 });
 
@@ -112,7 +149,14 @@ describe("session lifecycle sweep", () => {
     __resetSessionLifecycleForTests();
   });
 
-  it("archives a stale active session", async () => {
+  it("does no maintenance while the master switch is off", async () => {
+    await runSessionLifecycleSweep(now);
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("archives a stale active session after opt-in", async () => {
+    enableLifecycle(now);
+
     invokeMock.mockImplementation(async (command) => {
       if (command === "list_sessions") {
         return [
@@ -139,6 +183,8 @@ describe("session lifecycle sweep", () => {
   });
 
   it("does not archive an old session with recent activity", async () => {
+    enableLifecycle(now);
+
     invokeMock.mockImplementation(async (command) => {
       if (command === "list_sessions") {
         return [
@@ -164,15 +210,23 @@ describe("session lifecycle sweep", () => {
     );
   });
 
-  it("permanently deletes an archived session at 60 days", async () => {
+  it("protects pre-enable archives and purges only later eligible archives", async () => {
+    enableLifecycle(20 * DAY);
+
     invokeMock.mockImplementation(async (command) => {
       if (command === "list_sessions") {
         return [
           {
-            id: "expired",
-            created_at: now - 100 * DAY,
+            id: "legacy",
+            created_at: 0,
             archived: true,
-            archived_at: now - 60 * DAY,
+            archived_at: 10 * DAY,
+          },
+          {
+            id: "eligible",
+            created_at: 0,
+            archived: true,
+            archived_at: 40 * DAY,
           },
         ];
       }
@@ -183,13 +237,20 @@ describe("session lifecycle sweep", () => {
 
     const calls = invokeMock.mock.calls.map(([command]) => command);
     expect(calls).toEqual(["list_sessions", "delete_session", "purge_session"]);
-    expect(invokeMock).toHaveBeenCalledWith("delete_session", {
-      id: "expired",
+    expect(invokeMock).not.toHaveBeenCalledWith("delete_session", {
+      id: "legacy",
     });
-    expect(invokeMock).toHaveBeenCalledWith("purge_session", { id: "expired" });
+    expect(invokeMock).toHaveBeenCalledWith("delete_session", {
+      id: "eligible",
+    });
+    expect(invokeMock).toHaveBeenCalledWith("purge_session", {
+      id: "eligible",
+    });
   });
 
   it("restores the tombstone when permanent purge fails", async () => {
+    enableLifecycle(0);
+
     invokeMock.mockImplementation(async (command) => {
       if (command === "list_sessions") {
         return [
@@ -213,6 +274,8 @@ describe("session lifecycle sweep", () => {
   });
 
   it("coalesces concurrent sweeps into one single-flight run", async () => {
+    enableLifecycle(now);
+
     let release: (() => void) | undefined;
     const blocked = new Promise<void>((resolve) => {
       release = resolve;
