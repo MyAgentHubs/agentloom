@@ -16,11 +16,7 @@ export function SettingsGeneral() {
     value: string,
   ) => {
     const parsed = Number(value);
-    if (
-      !Number.isFinite(parsed) ||
-      parsed < MIN_SESSION_LIFECYCLE_DAYS
-    )
-      return;
+    if (!Number.isFinite(parsed) || parsed < MIN_SESSION_LIFECYCLE_DAYS) return;
     setSessionLifecyclePolicy({
       ...policy,
       [key]: Math.floor(parsed),
