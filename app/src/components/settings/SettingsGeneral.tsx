@@ -68,9 +68,7 @@ export function SettingsGeneral() {
         <p>{t("settings.general.subtitle")}</p>
       </div>
       <div className="st-lang__field">
-        <div className="st-lang__label">
-          {t("settings.general.groupLabel")}
-        </div>
+        <div className="st-lang__label">{t("settings.general.groupLabel")}</div>
         <div className="st-chat__group">
           <div className="st-chat__option st-chat__option--active">
             <span className="st-chat__text">
@@ -96,9 +94,7 @@ export function SettingsGeneral() {
                 aria-label={t("settings.general.enableLabel")}
                 style={{
                   ...styles.switch,
-                  background: policy.enabled
-                    ? "var(--green)"
-                    : "var(--ink-4)",
+                  background: policy.enabled ? "var(--green)" : "var(--ink-4)",
                 }}
                 onClick={toggleEnabled}
               >
@@ -106,9 +102,7 @@ export function SettingsGeneral() {
                   aria-hidden="true"
                   style={{
                     ...styles.switchKnob,
-                    transform: policy.enabled
-                      ? "translateX(18px)"
-                      : "translateX(0)",
+                    transform: policy.enabled ? "translateX(18px)" : "translateX(0)",
                   }}
                 />
               </button>
@@ -165,9 +159,7 @@ export function SettingsGeneral() {
             </span>
           </label>
 
-          <div className="st-chat__desc">
-            {t("settings.general.minHint")}
-          </div>
+          <div className="st-chat__desc">{t("settings.general.minHint")}</div>
           <div className="st-chat__desc">
             {t("settings.general.protectionHint")}
           </div>
