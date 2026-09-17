@@ -58,12 +58,18 @@ describe("SettingsGeneral", () => {
   it("renders English copy when English is active", () => {
     renderGeneral("en");
 
-    expect(screen.getByRole("heading", { name: "General" })).toBeInTheDocument();
     expect(
-      screen.getByRole("spinbutton", { name: "Auto-archive inactive sessions" }),
+      screen.getByRole("heading", { name: "General" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("spinbutton", {
+        name: "Auto-archive inactive sessions",
+      }),
     ).toHaveValue(3);
     expect(
-      screen.getByRole("spinbutton", { name: "Permanently delete archived sessions" }),
+      screen.getByRole("spinbutton", {
+        name: "Permanently delete archived sessions",
+      }),
     ).toHaveValue(60);
   });
 });
