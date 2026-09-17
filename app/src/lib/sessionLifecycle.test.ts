@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   __resetSessionLifecycleForTests,
   DEFAULT_SESSION_LIFECYCLE_POLICY,
@@ -6,17 +7,22 @@ import {
   latestActivityAt,
   normalizeLifecycleDays,
   normalizeSessionLifecyclePolicy,
+  runSessionLifecycleSweep,
   SESSION_LIFECYCLE_STORAGE_KEY,
   setSessionLifecyclePolicy,
   shouldArchiveSession,
   shouldPurgeArchivedSession,
 } from "./sessionLifecycle";
 
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+
+const invokeMock = vi.mocked(invoke);
 const DAY = 24 * 60 * 60;
 
 describe("session lifecycle policy", () => {
   beforeEach(() => {
     localStorage.clear();
+    invokeMock.mockReset();
     __resetSessionLifecycleForTests();
   });
 
@@ -96,5 +102,136 @@ describe("session lifecycle boundaries", () => {
 
   it("never retention-purges without archived_at", () => {
     expect(shouldPurgeArchivedSession(now, null, 60)).toBe(false);
+  });
+});
+
+describe("session lifecycle sweep", () => {
+  const now = 100 * DAY;
+
+  beforeEach(() => {
+    localStorage.clear();
+    invokeMock.mockReset();
+    __resetSessionLifecycleForTests();
+  });
+
+  it("archives a stale active session", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_sessions") {
+        return [
+          {
+            id: "stale",
+            created_at: now - 10 * DAY,
+            archived: false,
+            archived_at: null,
+          },
+        ];
+      }
+      if (command === "get_messages") {
+        return [{ created_at: now - 4 * DAY }];
+      }
+      return undefined;
+    });
+
+    await runSessionLifecycleSweep(now);
+
+    expect(invokeMock).toHaveBeenCalledWith("set_session_archived", {
+      id: "stale",
+      archived: true,
+    });
+  });
+
+  it("does not archive an old session with recent activity", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_sessions") {
+        return [
+          {
+            id: "recent",
+            created_at: now - 30 * DAY,
+            archived: false,
+            archived_at: null,
+          },
+        ];
+      }
+      if (command === "get_messages") {
+        return [{ created_at: now - DAY }];
+      }
+      return undefined;
+    });
+
+    await runSessionLifecycleSweep(now);
+
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "set_session_archived",
+      expect.anything(),
+    );
+  });
+
+  it("permanently deletes an archived session at 60 days", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_sessions") {
+        return [
+          {
+            id: "expired",
+            created_at: now - 100 * DAY,
+            archived: true,
+            archived_at: now - 60 * DAY,
+          },
+        ];
+      }
+      return undefined;
+    });
+
+    await runSessionLifecycleSweep(now);
+
+    const calls = invokeMock.mock.calls.map(([command]) => command);
+    expect(calls).toEqual(["list_sessions", "delete_session", "purge_session"]);
+    expect(invokeMock).toHaveBeenCalledWith("delete_session", { id: "expired" });
+    expect(invokeMock).toHaveBeenCalledWith("purge_session", { id: "expired" });
+  });
+
+  it("restores the tombstone when permanent purge fails", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_sessions") {
+        return [
+          {
+            id: "retryable",
+            created_at: now - 100 * DAY,
+            archived: true,
+            archived_at: now - 61 * DAY,
+          },
+        ];
+      }
+      if (command === "purge_session") throw new Error("gc failed");
+      return undefined;
+    });
+
+    await runSessionLifecycleSweep(now);
+
+    expect(invokeMock).toHaveBeenCalledWith("restore_session", {
+      id: "retryable",
+    });
+  });
+
+  it("coalesces concurrent sweeps into one single-flight run", async () => {
+    let release: (() => void) | undefined;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_sessions") {
+        await blocked;
+        return [];
+      }
+      return undefined;
+    });
+
+    const first = runSessionLifecycleSweep(now);
+    const second = runSessionLifecycleSweep(now);
+    release?.();
+    await Promise.all([first, second]);
+
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "list_sessions"),
+    ).toHaveLength(1);
   });
 });
