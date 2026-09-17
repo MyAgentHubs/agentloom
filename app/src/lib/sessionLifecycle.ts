@@ -77,9 +77,7 @@ export function getSessionLifecyclePolicy(): SessionLifecyclePolicy {
   return currentPolicy;
 }
 
-export function setSessionLifecyclePolicy(
-  next: SessionLifecyclePolicy,
-): void {
+export function setSessionLifecyclePolicy(next: SessionLifecyclePolicy): void {
   currentPolicy = normalizeSessionLifecyclePolicy(next);
   for (const listener of listeners) listener();
   if (!hasLocalStorage()) return;
