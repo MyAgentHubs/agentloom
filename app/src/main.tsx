@@ -7,6 +7,7 @@ import { preloadMarkdown } from "./lib/useMarkdown";
 import { showAppWindow } from "./lib/showAppWindow";
 import { installFatalErrorHandlers } from "./lib/fatalErrorHandlers";
 import { installCmdTiming } from "./lib/cmdTiming";
+import { installSessionLifecycleMaintenance } from "./lib/sessionLifecycle";
 import { FatalErrorBoundary } from "./components/FatalErrorBoundary";
 
 // 全局白屏兜底第一层：不依赖 React/i18n，尽可能早注册，
@@ -73,6 +74,10 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   </React.StrictMode>,
 );
 traceBoot("createRoot.render returned");
+
+// Session retention is day-granularity maintenance. Run once per app launch and
+// then hourly; the runner is single-flight and each mutation is idempotent.
+installSessionLifecycleMaintenance();
 
 async function prepareAndShowAppWindow() {
   try {
