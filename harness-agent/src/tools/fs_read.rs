@@ -56,7 +56,12 @@ impl Tool for FsReadTool {
                 return Ok(ToolOutcome::recoverable(msg));
             }
         };
-        let path = match resolve_for_read(ctx.workspace, &args.path, ctx.fs_read_scope) {
+        let path = match resolve_for_read(
+            ctx.workspace,
+            &args.path,
+            ctx.fs_read_scope,
+            ctx.extra_read_roots,
+        ) {
             Ok(path) => path,
             Err(HarnessError::PermissionDenied(_)) => {
                 let msg = format!(
@@ -208,26 +213,30 @@ pub fn resolve_in_workspace(workspace: &Path, path: &str) -> Result<PathBuf> {
 }
 
 /// Resolve a read path under the selected scope without changing the historical
-/// resolver shared by fs_write/fs_edit.
+/// resolver shared by fs_write/fs_edit. `extra_roots` (from CLI `--read-root`)
+/// are honored under every scope, including the default Workspace scope, on
+/// top of (never instead of) the scope's own roots.
 pub fn resolve_for_read(
     workspace: &Path,
     path: &str,
     scope: crate::fs_scope::FsReadScope,
+    extra_roots: &[PathBuf],
 ) -> Result<PathBuf> {
     let roots = match scope {
         crate::fs_scope::FsReadScope::ProjectDeps => crate::fs_scope::project_dependency_roots(),
         crate::fs_scope::FsReadScope::Workspace | crate::fs_scope::FsReadScope::Wide => &[],
     };
-    resolve_for_read_with_roots(workspace, path, scope, roots)
+    resolve_for_read_with_extra_roots(workspace, path, scope, roots, extra_roots)
 }
 
-pub(crate) fn resolve_for_read_with_roots(
+pub(crate) fn resolve_for_read_with_extra_roots(
     workspace: &Path,
     path: &str,
     scope: crate::fs_scope::FsReadScope,
     roots: &[PathBuf],
+    extra_roots: &[PathBuf],
 ) -> Result<PathBuf> {
-    if scope == crate::fs_scope::FsReadScope::Workspace {
+    if scope == crate::fs_scope::FsReadScope::Workspace && extra_roots.is_empty() {
         return resolve_in_workspace(workspace, path);
     }
 
@@ -238,7 +247,13 @@ pub(crate) fn resolve_for_read_with_roots(
         workspace.join(path)
     };
     let resolved = canonicalize_lenient(&candidate);
-    if !crate::fs_scope::read_path_allowed_with_roots(&workspace, &candidate, scope, roots) {
+    if !crate::fs_scope::read_path_allowed_with_extra_roots(
+        &workspace,
+        &candidate,
+        scope,
+        roots,
+        extra_roots,
+    ) {
         return Err(HarnessError::PermissionDenied(format!(
             "path is outside workspace: {}",
             resolved.to_string_lossy()
@@ -305,7 +320,12 @@ mod tests {
             "/etc/passwd",
         ] {
             let old = resolve_in_workspace(&workspace, input);
-            let new = resolve_for_read(&workspace, input, crate::fs_scope::FsReadScope::Workspace);
+            let new = resolve_for_read(
+                &workspace,
+                input,
+                crate::fs_scope::FsReadScope::Workspace,
+                &[],
+            );
             match (old, new) {
                 (Ok(a), Ok(b)) => assert_eq!(a, b),
                 (Err(a), Err(b)) => assert_eq!(format!("{a:?}"), format!("{b:?}")),
@@ -334,27 +354,30 @@ mod tests {
         let roots =
             crate::fs_scope::discover_project_dependency_roots(Some(&test_path), None, None, &[]);
         assert_eq!(
-            resolve_for_read_with_roots(
+            resolve_for_read_with_extra_roots(
                 &workspace,
                 dependency.to_str().unwrap(),
                 crate::fs_scope::FsReadScope::ProjectDeps,
                 &roots,
+                &[],
             )
             .unwrap(),
             dependency.canonicalize().unwrap()
         );
-        assert!(resolve_for_read_with_roots(
+        assert!(resolve_for_read_with_extra_roots(
             &workspace,
             random_outside.to_str().unwrap(),
             crate::fs_scope::FsReadScope::ProjectDeps,
             &roots,
+            &[],
         )
         .is_err());
-        assert!(resolve_for_read_with_roots(
+        assert!(resolve_for_read_with_extra_roots(
             &workspace,
             "/etc/passwd",
             crate::fs_scope::FsReadScope::Wide,
             &roots,
+            &[],
         )
         .is_ok());
 
@@ -374,6 +397,7 @@ mod tests {
                 file_ledger: &mut ledger,
                 network: crate::goal::NetworkPolicy::On,
                 fs_read_scope: scope,
+                extra_read_roots: &[],
             };
             let outcome = crate::tools::fs_write::FsWriteTool
                 .execute(
@@ -445,6 +469,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
 
         let out = FsReadTool
@@ -484,6 +509,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
 
         let out = FsReadTool
@@ -522,6 +548,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
         let out = FsReadTool
             .execute(
@@ -551,6 +578,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
 
         FsReadTool
@@ -578,6 +606,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
 
         FsReadTool
@@ -607,6 +636,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
 
         let out = FsReadTool
@@ -638,6 +668,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
 
         let out = FsReadTool
@@ -664,6 +695,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
 
         let out = FsReadTool
@@ -690,6 +722,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
 
         let out = FsReadTool
@@ -722,6 +755,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
         let out = FsReadTool
             .execute(&mut ctx, &call(json!({"path":"../escape.txt"})))

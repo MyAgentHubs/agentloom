@@ -90,7 +90,17 @@ fn map(event_type: &str, payload: &serde_json::Value) -> Mapped {
         | "provider.warning"
         | "mcp.server.failed"
         | "run.resumed"
-        | "run.interrupted" => Mapped::Dropped, // M2: add product variants for approval/blocked (others may stay dropped)
+        | "run.interrupted"
+        // t12-img 契约反向检查补的漏记（早已存在的 emit()，只是从未登记进 VOCABULARY）：
+        | "attachment.dropped"
+        | "context.terrain.attached"
+        | "evidence.workspace.unverifiable"
+        | "format.reflex.applied"
+        | "format.reflex.feedback"
+        | "safety_net.checkpoint"
+        | "safety_net.checkpoint_skipped"
+        | "scope.advisory"
+        | "scope.extended" => Mapped::Dropped, // M2: add product variants for approval/blocked (others may stay dropped)
         other => panic!("unmapped event type: {other}"),
     }
 }

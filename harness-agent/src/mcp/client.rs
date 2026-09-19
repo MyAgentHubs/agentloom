@@ -1,7 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::process::Stdio;
 use std::time::Duration;
 
+use http::{HeaderName, HeaderValue};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -11,12 +12,13 @@ use rmcp::model::{
     ReadResourceRequestParams,
 };
 use rmcp::service::{RoleClient, RunningService, ServiceError};
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{IntoTransport, StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{Peer, ServiceExt};
 
 use crate::error::{HarnessError, Result};
 use crate::exec::controlled::is_secret_env;
-use crate::mcp::config::McpServerConfig;
+use crate::mcp::config::{expand_env_placeholders, McpServerConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerCapabilities {
@@ -68,8 +70,23 @@ impl McpConnection {
     ) -> Result<(Self, ServerCapabilities)> {
         match cfg.url.as_deref() {
             Some(url) => {
-                let transport = StreamableHttpClientTransport::from_uri(url.to_string());
-                Self::serve(transport, connect_timeout, request_timeout).await
+                // rmcp's own `reqwest` (pulled in via the
+                // `transport-streamable-http-client-reqwest` feature) can be a
+                // different semver-major version than the `reqwest` this crate
+                // depends on directly for other purposes, so the transport's
+                // concrete client type must never be named here — only
+                // `StreamableHttpClientTransport`'s own inherent
+                // `from_uri`/`from_config` constructors know which one to use,
+                // and `Self::serve`'s generic bound infers the rest.
+                if let Some(headers) = mcp_http_headers(cfg)? {
+                    let config = StreamableHttpClientTransportConfig::with_uri(url.to_string())
+                        .custom_headers(headers);
+                    let transport = StreamableHttpClientTransport::from_config(config);
+                    Self::serve(transport, connect_timeout, request_timeout).await
+                } else {
+                    let transport = StreamableHttpClientTransport::from_uri(url.to_string());
+                    Self::serve(transport, connect_timeout, request_timeout).await
+                }
             }
             None => {
                 // MCP server 命令来自用户配置/CLI，不是 agent 输入；不属于 agent 写入向量。
@@ -222,6 +239,33 @@ impl McpConnection {
     {
         Self::serve(transport, connect_timeout, request_timeout).await
     }
+}
+
+/// Resolve `cfg.headers` into the `HeaderName`/`HeaderValue` map rmcp's
+/// Streamable HTTP transport expects, expanding `${ENV_NAME}` placeholders in
+/// each value first (see [`expand_env_placeholders`]) so secrets never need
+/// to be written into config.json. Returns `None` when the config has no
+/// headers at all, so the caller can fall back to the plain `from_uri`
+/// transport rather than attaching an empty header map.
+fn mcp_http_headers(cfg: &McpServerConfig) -> Result<Option<HashMap<HeaderName, HeaderValue>>> {
+    let Some(headers) = cfg.headers.as_ref() else {
+        return Ok(None);
+    };
+    if headers.is_empty() {
+        return Ok(None);
+    }
+    let mut resolved = HashMap::with_capacity(headers.len());
+    for (name, raw_value) in headers {
+        let value = expand_env_placeholders(name, raw_value)?;
+        let header_name = HeaderName::try_from(name.as_str()).map_err(|err| {
+            HarnessError::Runtime(format!("mcp header name `{name}` is invalid: {err}"))
+        })?;
+        let header_value = HeaderValue::try_from(value).map_err(|err| {
+            HarnessError::Runtime(format!("mcp header `{name}` value is invalid: {err}"))
+        })?;
+        resolved.insert(header_name, header_value);
+    }
+    Ok(Some(resolved))
 }
 
 fn client_info() -> ClientInfo {
@@ -434,7 +478,100 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             trusted: false,
+            headers: None,
         }
+    }
+
+    // ─── mcp_http_headers ───
+
+    #[test]
+    fn mcp_http_headers_none_when_config_has_no_headers() {
+        let cfg = cfg("");
+        assert!(mcp_http_headers(&cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn mcp_http_headers_none_when_headers_map_is_empty() {
+        let mut cfg = cfg("");
+        cfg.headers = Some(BTreeMap::new());
+        assert!(mcp_http_headers(&cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn mcp_http_headers_builds_map_and_expands_env_placeholder() {
+        std::env::set_var("MYAGENT_TEST_CLIENT_TOKEN", "sekrit");
+        let mut cfg = cfg("");
+        cfg.headers = Some(BTreeMap::from([
+            (
+                "Authorization".to_string(),
+                "Bearer ${MYAGENT_TEST_CLIENT_TOKEN}".to_string(),
+            ),
+            ("X-Static".to_string(), "value".to_string()),
+        ]));
+        let headers = mcp_http_headers(&cfg).unwrap().unwrap();
+        std::env::remove_var("MYAGENT_TEST_CLIENT_TOKEN");
+
+        assert_eq!(
+            headers
+                .get(&HeaderName::from_static("authorization"))
+                .map(|v| v.to_str().unwrap()),
+            Some("Bearer sekrit")
+        );
+        assert_eq!(
+            headers
+                .get(&HeaderName::try_from("X-Static").unwrap())
+                .map(|v| v.to_str().unwrap()),
+            Some("value")
+        );
+    }
+
+    #[test]
+    fn mcp_http_headers_errors_when_env_placeholder_unset() {
+        std::env::remove_var("MYAGENT_TEST_CLIENT_MISSING");
+        let mut cfg = cfg("");
+        cfg.headers = Some(BTreeMap::from([(
+            "Authorization".to_string(),
+            "Bearer ${MYAGENT_TEST_CLIENT_MISSING}".to_string(),
+        )]));
+        let err = mcp_http_headers(&cfg).unwrap_err();
+        assert!(err.to_string().contains("MYAGENT_TEST_CLIENT_MISSING"));
+    }
+
+    #[test]
+    fn mcp_http_headers_rejects_invalid_header_name() {
+        let mut cfg = cfg("");
+        cfg.headers = Some(BTreeMap::from([(
+            "bad header name".to_string(),
+            "v".to_string(),
+        )]));
+        let err = mcp_http_headers(&cfg).unwrap_err();
+        assert!(err.to_string().contains("bad header name"));
+    }
+
+    /// End-to-end wiring check: a url-type config with headers set must reach
+    /// transport construction (i.e. `mcp_http_headers` + `custom_headers` +
+    /// `from_config` all type-check and run) and fail with the expected
+    /// connect error, not a header-building panic or type error, when the
+    /// server is unreachable.
+    #[tokio::test]
+    async fn mcp_client_connect_with_headers_reaches_transport_and_fails_to_connect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = cfg("");
+        config.url = Some(format!("http://127.0.0.1:{port}/mcp"));
+        config.headers = Some(BTreeMap::from([(
+            "X-Static".to_string(),
+            "value".to_string(),
+        )]));
+
+        let result = McpConnection::connect(&config, Duration::from_secs(5)).await;
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("connecting to a closed port must fail"),
+        };
+        assert!(err.to_string().contains("mcp connect failed"), "got: {err}");
     }
 
     #[tokio::test]

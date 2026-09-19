@@ -14,15 +14,25 @@ type Props = {
   onClose: () => void;
   onCreate?: (args: NewProjectArgs) => void | Promise<void>;
   mode?: "create" | "edit";
-  initial?: { name: string; icon: string | null };
+  initial?: { name: string; icon: string | null; path?: string };
   onSave?: (args: {
     name: string;
     icon: string | null;
+    /** 新选的工作目录；未改动则为 null（调用方据此判断要不要调路径更新命令）。 */
+    path: string | null;
   }) => void | Promise<void>;
   onRemove?: () => void;
 };
 
 export const PROJECT_EMOJIS = ["📕", "📝", "📊", "🎨", "🐍", "🚀", "📁", "💡"];
+
+/** 路径过长时省略中段，保留首尾可辨认片段（T22：编辑项目「位置」行展示用）。 */
+export function elidePathMiddle(path: string, max = 56): string {
+  if (path.length <= max) return path;
+  const headLen = Math.ceil((max - 1) / 2);
+  const tailLen = Math.floor((max - 1) / 2);
+  return `${path.slice(0, headLen)}…${path.slice(path.length - tailLen)}`;
+}
 
 export function NewProjectSheet({
   open,
@@ -41,6 +51,8 @@ export function NewProjectSheet({
   const [newUnderDefault, setNewUnderDefault] = useState(true);
   const [icon, setIcon] = useState<string | null>(PROJECT_EMOJIS[0]);
   const [submitting, setSubmitting] = useState(false);
+  const [editPath, setEditPath] = useState<string | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -49,6 +61,8 @@ export function NewProjectSheet({
     setNewUnderDefault(true);
     setIcon(mode === "edit" ? (initial?.icon ?? null) : PROJECT_EMOJIS[0]);
     setSubmitting(false);
+    setEditPath(null);
+    setSubmitError(null);
     nameRef.current?.focus();
   }, [initial?.icon, initial?.name, mode, open]);
 
@@ -63,6 +77,17 @@ export function NewProjectSheet({
       if (typeof selected !== "string") return;
       setExistingPath(selected);
       setNewUnderDefault(false);
+    } catch {
+      // Closing or failing to open the native picker leaves the current choice intact.
+    }
+  }
+
+  async function chooseEditFolder() {
+    try {
+      const selected = await openDialog({ directory: true, multiple: false });
+      if (typeof selected !== "string") return;
+      setEditPath(selected);
+      setSubmitError(null);
     } catch {
       // Closing or failing to open the native picker leaves the current choice intact.
     }
@@ -95,9 +120,12 @@ export function NewProjectSheet({
   async function handleSubmit() {
     if (!trimmedName || submitting) return;
     setSubmitting(true);
+    setSubmitError(null);
     try {
       if (mode === "edit") {
-        await onSave?.({ name: trimmedName, icon });
+        const changedPath =
+          editPath !== null && editPath !== initial?.path ? editPath : null;
+        await onSave?.({ name: trimmedName, icon, path: changedPath });
       } else {
         await onCreate?.({
           name: trimmedName,
@@ -107,8 +135,9 @@ export function NewProjectSheet({
         });
       }
       onClose();
-    } catch {
+    } catch (error) {
       setSubmitting(false);
+      setSubmitError(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -200,6 +229,38 @@ export function NewProjectSheet({
                 </span>
               </button>
             </div>
+          </div>
+        )}
+
+        {mode === "edit" && (
+          <div className="new-project-field">
+            <span className="new-project-field__label">
+              {t("newProject.location.label")}
+            </span>
+            <div className="new-project-location">
+              <button
+                type="button"
+                className="new-project-location__option"
+                disabled={submitting}
+                onClick={chooseEditFolder}
+              >
+                <span
+                  className="new-project-location__radio"
+                  aria-hidden="true"
+                />
+                <span>
+                  <span className="new-project-location__title">
+                    {t("newProject.location.change")}
+                  </span>
+                  <span className="new-project-location__detail">
+                    {elidePathMiddle(editPath ?? initial?.path ?? "")}
+                  </span>
+                </span>
+              </button>
+            </div>
+            {submitError && (
+              <p className="new-project-field__error">{submitError}</p>
+            )}
           </div>
         )}
 

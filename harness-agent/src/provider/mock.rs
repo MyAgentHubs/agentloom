@@ -12,6 +12,7 @@ use crate::provider::{
 pub struct MockProvider {
     model: String,
     finish_reason: Option<FinishReason>,
+    supports_images: bool,
 }
 
 impl Default for MockProvider {
@@ -19,6 +20,7 @@ impl Default for MockProvider {
         Self {
             model: "mock-model".to_string(),
             finish_reason: None,
+            supports_images: false,
         }
     }
 }
@@ -26,6 +28,12 @@ impl Default for MockProvider {
 impl MockProvider {
     pub fn with_finish_reason(mut self, finish_reason: FinishReason) -> Self {
         self.finish_reason = Some(finish_reason);
+        self
+    }
+
+    /// 测试专用：让 mock 的 capabilities() 报告支持图片（默认 false，走降级路径）。
+    pub fn with_supports_images(mut self, supports_images: bool) -> Self {
+        self.supports_images = supports_images;
         self
     }
 }
@@ -38,6 +46,24 @@ impl ProviderClient for MockProvider {
         _tools: &[serde_json::Value],
         events: &mut EventRecorder,
     ) -> Result<ProviderResponse> {
+        // 记录收到的图片附件供测试断言（mock 无内部可变状态·走事件通道）。
+        // `provider.mock.images_received` 不属 `harness.runtime.v1` 对外契约——它只在
+        // mock provider 下发、从不上真机 wire，因此不登记进 `vocabulary::VOCABULARY`，
+        // 并在 `tests/contract_coverage.rs` 的反向检查里被显式豁免。
+        let received_images: Vec<&crate::image::ImageBlock> =
+            messages.iter().flat_map(|m| m.images.iter()).collect();
+        if !received_images.is_empty() {
+            events.emit(
+                "provider.mock.images_received",
+                json!({
+                    "count": received_images.len(),
+                    "media_types": received_images
+                        .iter()
+                        .map(|img| img.media_type.clone())
+                        .collect::<Vec<_>>(),
+                }),
+            )?;
+        }
         // Agentic loop scripted scenario (read->edit->verify >=3 turns). 由 tool 消息计数驱动，resume-safe。
         let is_agentic = messages.iter().any(|m| {
             m.content
@@ -250,7 +276,7 @@ impl ProviderClient for MockProvider {
             supports_streaming: true,
             supports_reasoning_deltas: true,
             supports_tool_calling: true,
-            supports_images: false,
+            supports_images: self.supports_images,
             supports_computer_use: false,
             supports_shell_tool: true,
             max_context_tokens: Some(128_000),

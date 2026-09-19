@@ -7,12 +7,14 @@ interface TaskInspectorProps {
   member: MemberUnit;
   onClose: () => void;
   onBackToList?: () => void;
+  sessionId?: string | null;
 }
 
 export function TaskInspector({
   member,
   onClose,
   onBackToList,
+  sessionId = null,
 }: TaskInspectorProps) {
   const { t } = useI18n();
   const MarkdownBody = useMarkdown();
@@ -72,7 +74,9 @@ export function TaskInspector({
         {member.sub &&
           (MarkdownBody ? (
             <div className="task-inspector__title">
-              <MarkdownBody streaming={false}>{member.sub}</MarkdownBody>
+              <MarkdownBody streaming={false} sessionId={sessionId}>
+                {member.sub}
+              </MarkdownBody>
             </div>
           ) : (
             <div
@@ -123,7 +127,7 @@ export function TaskInspector({
       <div className="task-inspector__card">
         <h4>{t("inspector.toolTrace")}</h4>
         {hasOutput ? (
-          <MessageContent blocks={member.blocks} />
+          <MessageContent blocks={member.blocks} sessionId={sessionId} />
         ) : (
           <p className="task-inspector__empty">{t("inspector.noOutput")}</p>
         )}

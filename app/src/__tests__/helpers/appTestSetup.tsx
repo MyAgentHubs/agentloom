@@ -1,0 +1,1 @@
+export { setupAppTests } from "./appTestLifecycle";

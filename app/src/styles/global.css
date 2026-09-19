@@ -10325,9 +10325,30 @@ html[data-os="macos"] {
   color: var(--ink-1);
 }
 .updsec__notes-body {
+  min-width: 0;
+  max-width: 100%;
   line-height: 1.6;
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+.updsec__notes-body :is(h1, h2, h3, h4, h5, h6) {
+  margin: 10px 0 4px;
+  color: var(--ink-1);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.updsec__notes-body > :first-child {
+  margin-top: 0;
+}
+.updsec__notes-body p,
+.updsec__notes-body ul,
+.updsec__notes-body ol {
+  margin: 4px 0;
+}
+.updsec__notes-body :is(pre, .mm-code) {
+  max-width: 100%;
+}
+.updsec__notes-body pre {
+  overflow-x: auto;
 }
 .updsec__error {
   margin-top: 8px;

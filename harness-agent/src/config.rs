@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{HarnessError, Result};
 use crate::mcp::config::McpServerConfig;
 use crate::provider::openai_compatible::OpenAiCompatibleConfig;
+pub(crate) mod config_images;
+mod context_tokens_seed; // t12-img 第四轮返工 P2-A：拆出，见该文件顶部注释（file_size_ratchet）
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
@@ -41,6 +43,8 @@ pub struct StoredProvider {
     pub context_tokens: Option<u32>,
     #[serde(default)]
     pub output_tokens: Option<u32>,
+    #[serde(default)]
+    pub supports_images: Option<bool>, // None = 走 image::default_supports_images 按家族猜
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,6 +347,7 @@ pub fn provider_config_with_model(
         fallback_model: None,
         context_tokens,
         output_tokens,
+        supports_images_override: config_images::resolve(&env_prefix, stored.as_ref())?,
     })
 }
 
@@ -381,18 +386,14 @@ pub fn default_model(provider: &str) -> String {
 /// 可用预算误算到极小值（实测：deepseek 不设此值会落 16384 默认、预算塌到 ~4157、
 /// 连固定系统/任务/地形头都装不下、每轮第 2 步即 `context_budget_exhausted`、模型零产出）。
 /// 只填经实测确认的 provider；上下文窗口随 model 变（如 kimi 默认 moonshot-v1-8k 只有 8K），
-/// 吃不准的留 `None` 走通用默认，别按 provider 瞎填高了被 API 拒。
+/// 吃不准的留 `None` 走通用默认，别按 provider 瞎填高了被 API 拒。t12-img P2-A 返工：
+/// `model_registry::lookup` 优先（回答对的不该被下面粗粒度兜底盖掉）；查不到落
+/// `context_tokens_seed::seed_by_model`（按 model 名而非 provider）。
 pub fn default_context_tokens(provider: &str, model: &str) -> Option<u32> {
-    match provider {
-        // "zai" 走 z.ai 的 anthropic 兼容端点，provider_id 不含 "glm"/"zhipu" 子串，
-        // 不会命中 model_registry 的 ProviderFamily::Glm 分支，故在此单独兜底。
-        // 200_000 与登记表 glm_spec 主线（4.6/5/5-turbo，default_model("zai")="glm-4.6"
-        // 正落这档）对齐——来源 docs.z.ai/guides/llm/glm-4.6，2026-08-21 核；原值
-        // 128_000 是旧登记值残留。注：未按 model 精细分档，走 zai 的 glm-5.2 仍会被
-        // 保守算成 200_000（非其真实 1M）——已知局限，不在本次改动范围内。
-        "zai" => Some(200_000),
-        _ => crate::model_registry::lookup(provider, model).map(|spec| spec.context_window),
+    if let Some(spec) = crate::model_registry::lookup(provider, model) {
+        return Some(spec.context_window);
     }
+    context_tokens_seed::seed_by_model(model)
 }
 
 pub fn default_output_tokens(provider: &str, model: &str) -> Option<u32> {
@@ -431,6 +432,9 @@ fn restrict_config_permissions(_path: &std::path::Path) -> Result<()> {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    mod default_context_tokens_image_alignment; // 拆出：file_size_ratchet 棘轮只降不升
+    mod default_context_tokens_seed_regression; // t12-img P2-A 返工：差分回归钉子
 
     struct EnvGuard {
         key: &'static str,
@@ -920,6 +924,7 @@ mod tests {
             model: "moonshot-v1-128k".into(),
             context_tokens: Some(999_999),
             output_tokens: Some(12_345),
+            ..Default::default()
         })
         .unwrap();
 
@@ -1006,21 +1011,24 @@ mod tests {
         assert!(err.to_string().contains("DEEPSEEK_TIMEOUT_SECS"));
     }
 
+    /// 两条 provider-save 回归测试共用的夹具（省一次多行 wrap；两处断言只查
+    /// `providers.len()`/`providers[0].id`，与 base_url/model 具体值无关）。
+    fn deepseek_stored_fixture() -> StoredProvider {
+        config_images::testing(
+            "deepseek",
+            "pk",
+            "https://api.deepseek.com/v1",
+            "deepseek-v4-flash",
+        )
+    }
+
     #[test]
     #[serial]
     fn save_search_config_preserves_providers_and_sets_0600() {
         let dir = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("MYAGENT_HOME", dir.path().to_str().unwrap());
 
-        save_provider(StoredProvider {
-            id: "deepseek".into(),
-            api_key: "pk".into(),
-            base_url: "https://api.deepseek.com/v1".into(),
-            model: "deepseek-v4-flash".into(),
-            context_tokens: None,
-            output_tokens: None,
-        })
-        .unwrap();
+        save_provider(deepseek_stored_fixture()).unwrap();
         let path = save_search_config(SearchConfig::Brave {
             api_key: "k".into(),
         })
@@ -1089,6 +1097,7 @@ mod tests {
                 m
             },
             trusted: true,
+            headers: None,
         };
 
         let path = save_mcp_server("my-server", server.clone()).unwrap();
@@ -1120,6 +1129,7 @@ mod tests {
                 args: vec![],
                 env: BTreeMap::new(),
                 trusted: true,
+                headers: None,
             },
         );
 
@@ -1140,6 +1150,7 @@ mod tests {
                 args: vec![],
                 env: BTreeMap::new(),
                 trusted: false,
+                headers: None,
             },
         );
 
@@ -1154,15 +1165,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("MYAGENT_HOME", dir.path().to_str().unwrap());
 
-        save_provider(StoredProvider {
-            id: "deepseek".into(),
-            api_key: "pk".into(),
-            base_url: "https://api.deepseek.com/v1".into(),
-            model: "deepseek-v4-flash".into(),
-            context_tokens: None,
-            output_tokens: None,
-        })
-        .unwrap();
+        save_provider(deepseek_stored_fixture()).unwrap();
 
         save_mcp_server(
             "my-server",
@@ -1173,6 +1176,7 @@ mod tests {
                 args: vec![],
                 env: BTreeMap::new(),
                 trusted: true,
+                headers: None,
             },
         )
         .unwrap();

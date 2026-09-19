@@ -40,13 +40,7 @@ async fn streams_content_and_reasoning_from_base_url_with_v1() {
         base_url: format!("{}/v1", server.uri()),
         model: "deepseek-v4-flash".to_string(),
         timeout_secs: 5,
-        temperature: None,
-        sampling: Default::default(),
-        network: myagent::goal::NetworkPolicy::On,
-        native_search_enabled: true,
-        fallback_model: None,
-        context_tokens: None,
-        output_tokens: None,
+        ..Default::default()
     })
     .unwrap();
     let temp = tempdir().unwrap();
@@ -122,13 +116,7 @@ async fn accumulates_streamed_tool_call_arguments() {
         base_url: server.uri(),
         model: "test-model".to_string(),
         timeout_secs: 5,
-        temperature: None,
-        sampling: Default::default(),
-        network: myagent::goal::NetworkPolicy::On,
-        native_search_enabled: true,
-        fallback_model: None,
-        context_tokens: None,
-        output_tokens: None,
+        ..Default::default()
     })
     .unwrap();
     let temp = tempdir().unwrap();
@@ -186,13 +174,7 @@ async fn tolerates_crlf_sse_and_provider_keepalive_json() {
         base_url: server.uri(),
         model: "test-model".to_string(),
         timeout_secs: 5,
-        temperature: None,
-        sampling: Default::default(),
-        network: myagent::goal::NetworkPolicy::On,
-        native_search_enabled: true,
-        fallback_model: None,
-        context_tokens: None,
-        output_tokens: None,
+        ..Default::default()
     })
     .unwrap();
     let temp = tempdir().unwrap();
@@ -236,14 +218,8 @@ async fn replays_reasoning_content_to_reasoning_provider() {
         api_key: "k".into(),
         base_url: server.uri(),
         model: "deepseek-v4-flash".into(),
-        timeout_secs: 30,
         temperature: Some(0.0),
-        sampling: Default::default(),
-        network: myagent::goal::NetworkPolicy::On,
-        native_search_enabled: true,
-        fallback_model: None,
-        context_tokens: None,
-        output_tokens: None,
+        ..Default::default()
     };
     let provider =
         myagent::provider::openai_compatible::OpenAiCompatibleProvider::new(cfg).unwrap();
@@ -304,14 +280,7 @@ async fn strips_reasoning_without_nonempty_tool_calls_for_reasoning_provider() {
         api_key: "k".into(),
         base_url: server.uri(),
         model: "deepseek-v4-flash".into(),
-        timeout_secs: 30,
-        temperature: None,
-        sampling: Default::default(),
-        network: myagent::goal::NetworkPolicy::On,
-        native_search_enabled: true,
-        fallback_model: None,
-        context_tokens: None,
-        output_tokens: None,
+        ..Default::default()
     };
     let provider =
         myagent::provider::openai_compatible::OpenAiCompatibleProvider::new(cfg).unwrap();
@@ -324,6 +293,7 @@ async fn strips_reasoning_without_nonempty_tool_calls_for_reasoning_provider() {
             tool_calls: Some(vec![]),
             reasoning_content: Some("reasoning-with-empty".into()),
             name: None,
+            images: Vec::new(),
         },
         ChatMessage::user("continue"),
     ];
@@ -364,14 +334,7 @@ async fn strips_reasoning_for_non_reasoning_provider() {
         api_key: "k".into(),
         base_url: server.uri(),
         model: "gpt-4.1-mini".into(),
-        timeout_secs: 30,
-        temperature: None,
-        sampling: Default::default(),
-        network: myagent::goal::NetworkPolicy::On,
-        native_search_enabled: true,
-        fallback_model: None,
-        context_tokens: None,
-        output_tokens: None,
+        ..Default::default()
     };
     let provider =
         myagent::provider::openai_compatible::OpenAiCompatibleProvider::new(cfg).unwrap();
@@ -444,13 +407,7 @@ async fn normal_stream_with_content_reasoning_and_complete_tool_finalizes() {
         base_url: server.uri(),
         model: "test-model".to_string(),
         timeout_secs: 5,
-        temperature: None,
-        sampling: Default::default(),
-        network: myagent::goal::NetworkPolicy::On,
-        native_search_enabled: true,
-        fallback_model: None,
-        context_tokens: None,
-        output_tokens: None,
+        ..Default::default()
     })
     .unwrap();
     let temp = tempdir().unwrap();
@@ -562,13 +519,7 @@ async fn collect_marks_idle_timeout_interruption_with_timeout_hint() {
         base_url: format!("http://{addr}"),
         model: "test-model".to_string(),
         timeout_secs: 1,
-        temperature: None,
-        sampling: Default::default(),
-        network: NetworkPolicy::On,
-        native_search_enabled: true,
-        fallback_model: None,
-        context_tokens: None,
-        output_tokens: None,
+        ..Default::default()
     })
     .unwrap();
     let temp = tempdir().unwrap();
@@ -704,13 +655,7 @@ async fn native_search_4xx_degrades_and_retries_without_native() {
         base_url: server.uri(),
         model: "test-model".to_string(),
         timeout_secs: 5,
-        temperature: None,
-        sampling: Default::default(),
-        network: NetworkPolicy::On,
-        native_search_enabled: true,
-        fallback_model: None,
-        context_tokens: None,
-        output_tokens: None,
+        ..Default::default()
     })
     .unwrap();
     let temp = tempdir().unwrap();
@@ -764,13 +709,9 @@ async fn captured_request_body(
         base_url: server.uri(),
         model: "test-model".to_string(),
         timeout_secs: 5,
-        temperature: None,
-        sampling: Default::default(),
         network,
         native_search_enabled,
-        fallback_model: None,
-        context_tokens: None,
-        output_tokens: None,
+        ..Default::default()
     })
     .unwrap();
     let temp = tempdir().unwrap();
@@ -1118,13 +1059,7 @@ fn kimi_provider(base_url: String) -> OpenAiCompatibleProvider {
         base_url,
         model: "moonshot-v1-8k".to_string(),
         timeout_secs: 5,
-        temperature: None,
-        sampling: Default::default(),
-        network: NetworkPolicy::On,
-        native_search_enabled: true,
-        fallback_model: None,
-        context_tokens: None,
-        output_tokens: None,
+        ..Default::default()
     })
     .unwrap()
 }
@@ -1177,13 +1112,7 @@ fn capabilities_declare_server_side_search_statically() {
             base_url: "http://localhost:1".into(),
             model: "m".into(),
             timeout_secs: 5,
-            temperature: None,
-            sampling: Default::default(),
-            network: myagent::goal::NetworkPolicy::On,
-            native_search_enabled: true,
-            fallback_model: None,
-            context_tokens: None,
-            output_tokens: None,
+            ..Default::default()
         })
         .unwrap()
     };
@@ -1212,13 +1141,7 @@ fn generic_provider(base_url: String) -> OpenAiCompatibleProvider {
         base_url,
         model: "test-model".to_string(),
         timeout_secs: 5,
-        temperature: None,
-        sampling: Default::default(),
-        network: NetworkPolicy::On,
-        native_search_enabled: true,
-        fallback_model: None,
-        context_tokens: None,
-        output_tokens: None,
+        ..Default::default()
     })
     .unwrap()
 }
@@ -1350,11 +1273,9 @@ async fn sampling_openai_configured_fields_match_wire_body() {
             top_p: Some(0.9),
             do_sample: Some(false),
         },
-        network: NetworkPolicy::On,
         native_search_enabled: false,
-        fallback_model: None,
-        context_tokens: None,
         output_tokens: Some(1234),
+        ..Default::default()
     })
     .unwrap();
     let temp = tempdir().unwrap();
@@ -1429,11 +1350,9 @@ async fn sampling_anthropic_configured_fields_match_wire_body() {
             top_p: Some(0.8),
             do_sample: Some(false),
         },
-        network: NetworkPolicy::On,
         native_search_enabled: false,
-        fallback_model: None,
-        context_tokens: None,
         output_tokens: Some(2345),
+        ..Default::default()
     })
     .unwrap();
     let temp = tempdir().unwrap();
@@ -1469,11 +1388,9 @@ async fn sampling_anthropic_never_sends_do_sample_even_when_configured() {
             top_p: Some(0.8),
             do_sample: Some(false),
         },
-        network: NetworkPolicy::On,
         native_search_enabled: false,
-        fallback_model: None,
-        context_tokens: None,
         output_tokens: Some(2345),
+        ..Default::default()
     })
     .unwrap();
     let temp = tempdir().unwrap();
@@ -1521,13 +1438,8 @@ async fn sampling_anthropic_unconfigured_fields_are_absent_from_wire_body() {
         base_url: server.uri(),
         model: "glm-4.6".into(),
         timeout_secs: 5,
-        temperature: None,
-        sampling: Default::default(),
-        network: NetworkPolicy::On,
         native_search_enabled: false,
-        fallback_model: None,
-        context_tokens: None,
-        output_tokens: None,
+        ..Default::default()
     })
     .unwrap();
     let temp = tempdir().unwrap();

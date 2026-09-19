@@ -7,13 +7,52 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  file-size-gate:
+    runs-on: ubuntu-latest
+    outputs:
+      baseline: ${{ steps.pin.outputs.baseline }}
+    steps:
+      - uses: actions/checkout@v4
+      # No candidate application code, tests or npm lifecycle runs before this
+      # gate. The checker and this workflow are themselves reviewable policy.
+      - name: Fetch and pin file size baseline
+        id: pin
+        env:
+          SIZE_GATE_BEFORE: ${{ github.event.before }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            # A push can contain multiple commits: HEAD^ would miss earlier growth.
+            # Never compare a main push to the just-pushed origin/main.
+            if [[ ! "$SIZE_GATE_BEFORE" =~ ^[0-9a-f]{40}$ || "$SIZE_GATE_BEFORE" == 0000000000000000000000000000000000000000 ]]; then
+              echo "ERROR: no pre-push baseline; first import requires a reviewed baseline, never HEAD or skip." >&2
+              exit 1
+            fi
+            git fetch --no-tags origin "$SIZE_GATE_BEFORE"
+            git rev-parse --verify "${SIZE_GATE_BEFORE}^{commit}"
+            git update-ref refs/remotes/origin/main "$SIZE_GATE_BEFORE"
+          fi
+          echo "baseline=$(git rev-parse 'refs/remotes/origin/main^{commit}')" >> "$GITHUB_OUTPUT"
+      - name: Check file sizes before candidate execution
+        # -I prevents candidate Python modules / sitecustomize from shadowing stdlib.
+        run: python3 -I scripts/check_file_size.py
+      - name: Test gate regressions
+        run: python3 -I scripts/test_file_size_gate.py
+
   frontend:
+    needs: file-size-gate
     name: Frontend (typecheck / test / format)
     runs-on: ubuntu-latest
     defaults:
@@ -21,6 +60,15 @@ jobs:
         working-directory: app
     steps:
       - uses: actions/checkout@v4
+      - name: Restore pinned file size baseline
+        env:
+          SIZE_GATE_BASELINE: ${{ needs.file-size-gate.outputs.baseline }}
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$SIZE_GATE_BASELINE"
+          git update-ref refs/remotes/origin/main "$SIZE_GATE_BASELINE"
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -32,6 +80,7 @@ jobs:
       - run: npm run format:check
 
   engine:
+    needs: file-size-gate
     name: Engine (myagent)
     runs-on: ubuntu-latest
     defaults:
@@ -51,6 +100,7 @@ jobs:
       - run: cargo test --locked --no-fail-fast
 
   app-backend:
+    needs: file-size-gate
     name: App backend (Rust)
     # macOS on purpose, not for cost: parts of the backend test suite exercise
     # macOS-only facilities (`/usr/bin/sandbox-exec` for the verifier sandbox,
@@ -66,6 +116,15 @@ jobs:
         working-directory: app/src-tauri
     steps:
       - uses: actions/checkout@v4
+      - name: Restore pinned file size baseline
+        env:
+          SIZE_GATE_BASELINE: ${{ needs.file-size-gate.outputs.baseline }}
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$SIZE_GATE_BASELINE"
+          git update-ref refs/remotes/origin/main "$SIZE_GATE_BASELINE"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -90,6 +149,7 @@ jobs:
       - run: cargo test --locked --no-fail-fast
 
   windows-check:
+    needs: file-size-gate
     name: App backend compiles on Windows
     # Type-check only, and deliberately not the test suite: a large share of the
     # backend tests use Unix-only facilities on purpose. What this job protects is

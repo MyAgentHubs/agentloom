@@ -17,6 +17,7 @@ export type DrillProps = {
   onStop?: (assignmentId: string) => void;
   goal?: GoalContract | null;
   criteria?: AcceptanceCriterion[];
+  sessionId?: string | null;
 };
 
 function tokLabel(m: MemberUnit, noTokens: string): string {
@@ -120,6 +121,7 @@ export function MemberDrillIn({
   onStop,
   goal,
   criteria = [],
+  sessionId = null,
 }: DrillProps) {
   const { t } = useI18n();
   const selected =
@@ -321,7 +323,7 @@ export function MemberDrillIn({
               {t("memberDrillIn.viewAssignment")}
             </summary>
             <div className="drillin__fold-body drillin__brief-body">
-              <MessageContent blocks={briefBlocks} />
+              <MessageContent blocks={briefBlocks} sessionId={sessionId} />
             </div>
           </details>
         )}
@@ -331,7 +333,7 @@ export function MemberDrillIn({
               {t("memberDrillIn.rawTrace")}
             </summary>
             <div className="drillin__fold-body drillin__raw-body">
-              <MessageContent blocks={selected.blocks} />
+              <MessageContent blocks={selected.blocks} sessionId={sessionId} />
             </div>
           </details>
         )}

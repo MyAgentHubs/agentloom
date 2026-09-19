@@ -15,6 +15,9 @@ use crate::provider::{
     ProviderResponse, ToolCall,
 };
 
+pub(crate) mod image_retry;
+pub(crate) mod image_wire;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SamplingParams {
     pub top_p: Option<f64>,
@@ -38,12 +41,15 @@ pub struct OpenAiCompatibleConfig {
     pub fallback_model: Option<String>,
     pub context_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
+    /// 显式覆盖 supports_images；None = 按 provider_id 家族猜默认值（见 `crate::image::default_supports_images`）。
+    pub supports_images_override: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatibleProvider {
     config: OpenAiCompatibleConfig,
     client: reqwest::Client,
+    images_disabled_at_runtime: std::sync::Arc<std::sync::atomic::AtomicBool>, // T19 出线自愈
 }
 
 impl OpenAiCompatibleProvider {
@@ -55,7 +61,11 @@ impl OpenAiCompatibleProvider {
             .connect_timeout(Duration::from_secs(30))
             .read_timeout(Duration::from_secs(config.timeout_secs))
             .build()?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            images_disabled_at_runtime: Default::default(),
+        })
     }
 
     fn endpoint(&self) -> String {
@@ -105,7 +115,9 @@ impl OpenAiCompatibleProvider {
                 message.reasoning_content = None;
             }
         }
-        body["messages"] = serde_json::to_value(wire_messages)?;
+        body["messages"] = serde_json::to_value(&wire_messages)?;
+        // 有 images 的消息按 OpenAI 多模态形态重拼 content；没 images 的一字节不变。
+        image_wire::apply_image_content(&mut body, &wire_messages);
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.to_vec());
             body["tool_choice"] = json!("auto");
@@ -220,41 +232,6 @@ impl OpenAiCompatibleProvider {
             }
         }
         primary
-    }
-
-    /// 发请求；若这轮原生搜索 Active 且 provider 返 4xx，则 warning + 不带原生重发一次。
-    /// 返回最终要 collect 的 Response。Kimi 每轮 post 也走这个（T8）。
-    async fn post_native_or_degrade(
-        &self,
-        messages: &[ChatMessage],
-        tools: &[Value],
-        events: &mut EventRecorder,
-    ) -> Result<reqwest::Response> {
-        use crate::provider::native_search::{
-            native_search_state, provider_family, NativeSearchState,
-        };
-        let family = provider_family(&self.config.provider_id);
-        let active = native_search_state(
-            family.has_native_search(),
-            self.config.network,
-            self.config.native_search_enabled,
-        ) == NativeSearchState::Active;
-        let response = self
-            .post(&self.build_body(messages, tools, true)?, events)
-            .await?;
-        if active && response.status().is_client_error() {
-            events.emit(
-                "provider.warning",
-                json!({
-                    "warning": "native_search_degraded",
-                    "status": response.status().as_u16(),
-                }),
-            )?;
-            return self
-                .post(&self.build_body(messages, tools, false)?, events)
-                .await;
-        }
-        Ok(response)
     }
 
     /// 检查状态 + 流式收集成 ProviderResponse。emit=false 时不发 text/reasoning delta（Kimi 内层用）。
@@ -495,7 +472,7 @@ impl ProviderClient for OpenAiCompatibleProvider {
         if family == ProviderFamily::Kimi && active {
             return self.kimi_turn_with_echo(messages, tools, events).await;
         }
-        let response = self.post_native_or_degrade(messages, tools, events).await?;
+        let response = self.post_with_image_guard(messages, tools, events).await?;
         self.collect(response, true, events).await
     }
 
@@ -509,7 +486,8 @@ impl ProviderClient for OpenAiCompatibleProvider {
                 .map(|spec| spec.supports_reasoning_deltas)
                 .unwrap_or_else(|| self.supports_reasoning()),
             supports_tool_calling: true,
-            supports_images: false,
+            supports_images: image_wire::resolve_supports_images(&self.config)
+                && !self.runtime_images_disabled(),
             supports_computer_use: false,
             supports_shell_tool: true,
             max_context_tokens: self.config.context_tokens,
@@ -739,13 +717,7 @@ mod tests {
             base_url: base_url.into(),
             model: model.into(),
             timeout_secs: 5,
-            temperature: None,
-            sampling: Default::default(),
-            network: crate::goal::NetworkPolicy::On,
-            native_search_enabled: true,
-            fallback_model: None,
-            context_tokens: None,
-            output_tokens: None,
+            ..Default::default()
         })
         .unwrap()
     }
@@ -1055,13 +1027,9 @@ mod tests {
             base_url: "https://example.test/v1".into(),
             model: "test-model".into(),
             timeout_secs: 5,
-            temperature: None,
-            sampling: Default::default(),
-            network: crate::goal::NetworkPolicy::On,
-            native_search_enabled: true,
-            fallback_model: None,
             context_tokens: Some(8192),
             output_tokens: Some(1024),
+            ..Default::default()
         })
         .unwrap();
         let caps = configured.capabilities();
@@ -1074,17 +1042,13 @@ mod tests {
             base_url: "https://example.test/v1".into(),
             model: "test-model".into(),
             timeout_secs: 5,
-            temperature: None,
-            sampling: Default::default(),
-            network: crate::goal::NetworkPolicy::On,
-            native_search_enabled: true,
-            fallback_model: None,
-            context_tokens: None,
-            output_tokens: None,
+            ..Default::default()
         })
         .unwrap();
         let caps = unspecified.capabilities();
         assert_eq!(caps.max_context_tokens, None);
         assert_eq!(caps.output_token_limit, None);
     }
+
+    mod image_tests;
 }

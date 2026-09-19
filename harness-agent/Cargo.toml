@@ -13,15 +13,18 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait = "0.1"
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }
 futures-util = "0.3"
+http = "1"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rmcp = { version = "2.2.0", default-features = false, features = ["client", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 scraper = "0.20"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11.0"
 similar = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
@@ -35,3 +38,16 @@ assert_cmd = "2"
 serial_test = "3"
 tempfile = "3"
 wiremock = "0.6"
+
+# 注意：[profile.release] 是本 crate 级全局 profile，app/scripts/release-macos.sh
+# 构建 macOS 桌面 sidecar 引擎二进制时用的也是这个默认 release profile（无 --profile
+# 参数即走它）。瘦身设置（strip 会剥桌面引擎符号、拖累崩溃排障；lto+codegen-units=1
+# 拉长桌面发版构建）不能塞进这里，只能给树莓派这类资源受限设备的产物开独立 profile。
+#
+# 树莓派等资源受限设备上跑的发布产物：体积与运行时开销优先于编译速度，走
+# `cargo build --profile release-small`（或 cargo-zigbuild 同参数）单独选用。
+[profile.release-small]
+inherits = "release"
+lto = "thin"
+strip = true
+codegen-units = 1

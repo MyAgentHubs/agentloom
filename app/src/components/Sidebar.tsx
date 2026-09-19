@@ -7,6 +7,7 @@ import type {
   NamespaceMeta,
 } from "../types/agent";
 import { useI18n } from "../i18n";
+import { sessionHasContinuationThread } from "../lib/continuationThread";
 import { ProjectSwitcherFooter } from "./ProjectSwitcherFooter";
 import { SessionGroupSection } from "./SessionGroupSection";
 import { SessionRow, type SessionDotStatus } from "./SessionRow";
@@ -64,6 +65,7 @@ type Props = {
   // 阶段1 Task1.3：全高列 chrome
   onToggleSidebar?: () => void;
   onHome?: () => void; // 总览入口（删 TopBar 后归位·不能 backlog·既有 App.test 断言「总览」）
+  onSearch?: () => void;
 };
 
 const emptyRunningSessionIds = new Set<string>();
@@ -130,17 +132,6 @@ function continuationChildrenByParent(list: Session[]): Map<string, Session[]> {
   return childrenByParent;
 }
 
-function sessionHasContinuationThread(
-  session: Session,
-  childrenByParent: Map<string, Session[]>,
-): boolean {
-  return (
-    session.parent_session_id !== null ||
-    session.continued_to_session_id !== null ||
-    (childrenByParent.get(session.id)?.length ?? 0) > 0
-  );
-}
-
 export const Sidebar = React.memo(function Sidebar({
   sessions,
   currentId,
@@ -184,6 +175,7 @@ export const Sidebar = React.memo(function Sidebar({
   onForward,
   onToggleSidebar,
   onHome,
+  onSearch,
 }: Props) {
   const { t } = useI18n();
   const [archOpen, setArchOpen] = useState(false);
@@ -391,7 +383,7 @@ export const Sidebar = React.memo(function Sidebar({
           className="iconbtn"
           aria-label={t("sidebar.search")}
           title={t("sidebar.searchTitle")}
-          disabled
+          onClick={onSearch}
         >
           <svg {...ic}>
             <circle cx="11" cy="11" r="7" />

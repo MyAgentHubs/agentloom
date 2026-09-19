@@ -27,6 +27,7 @@ fn unit_limits(budget: usize) -> BudgetLimits {
         min_recent: 1,
         chars_per_token: 1,
         per_msg_overhead: 0,
+        images_count_toward_budget: true,
     }
 }
 
@@ -156,6 +157,7 @@ fn opts(ws: &std::path::Path, prompt: &str) -> RunOptions {
         permission: myagent::shell::PermissionPolicy::Allow,
         network: myagent::goal::NetworkPolicy::On,
         fs_read_scope: myagent::fs_scope::FsReadScope::Workspace,
+        extra_read_roots: Vec::new(),
         fs_write_fence: myagent::exec::sandbox::FsWriteFence::Off,
         evidence_gate: myagent::orchestrator::EvidenceGate::Off,
         native_search_enabled: true,
@@ -173,6 +175,7 @@ fn opts(ws: &std::path::Path, prompt: &str) -> RunOptions {
         journal_root: ws.to_path_buf(),
         mcp_servers: Vec::new(),
         append_system_prompt: None,
+        images: Vec::new(),
     }
 }
 
@@ -624,6 +627,7 @@ async fn resume_compaction_threshold_ignores_messages_from_first_assistant_onwar
         myagent::config::SearchChoice::Ddg,
         0,
         0,
+        Vec::new(),
     )
     .await
     .unwrap();

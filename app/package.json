@@ -1,7 +1,7 @@
 {
   "name": "agentloom",
   "private": true,
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "AgentLoom is an open-source desktop workbench that turns many LLMs into one workforce you control.",
   "license": "AGPL-3.0-only",
   "repository": {
@@ -15,8 +15,9 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test": "vitest run && npm run test:scripts",
-    "test:scripts": "node --test scripts/updater-manifest.node-test.mjs",
+    "test": "npm run check:filesize && vitest run && npm run test:scripts",
+    "check:filesize": "python3 ../scripts/check_file_size.py",
+    "test:scripts": "node --test scripts/updater-manifest.node-test.mjs && python3 ../scripts/test_file_size_gate.py",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\"",
@@ -24,6 +25,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-clipboard-manager": "^2.3.3",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-opener": "^2",
     "anser": "^2.3.5",

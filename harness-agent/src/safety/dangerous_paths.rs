@@ -107,8 +107,9 @@ pub fn is_dangerous_config_target(arg: &str, cwd: &Path) -> bool {
 }
 
 use crate::safety::shell_parse::{
-    extract_redirects, has_cd_then_mutation, has_process_substitution, split_segments,
-    strip_wrappers, tokenize, RedirOp, Token, READ_COMMANDS, WRITE_COMMANDS,
+    derive_posix_ampersand, extract_redirects, has_ampersand_redirect, has_cd_then_mutation,
+    has_process_substitution, is_null_redirect_target, split_segments, strip_wrappers, tokenize,
+    without_redirects, RedirOp, Token, READ_COMMANDS, WRITE_COMMANDS,
 };
 
 /// 一条拒绝理由（rule = 稳定标识·detail = 给模型看的人话）。
@@ -125,16 +126,20 @@ fn deny(rule: &'static str, detail: impl Into<String>) -> Option<DenyReason> {
     })
 }
 
-/// 判一个路径 token 是否触发拒。is_write=true 时额外查 rm 系统路径 + 危险配置写。
-fn check_path_token(
-    tok: &Token,
-    cwd: &Path,
-    workspace: &Path,
+/// 扫描上下文：cwd/workspace/读范围/依赖根打包传递，减少调用点样板（纯参数捆绑·无行为变化）。
+/// `dependency_roots` 按 scope 门控（例如 ProjectDeps 发现的依赖根，Workspace scope 下
+/// 原样忽略——保这条历史不变量）；`extra_read_roots`（CLI `--read-root`）不受 scope 门控，
+/// 任意 scope 下都生效，两者语义不同、不合并进同一个字段。
+struct ScanCtx<'a> {
+    cwd: &'a Path,
+    workspace: &'a Path,
     fs_read_scope: crate::fs_scope::FsReadScope,
-    dependency_roots: &[PathBuf],
-    is_write: bool,
-    base: &str,
-) -> Option<DenyReason> {
+    dependency_roots: &'a [PathBuf],
+    extra_read_roots: &'a [PathBuf],
+}
+
+/// 判一个路径 token 是否触发拒。is_write=true 时额外查 rm 系统路径 + 危险配置写。
+fn check_path_token(tok: &Token, ctx: &ScanCtx, is_write: bool, base: &str) -> Option<DenyReason> {
     if tok.dynamic || tok.text.starts_with('~') {
         if is_write {
             return deny(
@@ -145,24 +150,25 @@ fn check_path_token(
                 ),
             );
         }
-        if fs_read_scope != crate::fs_scope::FsReadScope::Workspace && !tok.dynamic {
-            let suffix =
-                tok.text.strip_prefix("~/").or_else(
-                    || {
-                        if tok.text == "~" {
-                            Some("")
-                        } else {
-                            None
-                        }
-                    },
-                );
+        // Workspace scope 原本对 ~ 开头的静态路径不检查（依赖 shell 自己读不到就报错的
+        // 历史留白）；但只要调用方带了 extra roots（`--read-root`），这条 ~ 路径就必须
+        // 经过读范围判定——否则 `cat ~/.agentloom/pasted/x` 这类 tilde 写法会绕过检查。
+        if (ctx.fs_read_scope != crate::fs_scope::FsReadScope::Workspace
+            || !ctx.extra_read_roots.is_empty())
+            && !tok.dynamic
+        {
+            let suffix = tok
+                .text
+                .strip_prefix("~/")
+                .or_else(|| (tok.text == "~").then_some(""));
             if let (Some(home), Some(suffix)) = (std::env::var_os("HOME"), suffix) {
                 let expanded = PathBuf::from(home).join(suffix);
-                if !crate::fs_scope::read_path_allowed_with_roots(
-                    workspace,
+                if !crate::fs_scope::read_path_allowed_with_extra_roots(
+                    ctx.workspace,
                     &expanded,
-                    fs_read_scope,
-                    dependency_roots,
+                    ctx.fs_read_scope,
+                    ctx.dependency_roots,
+                    ctx.extra_read_roots,
                 ) {
                     return deny(
                         "outside_workspace",
@@ -173,7 +179,7 @@ fn check_path_token(
         }
         return None;
     }
-    let resolved = lexical_resolve(&tok.text, cwd);
+    let resolved = lexical_resolve(&tok.text, ctx.cwd);
     if is_write && (base == "rm" || base == "rmdir") && is_dangerous_removal_path(&resolved) {
         return deny(
             "rm_system_path",
@@ -181,13 +187,14 @@ fn check_path_token(
         );
     }
     let outside_allowed_read = !is_write
-        && crate::fs_scope::read_path_allowed_with_roots(
-            workspace,
+        && crate::fs_scope::read_path_allowed_with_extra_roots(
+            ctx.workspace,
             &resolved,
-            fs_read_scope,
-            dependency_roots,
+            ctx.fs_read_scope,
+            ctx.dependency_roots,
+            ctx.extra_read_roots,
         );
-    if is_outside_workspace(&resolved, workspace) && !outside_allowed_read {
+    if is_outside_workspace(&resolved, ctx.workspace) && !outside_allowed_read {
         return deny(
             "outside_workspace",
             format!(
@@ -196,7 +203,7 @@ fn check_path_token(
             ),
         );
     }
-    if is_write && is_dangerous_config_target(&tok.text, cwd) {
+    if is_write && is_dangerous_config_target(&tok.text, ctx.cwd) {
         return deny(
             "dangerous_config_write",
             format!(
@@ -216,21 +223,23 @@ pub fn dangerous_command_scan(
     cwd: &Path,
     workspace: &Path,
     fs_read_scope: crate::fs_scope::FsReadScope,
+    extra_read_roots: &[PathBuf],
 ) -> Option<DenyReason> {
     let roots = match fs_read_scope {
         crate::fs_scope::FsReadScope::ProjectDeps => crate::fs_scope::project_dependency_roots(),
         crate::fs_scope::FsReadScope::Workspace | crate::fs_scope::FsReadScope::Wide => &[],
     };
-    dangerous_command_scan_with_roots(command, cwd, workspace, fs_read_scope, roots)
+    let ctx = ScanCtx {
+        cwd,
+        workspace,
+        fs_read_scope,
+        dependency_roots: roots,
+        extra_read_roots,
+    };
+    dangerous_command_scan_with_roots(command, &ctx)
 }
 
-fn dangerous_command_scan_with_roots(
-    command: &str,
-    cwd: &Path,
-    workspace: &Path,
-    fs_read_scope: crate::fs_scope::FsReadScope,
-    dependency_roots: &[PathBuf],
-) -> Option<DenyReason> {
+fn dangerous_command_scan_with_roots(command: &str, ctx: &ScanCtx) -> Option<DenyReason> {
     if has_process_substitution(command) {
         return deny(
             "process_substitution",
@@ -253,36 +262,40 @@ fn dangerous_command_scan_with_roots(
             return None;
         }
     };
-    let segments = split_segments(&tokens);
+
+    // `&>` 双方言分歧点：bash 合并成重定向、dash/posix sh 读成 `&` 分隔+`>` 重定向；两种读法都扫、任一危险即拒。
+    scan_tokens(&tokens, ctx).or_else(|| {
+        has_ampersand_redirect(&tokens)
+            .then(|| scan_tokens(&derive_posix_ampersand(&tokens), ctx))
+            .flatten()
+    })
+}
+
+/// 按给定 token 读法扫一遍（bash 读法或 posix 派生读法均可传入）。
+fn scan_tokens(tokens: &[Token], ctx: &ScanCtx) -> Option<DenyReason> {
+    let segments = split_segments(tokens);
 
     if has_cd_then_mutation(&segments) {
         return deny(
             "cd_then_mutation",
-            "命令先 `cd` 再写/重定向；路径会按变更后的目录落地、绕过检查。请用明确相对路径、别 cd。"
+            "命令先 `cd` 再写/删文件或重定向到真实文件；路径会按变更后的目录落地、绕过检查。请传 `cwd` 参数并用明确相对路径。"
                 .to_string(),
         );
     }
 
     for seg in &segments {
-        let real = strip_wrappers(seg);
+        let words = without_redirects(seg);
+        let real = strip_wrappers(&words);
         let base = real.first().map(|t| t.text.as_str()).unwrap_or("");
         let is_write_cmd = WRITE_COMMANDS.contains(&base);
         let is_read_cmd = READ_COMMANDS.contains(&base);
 
         for (op, target) in extract_redirects(seg) {
-            if target.text == "/dev/null" {
+            if is_null_redirect_target(&target) {
                 continue;
             }
             let is_w = matches!(op, RedirOp::Out | RedirOp::Append);
-            if let Some(r) = check_path_token(
-                &target,
-                cwd,
-                workspace,
-                fs_read_scope,
-                dependency_roots,
-                is_w,
-                base,
-            ) {
+            if let Some(r) = check_path_token(&target, ctx, is_w, base) {
                 return Some(r);
             }
         }
@@ -303,15 +316,7 @@ fn dangerous_command_scan_with_roots(
                                 is_operator: false,
                                 dynamic: tok.dynamic,
                             };
-                            if let Some(r) = check_path_token(
-                                &path_tok,
-                                cwd,
-                                workspace,
-                                fs_read_scope,
-                                dependency_roots,
-                                is_write_cmd,
-                                base,
-                            ) {
+                            if let Some(r) = check_path_token(&path_tok, ctx, is_write_cmd, base) {
                                 return Some(r);
                             }
                         }
@@ -319,15 +324,7 @@ fn dangerous_command_scan_with_roots(
                         continue;
                     }
                 }
-                if let Some(r) = check_path_token(
-                    tok,
-                    cwd,
-                    workspace,
-                    fs_read_scope,
-                    dependency_roots,
-                    is_write_cmd,
-                    base,
-                ) {
+                if let Some(r) = check_path_token(tok, ctx, is_write_cmd, base) {
                     return Some(r);
                 }
             }
@@ -342,13 +339,7 @@ fn dangerous_command_scan_with_roots(
                     && t.text.contains('c');
                 if is_dash_c {
                     if let Some(payload) = it.peek() {
-                        if let Some(r) = dangerous_command_scan_with_roots(
-                            &payload.text,
-                            cwd,
-                            workspace,
-                            fs_read_scope,
-                            dependency_roots,
-                        ) {
+                        if let Some(r) = dangerous_command_scan_with_roots(&payload.text, ctx) {
                             return Some(r);
                         }
                     }
@@ -360,312 +351,4 @@ fn dangerous_command_scan_with_roots(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn dangerous_command_scan(command: &str, cwd: &Path, workspace: &Path) -> Option<DenyReason> {
-        super::dangerous_command_scan(
-            command,
-            cwd,
-            workspace,
-            crate::fs_scope::FsReadScope::Workspace,
-        )
-    }
-    use std::path::Path;
-
-    #[test]
-    fn lexical_resolve_joins_relative_and_collapses_dotdot() {
-        let cwd = Path::new("/ws/proj");
-        assert_eq!(
-            lexical_resolve("src/x.rs", cwd),
-            Path::new("/ws/proj/src/x.rs")
-        );
-        assert_eq!(
-            lexical_resolve("../../etc/passwd", cwd),
-            Path::new("/etc/passwd")
-        );
-        assert_eq!(lexical_resolve("/etc/hosts", cwd), Path::new("/etc/hosts"));
-        assert_eq!(lexical_resolve("./a/./b", cwd), Path::new("/ws/proj/a/b"));
-    }
-
-    #[test]
-    fn outside_workspace_detects_escape() {
-        let ws = Path::new("/ws/proj");
-        assert!(!is_outside_workspace(Path::new("/ws/proj/src/x.rs"), ws));
-        assert!(is_outside_workspace(Path::new("/etc/passwd"), ws));
-        assert!(is_outside_workspace(Path::new("/ws/other"), ws));
-    }
-
-    #[test]
-    fn dangerous_removal_paths_match_cc_list() {
-        assert!(is_dangerous_removal_path(Path::new("/")));
-        assert!(is_dangerous_removal_path(Path::new("/etc")));
-        assert!(is_dangerous_removal_path(Path::new("/usr")));
-        assert!(is_dangerous_removal_path(Path::new("/tmp/")));
-        assert!(is_dangerous_removal_path(Path::new("*")));
-        assert!(is_dangerous_removal_path(Path::new("/var/*")));
-        assert!(!is_dangerous_removal_path(Path::new("/usr/local/bin")));
-        assert!(!is_dangerous_removal_path(Path::new("/ws/proj/src")));
-    }
-
-    #[test]
-    fn dangerous_config_hits_files_and_dirs_case_insensitive() {
-        assert!(path_hits_dangerous_config(Path::new(
-            "/ws/proj/.git/config"
-        )));
-        assert!(path_hits_dangerous_config(Path::new("/ws/proj/.bashrc")));
-        assert!(path_hits_dangerous_config(Path::new(
-            "/ws/proj/.CLAUDE.json"
-        )));
-        assert!(path_hits_dangerous_config(Path::new(
-            "/ws/proj/.claude/settings.json"
-        )));
-        assert!(path_hits_dangerous_config(Path::new("/ws/proj/.mcp.json")));
-        assert!(!path_hits_dangerous_config(Path::new(
-            "/ws/proj/.gitignore"
-        )));
-        assert!(!path_hits_dangerous_config(Path::new(
-            "/ws/proj/.vscode/settings.json"
-        )));
-        assert!(!path_hits_dangerous_config(Path::new(
-            "/ws/proj/.idea/x.iml"
-        )));
-        assert!(!path_hits_dangerous_config(Path::new(
-            "/ws/proj/src/main.rs"
-        )));
-    }
-
-    #[test]
-    fn config_target_resolves_relative_to_cwd() {
-        let cwd = Path::new("/ws/proj/sub");
-        assert!(is_dangerous_config_target("../.git/config", cwd));
-        assert!(is_dangerous_config_target(".bashrc", cwd));
-        assert!(!is_dangerous_config_target("notes.md", cwd));
-    }
-
-    use std::path::PathBuf;
-
-    fn ws() -> (PathBuf, PathBuf) {
-        (PathBuf::from("/ws/proj"), PathBuf::from("/ws/proj"))
-    }
-
-    #[test]
-    fn scan_blocks_write_outside_workspace() {
-        let (cwd, w) = ws();
-        assert!(dangerous_command_scan("echo x > ../out.txt", &cwd, &w).is_some());
-        assert!(dangerous_command_scan("rm /etc/hosts", &cwd, &w).is_some());
-        assert!(dangerous_command_scan("mv src/a.rs /tmp/a.rs", &cwd, &w).is_some());
-    }
-
-    #[test]
-    fn scan_blocks_dangerous_removal_and_config() {
-        let (cwd, w) = ws();
-        assert_eq!(
-            dangerous_command_scan("rm -rf /etc", &cwd, &w)
-                .unwrap()
-                .rule,
-            "rm_system_path"
-        );
-        assert_eq!(
-            dangerous_command_scan("rm -rf /", &cwd, &w).unwrap().rule,
-            "rm_system_path"
-        );
-        assert_eq!(
-            dangerous_command_scan("rm .git/config", &cwd, &w)
-                .unwrap()
-                .rule,
-            "dangerous_config_write"
-        );
-        assert_eq!(
-            dangerous_command_scan("echo x > .bashrc", &cwd, &w)
-                .unwrap()
-                .rule,
-            "dangerous_config_write"
-        );
-    }
-
-    #[test]
-    fn scan_blocks_proc_sub_cd_mutation_and_expansion() {
-        let (cwd, w) = ws();
-        assert_eq!(
-            dangerous_command_scan("echo x > >(tee .git/config)", &cwd, &w)
-                .unwrap()
-                .rule,
-            "process_substitution"
-        );
-        assert_eq!(
-            dangerous_command_scan("cd .git && echo x > config", &cwd, &w)
-                .unwrap()
-                .rule,
-            "cd_then_mutation"
-        );
-        assert_eq!(
-            dangerous_command_scan("rm $HOME/x", &cwd, &w).unwrap().rule,
-            "unresolvable_target"
-        );
-    }
-
-    #[test]
-    fn scan_blocks_read_secret_outside_workspace() {
-        let (cwd, w) = ws();
-        assert!(dangerous_command_scan("cat /etc/passwd", &cwd, &w).is_some());
-    }
-
-    #[test]
-    fn scan_applies_scope_only_to_reads_and_never_to_writes() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace");
-        let venv = root.path().join("venv");
-        let python = venv.join("bin/python3");
-        let dependency = venv.join("lib/site-packages/foo.py");
-        std::fs::create_dir(&workspace).unwrap();
-        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
-        std::fs::write(venv.join("pyvenv.cfg"), "home = /usr\n").unwrap();
-        std::fs::write(&python, "").unwrap();
-        std::fs::write(&dependency, "x = 1\n").unwrap();
-        let workspace = workspace.canonicalize().unwrap();
-
-        let test_path = std::env::join_paths([python.parent().unwrap()]).unwrap();
-        let roots =
-            crate::fs_scope::discover_project_dependency_roots(Some(&test_path), None, None, &[]);
-        assert!(super::dangerous_command_scan_with_roots(
-            &format!("cat {}", dependency.display()),
-            &workspace,
-            &workspace,
-            crate::fs_scope::FsReadScope::Workspace,
-            &roots,
-        )
-        .is_some());
-        assert!(super::dangerous_command_scan_with_roots(
-            &format!("cat {}", dependency.display()),
-            &workspace,
-            &workspace,
-            crate::fs_scope::FsReadScope::ProjectDeps,
-            &roots,
-        )
-        .is_none());
-        for command in [
-            format!("tee {}", dependency.display()),
-            format!("rm {}", dependency.display()),
-        ] {
-            for scope in [
-                crate::fs_scope::FsReadScope::Workspace,
-                crate::fs_scope::FsReadScope::ProjectDeps,
-                crate::fs_scope::FsReadScope::Wide,
-            ] {
-                assert!(super::dangerous_command_scan_with_roots(
-                    &command, &workspace, &workspace, scope, &roots,
-                )
-                .is_some());
-            }
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn expanded_scope_still_blocks_tilde_credentials() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace");
-        let home = root.path().join("home");
-        std::fs::create_dir(&workspace).unwrap();
-        std::fs::create_dir_all(home.join(".ssh")).unwrap();
-        std::fs::write(home.join(".ssh/id_rsa"), "secret").unwrap();
-        let workspace = workspace.canonicalize().unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", &home);
-
-        assert!(super::dangerous_command_scan(
-            "cat ~/.ssh/id_rsa",
-            &workspace,
-            &workspace,
-            crate::fs_scope::FsReadScope::Wide,
-        )
-        .is_some());
-        // Workspace keeps the historical dynamic/tilde-read scan behavior.
-        assert!(super::dangerous_command_scan(
-            "cat ~/.ssh/id_rsa",
-            &workspace,
-            &workspace,
-            crate::fs_scope::FsReadScope::Workspace,
-        )
-        .is_none());
-
-        match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-    }
-
-    #[test]
-    fn scan_allows_normal_in_workspace_commands() {
-        let (cwd, w) = ws();
-        assert!(dangerous_command_scan("rm src/x.rs", &cwd, &w).is_none());
-        assert!(dangerous_command_scan("grep -r foo .", &cwd, &w).is_none());
-        assert!(dangerous_command_scan("echo x > out.txt", &cwd, &w).is_none());
-        assert!(dangerous_command_scan("cargo build", &cwd, &w).is_none());
-        assert!(dangerous_command_scan("cat src/main.rs", &cwd, &w).is_none());
-    }
-
-    #[test]
-    fn scan_is_honest_does_not_block_interpreters() {
-        // 诚实 gap（设计 §二·用户拍）：解释器/eval/xargs 不在防护内·不拦。别删这条。
-        let (cwd, w) = ws();
-        assert!(
-            dangerous_command_scan("python -c \"import os; os.remove('/etc/x')\"", &cwd, &w)
-                .is_none()
-        );
-        assert!(dangerous_command_scan("xargs rm < list.txt", &cwd, &w).is_none());
-        assert!(dangerous_command_scan("eval \"$DANGER\"", &cwd, &w).is_none());
-    }
-
-    #[test]
-    fn scan_fail_closed_on_unparseable_write() {
-        let (cwd, w) = ws();
-        assert!(dangerous_command_scan("rm 'unterminated", &cwd, &w).is_some());
-    }
-
-    #[test]
-    fn scan_recurses_into_sh_c_payload() {
-        let (cwd, w) = ws();
-        assert!(dangerous_command_scan("sh -c 'rm /etc/hosts'", &cwd, &w).is_some());
-        assert!(dangerous_command_scan("bash -c \"rm .git/config\"", &cwd, &w).is_some());
-    }
-
-    #[test]
-    fn scan_fixups_tilde_dd_and_redirect_branches() {
-        let (cwd, w) = ws();
-        // Bug 1：裸 ~ / ~/ 写删必须挡（HOME·致命 footgun）
-        assert!(dangerous_command_scan("rm -rf ~", &cwd, &w).is_some());
-        assert!(dangerous_command_scan("echo x > ~/out", &cwd, &w).is_some());
-        assert!(dangerous_command_scan("rm -rf ~/Documents", &cwd, &w).is_some());
-        // Bug 2：dd of=PATH 写工作区外必须挡
-        assert!(dangerous_command_scan("dd of=/etc/passwd", &cwd, &w).is_some());
-        assert!(dangerous_command_scan("dd if=/dev/zero of=../escape", &cwd, &w).is_some());
-        // dd 的非文件操作数（bs=/count=）不该误拦
-        assert!(
-            dangerous_command_scan("dd if=in.bin of=out.bin bs=4096 count=10", &cwd, &w).is_none()
-        );
-        // 补的分支覆盖：>> append 出界 / cp 目标出界 / /dev/null 放行
-        assert!(dangerous_command_scan("echo x >> ../out.txt", &cwd, &w).is_some());
-        assert!(dangerous_command_scan("cp src/a.rs /tmp/b.rs", &cwd, &w).is_some());
-        assert!(dangerous_command_scan("echo x > /dev/null", &cwd, &w).is_none());
-    }
-
-    #[test]
-    fn scan_fixups_shell_cluster_and_touch_mkdir() {
-        let (cwd, w) = ws();
-        // P1：组合 flag 簇 -lc / -ec 也要穿透 payload
-        assert!(dangerous_command_scan("bash -lc 'rm /etc/hosts'", &cwd, &w).is_some());
-        assert!(dangerous_command_scan("sh -ec 'rm .git/config'", &cwd, &w).is_some());
-        // 单独 -c 仍穿透（不回归）
-        assert!(dangerous_command_scan("bash -c 'rm /etc/hosts'", &cwd, &w).is_some());
-        // P2：touch/mkdir 出界写要挡
-        assert!(dangerous_command_scan("touch /etc/x", &cwd, &w).is_some());
-        assert!(dangerous_command_scan("mkdir /etc/foo", &cwd, &w).is_some());
-        assert!(dangerous_command_scan("touch ~/x", &cwd, &w).is_some());
-        // 工作区内 touch/mkdir 仍放行
-        assert!(dangerous_command_scan("touch out.txt", &cwd, &w).is_none());
-        assert!(dangerous_command_scan("mkdir -p src/new", &cwd, &w).is_none());
-    }
-}
+mod tests;

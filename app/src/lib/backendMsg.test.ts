@@ -2,11 +2,14 @@
 import { readFileSync, readdirSync } from "fs";
 import { describe, expect, it } from "vitest";
 import type { Locale, TranslationKey } from "../i18n";
+import { messages } from "../i18nMessages";
 import {
   classifyLeadError,
   parseBackendError,
   renderBackendError,
 } from "./backendMsg";
+
+const i18nMessages: Record<Locale, Record<string, string>> = messages;
 
 const templates: Partial<Record<TranslationKey, string>> = {
   "backend.landing.noEvidence":
@@ -25,21 +28,6 @@ const t = (
   }
   return template;
 };
-
-function loadI18nMessages(): Record<Locale, Record<string, string>> {
-  const source = readFileSync("src/i18nMessages.ts", "utf-8");
-  const match = source.match(
-    /export const messages = (\{[\s\S]*?\n\} as const)/,
-  );
-  if (!match) throw new Error("Could not locate the i18n message tables");
-  const literalText = match[1].replace(/\s+as const$/, "");
-  return new Function(`"use strict"; return (${literalText});`)() as Record<
-    Locale,
-    Record<string, string>
-  >;
-}
-
-const i18nMessages = loadI18nMessages();
 
 // Historical debt only. New codes must never be added to this allowlist.
 const HISTORICAL_MISSING_BACKEND_MESSAGE_CODES = new Set([

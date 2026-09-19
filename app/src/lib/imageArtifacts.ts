@@ -29,6 +29,8 @@ const SEARCH_TOOLS: ReadonlySet<string> = new Set([
 // read/write/edit 类工具的输出是「文件内容/改动回执」，verifier 是「测试日志」；
 // 里面出现的图片路径是被引用的字符串（如 import、补丁、日志里的截图路径），
 // 不是这次工具调用产出的图片工件，同样不该渲染成图片附件卡。
+// 注：不含 "file"（codex file_change）——见下方 PRODUCED_PATH_IN_SUMMARY_TOOLS 之外
+// 那条注释：它的 summary 只有 basename，真实路径由后端塞进 output，走通用扫描捞取。
 const CONTENT_TOOLS: ReadonlySet<string> = new Set([
   "Read",
   "fs_read",
@@ -40,16 +42,25 @@ const CONTENT_TOOLS: ReadonlySet<string> = new Set([
   "fs_write",
   "fs_edit",
   "apply_patch",
-  "file",
 ]);
 
-export function imagePathsFromTool(
-  block: Extract<Block, { type: "tool" }>,
-): string[] {
-  if (SEARCH_TOOLS.has(block.tool) || CONTENT_TOOLS.has(block.tool)) return [];
-  const tokens = `${block.summary}\n${block.output ?? ""}`.split(
-    IMAGE_PATH_TOKEN_BOUNDARY,
-  );
+// T24b 规则 A（工具产物即图）：这几个工具的 summary 恒等于本次操作的目标文件路径
+// （后端 tool_summary()/harness s("path") 直接取 file_path/path，没有其他杂字），
+// 是可信的「产物路径」信号——不同于 output（可能是确认文案/回执，会被 CONTENT_TOOLS
+// 挡住不扫，理由同上）。只信 summary 本身，不解禁整个工具去扫 output，避免重新引入
+// CONTENT_TOOLS 本要挡的「引用字符串误判成产物」。
+const PRODUCED_PATH_IN_SUMMARY_TOOLS: ReadonlySet<string> = new Set([
+  "Write",
+  "Edit",
+  "MultiEdit",
+  "write",
+  "edit",
+  "fs_write",
+  "fs_edit",
+]);
+
+function extractImagePathTokens(text: string): string[] {
+  const tokens = text.split(IMAGE_PATH_TOKEN_BOUNDARY);
   const paths = tokens
     .map((token) =>
       token
@@ -74,7 +85,23 @@ export function imagePathsFromTool(
         token.includes("/")
       );
     });
-  return [...new Set(paths)].slice(0, MAX_IMAGE_PATHS_PER_TOOL_BLOCK);
+  return [...new Set(paths)];
+}
+
+export function imagePathsFromTool(
+  block: Extract<Block, { type: "tool" }>,
+): string[] {
+  if (SEARCH_TOOLS.has(block.tool)) return [];
+  if (PRODUCED_PATH_IN_SUMMARY_TOOLS.has(block.tool)) {
+    return extractImagePathTokens(block.summary).slice(
+      0,
+      MAX_IMAGE_PATHS_PER_TOOL_BLOCK,
+    );
+  }
+  if (CONTENT_TOOLS.has(block.tool)) return [];
+  return extractImagePathTokens(
+    `${block.summary}\n${block.output ?? ""}`,
+  ).slice(0, MAX_IMAGE_PATHS_PER_TOOL_BLOCK);
 }
 
 export type ImageArtifacts = {

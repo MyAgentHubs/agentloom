@@ -167,6 +167,7 @@ export function RightPanel({
             member={inspectorMember}
             onClose={onCloseInspector ?? (() => {})}
             onBackToList={onBackToList}
+            sessionId={sessionId}
           />
         ) : showTaskList ? (
           <TaskList
@@ -183,6 +184,7 @@ export function RightPanel({
             onStop={drill.onStop}
             goal={drill.goal}
             criteria={drill.criteria}
+            sessionId={sessionId}
           />
         ) : tab === null ? (
           <div className="rppicker">

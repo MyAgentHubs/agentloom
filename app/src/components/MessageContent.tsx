@@ -43,6 +43,10 @@ import {
   setAttachmentDataUri,
 } from "../lib/attachmentCache";
 import { renderBackendError } from "../lib/backendMsg";
+import { isSvgDataUri } from "../lib/imageClipboard";
+import { canCopyImageInEnv } from "../lib/imageClipboardTauri";
+import { copyImageToClipboard } from "../lib/imageClipboardTauri";
+import "../styles/chatImage.css";
 
 type Props = {
   blocks: Block[];
@@ -76,6 +80,10 @@ type Props = {
   onContinueScope?: (text: string) => void;
   onOpenInspector?: (assignmentId: string) => void;
   readonlyReason?: string | null;
+  /// 规则 B 总开关，透传给正文 `text` 块的 MarkdownBody（其余卡片类型不受
+  /// 影响）。默认关闭；调用方（聊天流 MessageStream）按 message.role 决定
+  /// 是否传 true——只有 assistant 消息才自动出图，user 消息保持关闭。
+  autoInlineImagePaths?: boolean;
 };
 
 type AttachmentContent = {
@@ -117,7 +125,6 @@ function isRelativeImagePath(path: string): boolean {
 function isHtmlPath(path: string): boolean {
   return /\.html?$/i.test(path);
 }
-
 function mediaTypeFromPath(path: string): string {
   const extension = path.split(".").pop()?.toLowerCase();
   if (extension === "jpg" || extension === "jpeg") return "image/jpeg";
@@ -173,22 +180,6 @@ function useAttachmentImage(
   }, [fallbackMediaType, path, sessionId]);
 
   return { dataUri, failed };
-}
-
-function dataUriToBlob(dataUri: string): Blob {
-  const commaIndex = dataUri.indexOf(",");
-  if (commaIndex < 0) throw new Error("Invalid image data URI");
-
-  const metadata = dataUri.slice(0, commaIndex);
-  const mediaType = metadata.match(/^data:([^;,]+)/)?.[1] || "image/png";
-  const encoded = dataUri.slice(commaIndex + 1);
-  const decoded = metadata.includes(";base64")
-    ? atob(encoded)
-    : decodeURIComponent(encoded);
-  const bytes = Uint8Array.from(decoded, (character) =>
-    character.charCodeAt(0),
-  );
-  return new Blob([bytes], { type: mediaType });
 }
 
 type ImageContextTriggerProps = {
@@ -269,9 +260,7 @@ function ImageContextTarget({
   const [feedback, setFeedback] = useState<string | null>(null);
   const clipboard =
     typeof navigator === "undefined" ? undefined : navigator.clipboard;
-  const canCopyImage =
-    typeof clipboard?.write === "function" &&
-    typeof ClipboardItem !== "undefined";
+  const canCopyImage = canCopyImageInEnv(clipboard);
 
   useEffect(() => {
     if (!menuPosition) return;
@@ -361,11 +350,21 @@ function ImageContextTarget({
   const copyImage = async () => {
     setMenuPosition(null);
     try {
-      if (!canCopyImage) throw new Error("Clipboard image API unavailable");
-      const blob = dataUriToBlob(dataUri);
-      await clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+      await copyImageToClipboard(dataUri, clipboard, canCopyImage);
       setFeedback(t("messageContent.imageMenu.imageCopied"));
-    } catch {
+    } catch (e) {
+      console.warn("copyImage failed:", e instanceof Error ? e.name : e);
+      // svg 栅格化 / 写剪贴板失败时改复制路径兜底，别让用户干等一个死结的
+      // 「复制失败」——路径好歹能贴给别人当索引。
+      if (isSvgDataUri(dataUri) && typeof clipboard?.writeText === "function") {
+        try {
+          await clipboard.writeText(path);
+          setFeedback(t("messageContent.imageMenu.svgCopyFallback"));
+          return;
+        } catch {
+          // 兜底也失败，落到下面的通用失败提示。
+        }
+      }
       setFeedback(t("messageContent.imageMenu.copyFailed"));
     }
   };
@@ -642,6 +641,7 @@ function ImageArtifactThumbnail({
           }}
         >
           <img
+            className="al-chat-image"
             src={dataUri}
             alt={name}
             style={{
@@ -697,12 +697,8 @@ function ImageBlockContent({
             aria-haspopup="menu"
             onClick={() => onOpenLightbox?.(path)}
             {...contextProps}
+            className="al-chat-image"
             style={{
-              display: "block",
-              maxHeight: 240,
-              maxWidth: "100%",
-              objectFit: "contain",
-              height: "auto",
               cursor: onOpenLightbox ? "zoom-in" : undefined,
             }}
           />
@@ -777,6 +773,7 @@ function MessageContentImpl({
   onContinueScope,
   onOpenInspector,
   readonlyReason,
+  autoInlineImagePaths = false,
 }: Props) {
   const { t } = useI18n();
   const MarkdownBody = useMarkdown();
@@ -1083,6 +1080,7 @@ function MessageContentImpl({
         onOpenPreview={openPreviewOrExternal}
         onOpenLightbox={onOpenLightbox}
         sessionId={sessionId}
+        autoInlineImagePaths={autoInlineImagePaths}
       >
         {block.text}
       </MarkdownBody>

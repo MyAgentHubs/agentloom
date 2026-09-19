@@ -42,7 +42,7 @@ Tier meanings:
 
 ## 2. Event Vocabulary
 
-The complete `harness.runtime.v1` vocabulary is 68 event types.
+The complete `harness.runtime.v1` vocabulary is 77 event types.
 
 | type | tier / stability | payload contract |
 | --- | --- | --- |
@@ -110,10 +110,19 @@ The complete `harness.runtime.v1` vocabulary is 68 event types.
 | `approval.requested` | Tier 1 minimum / stable, `command` Tier 2 / additive | Minimum stable set is `approval_id`, `tool`, `summary`, `cwd`, `policy`, `write_paths`; current payload also has `command`, a display string currently equal to `summary`, not a literal argv contract. |
 | `approval.resolved` | Tier 1 / stable | `approval_id`, `decision`, optional `reason`. |
 | `artifact.created` | Tier 2 / additive | `artifact_id`, `kind`, `path`, `title`, `mime_type`. |
-| `capabilities.declared` | `provider_id` / `model_id` Tier 1 stable, rest Tier 2 additive | `provider_id`, `model_id`, `supports_streaming`, `supports_reasoning_deltas`, `supports_tool_calling`, `supports_images`, `supports_computer_use`, `supports_shell_tool`, optional `max_context_tokens`, optional `output_token_limit`, `server_side_search`. `server_side_search` is the Tier 2 additive static capability bit for whether the provider service has native server-side search, determined by provider family and independent of network/flag state. Option fields may be `null`. |
+| `capabilities.declared` | `provider_id` / `model_id` Tier 1 stable, rest Tier 2 additive | `provider_id`, `model_id`, `supports_streaming`, `supports_reasoning_deltas`, `supports_tool_calling`, `supports_images`, `supports_computer_use`, `supports_shell_tool`, optional `max_context_tokens`, optional `output_token_limit`, `server_side_search`. `server_side_search` is the Tier 2 additive static capability bit for whether the provider service has native server-side search, determined by provider family and independent of network/flag state. `supports_images` (t12-img; T19 refined to model-level) is inferred by `crate::image::resolve_default_supports_images`: a model-name seed table first (e.g. only `glm-4v`/`glm-4.1v`/`glm-4.5v`/`glm-4.6v`-style GLM models are vision-capable, not the whole GLM family), falling back to provider family/id (`crate::image::default_supports_images`); it can be overridden per provider via `{PREFIX}_SUPPORTS_IMAGES` env or stored config (`myagent config provider`), and `OpenAiCompatibleProvider` additionally holds a same-run runtime override (T19: flips to `false` after a provider 400-rejects an image-bearing request, see `attachment.dropped` reason `provider_rejected` below) — it is not a fixed per-provider constant. Option fields may be `null`. |
 | `provider.turn.finished` | Tier 2 / additive | Emitted after each provider response is received. Current payload includes `turn`, `finish_reason`, `text_len`, `reasoning_len`, and `tool_calls`; `finish_reason` is `null` when absent, otherwise `"stop"`, `"length"`, `"tool_calls"`, or `"other:<value>"`. |
 | `provider.warning` | Tier 2 / additive | `warning`, `error`. Only real SSE currently drives this; mock does not drive it. |
 | `mcp.server.failed` | Tier 2 / additive | `server`, `phase`, `error`. Emitted when one MCP server fails during connection or tool listing; the runtime skips that server and continues the run. |
+| `attachment.dropped` | Tier 2 / additive | A user-attached image was not sent with a message: either the target provider does not declare `supports_images` (`reason:"provider_no_image_support"`), a resumed run's reloaded history could not recover the image data from its `source_path` (`reason:"source_missing"` when the file is gone, `reason:"source_changed"` when its reread bytes/content fingerprint/media type no longer match what was recorded, or `reason:"too_many_images"` when a single historical message's reloaded images exceed the per-turn cap and the overflow — beyond the cap, in original order — is dropped), or (T19) the provider itself rejected an image-bearing request with an HTTP 400 whose body matches a known "image content not accepted (capability negation)" signature (`reason:"provider_rejected"`) — the run strips images, retries once, and remembers the runtime override for the rest of the run so it does not keep resending images that keep bouncing. (T19b) The signature match is narrow: only an `error.code` of `"1210"`, a message containing both `content.type` and `allowed values`, or a message containing `image` plus an explicit capability-negation phrase (`not support`/`unsupported`/`does not support`/`not enabled`) — genuine format/size/count errors (bad `image_url`, oversized image, corrupt base64, too many images) and non-JSON bodies no longer match, so they surface as real provider errors instead of being silently swallowed as a false "model rejected images" retry. When native server-side search is also Active for the same request, the image fuse takes priority over the search-degrade retry — a 400 whose body matches the image-rejection signature goes straight to strip-and-retry (2 requests total) instead of first being misattributed to search and triggering an unrelated `native_search_degraded` warning plus an extra no-op retry. Once the runtime override is flipped for a provider instance, subsequent turns in the same run keep stripping images from the wire payload (and keep appending the degradation notice, since the wire copy is rebuilt each turn) but no longer emit a repeat `attachment.dropped` for the same already-reported rejection — one event per image per run, not one per turn. Current payload includes `reason`, `file` (basename only, never a full path), `media_type`, `bytes`, and — for the provider-capability reasons (`provider_no_image_support`, `provider_rejected`) only — `provider_id` and `model`; for `reason:"provider_rejected"` specifically, also `provider_error` (the provider's raw rejection message/body, truncated to at most 300 characters). The in-message degradation notice text for `provider_rejected` says the model/endpoint "rejected" the image (with the truncated provider error appended for context) rather than asserting the model "does not support" images, since the latter is often an inference that may not hold for the specific format/size/count error that actually occurred. |
+| `context.terrain.attached` | Tier 3 / unstable | Pre-existing event, newly documented (t12-img contract-coverage sweep, not part of this change). Reports detected project roots attached to the run's context. Shape may still change; consumers must tolerate it. |
+| `evidence.workspace.unverifiable` | Tier 3 / unstable | Pre-existing event, newly documented (t12-img contract-coverage sweep). Emitted when the evidence gate cannot verify workspace integrity for a turn. Current payload includes `turn`, `reason`, `edit_epoch`, `green_epoch`. |
+| `format.reflex.applied` | Tier 3 / unstable | Pre-existing event, newly documented (t12-img contract-coverage sweep). Emitted once per file the format reflex auto-formatted after an edit. Current payload includes `path`. |
+| `format.reflex.feedback` | Tier 3 / unstable | Pre-existing event, newly documented (t12-img contract-coverage sweep). Emitted with the aggregated format-reflex feedback text fed back to the model. Current payload includes `text`. |
+| `safety_net.checkpoint` | Tier 3 / unstable | Pre-existing event, newly documented (t12-img contract-coverage sweep). Emitted when the adaptive safety net takes a git checkpoint before a turn. Current payload includes `turn`, `stash_ref`, `untracked`. |
+| `safety_net.checkpoint_skipped` | Tier 3 / unstable | Pre-existing event, newly documented (t12-img contract-coverage sweep). Emitted when the safety net's checkpoint attempt is skipped (nothing to checkpoint). Current payload includes `turn`. |
+| `scope.advisory` | Tier 3 / unstable | Pre-existing event, newly documented (t12-img contract-coverage sweep). Non-blocking advisory when a tool call touches paths outside the agent's current scope. Current payload includes `tool`, `paths`. |
+| `scope.extended` | Tier 3 / unstable | Pre-existing event, newly documented (t12-img contract-coverage sweep). Emitted when `propose_scope_change{kind:"scope"}` widens the agent's editable file scope and the run continues. Current payload includes `requested`, `added`, `detail`, `authored_by`. The tool result now returns `scope_extend_rejected` with per-path reasons only when nothing was added and nothing was already in scope; a path already in scope is reported separately as `already_in_scope` (not a rejection — the agent can already write it), and this event is not emitted unless something was newly added. |
 
 Plan mode may short-circuit explicit answer-only requests before worklist
 planning. When the objective clearly says not to edit files and only asks for a
@@ -308,6 +317,17 @@ of a stdio `command`; the two flags are mutually exclusive at the CLI layer.
 emit the same `mcp.server.failed` event (phase `connect`) as stdio servers — no
 event schema change.
 
+`config mcp add` additively accepts `--header KEY=VALUE` (repeatable,
+2026-09-02): a url-type server may carry custom HTTP headers sent with every
+request over Streamable HTTP. `McpServerConfig` gains an optional `headers`
+field (serde-default, so existing `config.json` files parse unchanged). A
+header value may reference `${ENV_NAME}`, expanded from the process
+environment at connect time — so a header carrying a secret (e.g.
+`Authorization=Bearer ${MY_TOKEN}`) never needs the secret written into
+config.json. `config mcp list` prints header *names* only, never values.
+Connecting with headers uses the same connect/failure behavior as a
+header-less url server — no event schema change.
+
 `run` additively accepts (2026-07-25, L3 multi-engine lead):
 `--mcp-server <name>=<url>` (repeatable) injects a per-invocation Streamable
 HTTP MCP server; injected servers are always `trusted: true` and override a
@@ -315,10 +335,19 @@ config-defined server of the same name (a stderr notice is printed, never
 silent). The url must start with `http://` or `https://`. And
 `--append-system-prompt <text>` appends the given text after the built-in
 executor system prompt (never replaces it; absent flag leaves the prompt
-byte-identical). Both flags apply to `run` only — `resume`, `plan` child
-tasks, and `shell` do not accept them (resume/plan still start with an empty
-MCP server set; wiring them is a separate, future additive change). No event
-schema change.
+byte-identical). Both flags apply to `run` only — `resume` and `shell`'s
+resume-a-turn path do not accept them. No event schema change.
+
+`resume` additively loads config-defined `mcp_servers` the same way `run` does
+(2026-09-02): the config-file MCP server set is connected on resume, so a
+resumed run can see and call the same MCP tools a fresh `run` with the same
+config would. `shell`'s per-turn resume (once a run is active) benefits the
+same way, since it goes through the same resume path. This closes the prior
+gap where resume hardcoded an empty MCP server set. `plan` child tasks are
+unaffected and still start with an empty MCP server set — wiring plan is a
+separate, future additive change. The per-invocation `--mcp-server` /
+`--append-system-prompt` flags remain `run`-only (see above); resume has no
+equivalent flag, only the config-defined set. No event schema change.
 
 The `memory` namespace includes `memory remember <text> [--tags a,b]
 [--workspace <path>]`, which records one user-taught lesson as directly active
@@ -423,6 +452,13 @@ rest additive). `capabilities()` is a static declarative query: implementations
 must not perform network I/O in `capabilities()` or in its construction chain;
 `info` runs no task and requires no API key. Future dynamic probing or
 negotiation must use a new channel instead of changing this static semantic.
+
+The runtime environment variable `MYAGENT_DEBUG` (additive, t12-img), when set
+to any value, turns on the image-attachment subsystem's debug log (stderr
+only, never `--jsonl` stdout): source-path reload outcomes and context-budget
+decisions about whether an attached image counted toward the turn's token
+estimate. Absent (the default), no extra output. This is a diagnostic aid, not
+a contract surface — its exact lines are not stable and must not be parsed.
 
 ### App-Owned Checkpoint Capability
 

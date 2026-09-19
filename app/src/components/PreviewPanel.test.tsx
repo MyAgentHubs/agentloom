@@ -23,10 +23,18 @@ vi.mock("@tauri-apps/api/core", () => ({
       ? __deferInvoke(Promise.resolve())
       : __deferInvoke(invokeMock(...a)),
 }));
+const messageContentSpy = vi.fn();
 vi.mock("./MessageContent", () => ({
-  MessageContent: ({ blocks }: { blocks: { text: string }[] }) => (
-    <div data-testid="md">{blocks[0].text}</div>
-  ),
+  MessageContent: ({
+    blocks,
+    sessionId,
+  }: {
+    blocks: { text: string }[];
+    sessionId?: string | null;
+  }) => {
+    messageContentSpy({ sessionId });
+    return <div data-testid="md">{blocks[0].text}</div>;
+  },
 }));
 vi.mock("./CodeBlock", () => ({
   CodeBlock: ({ code, lang }: { code: string; lang?: string }) => (
@@ -36,10 +44,10 @@ vi.mock("./CodeBlock", () => ({
   ),
 }));
 
-function renderPanel(path: string | null) {
+function renderPanel(path: string | null, sessionId?: string | null) {
   return render(
     <I18nProvider initialLocale="zh">
-      <PreviewPanel path={path} />
+      <PreviewPanel path={path} sessionId={sessionId} />
     </I18nProvider>,
   );
 }
@@ -49,6 +57,26 @@ beforeEach(() => {
 });
 
 describe("PreviewPanel", () => {
+  it("sessionId 传给内嵌 markdown 内容的 MessageContent", async () => {
+    messageContentSpy.mockClear();
+    invokeMock.mockResolvedValueOnce({
+      name: "a.md",
+      kind: "text",
+      content: "# Title",
+      truncated: false,
+      byteLen: 7,
+    });
+
+    renderPanel("a.md", "sess-preview-1");
+
+    await waitFor(() => {
+      expect(screen.getByTestId("md")).toBeInTheDocument();
+    });
+    expect(messageContentSpy).toHaveBeenCalledWith({
+      sessionId: "sess-preview-1",
+    });
+  });
+
   it("renders Markdown text with MessageContent", async () => {
     invokeMock.mockResolvedValueOnce({
       name: "a.md",

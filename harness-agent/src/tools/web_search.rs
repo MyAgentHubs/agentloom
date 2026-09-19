@@ -211,6 +211,7 @@ mod tests {
             file_ledger: &mut ledger,
             network,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
         let out = tool.execute(&mut ctx, &call(args)).await.unwrap(); // 始终 Ok（outcome）
         let value = serde_json::from_str(&out.content).unwrap();

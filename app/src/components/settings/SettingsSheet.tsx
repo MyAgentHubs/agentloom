@@ -3,6 +3,7 @@ import { SettingsShell, type SettingsPage } from "./SettingsShell";
 import { useI18n } from "../../i18n";
 import { SettingsAbout } from "./SettingsAbout";
 import { SettingsChat } from "./SettingsChat";
+import { SettingsGeneral } from "./SettingsGeneral";
 import { SettingsRemoteControl } from "./SettingsRemoteControl";
 
 type Props = {
@@ -70,7 +71,9 @@ export function SettingsSheet(props: Props) {
         </div>
         <div className="settings-sheet__body">
           <SettingsShell activeKey={props.page} onNavigate={props.onPageChange}>
-            {props.page === "agents" ? (
+            {props.page === "general" ? (
+              <SettingsGeneral />
+            ) : props.page === "agents" ? (
               props.agentsContent
             ) : props.page === "search" ? (
               props.searchContent

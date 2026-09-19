@@ -44,7 +44,7 @@ pub(crate) fn read_path_allowed_with_roots(
         return false;
     }
 
-    if credential_path_denied(&lexical) || credential_path_denied(&canonical) {
+    if credential_path_denied(&lexical, roots) || credential_path_denied(&canonical, roots) {
         return false;
     }
 
@@ -58,8 +58,137 @@ pub(crate) fn read_path_allowed_with_roots(
     }
 }
 
+/// 同 `read_path_allowed_with_roots`，但额外接受一份 `extra_roots`（CLI `--read-root`）：
+/// 这份 roots 在**任意** scope 下都生效（包含默认的 Workspace），且始终先过凭据
+/// deny-list 再放行——不改变 `roots`（scope 派生根，例如 ProjectDeps）原本按 scope 门控
+/// 的语义。`extra_roots` 为空时与 `read_path_allowed_with_roots` 完全等价。
+pub(crate) fn read_path_allowed_with_extra_roots(
+    workspace: &Path,
+    candidate: &Path,
+    scope: FsReadScope,
+    roots: &[PathBuf],
+    extra_roots: &[PathBuf],
+) -> bool {
+    if read_path_allowed_with_roots(workspace, candidate, scope, roots) {
+        return true;
+    }
+    if extra_roots.is_empty() {
+        return false;
+    }
+    let workspace = match workspace.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    let lexical = lexical_normalize(candidate);
+    let canonical = crate::tools::fs_read::canonicalize_lenient(candidate);
+    if credential_path_denied(&lexical, roots)
+        || credential_path_denied(&canonical, roots)
+        || credential_path_denied_under_roots(&lexical, extra_roots)
+        || credential_path_denied_under_roots(&canonical, extra_roots)
+    {
+        return false;
+    }
+    path_in_workspace_or_roots(&lexical, &workspace, extra_roots)
+        && path_in_workspace_or_roots(&canonical, &workspace, extra_roots)
+}
+
+/// `credential_path_denied` 只锚定 `$HOME`；`--read-root` 允许放行 HOME 之外的目录
+/// （例如 AgentLoom 粘贴附件目录、临时协作目录），那些目录下同样可能藏着凭据文件
+/// （用户把整个项目/主目录当 extra root 传进来时尤其常见）。这里对每个 extra root
+/// 做**根相对**的凭据规则判定，与 HOME 锚定规则并列、不互相替代。
+///
+/// 沿 root→path 的相对路径**逐段**匹配（任意深度），与 `credential_path_denied` 里
+/// `.env` 的 basename 全局规则同深度语义——不像早期版本那样只锚 root 顶层一层
+/// （`--read-root <多仓父目录>` 下 `repoA/.ssh/**` 这类子目录凭据必须同样被拒）。
+fn credential_path_denied_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    const CREDENTIAL_DIR_NAMES: &[&str] = &[".ssh", ".aws", ".gnupg", ".kube"];
+    const CREDENTIAL_BASENAMES: &[&str] = &[".netrc", ".git-credentials", ".npmrc", ".pypirc"];
+
+    roots.iter().any(|root| {
+        if root.as_os_str().is_empty() {
+            return false;
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            return false;
+        };
+        let components: Vec<&OsStr> = relative.components().map(Component::as_os_str).collect();
+        let hits_credential_dir = components.iter().enumerate().any(|(index, component)| {
+            let Some(name) = component.to_str() else {
+                return false;
+            };
+            if CREDENTIAL_DIR_NAMES.contains(&name) {
+                return true;
+            }
+            // `.docker` 只在下一段恰是 `config.json` 时才拒（同 HOME 锚定规则的
+            // `.docker/config.json`，不是整个 `.docker` 目录都算凭据）。
+            name == ".docker"
+                && components.get(index + 1).and_then(|next| next.to_str()) == Some("config.json")
+        });
+        if hits_credential_dir {
+            return true;
+        }
+        relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| CREDENTIAL_BASENAMES.contains(&name))
+    })
+}
+
 fn path_in_workspace_or_roots(path: &Path, workspace: &Path, roots: &[PathBuf]) -> bool {
-    path.starts_with(workspace) || roots.iter().any(|root| path.starts_with(root))
+    path.starts_with(workspace)
+        || roots
+            .iter()
+            // fail-closed 保险丝：空根（`Path::starts_with(Path::new(""))` 恒为 true）绝不能
+            // 参与比对，否则任何路径都会被判定为「在根内」。正常情况下 `resolve_read_roots`
+            // 已经不会产出空根，这里是双保险，防止别的入口再喂空根进来。
+            .any(|root| !root.as_os_str().is_empty() && path.starts_with(root))
+}
+
+/// 校验并归一 CLI `--read-root` 的原始输入：每个目录必须存在（否则报错，文案带路径），
+/// canonicalize 后去重。用于给 fs_read / shell_exec 的读范围判定喂一份稳定的 extra roots。
+pub fn resolve_read_roots(raw: &[PathBuf]) -> std::result::Result<Vec<PathBuf>, String> {
+    let mut roots = Vec::new();
+    for candidate in raw {
+        let canonical = candidate.canonicalize().map_err(|e| {
+            format!(
+                "--read-root {} does not exist or is not accessible: {e}",
+                candidate.to_string_lossy()
+            )
+        })?;
+        if !canonical.is_dir() {
+            return Err(format!(
+                "--read-root {} is not a directory",
+                candidate.to_string_lossy()
+            ));
+        }
+        if read_root_is_home_or_ancestor(&canonical) {
+            eprintln!(
+                "warning: --read-root {} is $HOME or an ancestor of $HOME; read-only is enforced by the credential deny-list, not a mount-level guarantee — files outside the known deny-list patterns remain readable.",
+                candidate.to_string_lossy()
+            );
+        }
+        // 同时留存 lexical 拼写（同 `discover_project_dependency_roots`
+        // 的先例）：调用方给工具/shell 的候选路径未必已经过 symlink 解析
+        // （macOS 典型例子：$TMPDIR 的 /var/... 是 /private/var/... 的
+        // symlink），只存 canonical 会让「同一个真实目录、不同拼写」的合法
+        // 候选被 lexical 对比误判成越界。
+        //
+        // 只在 lexical **非空且是绝对路径**时才留存：`--read-root .` /
+        // `..` / `./..` / `foo/..` 这类相对输入，`lexical_normalize` 会
+        // 折叠成空 PathBuf（`ParentDir` 在空 PathBuf 上 `pop()` 是 no-op），
+        // 而 `Path::starts_with(Path::new(""))` 恒为 true —— 空根一旦混进
+        // roots 就等于放行整个文件系统。相对输入的 lexical 拼写本来就匹配
+        // 不上任何候选路径（比对前都已 join 成绝对路径），留着只是死重，
+        // 唯独对 `.`/`..` 这类输入是有害的，所以直接不存。
+        let lexical = lexical_normalize(candidate);
+        if lexical.is_absolute() && !lexical.as_os_str().is_empty() && !roots.contains(&lexical) {
+            roots.push(lexical);
+        }
+        if !roots.contains(&canonical) {
+            roots.push(canonical);
+        }
+    }
+    Ok(roots)
 }
 
 pub(crate) fn project_dependency_roots() -> &'static [PathBuf] {
@@ -163,9 +292,12 @@ fn looks_like_python_root(root: &Path) -> bool {
     })
 }
 
-fn credential_path_denied(path: &Path) -> bool {
+fn credential_path_denied(path: &Path, project_deps_roots: &[PathBuf]) -> bool {
     let basename = path.file_name().and_then(|name| name.to_str());
     if basename == Some(".env") || basename.is_some_and(|name| name.starts_with(".env.")) {
+        return true;
+    }
+    if extension_credential_denied(path, basename, project_deps_roots) {
         return true;
     }
 
@@ -200,10 +332,69 @@ fn credential_path_denied(path: &Path) -> bool {
         ".terraform.d",
         ".m2/settings.xml",
         ".gradle/gradle.properties",
+        ".config/gh",
+        ".claude/.credentials.json",
+        // 注意：`.gitconfig` 故意**不在**这份列表里——它本身通常不含凭据（凭据在
+        // `.git-credentials`，已在上面）；agent 排查 git 身份/PATH 时会正常读它。
+        ".zshrc",
+        ".zshrc.d",
+        ".bashrc",
+        ".profile",
     ]
     .iter()
     .flat_map(|suffix| homes.iter().map(move |home| home.join(suffix)))
     .any(|denied| path == denied || path.starts_with(&denied))
+}
+
+/// `*.pem` / `*.key` 按扩展名拒绝私钥/证书文件，不锚定 HOME（同 `.env` 的判法一致）：
+/// 常见于项目里、也常见于随便一个被 `--read-root` 放行的目录。但两类地方要豁免，
+/// 否则会误杀合法的公开证书文件：
+/// 1. 公开证书包常见 basename（`cacert.pem` / `ca-bundle.crt` / `cert.pem`）——这些是
+///    CA 证书链，不是私钥/凭据；
+/// 2. project-deps 根（venv / cargo registry / …）内的路径——`site-packages/certifi/
+///    cacert.pem` 这类文件是 `--fs-read-scope project-deps` 的核心用例要放行的东西。
+///    `project_deps_roots` 由调用方传入（跟 `read_path_allowed_with_roots` 的 `roots`
+///    参数同一份，Workspace/Wide 下是空切片），不直接读全局 `project_dependency_roots()`
+///    缓存——测试才能喂假根验证这条豁免，不被进程级 `OnceLock` 缠住。
+/// workspace 内的路径早已在调用方（`read_path_allowed_with_roots` 的 early-return）
+/// 放行，走不到这里；这里只处理 workspace 外的路径。`--read-root`（`extra_roots`）**不**
+/// 享受这条豁免——那是用户显式放行的任意目录，`R/fixture.pem` 仍应被拒。
+fn extension_credential_denied(
+    path: &Path,
+    basename: Option<&str>,
+    project_deps_roots: &[PathBuf],
+) -> bool {
+    const PUBLIC_CERT_BASENAMES: &[&str] = &["cacert.pem", "ca-bundle.crt", "cert.pem"];
+
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    if !(ext.eq_ignore_ascii_case("pem") || ext.eq_ignore_ascii_case("key")) {
+        return false;
+    }
+    if basename.is_some_and(|name| PUBLIC_CERT_BASENAMES.contains(&name)) {
+        return false;
+    }
+    if project_deps_roots
+        .iter()
+        .any(|root| !root.as_os_str().is_empty() && path.starts_with(root))
+    {
+        return false;
+    }
+    true
+}
+
+/// `--read-root` 指向 `$HOME` 本身或它的祖先目录时，凭据 deny-list 是唯一的防线
+/// （见 `credential_path_denied` 的已知缺口，如 `.config/gh`/`*.pem` 之外的漏网文件）。
+/// 调用方（CLI）据此打一条 warn，不报错——用户可能就是想这么用。
+pub(crate) fn read_root_is_home_or_ancestor(canonical: &Path) -> bool {
+    let Some(home) = std::env::var_os("HOME") else {
+        return false;
+    };
+    let Ok(canonical_home) = PathBuf::from(home).canonicalize() else {
+        return false;
+    };
+    canonical_home.starts_with(canonical)
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
@@ -223,202 +414,4 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serial_test::serial;
-
-    #[test]
-    #[cfg(unix)]
-    fn project_deps_discovers_venv_and_real_interpreter_roots() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().unwrap();
-        let root_path = root.path().canonicalize().unwrap();
-        let workspace = root_path.join("workspace");
-        let venv = root_path.join("venv");
-        let python = venv.join("bin/python3");
-        let package = venv.join("lib/python3.11/site-packages/foo.py");
-        let base = root_path.join("base-python");
-        let real_python = base.join("bin/python3");
-        let stdlib = base.join("lib/python3.11/os.py");
-        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(package.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(real_python.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(stdlib.parent().unwrap()).unwrap();
-        std::fs::create_dir(&workspace).unwrap();
-        std::fs::write(venv.join("pyvenv.cfg"), "home = ../base-python\n").unwrap();
-        std::fs::write(&real_python, "").unwrap();
-        symlink(&real_python, &python).unwrap();
-        std::fs::write(&package, "x = 1\n").unwrap();
-        std::fs::write(&stdlib, "# stdlib\n").unwrap();
-
-        let test_path = std::env::join_paths([python.parent().unwrap()]).unwrap();
-        let roots = discover_project_dependency_roots(Some(&test_path), None, None, &[]);
-        assert!(
-            roots.contains(&venv.canonicalize().unwrap()),
-            "venv root missing from {roots:?}"
-        );
-        assert!(
-            roots.contains(&base.canonicalize().unwrap()),
-            "real interpreter root missing from {roots:?}"
-        );
-        let package_allowed =
-            read_path_allowed_with_roots(&workspace, &package, FsReadScope::ProjectDeps, &roots);
-        let stdlib_allowed =
-            read_path_allowed_with_roots(&workspace, &stdlib, FsReadScope::ProjectDeps, &roots);
-
-        assert!(package_allowed, "venv site-packages root should be allowed");
-        assert!(stdlib_allowed, "real interpreter root should be allowed");
-    }
-
-    #[test]
-    fn project_deps_rejects_pyenv_shim_pseudo_root() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace");
-        let pyenv = root.path().join(".pyenv");
-        let shim = pyenv.join("shims/python3");
-        let version_file = pyenv.join("version");
-        let version_python = pyenv.join("versions/3.11.0/bin/python3");
-        let other_version = pyenv.join("versions/3.11.0/lib/python3.11/os.py");
-        std::fs::create_dir(&workspace).unwrap();
-        std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(version_python.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(other_version.parent().unwrap()).unwrap();
-        std::fs::write(&shim, "#!/bin/sh\n").unwrap();
-        std::fs::write(&version_file, "3.11.0\n").unwrap();
-        std::fs::write(&version_python, "").unwrap();
-        std::fs::write(&other_version, "# stdlib\n").unwrap();
-
-        let test_path = std::env::join_paths([shim.parent().unwrap()]).unwrap();
-        let roots = discover_project_dependency_roots(Some(&test_path), None, None, &[]);
-        let version_allowed = read_path_allowed_with_roots(
-            &workspace,
-            &version_file,
-            FsReadScope::ProjectDeps,
-            &roots,
-        );
-        let other_version_allowed = read_path_allowed_with_roots(
-            &workspace,
-            &other_version,
-            FsReadScope::ProjectDeps,
-            &roots,
-        );
-
-        assert!(!version_allowed, "the pyenv parent must not become a root");
-        assert!(
-            !other_version_allowed,
-            "all pyenv versions must not be statically allowed"
-        );
-    }
-
-    #[test]
-    fn project_deps_without_python3_fails_closed() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace");
-        let outside = root.path().join("python-root/lib/python3.11/os.py");
-        std::fs::create_dir(&workspace).unwrap();
-        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
-        std::fs::write(&outside, "# stdlib\n").unwrap();
-
-        let roots = discover_project_dependency_roots(None, None, None, &[]);
-        let allowed =
-            read_path_allowed_with_roots(&workspace, &outside, FsReadScope::ProjectDeps, &roots);
-
-        assert!(!allowed);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn python_root_rejects_symlink_markers() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().unwrap();
-        let config_root = root.path().join("config-root");
-        let config_target = root.path().join("real-pyvenv.cfg");
-        std::fs::create_dir(&config_root).unwrap();
-        std::fs::write(&config_target, "home = elsewhere\n").unwrap();
-        symlink(&config_target, config_root.join("pyvenv.cfg")).unwrap();
-
-        let lib_root = root.path().join("lib-root");
-        let python_dir = root.path().join("python3.11");
-        std::fs::create_dir_all(lib_root.join("lib")).unwrap();
-        std::fs::create_dir(&python_dir).unwrap();
-        symlink(&python_dir, lib_root.join("lib/python3.11")).unwrap();
-
-        assert!(!looks_like_python_root(&config_root));
-        assert!(!looks_like_python_root(&lib_root));
-    }
-
-    #[test]
-    fn python_root_requires_a_python_version_directory_name() {
-        let root = tempfile::tempdir().unwrap();
-        let evil_root = root.path().join("evil");
-        let versioned_root = root.path().join("versioned");
-        std::fs::create_dir_all(evil_root.join("lib/python-evil")).unwrap();
-        std::fs::create_dir_all(versioned_root.join("lib/python3.11")).unwrap();
-
-        assert!(!looks_like_python_root(&evil_root));
-        assert!(looks_like_python_root(&versioned_root));
-    }
-
-    #[test]
-    fn project_deps_does_not_allow_random_system_paths() {
-        let workspace = tempfile::tempdir().unwrap();
-        assert!(!read_path_allowed_with_roots(
-            workspace.path(),
-            Path::new("/etc/passwd"),
-            FsReadScope::ProjectDeps,
-            &[],
-        ));
-    }
-
-    #[test]
-    #[serial]
-    fn wide_allows_system_files_but_denies_credentials() {
-        let workspace = tempfile::tempdir().unwrap();
-        assert!(read_path_allowed(
-            workspace.path(),
-            Path::new("/etc/passwd"),
-            FsReadScope::Wide,
-        ));
-
-        let home = std::env::var_os("HOME").expect("HOME is set");
-        assert!(!read_path_allowed(
-            workspace.path(),
-            &Path::new(&home).join(".ssh/id_rsa"),
-            FsReadScope::Wide,
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn canonical_target_cannot_bypass_credentials_deny_list() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace");
-        let fake_ssh = root.path().join("home/.ssh");
-        let link = root.path().join("x");
-        std::fs::create_dir(&workspace).unwrap();
-        std::fs::create_dir_all(&fake_ssh).unwrap();
-        std::fs::write(fake_ssh.join("id_rsa"), "secret").unwrap();
-        symlink(&fake_ssh, &link).unwrap();
-
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", root.path().join("home"));
-
-        for scope in [FsReadScope::ProjectDeps, FsReadScope::Wide] {
-            assert!(!read_path_allowed_with_roots(
-                &workspace,
-                &link.join("id_rsa"),
-                scope,
-                &[],
-            ));
-        }
-        match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-    }
-}
+mod tests;

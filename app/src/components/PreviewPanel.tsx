@@ -161,6 +161,7 @@ export function PreviewPanel({
             <MessageContent
               blocks={[{ type: "text", text: data.content } as Block]}
               streaming={false}
+              sessionId={sessionId}
             />
           ) : ext === "svg" ? (
             <img

@@ -193,6 +193,7 @@ impl Tool for ShellExecToolImpl {
             &cwd,
             &ws_canon,
             ctx.fs_read_scope,
+            ctx.extra_read_roots,
         ) {
             emit_tool_failed(
                 ctx.recorder,

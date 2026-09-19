@@ -165,6 +165,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
 
         let out = MemoryLookupTool
@@ -207,6 +208,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::Off,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
 
         let out = MemoryLookupTool

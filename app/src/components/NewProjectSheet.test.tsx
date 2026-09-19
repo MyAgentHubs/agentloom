@@ -13,7 +13,7 @@ function renderSheet(
     onClose?: () => void;
     onCreate?: ReturnType<typeof vi.fn>;
     mode?: "create" | "edit";
-    initial?: { name: string; icon: string | null };
+    initial?: { name: string; icon: string | null; path?: string };
     onSave?: ReturnType<typeof vi.fn>;
     onRemove?: ReturnType<typeof vi.fn>;
   } = {},
@@ -127,12 +127,12 @@ describe("NewProjectSheet", () => {
     expect(onClose).toHaveBeenCalledTimes(2);
   });
 
-  it("编辑模式预填名称和 emoji，隐藏位置并保存", async () => {
+  it("编辑模式预填名称和 emoji，未改路径时保存 path 为 null", async () => {
     const user = userEvent.setup();
     const onSave = vi.fn().mockResolvedValue(undefined);
     renderSheet({
       mode: "edit",
-      initial: { name: "我的小说", icon: "🎨" },
+      initial: { name: "我的小说", icon: "🎨", path: "/Users/me/novel" },
       onSave,
     });
 
@@ -141,7 +141,6 @@ describe("NewProjectSheet", () => {
     ).toBeInTheDocument();
     expect(screen.getByLabelText("名称")).toHaveValue("我的小说");
     expect(screen.getByRole("radio", { name: "项目标识 🎨" })).toBeChecked();
-    expect(screen.queryByText("位置")).not.toBeInTheDocument();
 
     await user.clear(screen.getByLabelText("名称"));
     await user.type(screen.getByLabelText("名称"), "新名字");
@@ -149,8 +148,68 @@ describe("NewProjectSheet", () => {
     await user.click(screen.getByRole("button", { name: "保存" }));
 
     await waitFor(() =>
-      expect(onSave).toHaveBeenCalledWith({ name: "新名字", icon: "🚀" }),
+      expect(onSave).toHaveBeenCalledWith({
+        name: "新名字",
+        icon: "🚀",
+        path: null,
+      }),
     );
+  });
+
+  it("编辑模式渲染当前路径", () => {
+    renderSheet({
+      mode: "edit",
+      initial: { name: "我的小说", icon: "🎨", path: "/Users/me/novel" },
+      onSave: vi.fn(),
+    });
+
+    expect(screen.getByText("位置")).toBeInTheDocument();
+    expect(screen.getByText("/Users/me/novel")).toBeInTheDocument();
+  });
+
+  it("编辑模式选新目录后保存携带新路径", async () => {
+    const user = userEvent.setup();
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    openMock.mockResolvedValue("/Users/me/new-home");
+    renderSheet({
+      mode: "edit",
+      initial: { name: "我的小说", icon: "🎨", path: "/Users/me/novel" },
+      onSave,
+    });
+
+    await user.click(screen.getByRole("button", { name: /更改位置/ }));
+    expect(openMock).toHaveBeenCalledWith({ directory: true, multiple: false });
+    expect(screen.getByText("/Users/me/new-home")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() =>
+      expect(onSave).toHaveBeenCalledWith({
+        name: "我的小说",
+        icon: "🎨",
+        path: "/Users/me/new-home",
+      }),
+    );
+  });
+
+  it("编辑模式保存被后端拒绝时显示错误且弹窗不关", async () => {
+    const user = userEvent.setup();
+    const onSave = vi.fn().mockRejectedValue(new Error("路径不存在：/nope"));
+    const { onClose } = renderSheet({
+      mode: "edit",
+      initial: { name: "我的小说", icon: "🎨", path: "/Users/me/novel" },
+      onSave,
+    });
+
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() =>
+      expect(screen.getByText("路径不存在：/nope")).toBeInTheDocument(),
+    );
+    expect(onClose).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("dialog", { name: "编辑项目" }),
+    ).toBeInTheDocument();
   });
 
   it("编辑模式点击移除项目触发 onRemove", async () => {

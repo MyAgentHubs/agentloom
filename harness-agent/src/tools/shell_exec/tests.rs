@@ -175,6 +175,7 @@ fn context<'a>(
         file_ledger,
         network: crate::goal::NetworkPolicy::On,
         fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+        extra_read_roots: &[],
     }
 }
 

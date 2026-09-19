@@ -1,0 +1,18 @@
+/* 会话内图片统一样式（规则 C）：不管图片来自 ![]()、规则 B 自动出图、
+   还是粘贴附件回显，都套这一份尺寸/圆角/边框，不再各处各写一套内联样式。 */
+.al-chat-image {
+  display: block;
+  max-width: 100%;
+  max-height: 360px;
+  object-fit: contain;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+}
+
+/* 加载中的占位块固定最小高度，图片就绪前不因为「从 0 高度跳到实际高度」
+   带动周围内容抖动。 */
+.al-chat-image-loading {
+  display: block;
+  min-height: 120px;
+}

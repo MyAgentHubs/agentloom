@@ -218,6 +218,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             trusted: false,
+            headers: None,
         }
     }
 

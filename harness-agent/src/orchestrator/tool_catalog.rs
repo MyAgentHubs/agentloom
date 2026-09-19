@@ -78,7 +78,7 @@ fn propose_scope_change_def() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "propose_scope_change",
-            "description": "Adjust the task boundary. For kind=scope WITH a `paths` list, your editable file scope is widened and the run CONTINUES. For objective/constraint (or scope without paths): if a human/decision channel is available the run STOPS for the user to decide; otherwise the change is rejected with guidance and the run CONTINUES under the existing contract.",
+            "description": "Adjust the task boundary. For kind=scope WITH a `paths` list, your editable file scope is widened and the run CONTINUES. For objective/constraint (or scope without paths): if a human/decision channel is available the run STOPS for the user to decide; otherwise the change is rejected with guidance and the run CONTINUES under the existing contract. `paths` must be workspace-relative (no absolute paths, no `..`); this only widens the fs_write/fs_edit file scope and never permits shell_exec writes outside the workspace — if the tool result is `scope_extend_rejected`, do not retry the same rejected path.",
             "parameters": { "type": "object",
                 "properties": {
                     "kind": { "type": "string", "enum": ["scope", "objective", "constraint"] },
@@ -202,6 +202,27 @@ pub fn build_offered_tools(
     native_search_enabled: bool,
     disallowed: &BTreeSet<String>,
 ) -> Vec<serde_json::Value> {
+    build_offered_tools_with_roots(
+        registry,
+        capabilities,
+        network,
+        native_search_enabled,
+        disallowed,
+        &[],
+    )
+}
+
+/// 同 `build_offered_tools`，额外把 `extra_read_roots`（CLI `--read-root`）追加进
+/// fs_read / shell_exec 的工具描述，让模型不用先撞一次拒才知道这些目录可读。
+/// 空切片时与 `build_offered_tools` 完全等价（不追加任何文案）。
+pub fn build_offered_tools_with_roots(
+    registry: &ToolRegistry,
+    capabilities: &crate::provider::ProviderCapabilities,
+    network: crate::goal::NetworkPolicy,
+    native_search_enabled: bool,
+    disallowed: &BTreeSet<String>,
+    extra_read_roots: &[std::path::PathBuf],
+) -> Vec<serde_json::Value> {
     if !capabilities.supports_tool_calling {
         return Vec::new();
     }
@@ -222,6 +243,35 @@ pub fn build_offered_tools(
             }
         }
     }
+    if !extra_read_roots.is_empty() {
+        // `extra_read_roots` 可能同时含同一目录的 lexical + canonical 两份拼写（macOS
+        // `/var` vs `/private/var` symlink 场景，见 `fs_scope::resolve_read_roots`）；
+        // 给模型的 note 只列 canonical 那一份，按出现顺序去重，别把同一目录报两遍噪音。
+        let mut seen = std::collections::BTreeSet::new();
+        let mut canonical_paths = Vec::new();
+        for root in extra_read_roots {
+            let canonical = crate::tools::fs_read::canonicalize_lenient(root);
+            let text = canonical.to_string_lossy().into_owned();
+            if seen.insert(text.clone()) {
+                canonical_paths.push(text);
+            }
+        }
+        let list = canonical_paths.join(", ");
+        let note = format!(
+            "Note: these extra directories outside the workspace are also readable (read-only): {list}."
+        );
+        for tool in tools.iter_mut() {
+            if matches!(
+                tool["function"]["name"].as_str(),
+                Some("fs_read") | Some("shell_exec") | Some("ls")
+            ) {
+                if let Some(orig) = tool["function"]["description"].as_str() {
+                    let updated = format!("{orig} {note}");
+                    tool["function"]["description"] = serde_json::Value::String(updated);
+                }
+            }
+        }
+    }
     tools.push(propose_scope_change_def());
     tools.push(propose_criterion_def());
     tools.push(register_issue_probe_def());
@@ -229,4 +279,146 @@ pub fn build_offered_tools(
     tools.push(update_working_state_def());
     tools.retain(|t| !disallowed.contains(t["function"]["name"].as_str().unwrap_or_default()));
     tools
+}
+
+#[cfg(test)]
+mod extra_read_root_note_tests {
+    use super::*;
+    use crate::provider::ProviderCapabilities;
+    use crate::tools::fs_read::FsReadTool;
+    use crate::tools::ls::LsTool;
+    use crate::tools::shell_exec::ShellExecTool;
+    use crate::tools::ToolRegistry;
+
+    fn caps() -> ProviderCapabilities {
+        ProviderCapabilities {
+            provider_id: "p".into(),
+            model_id: "m".into(),
+            supports_streaming: false,
+            supports_reasoning_deltas: false,
+            supports_tool_calling: true,
+            supports_images: false,
+            supports_computer_use: false,
+            supports_shell_tool: true,
+            max_context_tokens: None,
+            output_token_limit: None,
+            server_side_search: false,
+        }
+    }
+
+    fn registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(FsReadTool));
+        registry.register(Box::new(LsTool));
+        registry.register(Box::new(ShellExecTool));
+        registry
+    }
+
+    // P3-2：`ls` 也走了 extra roots（`resolve_for_read(ctx.extra_read_roots)`），
+    // 描述应该和 `fs_read` / `shell_exec` 一样带上 "(read-only)" note。
+    #[test]
+    fn ls_tool_description_gets_extra_root_note_like_fs_read_and_shell_exec() {
+        let root = tempfile::tempdir().unwrap();
+        let extra = root.path().join("extra");
+        std::fs::create_dir(&extra).unwrap();
+        let roots = crate::fs_scope::resolve_read_roots(std::slice::from_ref(&extra)).unwrap();
+
+        let tools = build_offered_tools_with_roots(
+            &registry(),
+            &caps(),
+            crate::goal::NetworkPolicy::On,
+            false,
+            &BTreeSet::new(),
+            &roots,
+        );
+
+        for name in ["fs_read", "ls", "shell_exec"] {
+            let tool = tools
+                .iter()
+                .find(|t| t["function"]["name"] == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            let description = tool["function"]["description"].as_str().unwrap();
+            assert!(
+                description.contains("also readable (read-only)"),
+                "{name} description missing extra-root note: {description}"
+            );
+        }
+
+        // P3-4：note 里点名的每条路径都必须真能被 `resolve_for_read` 放行——不能
+        // 光说不做，模型照着 note 里的路径读却撞拒。
+        let workspace = tempfile::tempdir().unwrap();
+        for root in &roots {
+            let canonical = crate::tools::fs_read::canonicalize_lenient(root);
+            assert!(
+                crate::tools::fs_read::resolve_for_read(
+                    workspace.path(),
+                    &canonical.to_string_lossy(),
+                    crate::fs_scope::FsReadScope::Workspace,
+                    &roots,
+                )
+                .is_ok(),
+                "note-eligible root {canonical:?} must be readable via resolve_for_read"
+            );
+        }
+    }
+
+    // P3-2：`resolve_read_roots` 可能同时留存同一目录的 lexical + canonical 两份拼写
+    // （macOS `/var` vs `/private/var`）；note 文案里不应该把同一个目录列两遍。这里直接
+    // 构造一份「同一真实目录、两个拼写」的 roots，不依赖 tempdir 是否恰好落在符号链接上。
+    #[test]
+    fn extra_root_note_lists_each_directory_once_even_with_dual_spellings() {
+        let root = tempfile::tempdir().unwrap();
+        let extra = root.path().join("extra");
+        std::fs::create_dir(&extra).unwrap();
+        let canonical = extra.canonicalize().unwrap();
+        let lexical_spelling = std::path::PathBuf::from(format!(
+            "{}/./extra",
+            root.path().to_string_lossy().trim_end_matches('/')
+        ));
+        assert_ne!(
+            canonical, lexical_spelling,
+            "test setup requires two distinct spellings of the same directory"
+        );
+        let roots = vec![lexical_spelling.clone(), canonical.clone()];
+
+        let tools = build_offered_tools_with_roots(
+            &registry(),
+            &caps(),
+            crate::goal::NetworkPolicy::On,
+            false,
+            &BTreeSet::new(),
+            &roots,
+        );
+        let fs_read_desc = tools
+            .iter()
+            .find(|t| t["function"]["name"] == "fs_read")
+            .unwrap()["function"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let occurrences = fs_read_desc
+            .matches(canonical.to_string_lossy().as_ref())
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "expected canonical dir to be listed exactly once, got {occurrences} in {fs_read_desc:?}"
+        );
+        assert!(
+            !fs_read_desc.contains(lexical_spelling.to_string_lossy().as_ref()),
+            "expected the non-canonical spelling to be dropped from the note, got {fs_read_desc:?}"
+        );
+
+        // P3-4：note 里实际点名的那份 canonical 路径必须真能被 `resolve_for_read` 放行。
+        let workspace = tempfile::tempdir().unwrap();
+        assert!(
+            crate::tools::fs_read::resolve_for_read(
+                workspace.path(),
+                &canonical.to_string_lossy(),
+                crate::fs_scope::FsReadScope::Workspace,
+                &roots,
+            )
+            .is_ok(),
+            "note-listed canonical dir {canonical:?} must be readable via resolve_for_read"
+        );
+    }
 }

@@ -1,5 +1,3 @@
-// @ts-expect-error - Vitest runs in Node, but this frontend tsconfig has no Node type declarations.
-import { readFileSync } from "fs";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -7,6 +5,7 @@ const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 import { I18nProvider, useI18n } from "./i18n";
+import { messages } from "./i18nMessages";
 import { OverviewHome } from "./components/OverviewHome";
 import { SettingsLanguage } from "./components/settings/SettingsLanguage";
 
@@ -185,36 +184,6 @@ describe("i18n", () => {
 });
 
 /**
- * i18n.tsx 里的 `messages` 对象没有导出（只导出了 `I18nKey` 类型，用于编译期约束），
- * 生产代码也不该为了测试专门开一个运行时导出口子。
- * 所以这里读源码文本、原样还原出 `const messages = { zh: {...}, en: {...} } as const`
- * 这段字面量并用 `Function` 求值，拿到真正的运行时对象来做 key 对齐检查——
- * 不修改 i18n.tsx。
- */
-function loadI18nMessages(): {
-  zh: Record<string, unknown>;
-  en: Record<string, unknown>;
-} {
-  const source = readFileSync("src/i18nMessages.ts", "utf-8");
-  const match = source.match(
-    /export const messages = (\{[\s\S]*?\n\} as const)/,
-  );
-  if (!match) {
-    throw new Error(
-      "i18n.test.tsx: 未能在 i18n.tsx 中定位 `const messages = {...} as const` 字面量，" +
-        "i18n.tsx 的结构可能变了，需要更新这条测试的解析逻辑。",
-    );
-  }
-  const literalText = match[1].replace(/\s+as const$/, "");
-  // eslint-disable-next-line no-new-func -- 从源码文本还原运行时对象，避免为测试改生产导出面
-  const messages = new Function(`"use strict"; return (${literalText});`)() as {
-    zh: Record<string, unknown>;
-    en: Record<string, unknown>;
-  };
-  return messages;
-}
-
-/**
  * 递归收集 key 路径（形如 `settings.search.title`）。
  * messages.zh / messages.en 目前是纯扁平对象（key 本身就是点分路径字符串，
  * value 全是 string），这里仍写成递归版本以兼容万一之后改成真嵌套对象的情况：
@@ -252,7 +221,6 @@ function formatKeyParityMismatch(
 
 describe("i18n key parity", () => {
   it("zh 和 en 的 key 集合完全一致（双向比较）", () => {
-    const messages = loadI18nMessages();
     const zhPaths = collectKeyPaths(messages.zh).sort();
     const enPaths = collectKeyPaths(messages.en).sort();
 

@@ -17,6 +17,7 @@ pub mod fs_scope;
 pub mod git_archive;
 pub mod goal;
 pub mod guardrails;
+pub mod image;
 pub mod inspect;
 pub mod journal;
 pub mod judge;
@@ -30,6 +31,7 @@ pub mod provider;
 pub mod run_progress;
 pub mod safety;
 pub mod shell;
+pub(crate) mod supports_images_seed; // T19：`default_supports_images` 的 model-name 种子表，见该文件顶部注释
 pub mod terrain;
 pub(crate) mod text_util;
 pub mod tools;

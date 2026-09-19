@@ -3,8 +3,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
+mod image_args;
 
-use crate::config::{self, StoredProvider};
+use crate::config::{self, config_images, StoredProvider};
 use crate::error::{HarnessError, Result};
 use crate::events::OutputMode;
 use crate::judge::{LlmJudge, NoopJudge};
@@ -96,6 +97,7 @@ fn merge_mcp_servers(
                 args: Vec::new(),
                 env: std::collections::BTreeMap::new(),
                 trusted: true,
+                headers: None,
             },
         );
     }
@@ -129,6 +131,10 @@ impl PreflightGate {
 #[derive(Debug, Parser)]
 #[command(name = "myagent")]
 #[command(about = "MyAgentHubs harness-agent CLI")]
+#[command(
+    after_help = "Environment: MYAGENT_DEBUG (any value) turns on stderr-only debug \
+logging for image-attachment reload and context-budget decisions; never affects --jsonl."
+)]
 pub struct Cli {
     #[command(flatten)]
     interactive: InteractiveArgs,
@@ -177,7 +183,7 @@ struct InteractiveArgs {
     #[arg(
         long,
         default_value = "deepseek",
-        help = "已知: deepseek|glm|kimi|qwen|grok|gemini|zai|anthropic|claude（后三走 Anthropic 协议·自动判）；也可传任意 OpenAI 兼容 provider 名；端点/密钥/协议用 {PREFIX}_BASE_URL / {PREFIX}_API_KEY / {PREFIX}_PROTOCOL 覆盖"
+        help = "已知: deepseek|glm|kimi|qwen|grok|gemini|zai|anthropic|claude（后三走 Anthropic 协议·自动判）；也可传任意 OpenAI 兼容 provider 名；端点/密钥/协议用 {PREFIX}_BASE_URL / {PREFIX}_API_KEY / {PREFIX}_PROTOCOL 覆盖；图片能力默认按家族猜，可用 {PREFIX}_SUPPORTS_IMAGES=true/false 覆盖"
     )]
     provider: String,
     #[arg(long, value_enum, default_value_t = PermissionPolicy::Ask)]
@@ -186,6 +192,11 @@ struct InteractiveArgs {
     network: crate::goal::NetworkPolicy,
     #[arg(long = "fs-read-scope", value_enum, default_value_t = crate::fs_scope::FsReadScope::Workspace)]
     fs_read_scope: crate::fs_scope::FsReadScope,
+    #[arg(
+        long = "read-root",
+        help = "显式放行的额外只读目录，可重复传（例如 AgentLoom 粘贴附件目录）。只放行读，写/删仍按 --fs-read-scope 原规则。注意：只读由策略层（deny-list + 路径判定）保证，不是挂载级只读——指向 $HOME 或其祖先目录时会打印一条 warning。"
+    )]
+    read_root: Vec<PathBuf>,
     #[arg(long = "fs-write-fence", value_enum, default_value_t = crate::exec::sandbox::FsWriteFence::Off)]
     fs_write_fence: crate::exec::sandbox::FsWriteFence,
     #[arg(long = "evidence-gate", value_enum, default_value_t = crate::orchestrator::EvidenceGate::Off)]
@@ -226,6 +237,8 @@ struct InteractiveArgs {
         help = "Stop early when the same reflex validation failure repeats this many consecutive times when approved verifiable criteria exist (default on; 0 disables)."
     )]
     watchdog_repeat: usize,
+    #[command(flatten)]
+    image_args: image_args::ImageArgs,
 }
 
 #[derive(Debug, Args)]
@@ -235,7 +248,7 @@ struct RunArgs {
     #[arg(
         long,
         default_value = "deepseek",
-        help = "已知: deepseek|glm|kimi|qwen|grok|gemini|zai|anthropic|claude（后三走 Anthropic 协议·自动判）；也可传任意 OpenAI 兼容 provider 名；端点/密钥/协议用 {PREFIX}_BASE_URL / {PREFIX}_API_KEY / {PREFIX}_PROTOCOL 覆盖"
+        help = "已知: deepseek|glm|kimi|qwen|grok|gemini|zai|anthropic|claude（后三走 Anthropic 协议·自动判）；也可传任意 OpenAI 兼容 provider 名；端点/密钥/协议用 {PREFIX}_BASE_URL / {PREFIX}_API_KEY / {PREFIX}_PROTOCOL 覆盖；图片能力默认按家族猜，可用 {PREFIX}_SUPPORTS_IMAGES=true/false 覆盖"
     )]
     provider: String,
     #[arg(long)]
@@ -246,6 +259,11 @@ struct RunArgs {
     network: crate::goal::NetworkPolicy,
     #[arg(long = "fs-read-scope", value_enum, default_value_t = crate::fs_scope::FsReadScope::Workspace)]
     fs_read_scope: crate::fs_scope::FsReadScope,
+    #[arg(
+        long = "read-root",
+        help = "显式放行的额外只读目录，可重复传（例如 AgentLoom 粘贴附件目录）。只放行读，写/删仍按 --fs-read-scope 原规则。注意：只读由策略层（deny-list + 路径判定）保证，不是挂载级只读——指向 $HOME 或其祖先目录时会打印一条 warning。"
+    )]
+    read_root: Vec<PathBuf>,
     #[arg(long = "fs-write-fence", value_enum, default_value_t = crate::exec::sandbox::FsWriteFence::Off)]
     fs_write_fence: crate::exec::sandbox::FsWriteFence,
     #[arg(long = "evidence-gate", value_enum, default_value_t = crate::orchestrator::EvidenceGate::Off)]
@@ -305,6 +323,8 @@ struct RunArgs {
         help = "把这段文本追加到内置 system prompt 之后（不替换）"
     )]
     append_system_prompt: Option<String>,
+    #[command(flatten)]
+    image_args: image_args::ImageArgs,
 }
 
 #[derive(Debug, Args)]
@@ -314,7 +334,7 @@ struct PlanArgs {
     #[arg(
         long,
         default_value = "deepseek",
-        help = "已知: deepseek|glm|kimi|qwen|grok|gemini|zai|anthropic|claude（后三走 Anthropic 协议·自动判）；也可传任意 OpenAI 兼容 provider 名；端点/密钥/协议用 {PREFIX}_BASE_URL / {PREFIX}_API_KEY / {PREFIX}_PROTOCOL 覆盖"
+        help = "已知: deepseek|glm|kimi|qwen|grok|gemini|zai|anthropic|claude（后三走 Anthropic 协议·自动判）；也可传任意 OpenAI 兼容 provider 名；端点/密钥/协议用 {PREFIX}_BASE_URL / {PREFIX}_API_KEY / {PREFIX}_PROTOCOL 覆盖；图片能力默认按家族猜，可用 {PREFIX}_SUPPORTS_IMAGES=true/false 覆盖"
     )]
     provider: String,
     #[arg(long)]
@@ -325,6 +345,11 @@ struct PlanArgs {
     network: crate::goal::NetworkPolicy,
     #[arg(long = "fs-read-scope", value_enum, default_value_t = crate::fs_scope::FsReadScope::Workspace)]
     fs_read_scope: crate::fs_scope::FsReadScope,
+    #[arg(
+        long = "read-root",
+        help = "显式放行的额外只读目录，可重复传（例如 AgentLoom 粘贴附件目录）。只放行读，写/删仍按 --fs-read-scope 原规则。注意：只读由策略层（deny-list + 路径判定）保证，不是挂载级只读——指向 $HOME 或其祖先目录时会打印一条 warning。"
+    )]
+    read_root: Vec<PathBuf>,
     #[arg(long = "fs-write-fence", value_enum, default_value_t = crate::exec::sandbox::FsWriteFence::Off)]
     fs_write_fence: crate::exec::sandbox::FsWriteFence,
     #[arg(long = "evidence-gate", value_enum, default_value_t = crate::orchestrator::EvidenceGate::Off)]
@@ -358,6 +383,8 @@ struct PlanArgs {
     /// Resume a crashed plan run from its persisted state.
     #[arg(long)]
     resume: bool,
+    #[command(flatten)]
+    image_args: image_args::ImageArgs,
 }
 
 #[derive(Debug, Args)]
@@ -366,7 +393,7 @@ struct ResumeArgs {
     prompt: Option<String>,
     #[arg(
         long,
-        help = "已知: deepseek|glm|kimi|qwen|grok|gemini|zai|anthropic|claude（后三走 Anthropic 协议·自动判）；也可传任意 OpenAI 兼容 provider 名；端点/密钥/协议用 {PREFIX}_BASE_URL / {PREFIX}_API_KEY / {PREFIX}_PROTOCOL 覆盖"
+        help = "已知: deepseek|glm|kimi|qwen|grok|gemini|zai|anthropic|claude（后三走 Anthropic 协议·自动判）；也可传任意 OpenAI 兼容 provider 名；端点/密钥/协议用 {PREFIX}_BASE_URL / {PREFIX}_API_KEY / {PREFIX}_PROTOCOL 覆盖；图片能力默认按家族猜，可用 {PREFIX}_SUPPORTS_IMAGES=true/false 覆盖"
     )]
     provider: Option<String>,
     #[arg(long)]
@@ -377,6 +404,11 @@ struct ResumeArgs {
     network: crate::goal::NetworkPolicy,
     #[arg(long = "fs-read-scope", value_enum, default_value_t = crate::fs_scope::FsReadScope::Workspace)]
     fs_read_scope: crate::fs_scope::FsReadScope,
+    #[arg(
+        long = "read-root",
+        help = "显式放行的额外只读目录，可重复传（例如 AgentLoom 粘贴附件目录）。只放行读，写/删仍按 --fs-read-scope 原规则。注意：只读由策略层（deny-list + 路径判定）保证，不是挂载级只读——指向 $HOME 或其祖先目录时会打印一条 warning。"
+    )]
+    read_root: Vec<PathBuf>,
     #[arg(long = "fs-write-fence", value_enum, default_value_t = crate::exec::sandbox::FsWriteFence::Off)]
     fs_write_fence: crate::exec::sandbox::FsWriteFence,
     #[arg(long = "evidence-gate", value_enum, default_value_t = crate::orchestrator::EvidenceGate::Off)]
@@ -415,6 +447,8 @@ struct ResumeArgs {
     realign_constraint: Vec<String>,
     #[arg(long = "realign-reason")]
     realign_reason: Option<String>,
+    #[command(flatten)]
+    image_args: image_args::ImageArgs,
 }
 
 #[derive(Debug, Args)]
@@ -431,7 +465,7 @@ struct InfoArgs {
     #[arg(
         long,
         default_value = "deepseek",
-        help = "已知: deepseek|glm|kimi|qwen|grok|gemini|zai|anthropic|claude（后三走 Anthropic 协议·自动判）；也可传任意 OpenAI 兼容 provider 名；端点/密钥/协议用 {PREFIX}_BASE_URL / {PREFIX}_API_KEY / {PREFIX}_PROTOCOL 覆盖"
+        help = "已知: deepseek|glm|kimi|qwen|grok|gemini|zai|anthropic|claude（后三走 Anthropic 协议·自动判）；也可传任意 OpenAI 兼容 provider 名；端点/密钥/协议用 {PREFIX}_BASE_URL / {PREFIX}_API_KEY / {PREFIX}_PROTOCOL 覆盖；图片能力默认按家族猜，可用 {PREFIX}_SUPPORTS_IMAGES=true/false 覆盖"
     )]
     provider: String,
     #[arg(long)]
@@ -496,6 +530,12 @@ struct ConfigMcpAddArgs {
     /// Environment variables (comma-separated KEY=VALUE pairs).
     #[arg(long, value_delimiter = ',')]
     env: Vec<String>,
+    /// Custom HTTP header sent with every request to a Streamable HTTP
+    /// server, as KEY=VALUE (repeatable). Only meaningful with --url. The
+    /// value may reference `${ENV_NAME}` to be expanded from the environment
+    /// at connect time, so secrets need not be written into config.json.
+    #[arg(long = "header")]
+    header: Vec<String>,
     /// Mark this server as trusted (allows tools without per-invocation approval).
     #[arg(long, default_value_t = false)]
     trusted: bool,
@@ -613,6 +653,8 @@ pub async fn run_from_env() -> Result<RunOutcome> {
 
 async fn run_command(args: RunArgs) -> Result<RunOutcome> {
     crate::exec::sandbox::validate_write_fence(args.fs_write_fence)?;
+    let extra_read_roots = crate::fs_scope::resolve_read_roots(&args.read_root)
+        .map_err(HarnessError::InvalidConfig)?;
     let workspace = args.workspace.unwrap_or(std::env::current_dir()?);
     let journal_root = resolve_journal_root(args.journal_dir, &workspace);
     let ws_for_learn = workspace.clone();
@@ -622,6 +664,7 @@ async fn run_command(args: RunArgs) -> Result<RunOutcome> {
     let auto_learn = args.auto_learn;
     let prompt = read_input(&args.input)?;
     let criteria = crate::goal::parse_criteria(&args.criteria)?;
+    let images = crate::image::load_images(&args.image_args.image)?;
     let disallowed_tools = args.disallow_tools.into_iter().collect();
     let output_mode = if args.jsonl {
         OutputMode::Jsonl
@@ -649,6 +692,7 @@ async fn run_command(args: RunArgs) -> Result<RunOutcome> {
             permission: args.permission,
             network: args.network,
             fs_read_scope: args.fs_read_scope,
+            extra_read_roots,
             fs_write_fence: args.fs_write_fence,
             evidence_gate: args.evidence_gate,
             native_search_enabled: args.native_search.enabled(),
@@ -671,6 +715,7 @@ async fn run_command(args: RunArgs) -> Result<RunOutcome> {
                 args.mcp_server,
             ),
             append_system_prompt: args.append_system_prompt,
+            images,
         },
     )
     .await?;
@@ -689,6 +734,8 @@ async fn run_command(args: RunArgs) -> Result<RunOutcome> {
 
 async fn resume_command(args: ResumeArgs) -> Result<RunOutcome> {
     crate::exec::sandbox::validate_write_fence(args.fs_write_fence)?;
+    let extra_read_roots = crate::fs_scope::resolve_read_roots(&args.read_root)
+        .map_err(HarnessError::InvalidConfig)?;
     let realign = resume_realign_input(&args)?;
     let workspace = args.workspace.unwrap_or(std::env::current_dir()?);
     let journal_root = resolve_journal_root(args.journal_dir, &workspace);
@@ -707,6 +754,7 @@ async fn resume_command(args: ResumeArgs) -> Result<RunOutcome> {
     } else {
         ControlInputKind::Sentinel
     };
+    let images = crate::image::load_images(&args.image_args.image)?;
 
     let result = resume_with_provider(
         &provider,
@@ -718,6 +766,7 @@ async fn resume_command(args: ResumeArgs) -> Result<RunOutcome> {
         args.permission,
         args.network,
         args.fs_read_scope,
+        extra_read_roots,
         args.fs_write_fence,
         args.max_turns,
         control_input,
@@ -728,6 +777,10 @@ async fn resume_command(args: ResumeArgs) -> Result<RunOutcome> {
         args.verify_every,
         args.watchdog_repeat,
         realign,
+        config::load_config()
+            .map(|c| c.mcp_servers())
+            .unwrap_or_default(),
+        images,
     )
     .await?;
     Ok(result.outcome)
@@ -795,10 +848,13 @@ async fn run_with_provider(
 
 async fn plan_command(args: PlanArgs) -> Result<RunOutcome> {
     crate::exec::sandbox::validate_write_fence(args.fs_write_fence)?;
+    let extra_read_roots = crate::fs_scope::resolve_read_roots(&args.read_root)
+        .map_err(HarnessError::InvalidConfig)?;
     let workspace = args.workspace.unwrap_or(std::env::current_dir()?);
     let journal_root = resolve_journal_root(args.journal_dir, &workspace);
     let objective = read_input(&args.input)?;
     let checks = crate::goal::parse_criteria(&args.criteria)?;
+    let images = crate::image::load_images(&args.image_args.image)?;
     let output_mode = if args.jsonl {
         OutputMode::Jsonl
     } else {
@@ -817,6 +873,7 @@ async fn plan_command(args: PlanArgs) -> Result<RunOutcome> {
         permission: args.permission,
         network: args.network,
         fs_read_scope: args.fs_read_scope,
+        extra_read_roots,
         fs_write_fence: args.fs_write_fence,
         output_mode,
         max_review_attempts: args.max_review_attempts,
@@ -826,6 +883,7 @@ async fn plan_command(args: PlanArgs) -> Result<RunOutcome> {
         max_eval_attempts: args.max_eval_attempts,
         default_task_max_turns: args.max_turns,
         preflight_gate: args.preflight_gate.enabled(),
+        images,
     };
     let result = plan_with_provider(
         &args.provider,
@@ -880,6 +938,7 @@ async fn resume_with_provider(
     permission: PermissionPolicy,
     network: crate::goal::NetworkPolicy,
     fs_read_scope: crate::fs_scope::FsReadScope,
+    extra_read_roots: Vec<PathBuf>,
     fs_write_fence: crate::exec::sandbox::FsWriteFence,
     max_turns: usize,
     control_input: ControlInputKind,
@@ -890,6 +949,8 @@ async fn resume_with_provider(
     verify_reflex_debt: usize,
     watchdog_repeat_threshold: usize,
     realign: Option<crate::goal::ReAlignInput>,
+    mcp_servers: Vec<crate::mcp::config::McpServerConfig>,
+    images: Vec<crate::image::ImageBlock>,
 ) -> Result<crate::orchestrator::RunResult> {
     match provider_name {
         "mock" => {
@@ -904,6 +965,7 @@ async fn resume_with_provider(
                 permission,
                 network,
                 fs_read_scope,
+                extra_read_roots.clone(),
                 fs_write_fence,
                 max_turns,
                 control_input,
@@ -914,6 +976,8 @@ async fn resume_with_provider(
                 verify_reflex_debt,
                 watchdog_repeat_threshold,
                 realign,
+                mcp_servers,
+                images,
             )
             .await
         }
@@ -944,6 +1008,7 @@ async fn resume_with_provider(
                         permission,
                         network,
                         fs_read_scope,
+                        extra_read_roots,
                         fs_write_fence,
                         max_turns,
                         control_input,
@@ -954,6 +1019,8 @@ async fn resume_with_provider(
                         verify_reflex_debt,
                         watchdog_repeat_threshold,
                         realign,
+                        mcp_servers,
+                        images,
                     )
                     .await
                 })
@@ -964,6 +1031,8 @@ async fn resume_with_provider(
 
 async fn interactive_command(args: InteractiveArgs) -> Result<()> {
     crate::exec::sandbox::validate_write_fence(args.fs_write_fence)?;
+    let extra_read_roots = crate::fs_scope::resolve_read_roots(&args.read_root)
+        .map_err(HarnessError::InvalidConfig)?;
     let workspace = args.workspace.unwrap_or(std::env::current_dir()?);
     let jsonl = args.jsonl;
     let journal_root = resolve_journal_root(args.journal_dir.clone(), &workspace);
@@ -979,6 +1048,7 @@ async fn interactive_command(args: InteractiveArgs) -> Result<()> {
     let mut active_run_id: Option<String> = None;
     let criteria = crate::goal::parse_criteria(&args.criteria)?;
     let mut context_files = args.context_files;
+    let mut pending_images = crate::image::load_images(&args.image_args.image)?; // 只随首次 fresh run 带出去
 
     if !jsonl {
         println!("myagent interactive");
@@ -1034,6 +1104,7 @@ async fn interactive_command(args: InteractiveArgs) -> Result<()> {
                 permission,
                 args.network,
                 args.fs_read_scope,
+                extra_read_roots.clone(),
                 args.fs_write_fence,
                 args.max_turns,
                 ControlInputKind::Sentinel,
@@ -1044,6 +1115,10 @@ async fn interactive_command(args: InteractiveArgs) -> Result<()> {
                 args.verify_every,
                 args.watchdog_repeat,
                 None,
+                config::load_config()
+                    .map(|c| c.mcp_servers())
+                    .unwrap_or_default(),
+                std::mem::take(&mut pending_images),
             )
             .await;
             (result, saved_provider)
@@ -1064,6 +1139,7 @@ async fn interactive_command(args: InteractiveArgs) -> Result<()> {
                     permission,
                     network: args.network,
                     fs_read_scope: args.fs_read_scope,
+                    extra_read_roots: extra_read_roots.clone(),
                     fs_write_fence: args.fs_write_fence,
                     evidence_gate: args.evidence_gate,
                     native_search_enabled: args.native_search.enabled(),
@@ -1083,6 +1159,7 @@ async fn interactive_command(args: InteractiveArgs) -> Result<()> {
                         .map(|c| c.mcp_servers())
                         .unwrap_or_default(),
                     append_system_prompt: None,
+                    images: std::mem::take(&mut pending_images),
                 },
             )
             .await;
@@ -1288,6 +1365,9 @@ fn info_command(args: InfoArgs) -> Result<()> {
                 fallback_model: None,
                 context_tokens: None,
                 output_tokens: None,
+                // env 优先、其次落盘覆盖——与真跑（`provider_config_with_model`）同一条
+                // 解析路径，`info` 报的值才不会跟实际跑起来时用的值不一致（P3-2）。
+                supports_images_override: config_images::resolve_for_info(provider)?,
             };
             let proto = protocol_override_for(provider);
             match crate::config::detect_provider_protocol(
@@ -1374,6 +1454,7 @@ fn config_command(command: ConfigCommand) -> Result<()> {
                     .unwrap_or_else(|| config::default_model(&provider)),
                 context_tokens: None,
                 output_tokens: None,
+                supports_images: None,
             })?;
             println!("saved provider {provider} to {}", path.to_string_lossy());
             Ok(())
@@ -1401,23 +1482,29 @@ fn config_command(command: ConfigCommand) -> Result<()> {
     }
 }
 
+/// Parse repeatable `KEY=VALUE` CLI values into a map, warning and dropping
+/// any pair that isn't well-formed (empty key, or missing `=`).
+fn parse_kv_pairs(pairs: &[String], label: &str) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .filter_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            match (parts.next(), parts.next()) {
+                (Some(k), Some(v)) if !k.is_empty() => Some((k.to_string(), v.to_string())),
+                _ => {
+                    eprintln!("warning: ignoring malformed {label} pair: {pair:?}");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 fn config_mcp_command(command: ConfigMcpCommand) -> Result<()> {
     match command {
         ConfigMcpCommand::Add(args) => {
-            let env: std::collections::BTreeMap<String, String> = args
-                .env
-                .iter()
-                .filter_map(|pair| {
-                    let mut parts = pair.splitn(2, '=');
-                    match (parts.next(), parts.next()) {
-                        (Some(k), Some(v)) if !k.is_empty() => Some((k.to_string(), v.to_string())),
-                        _ => {
-                            eprintln!("warning: ignoring malformed env pair: {pair:?}");
-                            None
-                        }
-                    }
-                })
-                .collect();
+            let env = parse_kv_pairs(&args.env, "env");
+            let headers = parse_kv_pairs(&args.header, "header");
 
             if args.command.is_none() && args.url.is_none() {
                 return Err(HarnessError::Runtime(
@@ -1432,6 +1519,11 @@ fn config_mcp_command(command: ConfigMcpCommand) -> Result<()> {
                 args: args.args,
                 env,
                 trusted: args.trusted,
+                headers: if headers.is_empty() {
+                    None
+                } else {
+                    Some(headers)
+                },
             };
 
             let path = config::save_mcp_server(&args.name, server)?;
@@ -1469,8 +1561,9 @@ fn config_mcp_command(command: ConfigMcpCommand) -> Result<()> {
                     let env_str = if server.env.is_empty() {
                         String::new()
                     } else {
-                        let pairs: Vec<_> =
-                            server.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                        // Print env var names only, values masked — env may carry secrets
+                        // (API keys, tokens) and must never be echoed in plain text.
+                        let pairs: Vec<_> = server.env.keys().map(|k| format!("{k}=***")).collect();
                         format!(" env=[{}]", pairs.join(","))
                     };
                     let args_str = if server.args.is_empty() {
@@ -1479,11 +1572,20 @@ fn config_mcp_command(command: ConfigMcpCommand) -> Result<()> {
                         format!(" args=[{}]", server.args.join(","))
                     };
                     let trusted_str = if server.trusted { " --trusted" } else { "" };
+                    let headers_str = match server.headers.as_ref() {
+                        Some(headers) if !headers.is_empty() => {
+                            // Print header names only — values may resolve secrets via
+                            // `${ENV_NAME}` and must never be echoed.
+                            let keys: Vec<_> = headers.keys().cloned().collect();
+                            format!(" headers=[{}]", keys.join(","))
+                        }
+                        _ => String::new(),
+                    };
                     let target = match &server.url {
                         Some(url) => format!("url={url}"),
                         None => format!("command={}", server.command),
                     };
-                    println!("mcp {name}: {target}{args_str}{env_str}{trusted_str}");
+                    println!("mcp {name}: {target}{args_str}{env_str}{headers_str}{trusted_str}");
                 }
             }
             Ok(())
@@ -1879,664 +1981,4 @@ fn read_saved_provider(workspace: &Path, run_id: &str) -> Result<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serial_test::serial;
-
-    fn make_candidate(id: &str) -> Lesson {
-        Lesson {
-            id: id.to_string(),
-            status: LessonStatus::Candidate,
-            source: LessonSource::AutoError,
-            created: "t".to_string(),
-            last_confirmed: "t".to_string(),
-            last_used: None,
-            evidence_runs: vec!["run-1".to_string()],
-            tags: vec!["build".to_string()],
-            observed_commands: vec!["cmd-1".to_string()],
-            episode_ref: Some("win-0123456789abcdef".to_string()),
-            body: "## 问题特征\ncargo build fails with E0463\n## 修复·做法\nRun `rustup update` before retrying.\n## 适用条件·边界\nRust toolchain drift in local workspace.\n".to_string(),
-        }
-    }
-
-    #[test]
-    fn run_args_parse_network_off() {
-        use clap::Parser;
-        let cli = Cli::try_parse_from(["myagent", "run", "hi", "--network", "off"]).unwrap();
-        match cli.command {
-            Some(Command::Run(args)) => assert_eq!(args.network, crate::goal::NetworkPolicy::Off),
-            _ => panic!("expected run"),
-        }
-    }
-
-    #[test]
-    fn run_args_network_defaults_on() {
-        use clap::Parser;
-        let cli = Cli::try_parse_from(["myagent", "run", "hi"]).unwrap();
-        match cli.command {
-            Some(Command::Run(args)) => assert_eq!(args.network, crate::goal::NetworkPolicy::On),
-            _ => panic!("expected run"),
-        }
-    }
-
-    #[test]
-    fn fs_read_scope_defaults_to_workspace_for_all_cli_entrypoints() {
-        use clap::Parser;
-
-        let cli = Cli::try_parse_from(["myagent"]).unwrap();
-        assert_eq!(
-            cli.interactive.fs_read_scope,
-            crate::fs_scope::FsReadScope::Workspace
-        );
-
-        for argv in [
-            vec!["myagent", "run", "hi"],
-            vec!["myagent", "plan", "build"],
-            vec!["myagent", "resume", "run-1"],
-        ] {
-            let cli = Cli::try_parse_from(argv).unwrap();
-            let scope = match cli.command.unwrap() {
-                Command::Run(args) => args.fs_read_scope,
-                Command::Plan(args) => args.fs_read_scope,
-                Command::Resume(args) => args.fs_read_scope,
-                other => panic!("unexpected command: {other:?}"),
-            };
-            assert_eq!(scope, crate::fs_scope::FsReadScope::Workspace);
-        }
-    }
-
-    #[test]
-    fn run_args_parse_explicit_fs_read_scope() {
-        use clap::Parser;
-
-        let cli = Cli::try_parse_from(["myagent", "run", "hi", "--fs-read-scope", "project-deps"])
-            .unwrap();
-        match cli.command {
-            Some(Command::Run(args)) => {
-                assert_eq!(
-                    args.fs_read_scope,
-                    crate::fs_scope::FsReadScope::ProjectDeps
-                );
-            }
-            other => panic!("expected run, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn fs_write_fence_defaults_off_for_all_cli_entrypoints() {
-        use clap::Parser;
-
-        let cli = Cli::try_parse_from(["myagent"]).unwrap();
-        assert_eq!(
-            cli.interactive.fs_write_fence,
-            crate::exec::sandbox::FsWriteFence::Off
-        );
-
-        for argv in [
-            vec!["myagent", "run", "hi"],
-            vec!["myagent", "plan", "build"],
-            vec!["myagent", "resume", "run-1"],
-        ] {
-            let cli = Cli::try_parse_from(argv).unwrap();
-            let fence = match cli.command.unwrap() {
-                Command::Run(args) => args.fs_write_fence,
-                Command::Plan(args) => args.fs_write_fence,
-                Command::Resume(args) => args.fs_write_fence,
-                other => panic!("unexpected command: {other:?}"),
-            };
-            assert_eq!(fence, crate::exec::sandbox::FsWriteFence::Off);
-        }
-    }
-
-    #[test]
-    fn run_args_parse_explicit_fs_write_fence() {
-        use clap::Parser;
-
-        let cli = Cli::try_parse_from(["myagent", "run", "hi", "--fs-write-fence", "on"]).unwrap();
-        match cli.command {
-            Some(Command::Run(args)) => {
-                assert_eq!(args.fs_write_fence, crate::exec::sandbox::FsWriteFence::On);
-            }
-            other => panic!("expected run, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn max_turn_defaults_apply_to_all_cli_entrypoints() {
-        use clap::Parser;
-
-        let cli = Cli::try_parse_from(["myagent"]).unwrap();
-        assert_eq!(
-            cli.interactive.max_turns,
-            crate::orchestrator::MIN_TASK_TURN_BUDGET
-        );
-
-        let cli = Cli::try_parse_from(["myagent", "run", "hi"]).unwrap();
-        match cli.command {
-            Some(Command::Run(args)) => {
-                assert_eq!(args.max_turns, crate::orchestrator::MIN_TASK_TURN_BUDGET);
-            }
-            other => panic!("expected run, got {other:?}"),
-        }
-
-        let cli = Cli::try_parse_from(["myagent", "plan", "build"]).unwrap();
-        match cli.command {
-            Some(Command::Plan(args)) => {
-                assert_eq!(args.max_turns, crate::orchestrator::MIN_TASK_TURN_BUDGET);
-            }
-            other => panic!("expected plan, got {other:?}"),
-        }
-
-        let cli = Cli::try_parse_from(["myagent", "resume", "run-1"]).unwrap();
-        match cli.command {
-            Some(Command::Resume(args)) => {
-                assert_eq!(args.max_turns, crate::orchestrator::MIN_TASK_TURN_BUDGET);
-            }
-            other => panic!("expected resume, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn plan_subcommand_parses_objective_and_knobs() {
-        use clap::Parser;
-        let cli = Cli::try_parse_from([
-            "myagent",
-            "plan",
-            "build the thing",
-            "--provider",
-            "mock",
-            "--max-review-attempts",
-            "4",
-            "--max-plan-steps",
-            "30",
-            "--max-replan-rounds",
-            "7",
-            "--max-turns",
-            "6",
-            "--criteria",
-            "cmd: cargo test",
-            "--resume",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Command::Plan(args)) => {
-                assert_eq!(args.input, "build the thing");
-                assert_eq!(args.provider, "mock");
-                assert_eq!(args.max_review_attempts, 4);
-                assert_eq!(args.max_plan_steps, 30);
-                assert_eq!(args.max_replan_rounds, 7);
-                assert_eq!(args.max_turns, 6);
-                assert_eq!(args.criteria, vec!["cmd: cargo test".to_string()]);
-                assert!(args.resume);
-            }
-            _ => panic!("expected plan"),
-        }
-    }
-
-    #[test]
-    fn plan_subcommand_defaults_max_replan_rounds_to_three() {
-        use clap::Parser;
-        let cli = Cli::try_parse_from(["myagent", "plan", "build"]).unwrap();
-        match cli.command {
-            Some(Command::Plan(args)) => assert_eq!(args.max_replan_rounds, 3),
-            _ => panic!("expected plan"),
-        }
-    }
-
-    #[test]
-    fn plan_subcommand_defaults_preflight_gate_on() {
-        use clap::Parser;
-        let cli = Cli::try_parse_from(["myagent", "plan", "do the thing"]).unwrap();
-        match cli.command {
-            Some(Command::Plan(args)) => {
-                assert!(matches!(args.preflight_gate, PreflightGate::On));
-            }
-            other => panic!("expected plan, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn plan_subcommand_parses_preflight_gate_off() {
-        use clap::Parser;
-        let cli =
-            Cli::try_parse_from(["myagent", "plan", "do the thing", "--preflight-gate", "off"])
-                .unwrap();
-        match cli.command {
-            Some(Command::Plan(args)) => {
-                assert!(matches!(args.preflight_gate, PreflightGate::Off));
-            }
-            other => panic!("expected plan, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn verify_and_watchdog_defaults_apply_to_all_cli_entrypoints() {
-        use clap::Parser;
-
-        let cli = Cli::try_parse_from(["myagent"]).unwrap();
-        assert_eq!(
-            cli.interactive.verify_every,
-            crate::orchestrator::DEFAULT_VERIFY_EVERY
-        );
-        assert_eq!(
-            cli.interactive.watchdog_repeat,
-            crate::orchestrator::DEFAULT_WATCHDOG_REPEAT
-        );
-
-        let cli = Cli::try_parse_from(["myagent", "run", "hi"]).unwrap();
-        match cli.command {
-            Some(Command::Run(args)) => {
-                assert_eq!(args.verify_every, crate::orchestrator::DEFAULT_VERIFY_EVERY);
-                assert_eq!(
-                    args.watchdog_repeat,
-                    crate::orchestrator::DEFAULT_WATCHDOG_REPEAT
-                );
-            }
-            _ => panic!("expected run"),
-        }
-
-        let cli = Cli::try_parse_from(["myagent", "resume", "run-1"]).unwrap();
-        match cli.command {
-            Some(Command::Resume(args)) => {
-                assert_eq!(args.verify_every, crate::orchestrator::DEFAULT_VERIFY_EVERY);
-                assert_eq!(
-                    args.watchdog_repeat,
-                    crate::orchestrator::DEFAULT_WATCHDOG_REPEAT
-                );
-            }
-            _ => panic!("expected resume"),
-        }
-    }
-
-    #[test]
-    fn resume_args_parse_realign_flags() {
-        use clap::Parser;
-
-        let cli = Cli::try_parse_from([
-            "myagent",
-            "resume",
-            "run-1",
-            "--realign-objective",
-            " ship smaller slice ",
-            "--realign-criteria",
-            "cmd: cargo test",
-            "--realign-scope",
-            " harness-agent ",
-            "--realign-constraint",
-            " no UI work ",
-            "--realign-reason",
-            "stuck repeating",
-        ])
-        .unwrap();
-
-        let Some(Command::Resume(args)) = cli.command else {
-            panic!("expected resume");
-        };
-        let input = resume_realign_input(&args).unwrap().expect("realign input");
-        assert_eq!(input.objective.as_deref(), Some(" ship smaller slice "));
-        assert_eq!(input.add_criteria.len(), 1);
-        assert_eq!(input.add_criteria[0].id, "c1");
-        assert_eq!(input.scope.as_deref(), Some(" harness-agent "));
-        assert_eq!(input.add_constraints, vec![" no UI work "]);
-        assert_eq!(input.reason, "stuck repeating");
-    }
-
-    #[test]
-    fn resume_realign_reason_alone_is_noop() {
-        use clap::Parser;
-
-        let cli = Cli::try_parse_from([
-            "myagent",
-            "resume",
-            "run-1",
-            "--realign-reason",
-            "only a reason",
-        ])
-        .unwrap();
-
-        let Some(Command::Resume(args)) = cli.command else {
-            panic!("expected resume");
-        };
-        assert!(resume_realign_input(&args).unwrap().is_none());
-    }
-
-    #[test]
-    fn run_args_parse_learn_flags() {
-        use clap::Parser;
-        let cli = Cli::try_parse_from(["myagent", "run", "do x", "--learn"]).unwrap();
-        match cli.command {
-            Some(Command::Run(args)) => assert!(args.learn && !args.auto_learn),
-            _ => panic!("expected run"),
-        }
-
-        let cli = Cli::try_parse_from(["myagent", "run", "do x", "--auto-learn"]).unwrap();
-        match cli.command {
-            Some(Command::Run(args)) => assert!(args.auto_learn),
-            _ => panic!("expected run"),
-        }
-    }
-
-    #[test]
-    fn parses_config_search_subcommand() {
-        use clap::Parser;
-        let cli = Cli::try_parse_from([
-            "myagent",
-            "config",
-            "search",
-            "--backend",
-            "brave",
-            "--api-key",
-            "k",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Command::Config {
-                command: ConfigCommand::Search(ConfigSearchArgs { backend, api_key }),
-            }) => {
-                assert_eq!(backend, "brave");
-                assert_eq!(api_key, "k");
-            }
-            _ => panic!("expected config search"),
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn config_command_search_exa_writes_exa_config() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("MYAGENT_HOME", tmp.path());
-        config_command(ConfigCommand::Search(ConfigSearchArgs {
-            backend: "exa".into(),
-            api_key: "k".into(),
-        }))
-        .unwrap();
-        let loaded = crate::config::load_config().unwrap().search;
-        assert!(
-            matches!(loaded, Some(crate::config::SearchConfig::Exa { api_key }) if api_key == "k")
-        );
-        std::env::remove_var("MYAGENT_HOME");
-    }
-
-    #[test]
-    #[serial]
-    fn config_command_search_brave_unchanged_and_unknown_not_written() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("MYAGENT_HOME", tmp.path());
-        config_command(ConfigCommand::Search(ConfigSearchArgs {
-            backend: "brave".into(),
-            api_key: "bk".into(),
-        }))
-        .unwrap();
-        assert!(matches!(
-            crate::config::load_config().unwrap().search,
-            Some(crate::config::SearchConfig::Brave { api_key }) if api_key == "bk"
-        ));
-        config_command(ConfigCommand::Search(ConfigSearchArgs {
-            backend: "bogus".into(),
-            api_key: "x".into(),
-        }))
-        .unwrap();
-        assert!(matches!(
-            crate::config::load_config().unwrap().search,
-            Some(crate::config::SearchConfig::Brave { .. })
-        ));
-        std::env::remove_var("MYAGENT_HOME");
-    }
-
-    #[test]
-    #[serial]
-    fn memory_remember_writes_active() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tempfile::tempdir().unwrap();
-        std::env::set_var("MYAGENT_HOME", tmp.path());
-
-        run_memory_remember(ws.path(), "cargo E0463 用 rustup update", &["build".into()]).unwrap();
-
-        let store = MemoryStore::for_workspace(ws.path()).unwrap();
-        let active = store.list_active().unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].source, LessonSource::UserTaught);
-        assert_eq!(active[0].status, LessonStatus::Active);
-
-        let log = std::fs::read_to_string(store.root().join("log.md")).unwrap();
-        assert!(log.contains("user_taught"));
-
-        std::env::remove_var("MYAGENT_HOME");
-    }
-
-    #[test]
-    #[serial]
-    fn accept_promotes_and_respects_cap() {
-        let home = tempfile::tempdir().unwrap();
-        std::env::set_var("MYAGENT_HOME", home.path());
-        let ws = tempfile::tempdir().unwrap();
-        let store = MemoryStore::for_workspace(ws.path()).unwrap();
-        store.init().unwrap();
-
-        store.write_lesson(&make_candidate("lesson-c1")).unwrap();
-        accept_candidate(ws.path(), "lesson-c1").unwrap();
-        assert_eq!(
-            store.read_lesson("lesson-c1").unwrap().status,
-            LessonStatus::Active
-        );
-        assert!(store.read_index().unwrap().contains("lesson-c1"));
-
-        for i in 0..49 {
-            let mut active = make_candidate(&format!("lesson-a{i}"));
-            active.status = LessonStatus::Active;
-            store.write_lesson(&active).unwrap();
-        }
-        assert_eq!(store.list_active().unwrap().len(), 50);
-        store.write_lesson(&make_candidate("lesson-over")).unwrap();
-        assert!(accept_candidate(ws.path(), "lesson-over").is_err());
-
-        std::env::remove_var("MYAGENT_HOME");
-    }
-
-    #[test]
-    #[serial]
-    fn reject_archives_not_in_index() {
-        let home = tempfile::tempdir().unwrap();
-        std::env::set_var("MYAGENT_HOME", home.path());
-        let ws = tempfile::tempdir().unwrap();
-        let store = MemoryStore::for_workspace(ws.path()).unwrap();
-        store.init().unwrap();
-
-        store.write_lesson(&make_candidate("lesson-r1")).unwrap();
-        reject_candidate(ws.path(), "lesson-r1").unwrap();
-        assert_eq!(
-            store.read_lesson("lesson-r1").unwrap().status,
-            LessonStatus::Archived
-        );
-        assert!(!store.read_index().unwrap().contains("lesson-r1"));
-
-        std::env::remove_var("MYAGENT_HOME");
-    }
-
-    #[test]
-    fn elevate_permission_raises_to_allow_only_when_always_used() {
-        use crate::shell::PermissionPolicy::*;
-        assert_eq!(elevate_permission(Ask, true), Allow);
-        assert_eq!(elevate_permission(Ask, false), Ask);
-        assert_eq!(elevate_permission(Deny, true), Allow);
-        assert_eq!(elevate_permission(Allow, false), Allow);
-    }
-
-    // ─── --mcp-server / --append-system-prompt flag parsing ───
-
-    #[test]
-    fn run_args_parse_mcp_server_single() {
-        use clap::Parser;
-        let cli = Cli::try_parse_from([
-            "myagent",
-            "run",
-            "hi",
-            "--mcp-server",
-            "lead=http://127.0.0.1:9000/mcp",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Command::Run(args)) => assert_eq!(
-                args.mcp_server,
-                vec![("lead".to_string(), "http://127.0.0.1:9000/mcp".to_string())]
-            ),
-            other => panic!("expected run, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn run_args_parse_mcp_server_repeatable() {
-        use clap::Parser;
-        let cli = Cli::try_parse_from([
-            "myagent",
-            "run",
-            "hi",
-            "--mcp-server",
-            "lead=http://127.0.0.1:9000/mcp",
-            "--mcp-server",
-            "aux=https://example.com/mcp",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Command::Run(args)) => assert_eq!(
-                args.mcp_server,
-                vec![
-                    ("lead".to_string(), "http://127.0.0.1:9000/mcp".to_string()),
-                    ("aux".to_string(), "https://example.com/mcp".to_string()),
-                ]
-            ),
-            other => panic!("expected run, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn run_args_mcp_server_defaults_empty() {
-        use clap::Parser;
-        let cli = Cli::try_parse_from(["myagent", "run", "hi"]).unwrap();
-        match cli.command {
-            Some(Command::Run(args)) => assert!(args.mcp_server.is_empty()),
-            other => panic!("expected run, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn run_args_mcp_server_missing_equals_is_rejected() {
-        use clap::Parser;
-        let err = Cli::try_parse_from(["myagent", "run", "hi", "--mcp-server", "lead-no-url"])
-            .unwrap_err();
-        assert!(err.to_string().contains("expected format"));
-    }
-
-    #[test]
-    fn run_args_mcp_server_non_http_url_is_rejected() {
-        use clap::Parser;
-        let err = Cli::try_parse_from([
-            "myagent",
-            "run",
-            "hi",
-            "--mcp-server",
-            "lead=ftp://example.com/mcp",
-        ])
-        .unwrap_err();
-        assert!(err.to_string().contains("http:// or https://"));
-    }
-
-    #[test]
-    fn run_args_mcp_server_empty_name_is_rejected() {
-        use clap::Parser;
-        let err = Cli::try_parse_from([
-            "myagent",
-            "run",
-            "hi",
-            "--mcp-server",
-            "=http://example.com/mcp",
-        ])
-        .unwrap_err();
-        assert!(err.to_string().contains("name must not be empty"));
-    }
-
-    #[test]
-    fn run_args_parse_append_system_prompt() {
-        use clap::Parser;
-        let cli = Cli::try_parse_from([
-            "myagent",
-            "run",
-            "hi",
-            "--append-system-prompt",
-            "TEAM LEAD MODE: use dispatch_worker.",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Command::Run(args)) => assert_eq!(
-                args.append_system_prompt.as_deref(),
-                Some("TEAM LEAD MODE: use dispatch_worker.")
-            ),
-            other => panic!("expected run, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn run_args_append_system_prompt_defaults_none() {
-        use clap::Parser;
-        let cli = Cli::try_parse_from(["myagent", "run", "hi"]).unwrap();
-        match cli.command {
-            Some(Command::Run(args)) => assert!(args.append_system_prompt.is_none()),
-            other => panic!("expected run, got {other:?}"),
-        }
-    }
-
-    // ─── merge_mcp_servers: config vs. flag-injected servers ───
-
-    fn mcp_cfg(name: &str, url: &str, trusted: bool) -> crate::mcp::config::McpServerConfig {
-        crate::mcp::config::McpServerConfig {
-            name: name.to_string(),
-            command: String::new(),
-            url: Some(url.to_string()),
-            args: Vec::new(),
-            env: Default::default(),
-            trusted,
-        }
-    }
-
-    #[test]
-    fn merge_mcp_servers_flag_overrides_same_name_config_server_and_is_trusted() {
-        let config_servers = vec![
-            mcp_cfg("serverA", "http://config-a.example/mcp", false),
-            mcp_cfg("serverB", "http://config-b.example/mcp", true),
-        ];
-        let flag_servers = vec![(
-            "serverA".to_string(),
-            "http://flag-a.example/mcp".to_string(),
-        )];
-        let merged = merge_mcp_servers(config_servers, flag_servers);
-
-        let a = merged.iter().find(|s| s.name == "serverA").unwrap();
-        assert_eq!(a.url.as_deref(), Some("http://flag-a.example/mcp"));
-        assert!(a.trusted, "flag-injected server must be trusted");
-
-        // serverB is untouched by the flag override.
-        let b = merged.iter().find(|s| s.name == "serverB").unwrap();
-        assert_eq!(b.url.as_deref(), Some("http://config-b.example/mcp"));
-        assert!(b.trusted);
-
-        assert_eq!(merged.len(), 2);
-    }
-
-    #[test]
-    fn merge_mcp_servers_no_flags_returns_config_servers_unchanged() {
-        let config_servers = vec![mcp_cfg("serverB", "http://config-b.example/mcp", true)];
-        let merged = merge_mcp_servers(config_servers.clone(), Vec::new());
-        assert_eq!(merged, config_servers);
-    }
-
-    #[test]
-    fn merge_mcp_servers_new_flag_name_adds_to_config_servers() {
-        let config_servers = vec![mcp_cfg("serverB", "http://config-b.example/mcp", true)];
-        let flag_servers = vec![("lead".to_string(), "http://127.0.0.1:9000/mcp".to_string())];
-        let merged = merge_mcp_servers(config_servers, flag_servers);
-        assert_eq!(merged.len(), 2);
-        let lead = merged.iter().find(|s| s.name == "lead").unwrap();
-        assert_eq!(lead.url.as_deref(), Some("http://127.0.0.1:9000/mcp"));
-        assert!(lead.trusted);
-    }
-}
+mod tests;

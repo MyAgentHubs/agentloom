@@ -2,3 +2,5 @@
 node_modules/
 # The repository root is not a Cargo project; ignore stray build output created there.
 /target/
+# Interrupted disposable file-size regression repositories.
+/.file-size-gate-test-*/

@@ -12,6 +12,7 @@ import {
   swapBack,
   useUpdaterSnapshot,
 } from "../../lib/updaterStore";
+import { useMarkdown } from "../../lib/useMarkdown";
 import type { TranslationKey } from "../../i18n";
 
 const appVersion =
@@ -26,6 +27,7 @@ const appVersion =
  */
 export function UpdateSection() {
   const { t } = useI18n();
+  const MarkdownBody = useMarkdown();
   const snapshot = useUpdaterSnapshot();
   const state = snapshot.state;
   // relaunch()/discardUpdate()（Ready）与 swapBack()（RecoveryOffered）互斥
@@ -172,7 +174,13 @@ export function UpdateSection() {
               <div className="updsec__notes-title">
                 {t("updater.popover.notes")}
               </div>
-              <div className="updsec__notes-body">{state.notes}</div>
+              <div className="updsec__notes-body">
+                {MarkdownBody ? (
+                  <MarkdownBody streaming={false}>{state.notes}</MarkdownBody>
+                ) : (
+                  <div style={{ whiteSpace: "pre-wrap" }}>{state.notes}</div>
+                )}
+              </div>
             </div>
           )}
           <div className="updsec__actions">

@@ -9,6 +9,7 @@
     "core:window:allow-set-focus",
     "opener:default",
     "dialog:default",
+    "clipboard-manager:allow-write-image",
     {
       "identifier": "opener:allow-open-path",
       "allow": [{ "path": "$TEMP/**" }]

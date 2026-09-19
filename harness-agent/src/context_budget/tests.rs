@@ -3,6 +3,11 @@ use crate::events::{EventEnvelope, EventRecorder, EventSink};
 use crate::provider::{ChatMessage, FunctionCall, ProviderCapabilities, ToolCall};
 use std::sync::{Arc, Mutex};
 
+// t12-img 双路审 P2-4：图片预算测试拆到独立文件（避免本文件继续超出文件大小
+// 门禁基线），经 `mod images;` 挂在这里，`tests/images.rs` 用 `use super::*;` 沿用
+// 本文件的 `tight_limits`/`fat`/`unwrap_fit` 等既有夹具。
+mod images;
+
 fn caps(max_ctx: Option<u32>, out: Option<u32>) -> ProviderCapabilities {
     ProviderCapabilities {
         provider_id: "p".into(),
@@ -100,6 +105,8 @@ fn tight_limits(context_tokens: usize, recent: usize, min_recent: usize) -> Budg
         min_recent,
         chars_per_token: 1,
         per_msg_overhead: 0,
+        // 测试夹具显式传了 context_tokens，视为"真实/已知"窗口，图片按现行行为计入。
+        images_count_toward_budget: true,
     }
 }
 
@@ -671,6 +678,7 @@ fn cap_message_clones_small_messages_byte_for_byte() {
         }]),
         reasoning_content: Some("small reasoning".to_string()),
         name: Some("small-name".to_string()),
+        images: Vec::new(),
     };
 
     let capped = cap_message(&message, 1_000, &limits);

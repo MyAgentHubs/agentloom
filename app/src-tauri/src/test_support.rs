@@ -17,6 +17,11 @@ pub fn tmp_root() -> (tempfile::TempDir, PathBuf) {
 pub fn mem_db() -> Connection {
     let c = Connection::open_in_memory().expect("open in-memory sqlite 失败");
     crate::db::init_schema(&c).expect("init_schema 失败");
+    // `:memory:` 连接没有文件路径，`search_index::migrate` 不会派生后台回填线程
+    // （见该函数注释）；测试库此刻通常是空的，这里显式同步驱动一次，让所有既有
+    // 测试（大多在插消息前就调用 mem_db()）默认落在「回填已完成」态，走真实的
+    // FTS 索引路径而不是回填未完成时的兜底路径。
+    crate::db::search_index::ensure_backfilled(&c).expect("ensure_backfilled 失败");
     // cluster L Phase 2 plan A Task 2 必修 #3：seed Local namespace + local-default repo
     // 防 repos.namespace_id / sessions.repo_id FK 约束失败崩既有 plan 1 / 2a 测试
     // rusqlite 0.32 bundled 默认 PRAGMA foreign_keys = 1 · 实测确认（/tmp/fk_test）

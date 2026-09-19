@@ -1142,3 +1142,23 @@ fn info_deepseek_json_works_offline_without_key() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["provider_id"], "deepseek");
 }
+
+#[test]
+fn info_json_supports_images_respects_env_override_p3_2() {
+    // P3-2：`myagent info` 此前只看落盘覆盖（`find_stored_supports_images`），真实
+    // 跑走 `config_images::resolve()`（env 优先）——设了 `{PREFIX}_SUPPORTS_IMAGES`
+    // 时两者会报告不一致的值。glm 家族默认 true，这里用 env 强制 false 并核对
+    // info --json 报的也是 false（与真跑一致）。
+    let out = Command::cargo_bin("myagent")
+        .unwrap()
+        .env("GLM_SUPPORTS_IMAGES", "false")
+        .args(["info", "--provider", "glm", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["supports_images"], false,
+        "info --json 必须尊重 GLM_SUPPORTS_IMAGES 环境覆盖，与真跑一致: {v}"
+    );
+}

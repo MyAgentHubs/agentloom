@@ -154,6 +154,7 @@ pub(crate) fn finalize_verdict(
 ///
 /// 这是所有完成入口唯一的判据来源：响应被截断、完全为空或仍含工具调用时不得完成；
 /// 空标准只接受模型以 `Stop` 主动结束且给出了文本；非空标准则必须经 evaluator 全部验过。
+#[cfg(test)]
 pub(crate) fn may_finalize(goal: &GoalState, response: Option<&ProviderResponse>) -> bool {
     finalize_verdict(goal, response).is_ok()
 }

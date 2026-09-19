@@ -105,6 +105,7 @@ fn opts(ws: &std::path::Path, criteria: &[&str], run_id: &str) -> RunOptions {
         permission: PermissionPolicy::Allow,
         network: myagent::goal::NetworkPolicy::On,
         fs_read_scope: myagent::fs_scope::FsReadScope::Workspace,
+        extra_read_roots: Vec::new(),
         fs_write_fence: myagent::exec::sandbox::FsWriteFence::Off,
         evidence_gate: myagent::orchestrator::EvidenceGate::Off,
         native_search_enabled: true,
@@ -123,6 +124,7 @@ fn opts(ws: &std::path::Path, criteria: &[&str], run_id: &str) -> RunOptions {
         watchdog_repeat_threshold: 0,
         mcp_servers: Vec::new(),
         append_system_prompt: None,
+        images: Vec::new(),
     }
 }
 

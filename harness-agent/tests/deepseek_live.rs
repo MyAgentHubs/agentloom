@@ -20,6 +20,7 @@ async fn deepseek_answers_and_survives_multi_turn_reasoning() {
         fallback_model: None,
         context_tokens: None,
         output_tokens: None,
+        supports_images_override: None,
     };
     let provider = OpenAiCompatibleProvider::new(cfg).unwrap();
     let dir = tempfile::tempdir().unwrap();

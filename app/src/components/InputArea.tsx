@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { importAttachmentPaths } from "../lib/importAttachmentPaths";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import type { Mode } from "./ModeDropdown";
 import { ComposerAgentSelector } from "./ComposerAgentSelector";
@@ -85,8 +86,7 @@ type Props = {
 };
 
 const MAX_H = 160;
-// 超长文本每键读 scrollHeight 会触发同步强制布局，耗时随全文长度线性增长——
-// 超过此阈值时跳过测量、直接锁最大高度+内部滚动，避免打字卡死。
+// 超长文本每键读 scrollHeight 会触发同步强制布局，耗时随全文长度线性增长——超过此阈值时跳过测量、直接锁最大高度+内部滚动，避免打字卡死。
 const AUTOSIZE_MAX_CHARS = 20000;
 // textarea 装几万字符后每次编辑触发全文断行 relayout·原生代价 autosize 早退救不了·
 // 超长粘贴转附件根治：粘贴文本超此阈值时不进输入框，落盘转成附件 chip。
@@ -362,7 +362,7 @@ export function InputArea({
     if (readonly) return;
     const sel = await openFileDialog({ multiple: true });
     const paths = sel === null ? [] : Array.isArray(sel) ? sel : [sel];
-    mergeAttachmentPaths(paths);
+    mergeAttachmentPaths(await importAttachmentPaths(paths, sessionId));
     const el = taRef.current;
     el?.focus();
   }
@@ -380,10 +380,8 @@ export function InputArea({
         if (!file) continue;
         try {
           const imageBase64 = arrayBufferToBase64(await file.arrayBuffer());
-          const path = await invoke<string>("save_pasted_image", {
-            imageBase64,
-            mediaType: file.type,
-          });
+          const args = { imageBase64, mediaType: file.type, sessionId };
+          const path = await invoke<string>("save_pasted_image", args);
           mergeAttachmentPaths([path]);
         } catch (error) {
           console.error("Failed to paste image attachment", error);
@@ -397,7 +395,8 @@ export function InputArea({
 
     event.preventDefault();
     try {
-      const path = await invoke<string>("save_pasted_text", { text });
+      const args = { text, sessionId };
+      const path = await invoke<string>("save_pasted_text", args);
       mergeAttachmentPaths([path]);
     } catch (error) {
       console.error("Failed to paste text attachment", error);
@@ -415,6 +414,7 @@ export function InputArea({
       try {
         const content = await invoke<AttachmentContent>("read_attachment", {
           path: attachment.path,
+          sessionId,
         });
         if (content.kind === "text") {
           blocks.push(

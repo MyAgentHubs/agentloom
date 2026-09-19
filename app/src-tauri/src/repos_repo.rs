@@ -1,6 +1,11 @@
 //! repos 表 CRUD（与 db.rs 同层、纯数据层、无业务逻辑）。
 //! 项目注册与交互业务落在 lib.rs IPC 入口；项目目录不要求是 git 仓库。
 
+// T22：project_path 挂在这里（而非 lib.rs 顶层新增 `mod`）是刻意的——lib.rs 行数已顶到
+// check_file_size.py 门禁基线（净增必须 ≤ 0），新命令挪一层挂靠可以不碰 lib.rs 的 mod 列表，
+// 只需在 lib.rs 既有 generate_handler! 列表行上追加一个 token（同行、不增行）。
+pub mod project_path;
+
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
@@ -128,6 +133,17 @@ pub fn rename_repo(conn: &Connection, id: &str, name: &str) -> rusqlite::Result<
     Ok(())
 }
 
+/// T22：编辑项目「换工作目录」——更新 path + last_used_at；所属会话记录不改（cwd 靠
+/// repo_id 关联解析，见 `resolve_session_workspace`）。校验（存在/可写/不嵌套/github 需
+/// git 仓）由 `project_path::update_project_path_business` 负责，此函数只做 UPDATE。
+pub fn update_repo_path(conn: &Connection, id: &str, path: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE repos SET path = ?2, last_used_at = strftime('%s','now') WHERE id = ?1",
+        (id, path),
+    )?;
+    Ok(())
+}
+
 pub fn set_repo_icon(conn: &Connection, id: &str, icon: Option<&str>) -> rusqlite::Result<()> {
     conn.execute("UPDATE repos SET icon = ?2 WHERE id = ?1", (id, icon))?;
     Ok(())
@@ -243,6 +259,18 @@ mod tests {
         let r = get_repo_by_id(&c, "r1").unwrap().unwrap();
         assert_eq!(r.status, "invalid");
         assert_eq!(r.path, "/tmp/a"); // 不删 path，留给修正对话框
+    }
+
+    #[test]
+    fn update_repo_path_updates_path_and_last_used_at() {
+        let c = mem_db();
+        add_repo(&c, "r1", "local", "local", None, "a", "/tmp/a", None).unwrap();
+        let before = get_repo_by_id(&c, "r1").unwrap().unwrap();
+        assert_eq!(before.last_used_at, None);
+        update_repo_path(&c, "r1", "/tmp/a-moved").unwrap();
+        let after = get_repo_by_id(&c, "r1").unwrap().unwrap();
+        assert_eq!(after.path, "/tmp/a-moved");
+        assert!(after.last_used_at.is_some());
     }
 
     #[test]

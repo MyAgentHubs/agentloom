@@ -177,6 +177,72 @@ fn add_with_url_saves_http_server() {
 }
 
 #[test]
+fn add_with_header_writes_headers_map() {
+    let home = tempdir().unwrap();
+    Command::cargo_bin("myagent")
+        .unwrap()
+        .env("MYAGENT_HOME", home.path())
+        .args([
+            "config",
+            "mcp",
+            "add",
+            "http-srv",
+            "--url",
+            "http://127.0.0.1:9000/mcp",
+            "--header",
+            "Authorization=Bearer ${MY_TOKEN}",
+            "--header",
+            "X-Api-Version=1",
+        ])
+        .assert()
+        .success();
+
+    let cfg = read_config(&home);
+    let headers = cfg["mcp_servers"]["http-srv"]["headers"]
+        .as_object()
+        .unwrap();
+    assert_eq!(headers.len(), 2);
+    assert_eq!(headers["Authorization"], "Bearer ${MY_TOKEN}");
+    assert_eq!(headers["X-Api-Version"], "1");
+}
+
+#[test]
+fn add_without_header_omits_headers_key() {
+    let home = tempdir().unwrap();
+    mcp_add(&home, "srv", "node", &[], &[], false);
+
+    let cfg = read_config(&home);
+    assert!(cfg["mcp_servers"]["srv"].get("headers").is_none());
+}
+
+#[test]
+fn list_shows_header_names_but_not_values() {
+    let home = tempdir().unwrap();
+    Command::cargo_bin("myagent")
+        .unwrap()
+        .env("MYAGENT_HOME", home.path())
+        .args([
+            "config",
+            "mcp",
+            "add",
+            "http-srv",
+            "--url",
+            "http://127.0.0.1:9000/mcp",
+            "--header",
+            "Authorization=Bearer super-secret-value",
+        ])
+        .assert()
+        .success();
+
+    let out = mcp_list(&home);
+    assert!(out.contains("headers=[Authorization]"), "got: {out}");
+    assert!(
+        !out.contains("super-secret-value"),
+        "header values must never be printed by `config mcp list`: {out}"
+    );
+}
+
+#[test]
 fn add_url_and_command_together_is_rejected() {
     let home = tempdir().unwrap();
     Command::cargo_bin("myagent")
@@ -312,8 +378,33 @@ fn list_single_shows_details() {
     assert!(out.contains("mcp srv:"));
     assert!(out.contains("command=myapp"));
     assert!(out.contains("args=[--verbose]"));
-    assert!(out.contains("env=[KEY=val]"));
+    // env values are masked — only the key is ever printed.
+    assert!(out.contains("env=[KEY=***]"));
+    assert!(
+        !out.contains("val"),
+        "env value must never be printed: {out}"
+    );
     assert!(out.contains("--trusted"));
+}
+
+#[test]
+fn list_shows_env_names_but_not_values() {
+    let home = tempdir().unwrap();
+    mcp_add(
+        &home,
+        "srv",
+        "node",
+        &[],
+        &["API_KEY=super-secret-value"],
+        false,
+    );
+
+    let out = mcp_list(&home);
+    assert!(out.contains("env=[API_KEY=***]"), "got: {out}");
+    assert!(
+        !out.contains("super-secret-value"),
+        "env values must never be printed by `config mcp list`: {out}"
+    );
 }
 
 #[test]

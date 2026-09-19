@@ -4,7 +4,7 @@ use super::{
 use crate::error::Result;
 use crate::events::EventRecorder;
 use crate::goal::GoalState;
-use crate::orchestrator::{build_offered_tools, EvidenceGate, RunOptions};
+use crate::orchestrator::{build_offered_tools_with_roots, EvidenceGate, RunOptions};
 use crate::provider::{ChatMessage, FinishReason, ProviderCapabilities, ProviderClient};
 use crate::tools::ToolRegistry;
 use serde_json::json;
@@ -596,12 +596,13 @@ pub(crate) async fn run_start_context_maintenance<P: ProviderClient>(
     if options.evidence_gate == EvidenceGate::Off {
         run_start_disallowed.insert("register_issue_probe".to_string());
     }
-    let tools = build_offered_tools(
+    let tools = build_offered_tools_with_roots(
         registry,
         capabilities,
         options.network,
         options.native_search_enabled,
         &run_start_disallowed,
+        &options.extra_read_roots,
     );
     compact_objective_at_run_start(provider, capabilities, messages, goal, recorder).await?;
     let limits = BudgetLimits::from_capabilities(capabilities);
@@ -683,6 +684,7 @@ mod tests {
             min_recent: 1,
             chars_per_token: 1,
             per_msg_overhead: 0,
+            images_count_toward_budget: true,
         }
     }
 

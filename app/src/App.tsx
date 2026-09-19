@@ -15,6 +15,8 @@ import { SessionMain } from "./components/SessionMain";
 import type { ContinuationDraftState } from "./components/ContinuationBriefPanel";
 import { OverviewHome } from "./components/OverviewHome";
 import { Sidebar } from "./components/Sidebar";
+import { GlobalSearch } from "./components/GlobalSearch";
+import { useGlobalSearch } from "./hooks/useGlobalSearch";
 import { RightPanel } from "./components/RightPanel";
 import type { RightPanelTab } from "./components/RightPanelTabs";
 import { GoalCriteriaPanel } from "./components/GoalCriteriaPanel";
@@ -40,6 +42,7 @@ import { Lightbox } from "./components/Lightbox";
 import { isAgentAvailable, type RuntimeDetect } from "./lib/agentAvailability";
 import { shouldShowInstallGuide } from "./lib/agentOnboarding";
 import { loadLastAgentId, saveLastAgentId } from "./lib/agentPrefStore";
+import { saveProjectEdits } from "./lib/editProject";
 import {
   deriveComposerBusy,
   deriveSendGate,
@@ -125,6 +128,11 @@ import {
 } from "./lib/backendMsg";
 import { humanizeStopReason } from "./lib/stopReason";
 import { deriveSessionTitle } from "./lib/sessionTitle";
+import {
+  undoFeedbackKey,
+  withRunCardStates,
+  type RunCommitState,
+} from "./lib/runCardState";
 import {
   draftFromResult,
   emptyDraft,
@@ -269,13 +277,6 @@ export function applyEventTransportBatch<T>(
 }
 /** 左栏行状态点三态（切走后仍知 agent 死活）：running=跑着；attention=needs_decision/error/blocked；done=completed。 */
 type SessionDotStatus = "running" | "attention" | "done";
-type RunCommitState = {
-  run_id: string;
-  state: string;
-  undo_total: number;
-  undo_undone: number;
-};
-type RunCardState = NonNullable<Extract<Block, { type: "run_card" }>["state"]>;
 type AppView = "overview" | "session" | "intro";
 type AppRoute = {
   view: AppView;
@@ -460,43 +461,6 @@ function sameRepoSelection(a: Set<RepoKey>, b: Set<RepoKey>): boolean {
     if (!b.has(key)) return false;
   }
   return true;
-}
-
-function undoFeedbackKey(sessionId: string, runId: string): string {
-  return `${sessionId}:${runId}`;
-}
-
-function runCardStateFromLedger(summary?: RunCommitState): RunCardState {
-  const total = Math.max(0, summary?.undo_total ?? 0);
-  const undone = Math.min(total, Math.max(0, summary?.undo_undone ?? 0));
-  if (total > 0 && undone === total) return "undone";
-  if (undone > 0) return "partially_undone";
-  return "active";
-}
-
-function withRunCardStates(
-  messages: ChatMessage[],
-  runStates?: Map<string, RunCommitState>,
-  undoFeedback?: Map<string, UndoResultRecord>,
-  sessionId?: string,
-): ChatMessage[] {
-  return messages.map((message) => ({
-    ...message,
-    content: message.content.map((block) => {
-      if (block.type !== "run_card") return block;
-      const summary = runStates?.get(block.run_id);
-      const undoResult = sessionId
-        ? undoFeedback?.get(undoFeedbackKey(sessionId, block.run_id))
-        : undefined;
-      return {
-        ...block,
-        state: runCardStateFromLedger(summary),
-        undo_total: Math.max(0, summary?.undo_total ?? 0),
-        undo_undone: Math.max(0, summary?.undo_undone ?? 0),
-        undo_result: undoResult,
-      };
-    }),
-  }));
 }
 
 function sendMessagePayload(
@@ -4527,16 +4491,11 @@ function AppContent() {
   async function handleEditProject(args: {
     name: string;
     icon: string | null;
+    path: string | null;
   }) {
     if (!editingRepo) return;
     try {
-      if (args.name !== editingRepo.name) {
-        await invoke("rename_repo", { id: editingRepo.id, name: args.name });
-      }
-      await invoke("set_repo_icon", {
-        id: editingRepo.id,
-        icon: args.icon,
-      });
+      await saveProjectEdits(invoke, editingRepo, args);
       const all = await invoke<RepoMeta[]>("list_repos");
       setAllRepos(all);
       setReposInActiveNs(
@@ -4545,7 +4504,7 @@ function AppContent() {
       setEditingRepo(null);
     } catch (error) {
       setToast(renderBackendError(String(error), t));
-      throw error;
+      throw new Error(renderBackendError(String(error), t));
     }
   }
 
@@ -6331,6 +6290,13 @@ function AppContent() {
     [],
   );
   const handleHome = useCallback(() => setView("overview"), []);
+  const gs = useGlobalSearch({
+    currentId,
+    loading,
+    t,
+    setToast,
+    onSelectSession: handleSidebarSelect,
+  });
   // msgfix2 Q1：composer 上方 chip 的三个交互 + recoverableMemberBlock 入队，
   // 都是「resolve currentIdRef.current 再调 sid 显式核心函数」的薄壳——sid 只在
   // 这一层解析一次，核心函数（enqueueComposerMessage/editQueuedMessage/...）
@@ -6681,6 +6647,7 @@ function AppContent() {
             onForward={handleForward}
             onToggleSidebar={handleToggleSidebar}
             onHome={handleHome}
+            onSearch={gs.openSearch}
           />
         )}
         <div
@@ -6805,6 +6772,8 @@ function AppContent() {
                   done={done}
                   sessionUsage={sessionUsage}
                   sessionId={currentId}
+                  searchTargetMessageId={gs.searchTargetMessageId}
+                  onSearchTargetResolved={gs.onTargetResolved}
                   onAgentChange={handleUserSelectAgent}
                   onMenuAgents={handleMenuAgents}
                   mode={mode}
@@ -6930,6 +6899,25 @@ function AppContent() {
           </div>
         </div>
       </div>
+      <GlobalSearch
+        open={gs.open}
+        currentId={currentId}
+        shortcutEnabled={
+          !settingsOpen &&
+          !newProjectOpen &&
+          editingRepo === null &&
+          lightbox === null &&
+          !aboutOpen &&
+          !showInstallGuide &&
+          !invalidDialog &&
+          !deleteTarget &&
+          !groupDeleteTarget &&
+          removeProjectTarget === null
+        }
+        onOpen={gs.openSearch}
+        onClose={gs.closeSearch}
+        onSelect={gs.onSelect}
+      />
       {showInstallGuide && (
         <AgentInstallGuideDialog
           onClose={() => setInstallGuideDismissed(true)}
@@ -6954,7 +6942,11 @@ function AppContent() {
         open={editingRepo !== null}
         initial={
           editingRepo
-            ? { name: editingRepo.name, icon: editingRepo.icon ?? null }
+            ? {
+                name: editingRepo.name,
+                icon: editingRepo.icon ?? null,
+                path: editingRepo.path,
+              }
             : undefined
         }
         onSave={handleEditProject}

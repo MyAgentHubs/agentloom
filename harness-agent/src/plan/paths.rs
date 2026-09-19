@@ -6,27 +6,29 @@
 pub fn normalize_scope_path(raw: &str) -> Result<String, String> {
     let p = raw.trim();
     if p.is_empty() {
-        return Err("路径为空".to_string());
+        return Err("empty path".to_string());
     }
     if p.starts_with('/') {
-        return Err(format!("不许绝对路径：{raw}"));
+        return Err(format!("absolute paths are not allowed: {raw}"));
     }
     if p.contains('*') || p.contains('?') || p.contains('[') {
-        return Err(format!("不许通配：{raw}"));
+        return Err(format!("glob characters are not allowed: {raw}"));
     }
     let mut out: Vec<&str> = Vec::new();
     for seg in p.split('/') {
         match seg {
             "" | "." => continue,
-            ".." => return Err(format!("不许 '..'：{raw}")),
+            ".." => return Err(format!("'..' is not allowed: {raw}")),
             ".git" | ".myagenthubs" => {
-                return Err(format!("不许保留路径段 '{seg}'：{raw}"));
+                return Err(format!(
+                    "reserved path segment '{seg}' is not allowed: {raw}"
+                ));
             }
             s => out.push(s),
         }
     }
     if out.is_empty() {
-        return Err(format!("路径无有效段：{raw}"));
+        return Err(format!("path has no valid segments: {raw}"));
     }
     Ok(out.join("/"))
 }
@@ -130,7 +132,10 @@ mod tests {
     fn gate_hardening_declared_scope_rejects_reserved_path_segments() {
         for raw in [".git/config", "src/.git/config", ".myagenthubs/runs/x"] {
             let err = normalize_scope_path(raw).expect_err("reserved path must be rejected");
-            assert!(err.contains("保留路径段"), "raw={raw}, err={err}");
+            assert!(
+                err.contains("reserved path segment"),
+                "raw={raw}, err={err}"
+            );
         }
         assert_eq!(
             normalize_scope_path("src/.gitignore").unwrap(),

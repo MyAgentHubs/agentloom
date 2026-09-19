@@ -2,13 +2,15 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { UseRepoDocumentResult } from "../hooks/useRepoDocument";
 import { useRepoDocument } from "../hooks/useRepoDocument";
+import { useMarkdown } from "../lib/useMarkdown";
 import { RepoDocumentPanel } from "./RepoDocumentPanel";
 
 vi.mock("../hooks/useRepoDocument");
-vi.mock("../lib/useMarkdown", () => ({ useMarkdown: () => null }));
+vi.mock("../lib/useMarkdown", () => ({ useMarkdown: vi.fn(() => null) }));
 
 const generate = vi.fn();
 const mockedUseRepoDocument = vi.mocked(useRepoDocument);
+const mockedUseMarkdown = vi.mocked(useMarkdown);
 function result(
   overrides: Partial<UseRepoDocumentResult> = {},
 ): UseRepoDocumentResult {
@@ -27,6 +29,37 @@ describe("RepoDocumentPanel", () => {
   beforeEach(() => {
     generate.mockReset();
     mockedUseRepoDocument.mockReturnValue(result());
+    mockedUseMarkdown.mockReturnValue(null);
+  });
+
+  it("项目文档没有会话上下文：MarkdownBody 不传 sessionId，只靠 B 规则（魔数验证过的位图）放行图片", () => {
+    const markdownBodySpy = vi.fn(
+      (props: { children: string; sessionId?: string | null }) => (
+        <div data-testid="md-body">{props.children}</div>
+      ),
+    );
+    mockedUseMarkdown.mockReturnValue(
+      markdownBodySpy as unknown as ReturnType<typeof useMarkdown>,
+    );
+    mockedUseRepoDocument.mockReturnValue(
+      result({
+        doc: {
+          repo_id: "repo-1",
+          content: "项目正文",
+          generated_at: 100,
+          head_sha: "1234567890",
+          stale: false,
+        },
+      }),
+    );
+
+    render(
+      <RepoDocumentPanel repoId="repo-1" agentId="agent-1" kind="intro" />,
+    );
+
+    expect(markdownBodySpy).toHaveBeenCalled();
+    const props = markdownBodySpy.mock.calls[0][0];
+    expect(props.sessionId).toBeUndefined();
   });
 
   it("空态显示 CTA 和只读声明，点击后用 agentId 生成", () => {

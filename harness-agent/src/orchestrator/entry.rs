@@ -103,6 +103,16 @@ pub async fn run_solo_with_control_scoped<P: ProviderClient>(
     )?;
 
     let mut messages = initial_messages(&options.prompt);
+    if !options.images.is_empty() {
+        if let Some(goal_message) = messages.iter_mut().rev().find(|m| m.role == "user") {
+            goal_message.images = options.images.clone();
+        }
+    }
+    crate::image::degrade_unsupported_images(
+        &mut messages,
+        &provider.capabilities(),
+        &mut recorder,
+    )?;
     inject_model_identity(&mut messages, &options.model);
     if let Some(extra) = options.append_system_prompt.as_deref() {
         append_to_system_prompt(&mut messages, extra);
@@ -200,6 +210,7 @@ pub async fn resume_solo<P: ProviderClient>(
     search: crate::config::SearchChoice,
     verify_reflex_debt: usize,
     watchdog_repeat_threshold: usize,
+    mcp_servers: Vec<McpServerConfig>,
 ) -> Result<RunResult> {
     resume_solo_with_judge(
         provider,
@@ -220,6 +231,7 @@ pub async fn resume_solo<P: ProviderClient>(
         verify_reflex_debt,
         watchdog_repeat_threshold,
         None,
+        mcp_servers,
     )
     .await
 }
@@ -244,6 +256,7 @@ pub async fn resume_solo_with_judge<P: ProviderClient>(
     verify_reflex_debt: usize,
     watchdog_repeat_threshold: usize,
     realign: Option<crate::goal::ReAlignInput>,
+    mcp_servers: Vec<McpServerConfig>,
 ) -> Result<RunResult> {
     resume_solo_with_judge_and_fs_scope(
         provider,
@@ -256,6 +269,7 @@ pub async fn resume_solo_with_judge<P: ProviderClient>(
         permission,
         network,
         crate::fs_scope::FsReadScope::Workspace,
+        Vec::new(),
         crate::exec::sandbox::FsWriteFence::Off,
         max_turns,
         control_input,
@@ -266,6 +280,8 @@ pub async fn resume_solo_with_judge<P: ProviderClient>(
         verify_reflex_debt,
         watchdog_repeat_threshold,
         realign,
+        mcp_servers,
+        Vec::new(),
     )
     .await
 }
@@ -282,6 +298,7 @@ pub async fn resume_solo_with_judge_and_fs_scope<P: ProviderClient>(
     permission: PermissionPolicy,
     network: crate::goal::NetworkPolicy,
     fs_read_scope: crate::fs_scope::FsReadScope,
+    extra_read_roots: Vec<PathBuf>,
     fs_write_fence: crate::exec::sandbox::FsWriteFence,
     max_turns: usize,
     control_input: ControlInputKind,
@@ -292,6 +309,8 @@ pub async fn resume_solo_with_judge_and_fs_scope<P: ProviderClient>(
     verify_reflex_debt: usize,
     watchdog_repeat_threshold: usize,
     realign: Option<crate::goal::ReAlignInput>,
+    mcp_servers: Vec<McpServerConfig>,
+    images: Vec<crate::image::ImageBlock>,
 ) -> Result<RunResult> {
     crate::exec::sandbox::validate_write_fence(fs_write_fence)?;
     let paths = RunPaths::new(&journal_root, &run_id);
@@ -331,8 +350,24 @@ pub async fn resume_solo_with_judge_and_fs_scope<P: ProviderClient>(
         )?;
     }
     if let Some(prompt) = prompt {
-        messages.push(ChatMessage::user(prompt));
+        messages.push(ChatMessage::user_with_images(prompt, images));
     }
+    // t12-img 第三轮 opus 审 P3-7：降级排在重读之前——目标 provider 根本不支持图片时
+    // 不该为历史图片白读盘（省一次不必要的磁盘 I/O），且 dropped 的 reason 应统一是
+    // `provider_no_image_support`，不是重读失败才报的 `source_missing`
+    // （换成不支持图片的 provider 续聊、源文件又恰好缺失时，此前会先报后者、掩盖了
+    // 真正原因）。
+    crate::image::degrade_unsupported_images(
+        &mut messages,
+        &provider.capabilities(),
+        &mut recorder,
+    )?;
+    // 载回的历史消息里，带图的 `images` 元信息还在但 `data_base64` 因落盘时
+    // `skip_serializing` 永远是空串——按 `source_path` 重读+重新校验，成功续接
+    // 真数据，失败则诚实剥图（否则会把"空 data URI"的坏块原样重发给 provider）。
+    // 只在 provider 支持图片时才会走到这里有实际内容要重读（上面已把不支持的情况
+    // 提前剥空）。
+    crate::image::reload_stale_images(&mut messages, &mut recorder)?;
 
     let objective = messages
         .iter()
@@ -378,6 +413,7 @@ pub async fn resume_solo_with_judge_and_fs_scope<P: ProviderClient>(
         permission,
         network,
         fs_read_scope,
+        extra_read_roots,
         fs_write_fence,
         evidence_gate: EvidenceGate::Off,
         native_search_enabled,
@@ -393,8 +429,10 @@ pub async fn resume_solo_with_judge_and_fs_scope<P: ProviderClient>(
         verify_reflex_debt,
         watchdog_repeat_threshold,
         journal_root: journal_root.clone(),
-        mcp_servers: Vec::new(),
+        mcp_servers,
         append_system_prompt: None,
+        // images 已经在上面并进 `messages`（附件挂在追加的那条 user 消息上），这里不重复带。
+        images: Vec::new(),
     };
     let mut control = make_control_source(options.control_input, &paths, &run_id);
     let interactive = matches!(options.output_mode, OutputMode::Human);

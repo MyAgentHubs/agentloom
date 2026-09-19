@@ -114,6 +114,7 @@ fn openai_provider_with_fallback(
         fallback_model: fallback_model.map(String::from),
         context_tokens: None,
         output_tokens: None,
+        supports_images_override: None,
     })
     .unwrap()
 }
@@ -136,6 +137,7 @@ fn anthropic_provider(base_url: &str) -> AnthropicProvider {
         fallback_model: None,
         context_tokens: None,
         output_tokens: None,
+        supports_images_override: None,
     })
     .unwrap()
 }
@@ -153,6 +155,7 @@ fn run_opts(ws: &std::path::Path, run_id: &str) -> RunOptions {
         permission: PermissionPolicy::Allow,
         network: myagent::goal::NetworkPolicy::On,
         fs_read_scope: myagent::fs_scope::FsReadScope::Workspace,
+        extra_read_roots: Vec::new(),
         fs_write_fence: myagent::exec::sandbox::FsWriteFence::Off,
         evidence_gate: myagent::orchestrator::EvidenceGate::Off,
         native_search_enabled: false,
@@ -169,6 +172,7 @@ fn run_opts(ws: &std::path::Path, run_id: &str) -> RunOptions {
         watchdog_repeat_threshold: 0,
         mcp_servers: Vec::new(),
         append_system_prompt: None,
+        images: Vec::new(),
     }
 }
 

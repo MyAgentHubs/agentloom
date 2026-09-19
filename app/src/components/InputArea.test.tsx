@@ -409,6 +409,41 @@ describe("InputArea", () => {
     );
   });
 
+  it("有 sessionId 时点击附件：拷进会话工作区，chip 用拷贝后的路径", async () => {
+    openMock.mockResolvedValue("/Users/me/desktop/shot.png");
+    invokeMock.mockResolvedValue("/repo/proj/.agentloom/attachments/shot.png");
+    render(
+      <I18nProvider>
+        <InputArea {...base({ sessionId: "sess-attach-1" })} />
+      </I18nProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "附加文件" }));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "import_attachment_into_workspace_cmd",
+        { sessionId: "sess-attach-1", path: "/Users/me/desktop/shot.png" },
+      ),
+    );
+    expect(await screen.findByText("shot.png")).toBeInTheDocument();
+  });
+
+  it("无 sessionId 时点击附件：不调用拷贝命令，保持原路径（既有行为不变）", async () => {
+    openMock.mockResolvedValue("/Users/me/spec.md");
+    render(
+      <I18nProvider>
+        <InputArea {...base()} />
+      </I18nProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "附加文件" }));
+
+    expect(await screen.findByText("spec.md")).toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "import_attachment_into_workspace",
+      expect.anything(),
+    );
+  });
+
   it("粘贴图片时保存到应用目录并显示附件 chip", async () => {
     invokeMock.mockResolvedValue("/Users/me/.agentloom/pasted/paste-1-0.png");
     render(
@@ -446,6 +481,7 @@ describe("InputArea", () => {
       expect(invokeMock).toHaveBeenCalledWith("save_pasted_image", {
         imageBase64: "iVBORw==",
         mediaType: "image/png",
+        sessionId: null,
       }),
     );
     expect(await screen.findByText("paste-1-0.png")).toBeInTheDocument();
@@ -489,6 +525,7 @@ describe("InputArea", () => {
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("save_pasted_text", {
         text: longText,
+        sessionId: null,
       }),
     );
     expect(await screen.findByText("paste-1-0.txt")).toBeInTheDocument();
@@ -536,6 +573,7 @@ describe("InputArea", () => {
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("save_pasted_text", {
         text: longText,
+        sessionId: null,
       }),
     );
     await waitFor(() => expect(textarea.value).toContain(longText));
@@ -582,11 +620,49 @@ describe("InputArea", () => {
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
     expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
       path: "/Users/me/spec.md",
+      sessionId: null,
     });
     const composed = onSend.mock.calls[0][0] as string;
     expect(composed).toContain("look at this");
     expect(composed).toContain("HELLO_FILE_BODY");
     expect(composed).toContain("Attached file: /Users/me/spec.md");
+  });
+
+  it("项目会话发送时读取附件带上 sessionId（不带会让 <项目>/.agentloom/attachments/ 里的粘贴文件读不到）", async () => {
+    invokeMock.mockImplementation((command: string) =>
+      command === "save_pasted_text"
+        ? Promise.resolve("/proj/.agentloom/attachments/paste-1.txt")
+        : Promise.resolve({ kind: "text", content: "x" }),
+    );
+    render(
+      <I18nProvider initialLocale="en">
+        <InputArea {...base({ sessionId: "sess-compose-1" })} />
+      </I18nProvider>,
+    );
+    const textarea = screen.getByPlaceholderText(
+      "Type a message…",
+    ) as HTMLTextAreaElement;
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        items: [{ kind: "string", type: "text/plain" }],
+        getData: () => "y".repeat(10001),
+      },
+    });
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "save_pasted_text",
+        expect.objectContaining({ sessionId: "sess-compose-1" }),
+      ),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+        path: "/proj/.agentloom/attachments/paste-1.txt",
+        sessionId: "sess-compose-1",
+      }),
+    );
   });
 
   it.each([

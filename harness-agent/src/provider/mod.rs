@@ -25,6 +25,10 @@ pub struct ChatMessage {
     pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// 图片附件（目前只挂在 user 消息上）。持久化只留元信息，绝不落盘 base64
+    /// （见 `crate::image::ImageBlock`）。wire 格式的 image 块由各 provider 出线时按需拼。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<crate::image::ImageBlock>,
 }
 
 impl ChatMessage {
@@ -36,6 +40,7 @@ impl ChatMessage {
             tool_calls: None,
             reasoning_content: None,
             name: None,
+            images: Vec::new(),
         }
     }
 
@@ -47,6 +52,23 @@ impl ChatMessage {
             tool_calls: None,
             reasoning_content: None,
             name: None,
+            images: Vec::new(),
+        }
+    }
+
+    /// 带图片附件的 user 消息（CLI `--image` 落地点）。
+    pub fn user_with_images(
+        content: impl Into<String>,
+        images: Vec<crate::image::ImageBlock>,
+    ) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: Some(content.into()),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            name: None,
+            images,
         }
     }
 
@@ -66,6 +88,7 @@ impl ChatMessage {
             },
             reasoning_content,
             name: None,
+            images: Vec::new(),
         }
     }
 
@@ -77,6 +100,7 @@ impl ChatMessage {
             tool_calls: None,
             reasoning_content: None,
             name: None,
+            images: Vec::new(),
         }
     }
 
@@ -93,6 +117,7 @@ impl ChatMessage {
             tool_calls: None,
             reasoning_content: None,
             name: Some(name.into()),
+            images: Vec::new(),
         }
     }
 }
@@ -185,7 +210,7 @@ pub fn shell_tool_definition() -> Value {
         "type": "function",
         "function": {
             "name": "shell_exec",
-            "description": "Run a shell command in the current workspace. Safety guard (best-effort, not a sandbox): the harness REFUSES common write/delete commands (rm/mv/cp/touch/mkdir/dd/redirects) that target paths outside the workspace, delete system paths or ~, write to .git or shell/tool startup configs (.bashrc/.zshrc/.gitconfig/.mcp.json/.claude.json/.claude/), use process substitution >(...)/<(...), or `cd` into a dir then write. Keep paths inside the workspace and use plain relative paths. If the guard refuses a command, do NOT try to work around it (e.g. via interpreter one-liners like python -c, eval, or xargs). Stop and report the refusal instead — if you believe it is wrong, say so in your report.",
+            "description": "Run a shell command in the current workspace. The working directory does not persist across calls; to change directories, pass the cwd parameter instead of using cd. Safety guard (best-effort, not a sandbox): the harness REFUSES common write/delete commands (rm/mv/cp/touch/mkdir/dd/redirects) that target paths outside the workspace, delete system paths or ~, write to .git or shell/tool startup configs (.bashrc/.zshrc/.gitconfig/.mcp.json/.claude.json/.claude/), use process substitution >(...)/<(...), or cd into a dir then write/delete files or redirect output to a real file. Redirecting output to /dev/null and pure file descriptor duplication are not file mutations; /dev/null used as ordinary arguments still follows normal workspace-path checks. Keep paths inside the workspace and use plain relative paths. If the guard refuses a command, do NOT try to work around it (e.g. via interpreter one-liners like python -c, eval, or xargs). Stop and report the refusal instead — if you believe it is wrong, say so in your report.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -195,7 +220,7 @@ pub fn shell_tool_definition() -> Value {
                     },
                     "cwd": {
                         "type": "string",
-                        "description": "Working directory. Defaults to the runtime workspace."
+                        "description": "Working directory for this call only. Defaults to the runtime workspace; use this parameter instead of cd."
                     },
                     "timeout_ms": {
                         "type": "integer",

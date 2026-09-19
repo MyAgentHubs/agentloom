@@ -1,9 +1,11 @@
 import { useMemo, useRef } from "react";
+import type { MutableRefObject } from "react";
 import type { Components } from "react-markdown";
 import type { LeadSummaryBlock as LSB, Finding } from "../types/agent";
 import { useI18n } from "../i18n";
 import { useMarkdownLib } from "../lib/useMarkdown";
 import {
+  localImageBareListItemComponent,
   localImageBareParagraphComponent,
   localImageMarkdownComponent,
   makeImgOnlyUrlTransform,
@@ -59,14 +61,20 @@ function LeadMarkdown({
   children,
   markdownLib,
   components,
+  bareParagraphOptsRef,
 }: {
   children: string;
   markdownLib: typeof MarkdownLib | null;
   components: Components;
+  // 规则 B 靠段落节点的 position.offset 切原文——LeadMarkdown 在同一次渲染里
+  // 被多个 section 各调一次、每次 children 不同，渲染前把当前这份原文同步
+  // 进共享 opts ref，供 localImageBareParagraphComponent 的 p 组件读取。
+  bareParagraphOptsRef: MutableRefObject<{ sourceText?: string }>;
 }) {
   if (!markdownLib) {
     return <div style={{ whiteSpace: "pre-wrap" }}>{children}</div>;
   }
+  bareParagraphOptsRef.current.sourceText = children;
   const leadUrlTransform = makeImgOnlyUrlTransform(
     markdownLib.defaultUrlTransform,
   );
@@ -258,15 +266,33 @@ export function LeadSummaryBlock({
   const imgComponent = useRef(localImageMarkdownComponent(imgOptsRef)).current;
 
   // lead 汇报是整块落地渲染、没有逐字流式的中间态（跟 MarkdownBody 的
-  // streaming prop 不对应），裸路径自动内联默认启用。
+  // streaming prop 不对应），且内容恒为 assistant/lead 产出（不是用户输入），
+  // 规则 B 自动出图固定打开（enabled: true，不受外部 prop 控制）。
   const bareParagraphOptsRef = useRef({
     sessionId,
     onOpenPreview,
     onOpenLightbox,
+    sourceText: undefined as string | undefined,
+    enabled: true,
   });
-  bareParagraphOptsRef.current = { sessionId, onOpenPreview, onOpenLightbox };
+  bareParagraphOptsRef.current.sessionId = sessionId;
+  bareParagraphOptsRef.current.onOpenPreview = onOpenPreview;
+  bareParagraphOptsRef.current.onOpenLightbox = onOpenLightbox;
+  // 整块 lead 汇报当一条「消息」处理：块内同一路径跨 section 只出一次图，
+  // 每次整块重渲染时重置。
+  const renderedImagePathsRef = useRef(new Set<string>());
+  renderedImagePathsRef.current = new Set<string>();
   const bareParagraphComponent = useRef(
-    localImageBareParagraphComponent(bareParagraphOptsRef),
+    localImageBareParagraphComponent(
+      bareParagraphOptsRef,
+      renderedImagePathsRef,
+    ),
+  ).current;
+  const bareListItemComponent = useRef(
+    localImageBareListItemComponent(
+      bareParagraphOptsRef,
+      renderedImagePathsRef,
+    ),
   ).current;
 
   const components = useMemo(
@@ -274,8 +300,9 @@ export function LeadSummaryBlock({
       ...leadMarkdownComponents,
       img: imgComponent,
       p: bareParagraphComponent,
+      li: bareListItemComponent,
     }),
-    [bareParagraphComponent, imgComponent],
+    [bareParagraphComponent, bareListItemComponent, imgComponent],
   );
 
   if (block.summary_source === "pending") {
@@ -331,7 +358,11 @@ export function LeadSummaryBlock({
         return heading === "" ? (
           <div className="lead-summary__say" key={i}>
             {body !== "" && (
-              <LeadMarkdown markdownLib={markdownLib} components={components}>
+              <LeadMarkdown
+                markdownLib={markdownLib}
+                components={components}
+                bareParagraphOptsRef={bareParagraphOptsRef}
+              >
                 {body}
               </LeadMarkdown>
             )}
@@ -341,7 +372,11 @@ export function LeadSummaryBlock({
             <h4 className="lead-summary__h">{heading}</h4>
             {body !== "" && (
               <div className="lead-summary__body">
-                <LeadMarkdown markdownLib={markdownLib} components={components}>
+                <LeadMarkdown
+                  markdownLib={markdownLib}
+                  components={components}
+                  bareParagraphOptsRef={bareParagraphOptsRef}
+                >
                   {body}
                 </LeadMarkdown>
               </div>

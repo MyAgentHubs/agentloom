@@ -15,6 +15,7 @@ async fn web_search_refused_when_network_off_no_live_call() {
         permission: myagent::shell::PermissionPolicy::Allow,
         network: myagent::goal::NetworkPolicy::Off,
         fs_read_scope: myagent::fs_scope::FsReadScope::Workspace,
+        extra_read_roots: Vec::new(),
         fs_write_fence: myagent::exec::sandbox::FsWriteFence::Off,
         evidence_gate: myagent::orchestrator::EvidenceGate::Off,
         native_search_enabled: true,
@@ -31,6 +32,7 @@ async fn web_search_refused_when_network_off_no_live_call() {
         watchdog_repeat_threshold: 0,
         mcp_servers: Vec::new(),
         append_system_prompt: None,
+        images: Vec::new(),
     };
     let res =
         myagent::orchestrator::run_solo(myagent::provider::mock::MockProvider::default(), opts)

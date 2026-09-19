@@ -36,6 +36,15 @@ pub(crate) fn build_anthropic_request(
                 }
             }
             "assistant" => {
+                if !msg.images.is_empty() {
+                    // 图片只该挂在 user 消息上；万一有代码路径把 images 塞进 assistant，
+                    // 静默忽略（这里天然不看 msg.images）而不是当异常处理——只补一条
+                    // debug 日志，方便排障发现"谁塞的"。
+                    crate::image::debug_log(&format!(
+                        "ignoring {} non-empty images on assistant role (images only apply to user messages)",
+                        msg.images.len()
+                    ));
+                }
                 let mut blocks: Vec<Value> = Vec::new();
                 if let Some(text) = &msg.content {
                     if !text.is_empty() {
@@ -59,6 +68,12 @@ pub(crate) fn build_anthropic_request(
                 push_role_blocks(&mut out, "assistant", blocks);
             }
             "tool" => {
+                if !msg.images.is_empty() {
+                    crate::image::debug_log(&format!(
+                        "ignoring {} non-empty images on tool role (images only apply to user messages)",
+                        msg.images.len()
+                    ));
+                }
                 let block = json!({
                     "type":"tool_result",
                     "tool_use_id": msg.tool_call_id.clone().unwrap_or_default(),
@@ -67,9 +82,30 @@ pub(crate) fn build_anthropic_request(
                 push_role_blocks(&mut out, "user", vec![block]);
             }
             _ => {
-                // user（含未知 role 当 user）·空内容也建一个 text 块（user 块允许·只 assistant 空块被拒）
-                let block = json!({"type":"text","text": msg.content.clone().unwrap_or_default()});
-                push_role_blocks(&mut out, "user", vec![block]);
+                // user（含未知 role 当 user）·空内容也建一个 text 块（user 块允许·只 assistant 空块被拒）。
+                // 有 images 时按 Anthropic 形态先图后文：[{type:image,...}...,{type:text,...}]。
+                let mut blocks: Vec<Value> = Vec::with_capacity(1 + msg.images.len());
+                for image in &msg.images {
+                    // 出线前最后一道保险丝（同款见 openai_compatible/image_wire.rs）：
+                    // data_base64 为空绝不发这张图出去。
+                    if image.data_base64.is_empty() {
+                        crate::image::debug_log(&format!(
+                            "dropping image with empty data_base64 before wire (media_type={})",
+                            image.media_type
+                        ));
+                        continue;
+                    }
+                    blocks.push(json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image.media_type,
+                            "data": image.data_base64,
+                        }
+                    }));
+                }
+                blocks.push(json!({"type":"text","text": msg.content.clone().unwrap_or_default()}));
+                push_role_blocks(&mut out, "user", blocks);
             }
         }
     }
@@ -314,7 +350,12 @@ impl ProviderClient for AnthropicProvider {
             supports_streaming: false,
             supports_reasoning_deltas: false,
             supports_tool_calling: true,
-            supports_images: false,
+            // 复用 openai_compatible::image_wire 那份 override-or-family 解析，不再内联
+            // 第二份逻辑（否则两处会漂——两边共用同一个 `OpenAiCompatibleConfig`）。
+            supports_images:
+                crate::provider::openai_compatible::image_wire::resolve_supports_images(
+                    &self.config,
+                ),
             supports_computer_use: false,
             supports_shell_tool: true,
             max_context_tokens: self.config.context_tokens,
@@ -347,6 +388,7 @@ mod tests {
             fallback_model: None,
             context_tokens: Some(128_000),
             output_tokens: None,
+            supports_images_override: None,
         };
         let p = super::AnthropicProvider::new(cfg).unwrap();
         let caps = p.capabilities();
@@ -554,5 +596,109 @@ mod tests {
     fn parse_missing_content_errors() {
         // content 缺失/非数组 → 报 provider 错·不静默空（codex MEDIUM6）
         assert!(parse_anthropic_response(&json!({"id":"x"})).is_err());
+    }
+
+    fn test_image() -> crate::image::ImageBlock {
+        crate::image::ImageBlock {
+            media_type: "image/png".into(),
+            data_base64: "QUJD".into(),
+            source_path: Some(std::path::PathBuf::from("/tmp/shot.png")),
+            bytes: 3,
+            sha256: None,
+        }
+    }
+
+    #[test]
+    fn user_message_without_images_keeps_single_text_block_unchanged() {
+        let msgs = vec![ChatMessage::user("hi")];
+        let body = build_anthropic_request(&msgs, &[], "glm-4.6", 4096, None, None).unwrap();
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0], json!({"type":"text","text":"hi"}));
+    }
+
+    #[test]
+    fn user_message_with_images_prepends_image_blocks_before_text() {
+        let msgs = vec![ChatMessage::user_with_images(
+            "describe this",
+            vec![test_image()],
+        )];
+        let body = build_anthropic_request(&msgs, &[], "glm-4.6", 4096, None, None).unwrap();
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(
+            blocks[0],
+            json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "QUJD",
+                }
+            })
+        );
+        assert_eq!(blocks[1], json!({"type":"text","text":"describe this"}));
+    }
+
+    #[test]
+    fn image_with_empty_data_base64_is_never_sent_fail_closed() {
+        // 同款保险丝（openai 侧见 image_wire.rs）：data_base64 为空绝不出线，哪怕
+        // Anthropic 这条路径当前只手搓 json、不经 apply_image_content。
+        let empty = crate::image::ImageBlock {
+            media_type: "image/png".into(),
+            data_base64: String::new(),
+            source_path: Some(std::path::PathBuf::from("/tmp/gone.png")),
+            bytes: 0,
+            sha256: None,
+        };
+        let msgs = vec![ChatMessage::user_with_images(
+            "describe this",
+            vec![empty, test_image()],
+        )];
+        let body = build_anthropic_request(&msgs, &[], "glm-4.6", 4096, None, None).unwrap();
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        let image_blocks: Vec<&Value> = blocks.iter().filter(|b| b["type"] == "image").collect();
+        assert_eq!(
+            image_blocks.len(),
+            1,
+            "空 data_base64 的图片必须被丢弃：{blocks:?}"
+        );
+        assert_eq!(image_blocks[0]["source"]["data"], "QUJD");
+        assert!(!body.to_string().contains("\"data\":\"\""));
+    }
+
+    #[test]
+    fn images_on_assistant_role_are_ignored_not_serialized() {
+        let mut assistant_with_stray_image = ChatMessage::assistant("looked already", None, vec![]);
+        assistant_with_stray_image.images = vec![test_image()];
+        let msgs = vec![ChatMessage::user("hi"), assistant_with_stray_image];
+        let body = build_anthropic_request(&msgs, &[], "glm-4.6", 4096, None, None).unwrap();
+        let assistant_msg = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .unwrap();
+        let blocks = assistant_msg["content"].as_array().unwrap();
+        assert!(
+            blocks.iter().all(|b| b["type"] != "image"),
+            "非 user 角色带图不该被拼成 image 块：{blocks:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_supports_images_reused_from_image_wire_module() {
+        // item 11：anthropic 侧的 supports_images 解析必须复用 openai_compatible::image_wire
+        // 那份，不再内联第二份 override-or-family 逻辑（否则两处会漂）。
+        let cfg = OpenAiCompatibleConfig {
+            provider_id: "deepseek".into(),
+            supports_images_override: Some(true),
+            ..Default::default()
+        };
+        let provider = AnthropicProvider::new(cfg).unwrap();
+        assert!(
+            provider.capabilities().supports_images,
+            "显式 override 必须生效，且必须走与 openai_compatible 相同的解析函数"
+        );
     }
 }

@@ -110,6 +110,7 @@ fn http_cfg(url: String) -> McpServerConfig {
         args: Vec::new(),
         env: Default::default(),
         trusted: false,
+        headers: None,
     }
 }
 

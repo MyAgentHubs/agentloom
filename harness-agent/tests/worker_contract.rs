@@ -120,6 +120,7 @@ async fn shell_exec_child_stays_in_same_process_group() {
         permission: myagent::shell::PermissionPolicy::Allow,
         network: myagent::goal::NetworkPolicy::On,
         fs_read_scope: myagent::fs_scope::FsReadScope::Workspace,
+        extra_read_roots: Vec::new(),
         fs_write_fence: myagent::exec::sandbox::FsWriteFence::Off,
         evidence_gate: myagent::orchestrator::EvidenceGate::Off,
         native_search_enabled: true,
@@ -136,6 +137,7 @@ async fn shell_exec_child_stays_in_same_process_group() {
         contract_policy: myagent::guardrails::ContractPolicy::Ask,
         mcp_servers: Vec::new(),
         append_system_prompt: None,
+        images: Vec::new(),
     };
     let res = run_solo_with_judge(PgidProbeProvider, Box::new(myagent::judge::NoopJudge), opts)
         .await

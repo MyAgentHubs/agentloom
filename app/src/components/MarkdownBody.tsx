@@ -6,6 +6,7 @@ import { CodeBlock } from "./CodeBlock";
 import { MermaidBlock } from "./MermaidBlock";
 import { useI18n } from "../i18n";
 import {
+  localImageBareListItemComponent,
   localImageBareParagraphComponent,
   localImageMarkdownComponent,
   makeImgOnlyUrlTransform,
@@ -46,6 +47,12 @@ type Props = {
   onOpenPreview?: (path: string) => void;
   onOpenLightbox?: (path: string) => void;
   sessionId?: string | null;
+  /// 规则 B（正文里裸写的绝对路径自动出图）总开关，默认关闭。绝对路径不受
+  /// sessionId/工作区边界限制（read_attachment 对绝对路径直接放行），只有
+  /// 聊天流里 assistant 消息的正文渲染点才该打开——其余消费方（仓库文档 /
+  /// 更新说明 / worker 子任务标题等）保持默认关，避免任意来源文本里提到的
+  /// 一句绝对路径就被无条件读盘渲图。
+  autoInlineImagePaths?: boolean;
 };
 
 export const MarkdownBody = React.memo(function MarkdownBody({
@@ -54,6 +61,7 @@ export const MarkdownBody = React.memo(function MarkdownBody({
   onOpenPreview,
   onOpenLightbox,
   sessionId,
+  autoInlineImagePaths = false,
 }: Props) {
   const { t } = useI18n();
   const attachmentPort = useAttachmentPort();
@@ -65,15 +73,32 @@ export const MarkdownBody = React.memo(function MarkdownBody({
     onOpenPreview,
     onOpenLightbox,
     streaming,
+    sourceText: children,
+    enabled: autoInlineImagePaths,
   });
   bareParagraphOptsRef.current = {
     sessionId,
     onOpenPreview,
     onOpenLightbox,
     streaming,
+    sourceText: children,
+    enabled: autoInlineImagePaths,
   };
+  // 规则 B 的消息级去重集合：同一条消息内同一路径只出一次图，每次渲染
+  // （即这条消息内容变化）重置。
+  const renderedImagePathsRef = useRef(new Set<string>());
+  renderedImagePathsRef.current = new Set<string>();
   const bareParagraphComponent = useRef(
-    localImageBareParagraphComponent(bareParagraphOptsRef),
+    localImageBareParagraphComponent(
+      bareParagraphOptsRef,
+      renderedImagePathsRef,
+    ),
+  ).current;
+  const bareListItemComponent = useRef(
+    localImageBareListItemComponent(
+      bareParagraphOptsRef,
+      renderedImagePathsRef,
+    ),
   ).current;
 
   const imgOptsRef = useRef({ sessionId, onOpenPreview, onOpenLightbox });
@@ -136,6 +161,7 @@ export const MarkdownBody = React.memo(function MarkdownBody({
       },
       img: imgComponent,
       p: bareParagraphComponent,
+      li: bareListItemComponent,
       table({ children }: React.ComponentProps<"table">) {
         return (
           <div className="mm-table-wrap">
@@ -161,6 +187,7 @@ export const MarkdownBody = React.memo(function MarkdownBody({
     [
       attachmentPort,
       bareParagraphComponent,
+      bareListItemComponent,
       imgComponent,
       onOpenPreview,
       sessionId,

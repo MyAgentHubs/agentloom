@@ -3,6 +3,19 @@ import { describe, expect, test, vi } from "vitest";
 import { MemberDrillIn } from "./MemberDrillIn";
 import type { MemberUnit } from "../types/agent";
 
+const messageContentSpy = vi.fn();
+vi.mock("./MessageContent", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./MessageContent")>();
+  return {
+    ...actual,
+    MessageContent: (props: Parameters<typeof actual.MessageContent>[0]) => {
+      messageContentSpy(props);
+      const Real = actual.MessageContent;
+      return <Real {...props} />;
+    },
+  };
+});
+
 const mk = (o: Partial<MemberUnit>): MemberUnit => ({
   participant_id: "w",
   assignment_id: "a",
@@ -21,6 +34,30 @@ const mk = (o: Partial<MemberUnit>): MemberUnit => ({
 });
 
 describe("MemberDrillIn", () => {
+  test("sessionId 一路传给派单 brief 和原始过程两处 MessageContent", () => {
+    messageContentSpy.mockClear();
+    const member = mk({
+      assignment_id: "a1",
+      taskPack: "## 总目标\n看下 X\n## 你的子任务\n看下 X\n",
+      blocks: [{ type: "text", text: "raw trace" }],
+    });
+
+    render(
+      <MemberDrillIn
+        members={[member]}
+        selectedId="a1"
+        onSelect={() => {}}
+        onBack={() => {}}
+        sessionId="sess-drill-1"
+      />,
+    );
+
+    expect(messageContentSpy).toHaveBeenCalled();
+    for (const call of messageContentSpy.mock.calls) {
+      expect(call[0].sessionId).toBe("sess-drill-1");
+    }
+  });
+
   test("带 taskPack 的队员渲染默认折叠的查看派单", () => {
     const member = mk({
       assignment_id: "a1",

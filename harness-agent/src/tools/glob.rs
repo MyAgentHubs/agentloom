@@ -289,6 +289,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
         let out = GlobTool.execute(&mut ctx, &call(args)).await.unwrap();
         serde_json::from_str(&out.content).unwrap()
@@ -373,6 +374,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
 
         let out = GlobTool
@@ -400,6 +402,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
 
         let out = GlobTool.execute(&mut ctx, &call(json!({}))).await.unwrap();

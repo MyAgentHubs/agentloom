@@ -1,14 +1,72 @@
-import { fireEvent, render } from "@testing-library/react";
-import { describe, it, expect, vi } from "vitest";
+import { fireEvent, render, waitFor } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { TaskInspector } from "./TaskInspector";
 import { I18nProvider } from "../i18n";
 import type { MemberUnit } from "../types/agent";
+
+// 本文件其余用例都不含本地图片 markdown 引用，不会触发 read_attachment；只有下面这条
+// 下面用例会用到，放在文件级 mock 不影响其它既有用例。
+const readAttachmentInvokeMock = vi.fn().mockResolvedValue({
+  kind: "image",
+  imageBase64: "",
+  mediaType: undefined,
+});
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (...args: unknown[]) => readAttachmentInvokeMock(...args),
+}));
 
 function wrapper({ children }: { children: React.ReactNode }) {
   return <I18nProvider initialLocale="zh">{children}</I18nProvider>;
 }
 
 describe("TaskInspector", () => {
+  beforeEach(() => {
+    readAttachmentInvokeMock.mockClear();
+  });
+
+  it("sessionId 一路带到 member.sub 与 member.blocks 两处渲染管线", async () => {
+    const member: MemberUnit = {
+      participant_id: "p-sid",
+      assignment_id: "a-sid",
+      task_id: "t-sid",
+      name: "Codex",
+      status: "done",
+      sub: "看图 ![diagram](diagram.png)",
+      steps_total: 1,
+      steps_done: 1,
+      cost_usd: null,
+      input_tokens: 0,
+      output_tokens: 0,
+      failed: false,
+      blocks: [{ type: "text", text: "原始过程 ![raw](trace.png)" }],
+      result: undefined,
+    };
+
+    render(
+      <TaskInspector
+        member={member}
+        onClose={() => {}}
+        sessionId="sess-inspector-1"
+      />,
+      { wrapper },
+    );
+
+    await waitFor(() =>
+      expect(
+        readAttachmentInvokeMock.mock.calls.some(
+          (call) => call[0] === "read_attachment",
+        ),
+      ).toBe(true),
+    );
+    const readCalls = readAttachmentInvokeMock.mock.calls.filter(
+      (call) => call[0] === "read_attachment",
+    );
+    expect(readCalls.length).toBeGreaterThan(0);
+    for (const call of readCalls) {
+      expect(call[1]).toMatchObject({ sessionId: "sess-inspector-1" });
+    }
+  });
+
   it("done member: shows conclusion, artifacts, verification, owner, and raw trace is folded", () => {
     const member: MemberUnit = {
       participant_id: "p1",
@@ -355,5 +413,37 @@ describe("TaskInspector", () => {
     );
 
     expect(queryByText("返回任务列表")).toBeNull();
+  });
+
+  it("member.sub 里的裸绝对路径不自动出图（P1：非聊天场景默认关闭规则 B）", async () => {
+    const member: MemberUnit = {
+      participant_id: "p1",
+      assignment_id: "a1",
+      task_id: "t1",
+      name: "Codex",
+      status: "running",
+      sub: "worker 提到 /Users/victim/secret.png 这个文件",
+      steps_total: 1,
+      steps_done: 0,
+      cost_usd: null,
+      input_tokens: 0,
+      output_tokens: 0,
+      failed: false,
+      blocks: [],
+      result: undefined,
+    };
+
+    const { findByText } = render(
+      <TaskInspector member={member} onClose={() => {}} />,
+      { wrapper },
+    );
+
+    // 等 MarkdownBody 异步加载完并渲出标题，确认走的是真正的 markdown 渲染路径
+    // （不是 `!MarkdownBody` 的 <pre> 兜底），而不是自动出图。
+    await findByText(/worker 提到 \/Users\/victim\/secret\.png 这个文件/);
+    expect(readAttachmentInvokeMock).not.toHaveBeenCalledWith(
+      "read_attachment",
+      expect.anything(),
+    );
   });
 });

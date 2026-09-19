@@ -206,9 +206,10 @@ describe("MarkdownBody images", () => {
       "src",
       "https://example.com/image.png",
     );
-    expect(screen.getByRole("img", { name: "remote" })).toHaveStyle({
-      maxWidth: "100%",
-    });
+    // 统一样式类（规则 C）——尺寸约束交给 .al-chat-image，不再各处内联。
+    expect(screen.getByRole("img", { name: "remote" })).toHaveClass(
+      "al-chat-image",
+    );
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
@@ -416,7 +417,11 @@ describe("MarkdownBody bare image paths", () => {
     });
 
     const { container } = render(
-      <MarkdownBody streaming={false} sessionId="session-bare-absolute">
+      <MarkdownBody
+        streaming={false}
+        autoInlineImagePaths={true}
+        sessionId="session-bare-absolute"
+      >
         {"\n\n/abs/path/chart.png\n\n"}
       </MarkdownBody>,
     );
@@ -441,7 +446,11 @@ describe("MarkdownBody bare image paths", () => {
     });
 
     const { container } = render(
-      <MarkdownBody streaming={false} sessionId="session-bare-file">
+      <MarkdownBody
+        streaming={false}
+        autoInlineImagePaths={true}
+        sessionId="session-bare-file"
+      >
         {"\n\nfile:///abs/x.svg\n\n"}
       </MarkdownBody>,
     );
@@ -458,37 +467,86 @@ describe("MarkdownBody bare image paths", () => {
     });
   });
 
-  it("keeps mixed paragraph text unchanged", () => {
-    render(
-      <MarkdownBody streaming={false}>
+  it("inlines a mid-sentence bare path below the unchanged paragraph text（规则 B②）", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "bWlkc2VudGVuY2U=",
+      mediaType: "image/png",
+    });
+
+    const { container } = render(
+      <MarkdownBody
+        streaming={false}
+        autoInlineImagePaths={true}
+        sessionId="session-mid-sentence"
+      >
         {"\n\n结果在 /a/b.png 里\n\n"}
       </MarkdownBody>,
     );
 
-    expect(screen.queryByRole("img")).not.toBeInTheDocument();
     expect(screen.getByText(/结果在 \/a\/b\.png 里/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(container.querySelector("img")).toHaveAttribute(
+        "src",
+        "data:image/png;base64,bWlkc2VudGVuY2U=",
+      );
+    });
+    expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+      path: "/a/b.png",
+      sessionId: "session-mid-sentence",
+    });
   });
 
-  it("does not render an inline-code image path as an image", () => {
-    render(
-      <MarkdownBody streaming={false}>{"\n\n`/a/b.png`\n\n"}</MarkdownBody>,
+  it("appends an inlined image below a backtick-wrapped image path (规则 B①)", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "YmFja3RpY2s=",
+      mediaType: "image/png",
+    });
+
+    const { container } = render(
+      <MarkdownBody
+        streaming={false}
+        autoInlineImagePaths={true}
+        sessionId="session-backtick"
+      >
+        {"\n\n`/a/b.png`\n\n"}
+      </MarkdownBody>,
     );
 
-    expect(screen.queryByRole("img")).not.toBeInTheDocument();
-    // <code> 原样文本仍在——不是被吞了，只是没被判成裸路径图。
-    const code = screen.getByText("/a/b.png");
-    expect(code.tagName).toBe("CODE");
+    // 原文不改——反引号内的路径仍原样渲成可点 <code>。
+    const code = container.querySelector("code");
+    expect(code?.textContent).toBe("/a/b.png");
+    // 规则 B：段落下方追加一块内联图。
+    await waitFor(() => {
+      expect(container.querySelector("img")).toHaveAttribute(
+        "src",
+        "data:image/png;base64,YmFja3RpY2s=",
+      );
+    });
+    expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+      path: "/a/b.png",
+      sessionId: "session-backtick",
+    });
   });
 
   it("keeps a standalone non-image path as text", () => {
-    render(<MarkdownBody streaming={false}>{"\n\n/a/b.txt\n\n"}</MarkdownBody>);
+    render(
+      <MarkdownBody streaming={false} autoInlineImagePaths={true}>
+        {"\n\n/a/b.txt\n\n"}
+      </MarkdownBody>,
+    );
 
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
     expect(screen.getByText("/a/b.txt")).toBeInTheDocument();
   });
 
   it("keeps a standalone relative image path as text", () => {
-    render(<MarkdownBody streaming={false}>{"\n\n./a.png\n\n"}</MarkdownBody>);
+    render(
+      <MarkdownBody streaming={false} autoInlineImagePaths={true}>
+        {"\n\n./a.png\n\n"}
+      </MarkdownBody>,
+    );
 
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
     expect(screen.getByText("./a.png")).toBeInTheDocument();
@@ -498,37 +556,67 @@ describe("MarkdownBody bare image paths", () => {
     invokeMock.mockRejectedValueOnce(new Error("boom"));
 
     render(
-      <MarkdownBody streaming={false}>{"\n\n/a/fail.png\n\n"}</MarkdownBody>,
+      <MarkdownBody streaming={false} autoInlineImagePaths={true}>
+        {"\n\n/a/fail.png\n\n"}
+      </MarkdownBody>,
     );
 
     await waitFor(() => {
       expect(screen.queryByRole("status")).not.toBeInTheDocument();
     });
-    expect(screen.getByText("/a/fail.png")).toBeInTheDocument();
+    // 原段落文本 + 追加块失败后的 fallback 各渲出一份同样的路径文本。
+    expect(screen.getAllByText("/a/fail.png").length).toBeGreaterThanOrEqual(2);
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
   });
 
   it("does not inline a protocol-relative bare path (//host/a.png)", () => {
     render(
-      <MarkdownBody streaming={false}>{"\n\n//host/a.png\n\n"}</MarkdownBody>,
+      <MarkdownBody streaming={false} autoInlineImagePaths={true}>
+        {"\n\n//host/a.png\n\n"}
+      </MarkdownBody>,
     );
 
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
     expect(screen.getByText("//host/a.png")).toBeInTheDocument();
   });
 
-  it("does not inline a bare path with trailing punctuation (/a/b.png。)", () => {
-    render(
-      <MarkdownBody streaming={false}>{"\n\n/a/b.png。\n\n"}</MarkdownBody>,
+  it("inlines a bare path after trimming trailing punctuation (/a/b.png。规则 B 规范化)", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "dHJhaWxpbmc=",
+      mediaType: "image/png",
+    });
+
+    const { container } = render(
+      <MarkdownBody
+        streaming={false}
+        autoInlineImagePaths={true}
+        sessionId="session-trailing-punct"
+      >
+        {"\n\n/a/b.png。\n\n"}
+      </MarkdownBody>,
     );
 
-    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    // 原文不改——句末全角句号仍在段落文本里。
     expect(screen.getByText("/a/b.png。")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(container.querySelector("img")).toHaveAttribute(
+        "src",
+        "data:image/png;base64,dHJhaWxpbmc=",
+      );
+    });
+    // 规范化：出图/read_attachment 用的是裁掉尾随句号后的路径。
+    expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+      path: "/a/b.png",
+      sessionId: "session-trailing-punct",
+    });
   });
 
   it("does not inline a bare path with a query string (/a/b.png?x=1)", () => {
     render(
-      <MarkdownBody streaming={false}>{"\n\n/a/b.png?x=1\n\n"}</MarkdownBody>,
+      <MarkdownBody streaming={false} autoInlineImagePaths={true}>
+        {"\n\n/a/b.png?x=1\n\n"}
+      </MarkdownBody>,
     );
 
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
@@ -543,7 +631,11 @@ describe("MarkdownBody bare image paths", () => {
     });
 
     const { container } = render(
-      <MarkdownBody streaming={false} sessionId="session-svg-upper">
+      <MarkdownBody
+        streaming={false}
+        autoInlineImagePaths={true}
+        sessionId="session-svg-upper"
+      >
         {"\n\n/a/b.SVG\n\n"}
       </MarkdownBody>,
     );
@@ -560,21 +652,42 @@ describe("MarkdownBody bare image paths", () => {
     });
   });
 
-  it("keeps a bare path mixed with bold text unchanged (**粗体** /a/b.png)", () => {
-    render(
-      <MarkdownBody streaming={false}>
+  it("inlines a bare path mixed with bold text below the paragraph (**粗体** /a/b.png，规则 B②)", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "Ym9sZA==",
+      mediaType: "image/png",
+    });
+
+    const { container } = render(
+      <MarkdownBody
+        streaming={false}
+        autoInlineImagePaths={true}
+        sessionId="session-bold-mixed"
+      >
         {"\n\n**粗体** /a/b.png\n\n"}
       </MarkdownBody>,
     );
 
-    expect(screen.queryByRole("img")).not.toBeInTheDocument();
-    expect(screen.getByText("粗体")).toBeInTheDocument();
-    expect(screen.getByText(/\/a\/b\.png/)).toBeInTheDocument();
+    // 原文不改——加粗文字与路径文字都还在同一个 <p> 里。
+    const paragraph = container.querySelector("p");
+    expect(paragraph?.querySelector("strong")?.textContent).toBe("粗体");
+    expect(paragraph?.textContent).toContain("/a/b.png");
+    await waitFor(() => {
+      expect(container.querySelector("img")).toHaveAttribute(
+        "src",
+        "data:image/png;base64,Ym9sZA==",
+      );
+    });
+    expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+      path: "/a/b.png",
+      sessionId: "session-bold-mixed",
+    });
   });
 
   it("does not inline a file:// URL with a non-empty host", () => {
     render(
-      <MarkdownBody streaming={false}>
+      <MarkdownBody streaming={false} autoInlineImagePaths={true}>
         {"\n\nfile://host/a.png\n\n"}
       </MarkdownBody>,
     );
@@ -591,12 +704,17 @@ describe("MarkdownBody bare image paths", () => {
     });
 
     const { container } = render(
-      <MarkdownBody streaming={false} sessionId="session-line-split">
+      <MarkdownBody
+        streaming={false}
+        autoInlineImagePaths={true}
+        sessionId="session-line-split"
+      >
         {"\n\n一句话\n/a/b.png\n\n"}
       </MarkdownBody>,
     );
 
-    expect(screen.getByText("一句话")).toBeInTheDocument();
+    // 原文不改——两行仍是同一个 <p> 里的原样文本（含内部换行）。
+    expect(container.querySelector("p")?.textContent).toContain("一句话");
     await waitFor(() => {
       expect(container.querySelectorAll("img")).toHaveLength(1);
     });
@@ -614,7 +732,11 @@ describe("MarkdownBody bare image paths", () => {
     });
 
     const { container } = render(
-      <MarkdownBody streaming={false} sessionId="session-two-lines">
+      <MarkdownBody
+        streaming={false}
+        autoInlineImagePaths={true}
+        sessionId="session-two-lines"
+      >
         {"\n\n/a/one.png\n/a/two.png\n\n"}
       </MarkdownBody>,
     );
@@ -634,7 +756,11 @@ describe("MarkdownBody bare image paths", () => {
 
   it("disables bare-path auto-inlining while streaming but keeps ![]() working", () => {
     render(
-      <MarkdownBody streaming={true} sessionId="session-streaming">
+      <MarkdownBody
+        streaming={true}
+        autoInlineImagePaths={true}
+        sessionId="session-streaming"
+      >
         {"\n\n/a/b.png\n\n![x](https://example.com/x.png)"}
       </MarkdownBody>,
     );
@@ -646,6 +772,297 @@ describe("MarkdownBody bare image paths", () => {
       "src",
       "https://example.com/x.png",
     );
+  });
+
+  it("inlines a bare path once streaming ends after starting mid-stream", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "c3RyZWFtZW5k",
+      mediaType: "image/png",
+    });
+
+    const { container, rerender } = render(
+      <MarkdownBody
+        streaming={true}
+        autoInlineImagePaths={true}
+        sessionId="session-stream-end"
+      >
+        {"\n\n/a/streaming.png"}
+      </MarkdownBody>,
+    );
+    expect(container.querySelector("img")).toBeNull();
+
+    rerender(
+      <MarkdownBody
+        streaming={false}
+        autoInlineImagePaths={true}
+        sessionId="session-stream-end"
+      >
+        {"\n\n/a/streaming.png\n\n"}
+      </MarkdownBody>,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector("img")).toHaveAttribute(
+        "src",
+        "data:image/png;base64,c3RyZWFtZW5k",
+      );
+    });
+  });
+
+  it("抽取 <...> 包裹且内部含空格的路径（规则 B④）", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "YW5nbGVzcGFjZQ==",
+      mediaType: "image/png",
+    });
+
+    const { container } = render(
+      <MarkdownBody
+        streaming={false}
+        autoInlineImagePaths={true}
+        sessionId="session-angle-space"
+      >
+        {"\n\n详见 </Users/alice/my pics/a b.png> 这张图\n\n"}
+      </MarkdownBody>,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector("img")).toHaveAttribute(
+        "src",
+        "data:image/png;base64,YW5nbGVzcGFjZQ==",
+      );
+    });
+    expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+      path: "/Users/alice/my pics/a b.png",
+      sessionId: "session-angle-space",
+    });
+  });
+
+  it("抽取 ~ 开头的路径（规则 B②）", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "aG9tZWRpcg==",
+      mediaType: "image/png",
+    });
+
+    const { container } = render(
+      <MarkdownBody
+        streaming={false}
+        autoInlineImagePaths={true}
+        sessionId="session-tilde"
+      >
+        {"\n\n看 ~/Pictures/cat.webp 这张\n\n"}
+      </MarkdownBody>,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector("img")).toHaveAttribute(
+        "src",
+        "data:image/png;base64,aG9tZWRpcg==",
+      );
+    });
+    expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+      path: "~/Pictures/cat.webp",
+      sessionId: "session-tilde",
+    });
+  });
+
+  it("列表项下方追加图片块", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "bGlzdGl0ZW0=",
+      mediaType: "image/png",
+    });
+
+    const { container } = render(
+      <MarkdownBody
+        streaming={false}
+        autoInlineImagePaths={true}
+        sessionId="session-list-item"
+      >
+        {"- 见 /a/list-item.png 这项\n"}
+      </MarkdownBody>,
+    );
+
+    expect(screen.getByText(/见 \/a\/list-item\.png 这项/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(container.querySelector("img")).toHaveAttribute(
+        "src",
+        "data:image/png;base64,bGlzdGl0ZW0=",
+      );
+    });
+  });
+
+  it("同一路径在消息里出现两次只出一图（消息级去重）", async () => {
+    invokeMock.mockResolvedValue({
+      kind: "image",
+      imageBase64: "ZGVkdXA=",
+      mediaType: "image/png",
+    });
+
+    const { container } = render(
+      <MarkdownBody
+        streaming={false}
+        autoInlineImagePaths={true}
+        sessionId="session-dedup"
+      >
+        {"\n\n先看 `/a/dup.png`\n\n再看一次 /a/dup.png 确认\n\n"}
+      </MarkdownBody>,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelectorAll("img")).toHaveLength(1);
+    });
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("已是 ![]() 语法的路径不会被规则 B 重复追加", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "bm9kdXA=",
+      mediaType: "image/png",
+    });
+
+    const { container } = render(
+      <MarkdownBody
+        streaming={false}
+        autoInlineImagePaths={true}
+        sessionId="session-no-dup"
+      >
+        {"\n\n![chart](/a/already.png) 见上图\n\n"}
+      </MarkdownBody>,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelectorAll("img")).toHaveLength(1);
+    });
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("MarkdownBody autoInlineImagePaths gating（默认关闭·P1）", () => {
+  it("默认（不传 autoInlineImagePaths）不自动出图、不调 read_attachment", () => {
+    render(
+      <MarkdownBody streaming={false} sessionId="session-default-off">
+        {"\n\n结果在 /Users/victim/secret.png 里\n\n"}
+      </MarkdownBody>,
+    );
+
+    expect(
+      screen.getByText(/结果在 \/Users\/victim\/secret\.png 里/),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("显式 autoInlineImagePaths={false} 同样不出图", () => {
+    render(
+      <MarkdownBody
+        streaming={false}
+        sessionId="session-explicit-off"
+        autoInlineImagePaths={false}
+      >
+        {"\n\n/a/b.png\n\n"}
+      </MarkdownBody>,
+    );
+
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("autoInlineImagePaths={true} 打开后照常出图（与规则 B 行为一致）", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "b3B0aW4=",
+      mediaType: "image/png",
+    });
+
+    const { container } = render(
+      <MarkdownBody
+        streaming={false}
+        sessionId="session-explicit-on"
+        autoInlineImagePaths={true}
+      >
+        {"\n\n/a/b.png\n\n"}
+      </MarkdownBody>,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector("img")).toHaveAttribute(
+        "src",
+        "data:image/png;base64,b3B0aW4=",
+      );
+    });
+    expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+      path: "/a/b.png",
+      sessionId: "session-explicit-on",
+    });
+  });
+
+  it("![]() 语法渲图不受 autoInlineImagePaths 影响（关闭时依旧出图）", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "image",
+      imageBase64: "c3ludGF4",
+      mediaType: "image/png",
+    });
+
+    const { container } = render(
+      <MarkdownBody streaming={false} sessionId="session-syntax-unaffected">
+        {"![chart](/a/chart.png)"}
+      </MarkdownBody>,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector("img")).toHaveAttribute(
+        "src",
+        "data:image/png;base64,c3ludGF4",
+      );
+    });
+  });
+});
+
+describe("MarkdownBody bare image re-render 回归（P2·去重不误判）", () => {
+  it("内容不变、无关 prop（onOpenLightbox 函数身份）变化触发 re-render 后图片仍在", async () => {
+    invokeMock.mockResolvedValue({
+      kind: "image",
+      imageBase64: "cmVyZW5kZXI=",
+      mediaType: "image/png",
+    });
+
+    const content = "\n\n看 /a/rerender.png 这张\n\n";
+    const { container, rerender } = render(
+      <MarkdownBody
+        streaming={false}
+        sessionId="session-rerender"
+        autoInlineImagePaths={true}
+        onOpenLightbox={() => {}}
+      >
+        {content}
+      </MarkdownBody>,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelectorAll("img")).toHaveLength(1);
+    });
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+
+    // 内容原样不变，仅 onOpenLightbox 换一个新的函数引用触发 re-render。
+    rerender(
+      <MarkdownBody
+        streaming={false}
+        sessionId="session-rerender"
+        autoInlineImagePaths={true}
+        onOpenLightbox={() => {}}
+      >
+        {content}
+      </MarkdownBody>,
+    );
+
+    // re-render 后图片既没消失也没重复出现第二张；去重集合每次渲染整体
+    // 重建，不会把「早前渲染出过的图」错判成「这次消息里的重复路径」。
+    expect(container.querySelectorAll("img")).toHaveLength(1);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
   });
 });
 

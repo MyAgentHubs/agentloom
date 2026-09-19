@@ -12,6 +12,13 @@ const DEFAULT_OUTPUT_HEADROOM: usize = 8_192;
 const SAFETY_BUFFER: usize = 2_048;
 const CHARS_PER_TOKEN: usize = 3;
 const PER_MSG_OVERHEAD: usize = 4;
+/// 每张图片固定按这么多 token 计入预算（t12-img 双路审 P2-4：此前完全不数图片，
+/// 一张 10MB 图（13.6MB base64）被算成 0 token，`FitOutcome::Fit` 判没事，真实
+/// vision API 计费/context 占用远不是 0）。字节/cpt 的近似不适用图片（图片走
+/// vision tokenizer，不是文本 token 化），固定值是保守估计，不做逐字节换算。
+const IMAGE_TOKEN_ESTIMATE: usize = 1_600;
+/// 非最新一轮的带图 user 消息被压缩剥掉图片时换成的说明行。
+const IMAGE_ELIDED_NOTICE: &str = "\n[图片已因上下文压缩省略]";
 /// 单条消息在 wire 里允许占的 token 上限阶梯（预算的几分之一·从宽到紧）。
 const MSG_CAP_DIVISORS: [usize; 2] = [8, 32];
 /// 单条上限的硬下限（防小预算下把消息剪成没有信息量）。
@@ -27,6 +34,12 @@ pub struct BudgetLimits {
     pub min_recent: usize,
     pub chars_per_token: usize,
     pub per_msg_overhead: usize,
+    /// true 当 provider 报过真实 `max_context_tokens`（或 config.rs `default_context_tokens`
+    /// 有登记）；false 时 `context_tokens` 是 `DEFAULT_CONTEXT_TOKENS` 保守猜测值——此时
+    /// 图片不计入预算（t12-img 第三轮 opus 审 P2-1(c)：不能拿猜的数毙掉用户明确要发的
+    /// 附件——openai/gpt-4o 这类没登记真实窗口的 vision provider，3 张图就会把黄金路径
+    /// 打死）。图片本身仍会正常出线，只是不参与这份猜测预算的估值。
+    pub images_count_toward_budget: bool,
 }
 
 impl BudgetLimits {
@@ -46,6 +59,7 @@ impl BudgetLimits {
             min_recent: 1,
             chars_per_token: CHARS_PER_TOKEN,
             per_msg_overhead: PER_MSG_OVERHEAD,
+            images_count_toward_budget: caps.max_context_tokens.is_some(),
         }
     }
 
@@ -81,10 +95,19 @@ fn msg_text_bytes(m: &ChatMessage) -> usize {
     n
 }
 
-/// 保守确定性估值：字节/cpt（宁可高估·cpt 取 3 比 CC 的 4 保守）+ 每条固定开销。
+/// 保守确定性估值：字节/cpt（宁可高估·cpt 取 3 比 CC 的 4 保守）+ 每条固定开销 +
+/// 每张图片固定 `IMAGE_TOKEN_ESTIMATE`（图片走 vision tokenizer，字节/cpt 近似对它不适用）。
+/// `limits.images_count_toward_budget == false`（落 `DEFAULT_CONTEXT_TOKENS` 猜测预算）
+/// 时不计图片——见 `BudgetLimits::images_count_toward_budget` 文档（P2-1(c)）。
 pub fn estimate_tokens(messages: &[ChatMessage], limits: &BudgetLimits) -> usize {
     let bytes: usize = messages.iter().map(msg_text_bytes).sum();
-    bytes.div_ceil(limits.chars_per_token) + limits.per_msg_overhead * messages.len()
+    let image_tokens = if limits.images_count_toward_budget {
+        let image_count: usize = messages.iter().map(|m| m.images.len()).sum();
+        image_count * IMAGE_TOKEN_ESTIMATE
+    } else {
+        0
+    };
+    bytes.div_ceil(limits.chars_per_token) + limits.per_msg_overhead * messages.len() + image_tokens
 }
 
 pub fn estimate_tools_tokens(tools: &[Value], limits: &BudgetLimits) -> usize {
@@ -240,6 +263,7 @@ fn fold_tool(m: &ChatMessage) -> ChatMessage {
         tool_calls: None,
         reasoning_content: None,
         name: m.name.clone(),
+        images: Vec::new(),
     }
 }
 
@@ -255,6 +279,7 @@ fn build_candidate(
 ) -> Vec<ChatMessage> {
     let n = groups.len();
     let recent_from = n.saturating_sub(keep_recent);
+    let latest_group = n.saturating_sub(1);
     let mut out: Vec<ChatMessage> = head.to_vec();
     if drop_oldest > 0 {
         out.push(ChatMessage::user(dropped_turns_marker(drop_oldest)));
@@ -267,6 +292,20 @@ fn build_candidate(
         for m in group {
             if !is_recent && m.role == "tool" {
                 out.push(fold_tool(m));
+            } else if m.role == "user"
+                && !m.images.is_empty()
+                && gi != latest_group
+                && limits.images_count_toward_budget
+            {
+                // 已经在压缩（本函数只在超预算时被调用）——非最新一轮的带图 user
+                // 消息，图片本身占的 token 救不了（vision 数据不是"重复读小范围"就
+                // 能省的东西），直接剥掉换一行说明；最新一轮的图片是用户当下正在
+                // 讨论的东西，不剥。
+                // t12-img 第四轮返工（P3-H）：`images_count_toward_budget == false`
+                // （猜测预算，图片压根没计进 token 估值）时剥图是零收益纯丢数据——
+                // 省 0 token，还要 `push_str(IMAGE_ELIDED_NOTICE)` 让候选更大一点，
+                // 所以这个开关关着就不剥。
+                out.push(strip_images_for_budget(m));
             } else if let Some(cap) = msg_cap_tokens {
                 out.push(cap_message(m, cap, limits));
             } else {
@@ -277,6 +316,23 @@ fn build_candidate(
     out
 }
 
+/// 剥掉一条 user 消息的图片附件，换成一行确定性说明（不落盘/不发事件——只是这次
+/// 临时 wire 候选的形状，canonical 历史不受影响）。`content` 原为 `None` 时不留
+/// `IMAGE_ELIDED_NOTICE` 的前导换行（t12-img 第三轮 opus 审 P3-6：与 `image.rs`
+/// 里 `stale_notice` 那条路径的 `trim_start()` 对齐）。
+fn strip_images_for_budget(m: &ChatMessage) -> ChatMessage {
+    let mut out = m.clone();
+    out.images = Vec::new();
+    out.content = Some(match out.content.take() {
+        Some(mut content) => {
+            content.push_str(IMAGE_ELIDED_NOTICE);
+            content
+        }
+        None => IMAGE_ELIDED_NOTICE.trim_start().to_string(),
+    });
+    out
+}
+
 /// 把 wire 压进预算。返回「能塞下的最省删」候选；连最小钉住都超 → Overflow。
 /// 纯函数·确定性·无 LLM·无落盘。只作用于临时 wire（canonical 不受影响）。
 pub fn fit_to_budget(
@@ -284,6 +340,15 @@ pub fn fit_to_budget(
     limits: &BudgetLimits,
     reserve_tokens: usize,
 ) -> FitOutcome {
+    if !limits.images_count_toward_budget {
+        let image_count: usize = wire.iter().map(|m| m.images.len()).sum();
+        if image_count > 0 {
+            crate::image::debug_log(&format!(
+                "context budget: {image_count} image(s) present but context_tokens is a guessed \
+                 default ({DEFAULT_CONTEXT_TOKENS}); not counting images toward budget (P2-1(c))"
+            ));
+        }
+    }
     let budget = limits.budget().saturating_sub(reserve_tokens);
     if estimate_tokens(&wire, limits) <= budget {
         return FitOutcome::Fit(wire);

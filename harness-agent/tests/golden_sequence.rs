@@ -15,6 +15,7 @@ fn opts(ws: &std::path::Path, run_id: &str, prompt: &str, criteria: &[&str]) -> 
         permission: myagent::shell::PermissionPolicy::Allow,
         network: myagent::goal::NetworkPolicy::On,
         fs_read_scope: myagent::fs_scope::FsReadScope::Workspace,
+        extra_read_roots: Vec::new(),
         fs_write_fence: myagent::exec::sandbox::FsWriteFence::Off,
         evidence_gate: myagent::orchestrator::EvidenceGate::Off,
         native_search_enabled: true,
@@ -35,6 +36,7 @@ fn opts(ws: &std::path::Path, run_id: &str, prompt: &str, criteria: &[&str]) -> 
         journal_root: ws.to_path_buf(),
         mcp_servers: Vec::new(),
         append_system_prompt: None,
+        images: Vec::new(),
     }
 }
 

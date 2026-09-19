@@ -48,7 +48,12 @@ impl Tool for LsTool {
             }
         };
         let requested_path = args.path.as_deref().unwrap_or(".");
-        let dir = match resolve_for_read(ctx.workspace, requested_path, ctx.fs_read_scope) {
+        let dir = match resolve_for_read(
+            ctx.workspace,
+            requested_path,
+            ctx.fs_read_scope,
+            ctx.extra_read_roots,
+        ) {
             Ok(dir) => dir,
             Err(HarnessError::PermissionDenied(_)) => {
                 let msg = format!(
@@ -135,6 +140,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
         let out = LsTool
             .execute(&mut ctx, &call(json!({"path":"."})))
@@ -169,6 +175,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
 
         let out = LsTool
@@ -200,6 +207,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
 
         let out = LsTool
@@ -232,6 +240,7 @@ mod tests {
             file_ledger: &mut ledger,
             network: crate::goal::NetworkPolicy::On,
             fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+            extra_read_roots: &[],
         };
 
         let out = LsTool

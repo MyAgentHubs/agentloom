@@ -5,6 +5,8 @@ import {
   setAttachmentDataUri,
 } from "../lib/attachmentCache";
 import { useAttachmentPort } from "../lib/attachmentPortContext";
+import { scanImagePaths } from "../lib/imagePathScan";
+import "../styles/chatImage.css";
 
 export function isLocalImagePath(src: string): boolean {
   if (
@@ -38,7 +40,7 @@ const FILE_SCHEME_RE = /^file:\/{1,3}/i;
 ///
 /// 空格/中文等 percent-encoded 字符经 decodeURIComponent 还原，解码失败（畸形
 /// 转义）时按原样剥壳串继续校验兜底。
-function stripFileScheme(url: string): string | null {
+export function stripFileScheme(url: string): string | null {
   const match = FILE_SCHEME_RE.exec(url);
   if (!match) return null;
   const slashCount = match[0].length - "file:".length;
@@ -51,24 +53,6 @@ function stripFileScheme(url: string): string | null {
     // 畸形转义：原样剥壳串继续走下面的绝对路径校验兜底。
   }
   return decoded.startsWith("/") ? decoded : null;
-}
-
-const BARE_IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|svg|bmp)$/i;
-
-/// 单行裸路径判定：一行 trim 后若恰是一条本地绝对路径 / file: URL 且后缀为
-/// 图片，返回剥壳解码后的路径；否则 null。行内空白（路径与文字混排）一律拒绝。
-/// 非 file: 形态额外过 isLocalImagePath，把 `//host/a.png` 协议相对形态这类
-/// 「看着像绝对路径其实不是本地文件」拒掉——但仍要求 `/` 开头，不放宽到相对路径
-/// （`./a.png`、`assets/x.png` 这类裸路径不自动内联，维持既有语义）。
-function bareLocalImagePathToken(text: string): string | null {
-  const trimmed = text.trim();
-  if (!trimmed || /\s/.test(trimmed)) return null;
-  const stripped = stripFileScheme(trimmed);
-  const candidate =
-    stripped ??
-    (trimmed.startsWith("/") && isLocalImagePath(trimmed) ? trimmed : null);
-  if (candidate == null) return null;
-  return BARE_IMAGE_EXT_RE.test(candidate) ? candidate : null;
 }
 
 /// react-markdown 的 urlTransform 工厂：本地路径豁免只作用于 <img src>（配合
@@ -194,9 +178,9 @@ export function LocalMarkdownImage({
       <img
         src={dataUri}
         alt={alt ?? ""}
+        className="al-chat-image"
         onClick={onOpenLightbox ? () => onOpenLightbox(decodedPath) : undefined}
         style={{
-          maxWidth: "100%",
           cursor: onOpenLightbox ? "zoom-in" : undefined,
         }}
       />
@@ -206,7 +190,11 @@ export function LocalMarkdownImage({
     return <PreviewablePath path={decodedPath} onOpenPreview={onOpenPreview} />;
   }
   return (
-    <span role="status" aria-label={alt || decodedPath}>
+    <span
+      role="status"
+      aria-label={alt || decodedPath}
+      className="al-chat-image-loading"
+    >
       {decodedPath}
     </span>
   );
@@ -216,20 +204,76 @@ type BareParagraphOpts = {
   sessionId?: string | null;
   onOpenPreview?: (path: string) => void;
   onOpenLightbox?: (path: string) => void;
-  /// 流式输出中途关闭裸路径自动内联：半吐的路径行会闪图 + 空耗一次
+  /// 规则 B 总开关：默认关闭，调用方（MarkdownBody 的 autoInlineImagePaths /
+  /// LeadSummaryBlock 固定传 true）显式打开才扫描裸路径。不是任何调用方都该
+  /// 自动出图——非聊天场景（文档预览 / 更新说明 / worker 子任务标题等）不传
+  /// 即保持关闭，避免文本里提到的任意绝对路径被无条件读进来。
+  enabled?: boolean;
+  /// 流式输出中途关闭规则 B 自动出图：半吐的路径行会闪图 + 空耗一次
   /// read_attachment invoke。`![]()` 语法渲染（localImageMarkdownComponent）
   /// 不受这个开关影响，只影响这条裸路径兜底通道。
   streaming?: boolean;
+  /// 传给 <Markdown> 的完整原始 markdown 源文本——配合 mdast/hast 节点的
+  /// position.offset 切出「这一段」的原始片段交给 scanImagePaths 扫描。
+  /// 调用方需在每次渲染前把它同步进 optsRef（与 sessionId 等字段同款写法）。
+  sourceText?: string;
 };
 
-/// markdown 段落渲染器：段落是单个 text 节点时按 `\n` 按行切分（CommonMark 里
-/// 「一句话↵路径」「连续两行两路径」这类无空行场景是同一个 text node 带 `\n`，
-/// 不按行切分永远不会命中），逐行判是否为本地图片裸路径——命中的行渲成图，未
-/// 命中的行原样保留文本、行序不变；整段无一行命中则原样渲 <p> 不动。命中的图
-/// 仍包在 <p> 里（而不是直接顶掉 <p>），让裸路径图与 `![]()` 图上下间距一致。
-/// 用于兜底 agent 忘写 ![]() 语法、只在正文裸写图片路径的情况（D5-G3/G4）。
+/// markdown 段落渲染器（规则 B）：不改动段落原有渲染，按段落在原始 markdown
+/// 源里的 position 偏移切出该段原文，交给 scanImagePaths 抽取反引号内 /
+/// 句中裸绝对路径 / file:// / <...含空格> 几种形态的本地图片路径，命中的
+/// 每条路径在段落下方追加一块 LocalMarkdownImage；`![]()` 语法已产生的路径
+/// 由 scanImagePaths 自行跳过，不会重复渲染。renderedPathsRef 是调用方持有
+/// 的「本条消息已出过图的路径集合」，用来做跨段落的消息级去重（同一路径在
+/// 消息里出现几次只渲一次图），每次消息重新渲染前由调用方清空。
+/// 用当前节点在原始 markdown 源里的 position 偏移切出原文，扫描出「本条消息
+/// 内还没出过图」的新路径；命中的路径立刻登记进 renderedPathsRef，供后续
+/// 段落 / 列表项级去重判断。node 没有 position（如某些插件合成节点）或调用方
+/// 没提供 sourceText 时，视为无法安全切片，返回空数组（原样渲染，不出图）。
+function scanNewBareImagePaths(
+  node:
+    | { position?: { start?: { offset?: number }; end?: { offset?: number } } }
+    | undefined,
+  opts: BareParagraphOpts,
+  renderedPathsRef: React.MutableRefObject<Set<string>>,
+): string[] {
+  const start = node?.position?.start?.offset;
+  const end = node?.position?.end?.offset;
+  if (start == null || end == null || !opts.sourceText) return [];
+
+  const raw = opts.sourceText.slice(start, end);
+  const newPaths = scanImagePaths(raw).filter(
+    (path) => !renderedPathsRef.current.has(path),
+  );
+  newPaths.forEach((path) => renderedPathsRef.current.add(path));
+  return newPaths;
+}
+
+function BareImageAppend({
+  paths,
+  opts,
+}: {
+  paths: string[];
+  opts: BareParagraphOpts;
+}) {
+  return (
+    <>
+      {paths.map((path) => (
+        <LocalMarkdownImage
+          key={path}
+          path={path}
+          sessionId={opts.sessionId}
+          onOpenPreview={opts.onOpenPreview}
+          onOpenLightbox={opts.onOpenLightbox}
+        />
+      ))}
+    </>
+  );
+}
+
 export function localImageBareParagraphComponent(
   optsRef: React.MutableRefObject<BareParagraphOpts>,
+  renderedPathsRef: React.MutableRefObject<Set<string>>,
 ) {
   return function MarkdownParagraph({
     children,
@@ -237,44 +281,49 @@ export function localImageBareParagraphComponent(
     ...props
   }: React.ComponentProps<"p"> & ExtraProps) {
     const opts = optsRef.current;
-    if (opts.streaming) {
-      return <p {...props}>{children}</p>;
-    }
-    const sole = node?.children.length === 1 ? node.children[0] : undefined;
-    if (sole?.type !== "text") {
-      return <p {...props}>{children}</p>;
-    }
-    const lines = sole.value.split("\n");
-    const linePaths = lines.map((line) => bareLocalImagePathToken(line));
-    if (!linePaths.some((path) => path != null)) {
-      return <p {...props}>{children}</p>;
-    }
+    const original = <p {...props}>{children}</p>;
+    if (!opts.enabled || opts.streaming) return original;
+
+    const newPaths = scanNewBareImagePaths(node, opts, renderedPathsRef);
+    if (newPaths.length === 0) return original;
+
+    // <img> 是行内内容，作为 <p> 的紧邻兄弟元素追加，不破坏 HTML 结构。
     return (
-      <p {...props}>
-        {lines.map((line, i) => {
-          const path = linePaths[i];
-          const content =
-            path != null ? (
-              <LocalMarkdownImage
-                key={`img-${i}`}
-                path={path}
-                sessionId={opts.sessionId}
-                onOpenPreview={opts.onOpenPreview}
-                onOpenLightbox={opts.onOpenLightbox}
-              />
-            ) : (
-              <React.Fragment key={`txt-${i}`}>{line}</React.Fragment>
-            );
-          return i === 0 ? (
-            content
-          ) : (
-            <React.Fragment key={`ln-${i}`}>
-              <br />
-              {content}
-            </React.Fragment>
-          );
-        })}
-      </p>
+      <>
+        {original}
+        <BareImageAppend paths={newPaths} opts={opts} />
+      </>
+    );
+  };
+}
+
+/// markdown 列表项渲染器（规则 B，列表项版）：CommonMark 紧凑列表（相邻项间
+/// 无空行）不会给列表项内容包一层 <p>（remark-rehype 直接把段落内容摊平进
+/// <li>），localImageBareParagraphComponent 的 p 组件因此永远不会被调用到——
+/// 这里单独接管 li 节点本身的 position 做同一套扫描。<ul>/<ol> 只允许 <li>
+/// 做直接子元素，图片块必须嵌在 <li> 内部（而不是像段落那样接成兄弟节点）。
+export function localImageBareListItemComponent(
+  optsRef: React.MutableRefObject<BareParagraphOpts>,
+  renderedPathsRef: React.MutableRefObject<Set<string>>,
+) {
+  return function MarkdownListItem({
+    children,
+    node,
+    ...props
+  }: React.ComponentProps<"li"> & ExtraProps) {
+    const opts = optsRef.current;
+    if (!opts.enabled || opts.streaming) {
+      return <li {...props}>{children}</li>;
+    }
+
+    const newPaths = scanNewBareImagePaths(node, opts, renderedPathsRef);
+    return (
+      <li {...props}>
+        {children}
+        {newPaths.length > 0 && (
+          <BareImageAppend paths={newPaths} opts={opts} />
+        )}
+      </li>
     );
   };
 }
@@ -295,7 +344,7 @@ export function localImageMarkdownComponent(
   return function MarkdownImg({
     src,
     alt,
-    style,
+    className,
     node: _node,
     ...props
   }: React.ComponentProps<"img"> & { node?: unknown }) {
@@ -317,7 +366,7 @@ export function localImageMarkdownComponent(
         {...props}
         src={src || undefined}
         alt={alt ?? ""}
-        style={{ ...style, maxWidth: "100%" }}
+        className={className ? `al-chat-image ${className}` : "al-chat-image"}
       />
     );
   };

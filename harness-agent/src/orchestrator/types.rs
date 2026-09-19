@@ -24,6 +24,8 @@ pub struct RunOptions {
     pub permission: PermissionPolicy,
     pub network: crate::goal::NetworkPolicy,
     pub fs_read_scope: crate::fs_scope::FsReadScope,
+    /// 显式放行的额外只读根（CLI `--read-root`，可重复）。默认空——行为与改前一致。
+    pub extra_read_roots: Vec<PathBuf>,
     pub fs_write_fence: crate::exec::sandbox::FsWriteFence,
     pub evidence_gate: EvidenceGate,
     pub native_search_enabled: bool,
@@ -41,6 +43,8 @@ pub struct RunOptions {
     pub watchdog_repeat_threshold: usize,
     pub journal_root: PathBuf,
     pub mcp_servers: Vec<McpServerConfig>,
+    /// CLI `--image` 附件（挂在首条 user 消息/goal 上；不支持图片的 provider 会被诚实降级掉）。
+    pub images: Vec<crate::image::ImageBlock>,
     /// Extra text appended after `EXECUTOR_SYSTEM_PROMPT` (not a replacement).
     /// Populated by `myagent run --append-system-prompt`; `None` elsewhere
     /// (resume / plan child runs do not accept this flag yet).

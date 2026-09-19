@@ -1,5 +1,5 @@
 /// Authoritative event vocabulary for harness.runtime.v1:
-/// 68 event types in the harness.runtime.v1 vocabulary.
+/// 77 event types in the harness.runtime.v1 vocabulary.
 pub const VOCABULARY: &[&str] = &[
     "run.started",
     "run.resumed",
@@ -69,6 +69,17 @@ pub const VOCABULARY: &[&str] = &[
     "provider.turn.finished",
     "provider.warning",
     "mcp.server.failed",
+    // t12-img 双路审 P2-2 反向检查补的漏记：以下都是本仓早已存在的 `.emit(...)`
+    // 调用点，只是从未登记进这份词汇表——不是本次新引入的事件类型。
+    "attachment.dropped",
+    "context.terrain.attached",
+    "evidence.workspace.unverifiable",
+    "format.reflex.applied",
+    "format.reflex.feedback",
+    "safety_net.checkpoint",
+    "safety_net.checkpoint_skipped",
+    "scope.advisory",
+    "scope.extended",
 ];
 
 pub fn is_known(event_type: &str) -> bool {

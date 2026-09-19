@@ -11,7 +11,6 @@ use crate::events::{EventRecorder, OutputMode};
 use crate::goal::GoalState;
 use crate::guardrails::Guardrails;
 use crate::journal::{load_conversation, save_conversation, RunPaths, SavedConversation};
-#[cfg(test)]
 use crate::mcp::config::McpServerConfig;
 use crate::plan::write_audit::TaskScope;
 use crate::provider::pairing::repair_tool_pairing;
@@ -31,6 +30,7 @@ mod probe_runner;
 mod progress_probe;
 mod prompt;
 mod run_loop;
+pub(crate) mod scope_change_result;
 mod signals;
 mod tool_catalog;
 mod tool_gate;

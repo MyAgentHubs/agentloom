@@ -16,6 +16,25 @@ const { invokeMock, listenMock } = vi.hoisted(() => ({
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: listenMock }));
 
+// 更新说明没有会话上下文，MarkdownBody 应该保持不传 sessionId（只靠 B 规则放行
+// 图片）——用 importOriginal 包一层 spy，既不打断既有用例依赖的真实 markdown 渲染，
+// 又能核到调用方到底传了什么 props。
+const markdownBodySpy = vi.fn();
+vi.mock("../../lib/useMarkdown", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../lib/useMarkdown")>();
+  return {
+    ...actual,
+    useMarkdown: (...args: Parameters<typeof actual.useMarkdown>) => {
+      const Real = actual.useMarkdown(...args);
+      if (!Real) return Real;
+      return (props: Parameters<typeof Real>[0]) => {
+        markdownBodySpy(props);
+        return <Real {...props} />;
+      };
+    },
+  };
+});
+
 import { __resetForTests } from "../../lib/updaterStore";
 import { UpdateSection } from "./UpdateSection";
 
@@ -210,11 +229,27 @@ describe("UpdateSection", () => {
     );
   });
 
-  it("available → 显示版本号与更新说明全文，不使用折叠容器", async () => {
+  it("更新说明没有会话上下文：MarkdownBody 不传 sessionId，只靠 B 规则放行图片", async () => {
+    markdownBodySpy.mockClear();
     invokeMock.mockResolvedValueOnce(
       snap(1, "available", {
         version: "0.3.0",
-        notes: "第一行改进\n第二行完整说明",
+        notes: "## Highlights\n\n第二行完整说明",
+        pub_date: null,
+      }),
+    );
+    render(<UpdateSection />);
+
+    await waitFor(() => expect(markdownBodySpy).toHaveBeenCalled());
+    const props = markdownBodySpy.mock.calls[0][0] as { sessionId?: unknown };
+    expect(props.sessionId).toBeUndefined();
+  });
+
+  it("available → 用 MarkdownBody 渲染更新说明全文，不使用折叠容器", async () => {
+    invokeMock.mockResolvedValueOnce(
+      snap(1, "available", {
+        version: "0.3.0",
+        notes: "## Highlights\n\n**Maintenance release**\n\n第二行完整说明",
         pub_date: null,
       }),
     );
@@ -224,13 +259,42 @@ describe("UpdateSection", () => {
       expect(screen.getByText(/发现新版本 v0.3.0/)).toBeInTheDocument(),
     );
     expect(screen.getByText("更新说明")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { level: 2, name: "Highlights" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("## Highlights")).not.toBeInTheDocument();
     expect(container.querySelector(".updsec__notes-body")).toHaveTextContent(
-      "第一行改进 第二行完整说明",
+      "Highlights Maintenance release 第二行完整说明",
     );
+    expect(screen.getByText("Maintenance release").tagName).toBe("STRONG");
     expect(container.querySelector("details")).toBeNull();
     expect(
       screen.getByRole("button", { name: "跳过此版本" }),
     ).toBeInTheDocument();
+  });
+
+  it("更新说明里的裸绝对路径不自动出图（P1：非聊天场景默认关闭规则 B）", async () => {
+    invokeMock.mockResolvedValueOnce(
+      snap(1, "available", {
+        version: "0.3.0",
+        notes: "详见 /Users/victim/secret.png 这张截图",
+        pub_date: null,
+      }),
+    );
+    render(<UpdateSection />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/发现新版本 v0.3.0/)).toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText(/详见 \/Users\/victim\/secret\.png 这张截图/),
+      ).toBeInTheDocument(),
+    );
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "read_attachment",
+      expect.anything(),
+    );
   });
 
   it("available → 跳过键触发 updater_skip_version 并折回 up_to_date", async () => {

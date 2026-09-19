@@ -426,7 +426,7 @@ mod tests {
             ));
             let r = bounce_reasons(review_worklist(&t));
             assert!(
-                r.iter().any(|s| s.contains("保留路径段")),
+                r.iter().any(|s| s.contains("reserved path segment")),
                 "fs={fs} 应被保留路径闸打回: {r:?}"
             );
         }

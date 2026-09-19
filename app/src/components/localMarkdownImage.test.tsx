@@ -38,10 +38,10 @@ describe("LocalMarkdownImage — 不注入 AttachmentPort（现行为）", () =>
       <LocalMarkdownImage path="assets/x.png" alt="chart" sessionId="s1" />,
     );
 
-    expect(await screen.findByRole("img", { name: "chart" })).toHaveAttribute(
-      "src",
-      "data:image/png;base64,ZGVmYXVsdA==",
-    );
+    const img = await screen.findByRole("img", { name: "chart" });
+    expect(img).toHaveAttribute("src", "data:image/png;base64,ZGVmYXVsdA==");
+    // 规则 C：统一样式类，不再各处内联 maxWidth。
+    expect(img).toHaveClass("al-chat-image");
     expect(invoke).toHaveBeenCalledWith("read_attachment", {
       path: "assets/x.png",
       sessionId: "s1",

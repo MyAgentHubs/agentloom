@@ -1,6 +1,6 @@
 [package]
 name = "agentloom"
-version = "0.2.9"
+version = "0.2.10"
 description = "AgentLoom is an open-source desktop workbench that turns many LLMs into one workforce you control."
 authors = ["MyAgentHubs <panda@myagenthubs.com>"]
 license = "AGPL-3.0-only"
@@ -23,9 +23,10 @@ tauri-build = { version = "2", features = [] }
 base64 = "0.22"
 getrandom = "0.3"
 zeroize = "1"
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -125,6 +125,35 @@ mod tests {
     }
 
     #[test]
+    fn save_conversation_with_images_never_writes_base64_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.json");
+        let image = crate::image::ImageBlock {
+            media_type: "image/png".into(),
+            data_base64: "TOTALLY_SECRET_BASE64_PAYLOAD".into(),
+            source_path: Some(PathBuf::from("/tmp/shot.png")),
+            bytes: 4,
+            sha256: None,
+        };
+        let saved = SavedConversation {
+            run_id: "r1".into(),
+            provider: "deepseek".into(),
+            model: "deepseek-v4-flash".into(),
+            messages: vec![crate::provider::ChatMessage::user_with_images(
+                "look at this",
+                vec![image],
+            )],
+        };
+        save_conversation(&path, &saved).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("TOTALLY_SECRET_BASE64_PAYLOAD"));
+        assert!(!on_disk.contains("data_base64"));
+        // 元信息（路径/大小/media_type）该留的还在，方便排障。
+        assert!(on_disk.contains("shot.png"));
+        assert!(on_disk.contains("image/png"));
+    }
+
+    #[test]
     fn contract_path_under_journal_root_and_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let paths = RunPaths::new(dir.path(), "run_x");

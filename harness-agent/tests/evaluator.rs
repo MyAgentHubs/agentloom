@@ -13,6 +13,7 @@ async fn verifiable_passing_check_cmd_completes() {
         permission: myagent::shell::PermissionPolicy::Allow,
         network: myagent::goal::NetworkPolicy::On,
         fs_read_scope: myagent::fs_scope::FsReadScope::Workspace,
+        extra_read_roots: Vec::new(),
         fs_write_fence: myagent::exec::sandbox::FsWriteFence::Off,
         evidence_gate: myagent::orchestrator::EvidenceGate::Off,
         native_search_enabled: true,
@@ -29,6 +30,7 @@ async fn verifiable_passing_check_cmd_completes() {
         watchdog_repeat_threshold: 0,
         mcp_servers: Vec::new(),
         append_system_prompt: None,
+        images: Vec::new(),
     };
 
     let res =
@@ -63,6 +65,7 @@ async fn verifiable_failing_check_cmd_does_not_complete() {
         permission: myagent::shell::PermissionPolicy::Allow,
         network: myagent::goal::NetworkPolicy::On,
         fs_read_scope: myagent::fs_scope::FsReadScope::Workspace,
+        extra_read_roots: Vec::new(),
         fs_write_fence: myagent::exec::sandbox::FsWriteFence::Off,
         evidence_gate: myagent::orchestrator::EvidenceGate::Off,
         native_search_enabled: true,
@@ -79,6 +82,7 @@ async fn verifiable_failing_check_cmd_does_not_complete() {
         watchdog_repeat_threshold: 0,
         mcp_servers: Vec::new(),
         append_system_prompt: None,
+        images: Vec::new(),
     };
 
     let res =
@@ -122,6 +126,7 @@ async fn blocked_when_check_cmd_keeps_failing() {
         permission: myagent::shell::PermissionPolicy::Allow,
         network: myagent::goal::NetworkPolicy::On,
         fs_read_scope: myagent::fs_scope::FsReadScope::Workspace,
+        extra_read_roots: Vec::new(),
         fs_write_fence: myagent::exec::sandbox::FsWriteFence::Off,
         evidence_gate: myagent::orchestrator::EvidenceGate::Off,
         native_search_enabled: true,
@@ -138,6 +143,7 @@ async fn blocked_when_check_cmd_keeps_failing() {
         watchdog_repeat_threshold: 0,
         mcp_servers: Vec::new(),
         append_system_prompt: None,
+        images: Vec::new(),
     };
 
     myagent::orchestrator::run_solo(myagent::provider::mock::MockProvider::default(), opts)

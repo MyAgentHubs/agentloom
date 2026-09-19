@@ -1,17 +1,8 @@
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { act, useState } from "react";
 import { afterEach, beforeEach, describe, it, expect, vi, test } from "vitest";
-import {
-  MessageStream,
-  stableMessageKeys,
-  shallowBlockEqual,
-} from "./MessageStream";
-import type {
-  Block,
-  ChatMessage,
-  LeadSummaryBlock,
-  MemberUnit,
-} from "../types/agent";
+import { MessageStream, stableMessageKeys } from "./MessageStream";
+import type { ChatMessage, LeadSummaryBlock, MemberUnit } from "../types/agent";
 import { setChatVerbosity } from "../lib/chatVerbosity";
 
 const messageContentMountProbe = vi.hoisted(() => vi.fn());
@@ -638,6 +629,57 @@ describe("MessageStream", () => {
       expect(screen.getByText("history-0")).toBeInTheDocument();
     });
 
+    it("搜索命中早于初始 30 条的消息时立即扩展窗口并定位", () => {
+      vi.useFakeTimers();
+      const scrollIntoView = vi.fn();
+      Element.prototype.scrollIntoView = scrollIntoView;
+      const onResolved = vi.fn();
+      const longHistory = numberedMessages("search-history", 75).map(
+        (message, index) => ({ ...message, id: index + 1 }),
+      );
+
+      const { container } = render(
+        <MessageStream
+          messages={longHistory}
+          busy={false}
+          sessionId="session-search"
+          searchTargetMessageId={6}
+          onSearchTargetResolved={onResolved}
+        />,
+      );
+
+      expect(screen.getByText("search-history-5")).toBeInTheDocument();
+      expect(container.querySelector('[data-message-id="6"]')).toHaveClass(
+        "turn--search-target",
+      );
+      expect(scrollIntoView).toHaveBeenCalledWith({
+        behavior: "smooth",
+        block: "center",
+      });
+      expect(onResolved).toHaveBeenCalledWith(true);
+
+      act(() => vi.advanceTimersByTime(1600));
+      expect(container.querySelector('[data-message-id="6"]')).not.toHaveClass(
+        "turn--search-target",
+      );
+    });
+
+    it("搜索目标不在会话消息中时返回可见降级信号", () => {
+      const onResolved = vi.fn();
+
+      render(
+        <MessageStream
+          messages={numberedMessages("missing", 40)}
+          busy={false}
+          sessionId="session-search"
+          searchTargetMessageId={999}
+          onSearchTargetResolved={onResolved}
+        />,
+      );
+
+      expect(onResolved).toHaveBeenCalledWith(false);
+    });
+
     it("向前补渲一片时，已渲染消息零 remount 零重渲，仅渲染新片", () => {
       vi.useFakeTimers();
       mockIdleScheduler();
@@ -1242,383 +1284,31 @@ describe("团队队长 role pill", () => {
   });
 });
 
-describe("shallowBlockEqual（T6：判等去掉巨型块全量 JSON.stringify）", () => {
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
+describe("规则 B 自动出图·仅 assistant 消息打开（P1）", () => {
+  it("assistant 消息里的裸绝对路径自动出图，user 消息里同样的路径不出图", async () => {
+    const mixed: ChatMessage[] = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "看看 /a/from-user.png 这张" }],
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "结果在 /a/from-assistant.png 里" }],
+        engine: "claude",
+      },
+    ];
 
-  it("同内容不同引用的两个块判 true", () => {
-    const a: Block = { type: "text", text: "hello" };
-    const b: Block = { type: "text", text: "hello" };
-    expect(a).not.toBe(b);
-    expect(shallowBlockEqual(a, b)).toBe(true);
-  });
+    render(<MessageStream messages={mixed} busy={false} />);
 
-  it("text 改一字符判 false", () => {
-    const a: Block = { type: "text", text: "hello" };
-    const b: Block = { type: "text", text: "hellp" };
-    expect(shallowBlockEqual(a, b)).toBe(false);
-  });
-
-  it("嵌套字段（team_run.members 深处）改一个值判 false", () => {
-    const baseMember: MemberUnit = {
-      participant_id: "w",
-      assignment_id: "a1",
-      task_id: "t1",
-      name: "Codex",
-      status: "running",
-      sub: "改 GoalBar",
-      steps_total: 1,
-      steps_done: 0,
-      cost_usd: null,
-      input_tokens: 0,
-      output_tokens: 0,
-      failed: false,
-      blocks: [{ type: "text", text: "改中" }],
-    };
-    const a: Block = {
-      type: "team_run",
-      run_id: "r1",
-      goal: null,
-      lead: "Claude",
-      members: [baseMember],
-    };
-    const b: Block = {
-      type: "team_run",
-      run_id: "r1",
-      goal: null,
-      lead: "Claude",
-      members: [{ ...baseMember, steps_done: 1 }],
-    };
-    expect(shallowBlockEqual(a, b)).toBe(false);
-    // 深处未变时应判等
-    const c: Block = {
-      type: "team_run",
-      run_id: "r1",
-      goal: null,
-      lead: "Claude",
-      members: [{ ...baseMember }],
-    };
-    expect(shallowBlockEqual(a, c)).toBe(true);
-    // 深处变化（嵌套 blocks 内的 text）应判不等
-    const d: Block = {
-      type: "team_run",
-      run_id: "r1",
-      goal: null,
-      lead: "Claude",
-      members: [
-        {
-          ...baseMember,
-          blocks: [{ type: "text", text: "改完了" }],
-        },
-      ],
-    };
-    expect(shallowBlockEqual(a, d)).toBe(false);
-  });
-
-  it("1MB 级 text 块判等不整块 JSON.stringify（只有巨型 text 字段走 === 短路）", () => {
-    const bigText = "x".repeat(1_000_000);
-    const a: Block = { type: "text", text: bigText };
-    const b: Block = { type: "text", text: `${bigText}` };
-    const spy = vi.spyOn(JSON, "stringify");
-    expect(shallowBlockEqual(a, b)).toBe(true);
-    expect(spy).not.toHaveBeenCalled();
-  });
-
-  it("1MB 级 text 内容不同仍判 false（仍不整块 stringify）", () => {
-    const bigText = "x".repeat(1_000_000);
-    const a: Block = { type: "text", text: bigText };
-    const b: Block = { type: "text", text: `${bigText}y` };
-    const spy = vi.spyOn(JSON, "stringify");
-    expect(shallowBlockEqual(a, b)).toBe(false);
-    expect(spy).not.toHaveBeenCalled();
-  });
-
-  it("单侧 undefined 判 false，双 undefined 判 true（D3 P2③ 守卫，不抛 TypeError）", () => {
-    const a: Block = { type: "text", text: "hello" };
-    expect(shallowBlockEqual(a, undefined as unknown as Block)).toBe(false);
-    expect(shallowBlockEqual(undefined as unknown as Block, a)).toBe(false);
-    expect(
-      shallowBlockEqual(
-        undefined as unknown as Block,
-        undefined as unknown as Block,
-      ),
-    ).toBe(true);
-  });
-});
-
-describe("巨型文本块 memo 集成（D3 整盘审 P2⑤）", () => {
-  it("内容变化触发更新，同内容不同引用重渲不触发多余渲染", () => {
-    const hugeA = "x".repeat(60_000);
-    const hugeB = "y".repeat(60_000);
-    const makeMessage = (text: string): ChatMessage & { id: string } => ({
-      id: "huge-text-1",
-      role: "assistant",
-      engine: "claude",
-      content: [{ type: "text", text }],
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("read_attachment", {
+        path: "/a/from-assistant.png",
+        sessionId: null,
+      });
     });
-
-    messageContentRenderProbe.mockClear();
-    const { rerender, container } = render(
-      <MessageStream messages={[makeMessage(hugeA)]} busy={false} />,
-    );
-    expect(container.querySelector(".huge-text__body")?.textContent).toBe(
-      hugeA.slice(0, 4000),
-    );
-    expect(messageContentRenderProbe).toHaveBeenCalledTimes(1);
-
-    // 内容变化（不同引用、不同内容）：应触发重渲，DOM 更新为新内容，不被 memo 吞掉。
-    rerender(<MessageStream messages={[makeMessage(hugeB)]} busy={false} />);
-    expect(container.querySelector(".huge-text__body")?.textContent).toBe(
-      hugeB.slice(0, 4000),
-    );
-    expect(messageContentRenderProbe.mock.calls.length).toBeGreaterThan(1);
-
-    // 同内容不同引用重渲（App.displayMessages 浅克隆场景）：不应触发多余渲染。
-    messageContentRenderProbe.mockClear();
-    rerender(<MessageStream messages={[makeMessage(hugeB)]} busy={false} />);
-    expect(messageContentRenderProbe).not.toHaveBeenCalled();
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────
-// V3b（2026-08-26·刀②「桌面 chat verbose 分级」渲染接线）：MessageStream 传档位 +
-// 新 streaming 判据 + scope_change 顺修断线。设计稿
-// desktop-verbose-design §2B
-// ─────────────────────────────────────────────────────────────────────────
-
-describe("MessageStream verbosity 传档（V3b）", () => {
-  it("切档后已 memo 的历史 turn 立即重绘（setChatVerbosity 触发·chip 出现/消失）", () => {
-    const { container } = render(
-      <MessageStream
-        busy={false}
-        messages={[
-          {
-            role: "assistant",
-            engine: "claude",
-            content: [
-              {
-                type: "tool",
-                id: "t1",
-                tool: "Bash",
-                summary: "跑测试",
-                card: "compact",
-                status: "failed",
-                exit_code: 1,
-                output: "boom",
-              },
-            ],
-          },
-        ]}
-      />,
-    );
-
-    // beforeEach 已把档位重置为 full——现状零变化，无 activity-fold。
-    expect(container.querySelector(".activity-fold")).toBeNull();
-
-    act(() => {
-      setChatVerbosity("minimal");
+    expect(invokeMock).not.toHaveBeenCalledWith("read_attachment", {
+      path: "/a/from-user.png",
+      sessionId: null,
     });
-
-    expect(container.querySelector(".activity-fold")).not.toBeNull();
-
-    act(() => {
-      setChatVerbosity("full");
-    });
-
-    expect(container.querySelector(".activity-fold")).toBeNull();
-  });
-});
-
-describe("MessageStream streaming 判据矩阵（V3b §2B ③）", () => {
-  it("busy=false + stream_live=true → 非 streaming（busy 最外层短路·双保险）", () => {
-    const { container } = render(
-      <MessageStream
-        busy={false}
-        messages={[
-          {
-            role: "assistant",
-            engine: "claude",
-            content: [{ type: "text", text: "旧内容" }],
-            stream_live: true,
-          },
-        ]}
-      />,
-    );
-
-    expect(container.querySelector(".turn__working")).toBeNull();
-  });
-
-  it("busy=true + stream_live=false（末条 assistant）→ 非 streaming（权威封口）", () => {
-    const { container } = render(
-      <MessageStream
-        busy={true}
-        messages={[
-          {
-            role: "assistant",
-            engine: "claude",
-            content: [{ type: "text", text: "已封口" }],
-            stream_live: false,
-          },
-        ]}
-      />,
-    );
-
-    expect(container.querySelector(".turn__working")).toBeNull();
-  });
-
-  it("busy=true + 未打标 + 末条 assistant → streaming（兜底生效）", () => {
-    const { container } = render(
-      <MessageStream
-        busy={true}
-        messages={[
-          {
-            role: "assistant",
-            engine: "claude",
-            content: [{ type: "text", text: "进行中" }],
-          },
-        ]}
-      />,
-    );
-
-    expect(container.querySelector(".turn__working")).not.toBeNull();
-  });
-
-  it("busy=true + 未打标 + 末条是 user → 旧 assistant 非 streaming（v1 病灶已修）", () => {
-    const { container } = render(
-      <MessageStream
-        busy={true}
-        messages={[
-          {
-            role: "assistant",
-            engine: "claude",
-            content: [{ type: "text", text: "旧回合" }],
-          },
-          { role: "user", content: [{ type: "text", text: "追加提问" }] },
-        ]}
-      />,
-    );
-
-    expect(container.querySelector(".turn__working")).toBeNull();
-  });
-});
-
-describe("MessageStream → RunLeadTurn 在 minimal 档照常渲染（V3b §2B「团队回合不折算」）", () => {
-  it("team_run / coding_task / lead_summary / decision_card 不经 MessageContent，minimal 档下原样出现", () => {
-    setChatVerbosity("minimal");
-
-    const teamRunMessage: ChatMessage = {
-      role: "assistant",
-      engine: "agent-team",
-      content: [
-        {
-          type: "team_run",
-          run_id: "run-team",
-          goal: null,
-          lead: "Claude",
-          members: [
-            {
-              participant_id: "w",
-              assignment_id: "a1",
-              task_id: "t1",
-              name: "Codex",
-              status: "running",
-              sub: "改 GoalBar",
-              steps_total: 1,
-              steps_done: 0,
-              cost_usd: null,
-              input_tokens: 0,
-              output_tokens: 0,
-              failed: false,
-              blocks: [{ type: "text", text: "改中" }],
-            },
-          ],
-        },
-      ],
-    };
-    const codingTaskMessage: ChatMessage = {
-      role: "assistant",
-      engine: "claude",
-      agent_id: "claude",
-      agent_name_snapshot: "Claude",
-      content: [
-        {
-          type: "coding_task",
-          run_id: "run-coding",
-          assignment_id: "a-coding",
-          worker_name: "Claude",
-          phase: "verifying",
-        },
-      ],
-    };
-    const leadSummaryMessage: ChatMessage = {
-      role: "assistant",
-      engine: "claude",
-      content: [leadSummary("run-summary")],
-    };
-    const decisionMessage: ChatMessage = {
-      role: "assistant",
-      engine: "claude",
-      content: [dc("run-decision")],
-    };
-
-    const { container } = render(
-      <MessageStream
-        busy
-        messages={[
-          teamRunMessage,
-          codingTaskMessage,
-          leadSummaryMessage,
-          decisionMessage,
-        ]}
-      />,
-    );
-
-    // team_run：BackgroundTaskStack（.taskstack）。
-    expect(container.querySelector(".taskstack")).not.toBeNull();
-    // coding_task：CodingTaskBar 右侧状态徽标（.task-badge），且这条 turn 不再渲
-    // BackgroundTaskStack（showWorkerTaskStack=false，两者共用 .task-badge class）。
-    expect(container.querySelector(".task-badge")).not.toBeNull();
-    // lead_summary：leadSummary() 夹具的正文。
-    expect(screen.getByText("结论：验收通过。")).toBeInTheDocument();
-    // decision_card：DecisionCard 卡片本体 + question 文案。
-    expect(container.querySelector(".decision-card")).not.toBeNull();
-    expect(screen.getByText("决策Q")).toBeInTheDocument();
-  });
-});
-
-describe("MessageStream onContinueScope 顺修既有断线（V3b）", () => {
-  it("onContinueScope 从 MessageStream props 一路传到 ScopeChangeCard 点击", () => {
-    const onContinueScope = vi.fn();
-    render(
-      <MessageStream
-        busy={false}
-        onContinueScope={onContinueScope}
-        messages={[
-          {
-            role: "assistant",
-            engine: "claude",
-            content: [
-              {
-                type: "scope_change",
-                changes: [
-                  {
-                    proposal_id: "p1",
-                    kind: "scope",
-                    detail_text: "新范围详情",
-                    detail_summary: null,
-                  },
-                ],
-              },
-            ],
-          },
-        ]}
-      />,
-    );
-
-    fireEvent.click(screen.getByText("采纳并继续"));
-
-    expect(onContinueScope).toHaveBeenCalledTimes(1);
-    expect(onContinueScope).toHaveBeenCalledWith(expect.any(String));
   });
 });

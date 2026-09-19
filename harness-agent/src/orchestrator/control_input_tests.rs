@@ -20,6 +20,7 @@ async fn jsonl_output_with_sentinel_control_honors_interrupt_file() {
         permission: PermissionPolicy::Allow,
         network: crate::goal::NetworkPolicy::On,
         fs_read_scope: crate::fs_scope::FsReadScope::Workspace,
+        extra_read_roots: Vec::new(),
         fs_write_fence: crate::exec::sandbox::FsWriteFence::Off,
         native_search_enabled: true,
         disallowed_tools: Default::default(),
@@ -35,6 +36,7 @@ async fn jsonl_output_with_sentinel_control_honors_interrupt_file() {
         watchdog_repeat_threshold: 0,
         mcp_servers: Vec::new(),
         append_system_prompt: None,
+        images: Vec::new(),
     };
     let res = run_solo(crate::provider::mock::MockProvider::default(), opts)
         .await
