@@ -375,8 +375,11 @@ mod extra_read_root_note_tests {
             "{}/./extra",
             root.path().to_string_lossy().trim_end_matches('/')
         ));
+        // Compare the raw spellings: `Path` equality normalizes `./` away, which would
+        // make this setup check fail on Linux where `/tmp` is not a symlink.
         assert_ne!(
-            canonical, lexical_spelling,
+            canonical.as_os_str(),
+            lexical_spelling.as_os_str(),
             "test setup requires two distinct spellings of the same directory"
         );
         let roots = vec![lexical_spelling.clone(), canonical.clone()];
