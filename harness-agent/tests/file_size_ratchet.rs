@@ -84,11 +84,14 @@ const WHITELIST: &[(&str, usize)] = &[
     // default_output_tokens 补 zai 分支来源注释 + 新增 zai_has_output_default_not_none
     // 回归测试(+26)
     // 棘轮收口：McpServerConfig 加 headers 字段·4 处既有测试字面量机械补 headers: None(+4)
-    ("config.rs", 1190),
-    // 棘轮收口：MCP Streamable HTTP 自定义请求头——build header map（HeaderName/
-    // HeaderValue + ${ENV_NAME} 展开）+ connect_with_timeouts 分支 + 7 条单测，
-    // 首次越过 800 硬上限，本文件仍是「一件事」（一个 mcp client 连接实现），暂不拆分。
-    ("mcp/client.rs", 909),
+    // 棘轮收紧：config.rs 把 mod tests 整段搬到外部文件 config/tests.rs（过
+    // check_file_size.py 硬门禁），主文件降回 800 行以下，不再需要白名单条目——
+    // 原条目（1190）整条移除。
+    //
+    // 棘轮收紧：mcp/client.rs 把 mod tests 整段搬到外部文件 mcp/client/tests.rs
+    // （过 check_file_size.py 硬门禁），主文件降回 800 行以下，不再需要白名单
+    // 条目——原条目（909）整条移除。
+    //
     // 棘轮收紧：safety/dangerous_paths.rs 曾因 T13 --read-root 贯穿 shell 危险命令
     // 扫描（ScanCtx 加 extra_read_roots 字段 + dangerous_command_scan 新参数 + 对应
     // 正反测试语料）首次越过 800 硬上限；已把 mod tests 整段搬到外部文件

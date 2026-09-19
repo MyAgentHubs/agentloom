@@ -2,6 +2,7 @@ import type { ChangedFile, MemberUnit } from "../types/agent";
 import { useI18n, type TranslationKey } from "../i18n";
 import { MessageContent } from "./MessageContent";
 import { useMarkdown } from "../lib/useMarkdown";
+import "../styles/taskInspector.css";
 
 interface TaskInspectorProps {
   member: MemberUnit;
