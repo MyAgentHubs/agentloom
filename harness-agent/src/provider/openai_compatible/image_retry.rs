@@ -1,9 +1,10 @@
-//! T19 出线自愈：`supports_images` 判定表（种子表/家族猜）总会有漏——新型号、走自定义
-//! 代理的端点。这里加一道运行时保险丝：真实发生 400 且响应体带着「图片内容不被接受」
-//! 的已知特征、且本次请求确实带了图片块时，把这个 provider 实例的 supports_images
-//! 运行时覆盖为 false、剥图重发一次；不满足条件（含「已经重试过」）原样透传。
-//! 拆出单独文件（同 `image_wire.rs`）：避免 `openai_compatible.rs` 继续逼近文件大小
-//! 门禁的基线历史额度。
+//! Runtime self-heal for image support: the `supports_images` lookup table (seed table / family
+//! guess) will always have gaps—new models, custom proxy endpoints. This adds a runtime fuse: when
+//! a request that actually included image blocks gets a real 400 whose response body matches a
+//! known "image content not accepted" signature, this provider instance's `supports_images` is
+//! overridden to false at runtime and the request is resent once with images stripped; otherwise
+//! (including "already retried once") the response passes through unchanged. Split into its own
+//! file (like `image_wire.rs`) to keep `openai_compatible.rs` under the file-size ratchet.
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 
@@ -11,8 +12,8 @@ use crate::provider::{ChatMessage, ProviderCapabilities, ProviderClient};
 
 impl super::OpenAiCompatibleProvider {
     /// 发请求；若这轮原生搜索 Active 且 provider 返 4xx，则 warning + 不带原生重发一次。
-    /// 返回最终要 collect 的 Response。Kimi 每轮 post 也走这个（T8）。挪进本文件（同
-    /// `image_wire.rs`）：避免 `openai_compatible.rs` 继续逼近文件大小门禁棘轮上限。
+    /// Returns the final Response to collect; Kimi's per-turn post also goes through here (kept in
+    /// this file, alongside `image_wire.rs`, to keep `openai_compatible.rs` under the file-size ratchet).
     ///
     /// T19b P3-2：图片保险丝优先于搜索降级。原生搜索 Active 的 GLM 这类家族真实撞到的
     /// 400 常常是厂商拒图（`is_image_rejected_body`），跟搜索毫无关系——若不加甄别，会
@@ -73,12 +74,14 @@ impl super::OpenAiCompatibleProvider {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// `next_turn` 的唯一发请求入口（T19）：运行时已经因为上一轮 400 拒图而降级过，这轮
-    /// 直接把图剥掉再发——不再让 provider 二次撞线。这里剥图**不 emit** `attachment.dropped`
-    /// （T19b P2-2）：同一张图已经在第一次被拒时记过一条事件了，覆盖生效后每轮都重复剥
-    /// 同一批图（canonical messages 从没被真正改过），若照样每轮都 emit 会把一张图记成
-    /// N 条 dropped 事件——说明行仍每轮追加在这份临时 wire 副本上（wire 用完即弃）。
-    /// 还没降级过，走正常发送 + 事后判 400 特征（见 `maybe_retry_after_image_rejection`）。
+    /// The single request-sending entry point for `next_turn`: once the runtime has downgraded
+    /// because of a 400 image rejection on a previous turn, this turn strips images before sending
+    /// directly, so the provider never hits the same wall twice. Stripping here does **not** emit
+    /// `attachment.dropped` again: the same image already got one dropped-event recorded on its first
+    /// rejection, and once the override is active every later turn re-strips the same images from a
+    /// temporary wire copy (canonical messages is never actually mutated), so re-emitting every turn
+    /// would record one image as N dropped events. Before any downgrade, send normally and check for
+    /// the 400 signature afterward (see `maybe_retry_after_image_rejection`).
     pub(crate) async fn post_with_image_guard(
         &self,
         messages: &[ChatMessage],

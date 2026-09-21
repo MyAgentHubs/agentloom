@@ -1,5 +1,5 @@
 //! 写入闸：任务级 files_scope/forbidden_scope 越界判定（实时挡 + 跑完增量审计共用·spec §4.5）。
-//! 纯路径判定（本段·无 IO）+ git 增量审计（T4 段·shell）。真·涟漪有界执行点。
+//! Pure path checks avoid IO; incremental Git auditing detects writes outside the allowed scope.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -173,7 +173,7 @@ pub fn scope_violation(rel_path: &str, scope: &TaskScope) -> Option<String> {
 }
 
 /// 一批【观察到的原始相对路径】逐条判越界（跑完增量审计 / 实时闸用）。
-/// 每条先用 observed-path normalizer 词法清理（glob 字符保留）；无法规范化（含越界 ..）→ **保守判违规**（B3·fail closed）。
+/// Normalize each observed path while preserving glob characters; reject paths that cannot be normalized so invalid paths cannot bypass scope checks.
 pub fn classify_violations(changed_raw: &[String], scope: &TaskScope) -> Vec<Violation> {
     changed_raw
         .iter()
@@ -192,7 +192,7 @@ pub fn classify_violations(changed_raw: &[String], scope: &TaskScope) -> Vec<Vio
 pub struct WriteBaseline {
     /// 工作树快照 commit（git stash create·含此前任务未提交改动）·空树退化 HEAD。
     pub pre_ref: String,
-    /// 开跑前 untracked 文件 path→内容 hash（B4：逮「基线前已存在、被本任务改了内容」的 untracked）。
+    /// Baseline content hashes ensure edits to pre-existing untracked files are detected, even when their paths are unchanged.
     pub pre_untracked: BTreeMap<String, u64>,
 }
 
@@ -288,7 +288,7 @@ pub fn changed_paths_since(worktree: &Path, baseline: &WriteBaseline) -> Result<
     .collect();
     for (path, hash) in untracked_hashed(worktree)? {
         if baseline.pre_untracked.get(&path) != Some(&hash) {
-            set.insert(path); // 新 untracked 或基线前 untracked 被改内容（B4）
+            set.insert(path); // Include new untracked files and content changes to pre-existing untracked files so neither escapes auditing.
         }
     }
     Ok(set.into_iter().collect())
@@ -581,7 +581,7 @@ mod tests {
 
     #[test]
     fn glob_char_path_out_of_scope_is_flagged_not_dropped() {
-        // B3：真实文件名含 glob 字符·范围外·必须被逮（不能 fail-open 丢弃）
+        // Literal glob characters in an out-of-scope filename must not cause the file to be silently excluded from auditing.
         let v = classify_violations(&["evil[1].rs".to_string()], &scope(&["src/a.rs"], &[]));
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].path, "evil[1].rs");
@@ -589,7 +589,7 @@ mod tests {
 
     #[test]
     fn unnormalizable_path_fails_closed() {
-        // B3：无法规范化（越界 ..）→ 保守判违规·不漏
+        // Paths that escape the root during normalization must be rejected so malformed paths cannot bypass scope checks.
         let v = classify_violations(&["../escape.rs".to_string()], &scope(&["src/a.rs"], &[]));
         assert_eq!(v.len(), 1);
     }
@@ -682,7 +682,7 @@ mod tests {
 
     #[test]
     fn modifying_pre_baseline_untracked_out_of_scope_is_caught() {
-        // B4：基线前已存在的 untracked out-of-scope 文件·本任务改它内容 → 必逮(不能假绿)
+        // Changing a pre-existing untracked file outside the allowed scope must fail the audit, even though its path was already present.
         let dir = init_repo();
         let p = dir.path();
         std::fs::write(p.join("src/leftover.rs"), "v1\n").unwrap(); // 基线前 untracked(范围外)

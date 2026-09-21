@@ -31,13 +31,13 @@ fn session_index_snapshot_runs_on_named_background_thread_and_is_delivered() {
     );
 }
 
-/// idlefix-T1 补针 C（skeptic 点名 TOCTOU）：`list_session_runtime_replay_rows` 读出的是
-/// "读那一刻"的现状——本用例里故意造出陈旧行（status=running），且让 provider 阻塞在"已被
-/// 调用、尚未返回"这个窗口里，模拟"读之后、入队之前，真实状态已经翻转"。这个窗口期间，一次
-/// "真实"翻转（走 `enqueue_run_status_milestone_with_gate`——`publish_run_status_milestone`
-/// 真正落地时调的同一份函数）并发尝试把新状态（idle）入队。断言：客户端最终收到的最后一帧
-/// 是新状态，陈旧的补发帧排不到它后面——不是靠时序侥幸，是靠 `run_status_replay_gate`
-/// 强制互斥（provider 未放行前，"实时"入队被挡在锁外）。
+/// Block `list_session_runtime_replay_rows` after it reads a stale running status but
+/// before it returns, exposing the read-to-enqueue race. During that window, attempt
+/// to enqueue a live idle transition through `enqueue_run_status_milestone_with_gate`,
+/// the same path used by `publish_run_status_milestone`. The last delivered status must
+/// be idle: stale replay must never follow the newer live transition. Verify that
+/// `run_status_replay_gate` blocks live enqueue until the replay provider is released,
+/// so ordering follows mutual exclusion rather than favorable thread scheduling.
 #[test]
 fn run_status_replay_batch_is_ordered_before_a_racing_live_transition_toctou() {
     let stale_row = crate::db::SessionRuntimeReplayRow {

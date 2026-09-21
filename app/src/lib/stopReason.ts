@@ -11,7 +11,7 @@ type Translate = (
  * `harness_needs_decision_message`（exit4·run.needs_decision，已改为在白名单内
  * 优先用更具体的 blocked_reason 顶替笼统的顶层 reason="blocked_questions"）。
  *
- * 覆盖范围（对齐 harness-agent 实际会发的 reason 值·2026-07-25 opus 对抗审核过一遍）：
+ * Coverage tracks the actual reason values the harness-agent backend can emit, cross-checked against adversarial review.
  * - exit4（run.needs_decision）：blocked_questions / no_progress / stuck_repeating /
  *   budget_exhausted_still_progressing / context_budget_exhausted。
  * - exit3（run.blocked）：approval_unavailable / rejected_repeatedly。同样是 exit3 的

@@ -9,7 +9,7 @@ type Translate = (
  * chat 消息流工具卡展示层：内部工具名（claude 原名 / myagent 名 / codex 伪名 /
  * 交付四件套）→ 人话 i18n key。纯展示层映射，后端事件契约（block.tool 原值）不变。
  *
- * 覆盖范围（F1 实勘定罪·2026-07-25）：
+ * Coverage below is cross-checked against the actual tool names each backend/agent can emit.
  * - claude 原名：Bash / Read / Write / Edit / Glob / Grep / Task / TodoWrite /
  *   WebFetch / WebSearch / NotebookEdit / BashOutput / KillShell。
  * - myagent 名：fs_read / fs_edit / fs_write / shell_exec / grep / glob / ls /
@@ -17,7 +17,7 @@ type Translate = (
  * - codex 伪名：command / file / image_gen。
  * - 交付四件套：mcp__agentloom__commit / push / create_pr / publish（这四个从
  *   streamItems.ts 的隐藏名单里拎出来显示，映射层同样要给人话）。
- * - verifier：propose_verifier Auto 直跑后落库的结果信息卡（决策打扰收敛刀 T2 改款·
+ * - verifier: the info card persisted after propose_verifier auto-runs; its tool name is fixed as "verifier" across call sites and must not be renamed.
  *   fold-default），工具名固定 "verifier"（跨刀协调已定，别改名）。
  *
  * 未收录的工具名原样透传——前向兼容的硬要求：新工具在这张表补上之前必须保持可见，
@@ -56,7 +56,7 @@ const TOOL_NAME_KEYS: Record<string, I18nKey> = {
   mcp__agentloom__push: "toolCard.name.push",
   mcp__agentloom__create_pr: "toolCard.name.createPr",
   mcp__agentloom__publish: "toolCard.name.publish",
-  // 验证回执（决策打扰收敛刀 T2 改款·fold-default）
+  // Verification receipt card (fold-default).
   verifier: "toolCard.name.verifier",
 };
 

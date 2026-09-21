@@ -2,7 +2,7 @@
 
 use super::*;
 
-// M1-T1（remote control M0 §4c）：session_runtime 表 helper 单测。
+// Unit tests for the session_runtime table helpers.
 
 #[test]
 fn set_session_runtime_same_values_do_not_publish() {

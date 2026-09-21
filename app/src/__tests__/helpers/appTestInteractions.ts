@@ -104,8 +104,8 @@ export function createAppTestInteractions(
     }) => void;
   }
 
-  // 决策打扰收敛刀 T1·症状 B：镜像 leadDecisionCardCb，取 lead-message-appended listener
-  // 的回调直接手动触发（App 收到后端 append_decision_echo 写库成功的 emit）。
+  // Mirrors leadDecisionCardCb by directly invoking the lead-message-appended listener's callback,
+  // simulating the backend having successfully persisted append_decision_echo and emitted the update.
   function leadMessageAppendedCb() {
     const handler = listenMock.mock.calls.find(
       (c) => c[0] === "lead-message-appended",

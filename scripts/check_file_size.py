@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Read-only local feedback. CI with a freshly fetched baseline is authoritative.
 
-No arguments, environment overrides, baseline files, writes, or rename detection.
+No arguments (or an optional `--base <ref>` to override the baseline ref),
+no environment overrides, baseline files, writes, or rename detection.
 The checked worktree is anchored to this script, not the caller's cwd.
 """
 
@@ -264,20 +265,59 @@ def historical_lines(root, oids):
     return counts
 
 
-def check(root):
+def select_internal_baseline_ref(root):
+    # Fall back only when a ref is absent, never when an existing ref is broken.
+    return next((ref for ref in BASELINE_REFS
+                if git(root, "rev-parse", "--verify", "--quiet", ref, missing_ok=True) is not None), None)
+
+
+def check(root, base=None):
     toplevel = os.fsdecode(git(root, "rev-parse", "--show-toplevel")).rstrip("\n")
     if Path(toplevel).resolve() != root:
         raise GateError("检查器必须位于被检查仓库根目录的 scripts/ 下")
-    # Fall back only when a ref is absent, never when an existing ref is broken.
-    selected = next((ref for ref in BASELINE_REFS
-                     if git(root, "rev-parse", "--verify", "--quiet", ref, missing_ok=True) is not None), None)
-    if selected is None:
-        raise GateError("缺少基线 origin/master 或 origin/main；先显式 fetch 远端历史。"
-                        "首次导入须先建立经审查的基线；禁止退回 HEAD 或跳过。")
-    commit = git(root, "rev-parse", "--verify", selected + "^{commit}").strip().decode("ascii")
-    print(f"基线：{selected.removeprefix('refs/remotes/')} ({commit})", flush=True)
+    fallback_roots, fallback_commit = frozenset(), None
+    if base is not None:
+        # An explicit --base ref (e.g. the previous public snapshot) replaces
+        # the BASELINE_REFS candidates entirely; it must resolve to a commit.
+        resolved = git(root, "rev-parse", "--verify", "--quiet", base + "^{commit}", missing_ok=True)
+        if resolved is None:
+            raise GateError(f"基线 ref 不存在：{base}")
+        commit = resolved.strip().decode("ascii")
+        print(f"基线：{base} ({commit})", flush=True)
+        # Only under an explicit --base: a ref may never have tracked a whole
+        # snapshot-optional root (e.g. the public release strips remote-web
+        # entirely). Such a root is still judged, but against the internal
+        # baseline instead of --base, never silently against the hard cap
+        # alone. A root with even one file in the --base tree is judged
+        # against --base as usual.
+        fallback_roots = frozenset(
+            prefix for prefix in SNAPSHOT_OPTIONAL_ROOTS
+            if prefix in SCAN_ROOTS and not git(root, "ls-tree", "-z", commit, "--", prefix)
+        )
+        if fallback_roots:
+            fallback_ref = select_internal_baseline_ref(root)
+            if fallback_ref is None:
+                raise GateError(
+                    "以下根在基线 " + base + " 中缺失，且缺少可回退的内部基线 origin/master 或 "
+                    "origin/main（先显式 fetch 远端历史）：" + "、".join(sorted(fallback_roots))
+                )
+            fallback_commit = git(root, "rev-parse", "--verify", fallback_ref + "^{commit}").strip().decode("ascii")
+            for prefix in sorted(fallback_roots):
+                print(f"回退：{prefix}（基线 {base} 不含该根，改按 {fallback_ref} 判定）", flush=True)
+    else:
+        selected = select_internal_baseline_ref(root)
+        if selected is None:
+            raise GateError("缺少基线 origin/master 或 origin/main；先显式 fetch 远端历史。"
+                            "首次导入须先建立经审查的基线；禁止退回 HEAD 或跳过。")
+        commit = git(root, "rev-parse", "--verify", selected + "^{commit}").strip().decode("ascii")
+        print(f"基线：{selected.removeprefix('refs/remotes/')} ({commit})", flush=True)
     check_coverage(root)
     baseline = baseline_blobs(root, commit)
+    if fallback_commit is not None:
+        fallback_blobs = baseline_blobs(root, fallback_commit)
+        for path, oid in fallback_blobs.items():
+            if any(path.startswith(prefix + "/") for prefix in fallback_roots):
+                baseline[path] = oid
     files = collect_current(root, commit)
     # Validate UTF-8 on both sides even if the current file is below its cap.
     previous = historical_lines(root, [
@@ -308,12 +348,18 @@ def check(root):
 
 
 def main():
-    if len(sys.argv) != 1:
-        print("ERROR：检查器不接受命令行参数；基线固定按 origin/master、origin/main 选择，"
-              "不支持环境变量覆盖。", file=sys.stderr)
+    base = None
+    if len(sys.argv) == 1:
+        pass
+    elif len(sys.argv) == 3 and sys.argv[1] == "--base":
+        base = sys.argv[2]
+    else:
+        print("ERROR：检查器只接受无参数或 `--base <ref>`；基线默认按 origin/master、origin/main 选择，"
+              "不支持环境变量覆盖；`--base <ref>` 用于改用指定 ref（例如上一版公开快照）算总账。",
+              file=sys.stderr)
         return 2
     try:
-        return check(Path(__file__).resolve().parent.parent)
+        return check(Path(__file__).resolve().parent.parent, base=base)
     except (GateError, OSError, ValueError) as error:
         print(f"ERROR：文件大小门禁无法完成，拒绝放行：{error}", file=sys.stderr)
         return 2

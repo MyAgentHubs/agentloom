@@ -1,7 +1,7 @@
-//! T1 图片附件：把有 images 的消息拼成 OpenAI 多模态 content 数组形态
-//! `[{"type":"text",...},{"type":"image_url",...}...]`（先文本后图）。
-//! 拆出单独文件（避免 `openai_compatible.rs` 继续超出文件大小门禁的基线历史额度）。
-//! 没 images 的消息保持 serde 派生出的原样字符串形态，调用方一字节不变。
+//! Renders any message carrying images into the OpenAI multimodal content-array shape
+//! `[{"type":"text",...},{"type":"image_url",...}...]` (text first, then images). Split into its
+//! own file to keep `openai_compatible.rs` under the file-size ratchet. Messages without images
+//! keep their plain serde-derived string form untouched, byte-for-byte, for every caller.
 
 use serde_json::{json, Value};
 

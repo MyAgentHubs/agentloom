@@ -640,7 +640,7 @@ export const MessageStream = React.memo(function MessageStream({
           (message.stream_live == null &&
             i === messages.length - 1 &&
             message.role === "assistant"));
-      // 块 B（T5·BLOCK-4·P1-3）：含 team_run/coding_task/decision_card 的消息继续用
+      // Messages carrying team_run/coding_task/decision_card blocks keep using
       // 块内 run id 派 key；普通消息优先用 client id，否则用 role + 首块内容指纹 +
       // 同指纹序号。displayMessages 会克隆消息对象，故不能用 WeakMap 对象身份。
       renderItems.push(

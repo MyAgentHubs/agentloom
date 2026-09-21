@@ -263,7 +263,7 @@ fn harness_lead_cmd_in_builds_run_argv_with_mcp_and_disallow_tools() {
         contains_adjacent_pair(&args, "--disallow-tools", "fs_edit,fs_write,shell_exec"),
         "{args:?}"
     );
-    // T4：lead 回合预算放宽到 120（引擎默认 40 轮对「读码+派单+问人」结构性太紧）。
+    // Preserve the 120-turn lead budget so code reading, delegation, and questions fit beyond the 40-turn default.
     assert!(
         contains_adjacent_pair(&args, "--max-turns", "120"),
         "{args:?}"
@@ -346,8 +346,8 @@ fn harness_lead_cmd_in_writes_large_prompt_to_app_domain_file() {
     assert_eq!(std::fs::read(&prompt_path).unwrap(), prompt.as_bytes());
 }
 
-/// T3：lead spawn 路径（`harness_lead_cmd_in`）与 `HarnessBackend` 共用
-/// `apply_harness_provider_env`——`agents.api_timeout_ms` 同样要能到达 lead 子进程 env。
+/// Lead spawning shares `apply_harness_provider_env` with `HarnessBackend`, so configured
+/// API timeouts must also reach the lead subprocess with milliseconds converted to seconds.
 #[test]
 fn harness_lead_cmd_in_maps_api_timeout_ms_to_myagent_timeout_secs() {
     let _home_lock = crate::worktree::test_home_lock();

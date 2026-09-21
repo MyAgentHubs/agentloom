@@ -41,7 +41,7 @@ export type AgentEvent =
       input_tokens: number | null;
       output_tokens: number | null;
       final_text: string | null;
-      // plan B3：B1 后端已 emit 的 commit 结构化字段（空轮全 null）
+      // Structured commit fields already emitted by the backend; all are null on an empty turn.
       run_id?: string | null;
       commit_sha?: string | null;
       files_changed?: number | null;
@@ -371,7 +371,7 @@ export type LeadSummaryBlock = {
   findings: Finding[];
   artifact_refs: ArtifactRef[];
 };
-/** 镜像后端 db::AcceptanceCriterion（含 waiver·B5：reason 在 DB·Criterion 无此字段）。 */
+/** Mirrors backend db::AcceptanceCriterion, including waivers; the waiver reason lives in the DB row, not on this Criterion type. */
 export type AcceptanceCriterion = {
   id: string;
   session_id: string;
@@ -488,12 +488,12 @@ export type Block =
       artifact_refs: ArtifactRef[];
     }
   | {
-      // B2：live-only gate 草案块（不持久化·冻结后清·数据在 App gateBySession state·按 session_id 取）
+      // Live-only gate draft block: never persisted and cleared once frozen; data lives in App's gateBySession state, keyed by session_id.
       type: "gate_card";
       session_id: string;
     }
   | {
-      // B2：live-only 队长拟失败块（不持久化）
+      // Live-only lead-proposed-failure block; never persisted.
       type: "draft_failed";
       session_id: string;
     }
@@ -531,7 +531,7 @@ export type Block =
       type: "context_truncated";
     }
   | {
-      // 刀 R R3-T3：后端归约器持久化的收尾卡块型（db.rs Block::RunTerminal 镜像）。
+      // Persisted run-terminal card block produced by the backend reducer; mirrors db.rs Block::RunTerminal.
       // status 取值 "completed"/"error"/"interrupted"/"needs_decision"/"blocked"/"fallback"，
       // 可能出现未来未知值 → 前端按未知态兜底展示，不收紧字面量联合。
       type: "run_terminal";
@@ -569,7 +569,7 @@ export type ReviewResult = {
   has_changes: boolean;
   stat: string;
   patch: string;
-  /** plan B3：结构化变更文件数（角标用） */
+  /** Structured changed-file count used for the badge. */
   files_changed: number;
   files: ReviewFileResult[];
   /** false = 项目不是带 HEAD 的 git 工作树，无法生成 diff。 */
@@ -606,7 +606,7 @@ export type DetectResult = {
 };
 
 /** 镜像 plan A Task 2 加完的 db::Session · 4 字段（含 repo_id + namespace_id）。
- *  plan B B4：namespace_id 让 openSession 跨 ns 切时同步 activeNamespaceId。 */
+ * namespace_id lets openSession keep activeNamespaceId in sync when switching across namespaces. */
 export type Session = {
   id: string;
   title: string;

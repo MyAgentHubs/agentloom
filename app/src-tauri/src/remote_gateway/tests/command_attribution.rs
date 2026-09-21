@@ -1,10 +1,10 @@
 #![cfg(test)]
 
 use super::*;
-/// M2-4c(B2)：`test_inner_for_command_attribution` 只暴露 `input_send_handler`——参数化跑
-/// 三种下行命令（input.send/control.stop/input.answer）的测试需要同时控制三个 handler，
-/// 这里补一个全量版本；`control_replay_handler` 固定放行（`|_, _| true`），三种命令测试
-/// 都不关心 replay 去重语义。
+/// Unlike `test_inner_for_command_attribution`, which exposes only `input_send_handler`,
+/// this helper makes all three command handlers controllable for attribution checks.
+/// `control_replay_handler` always permits replay via `|_, _| true` because these
+/// cases isolate repository attribution from replay deduplication.
 fn test_inner_for_command_attribution_all_handlers(
     session_repo_provider: impl Fn(&str) -> Result<Option<String>, String> + Send + Sync + 'static,
     input_send_handler: impl Fn(InputSendFrame) -> Option<AckOutcome> + Send + Sync + 'static,
@@ -51,16 +51,16 @@ fn test_inner_for_command_attribution_all_handlers(
 
 // ---- M2-4c：命令归属 fail-closed ----------------------------------------------------
 
-/// ①下行：active 模式，B 项目会话的命令必须 failed（不到达业务 handler）；A 项目（active
-/// repo 本身）的会话必须正常放行、真的到达 handler。**B2 参数化**：三种下行命令
-/// input.send/control.stop/input.answer 各走一遍闸——三个命令类型各有自己的
-/// `command_session_allowed(inner, session)` 调用点（`handle_command_envelope`
-/// 的三个 match 分支），闸被删掉一个就该只有对应那种命令的红。这三个都被拿去做变异
-/// 自证：把某个命令类型的闸删掉，这里对应那个 case 必须从红变绿地失败（细节见收尾报告
-/// 里贴的变异输出）。**P0-b（2026-08-14）新增第四臂 control.snapshot**：它没有独立的
-/// `*_handler` 函数指针可挂 `received` 钩子（直接原子读 `partial_snapshots` + 直接入队
-/// 里程碑），正例改用「ack outcome==ok」判定，`checks_received` 置 `false` 跳过共享
-/// `received` 向量断言（负例分支仍照旧，因为对所有 case 它天然保持空，不受影响）。
+/// In active mode, commands for another repository must fail before reaching a handler,
+/// while commands for the active repository must reach their handlers successfully.
+/// Exercise input.send, control.stop, and input.answer independently because each has
+/// its own `command_session_allowed(inner, session)` call in `handle_command_envelope`.
+/// Removing any branch's gate must make the corresponding rejection case fail.
+/// Also exercise control.snapshot, whose success path has no injectable `*_handler`.
+/// It reads `partial_snapshots` atomically and enqueues milestones directly, so no
+/// `received` hook can observe dispatch. Its positive case checks the successful ack
+/// and sets `checks_received` to `false` to skip the shared `received` assertion.
+/// Every negative case must still leave the handler observation vector empty.
 #[test]
 fn m2_4c_active_mode_rejects_other_repo_session_and_allows_active_repo_session() {
     struct Case {
@@ -462,10 +462,10 @@ fn m2_4c_active_mode_milestone_drain_filters_other_repo_session_and_sends_active
     server.join().unwrap();
 }
 
-/// ⑤b（B2 补漏）上行 live：跟 ⑤ 同形但走 `upstream_tx`/`drain_live_queue`——active 模式下
-/// B 项目会话的 live 事件在 drain 阶段被静默过滤，A 项目会话正常出线。⑤ 只覆盖了
-/// `drain_milestone_queue` 那半，`drain_live_queue` 里新增的同款判定此前完全没有专门测试
-/// 顶着（上一轮"live 的 attribution 恒 false"变异能存活正是因为这里没有测试）。
+/// Exercise live attribution through `upstream_tx` and `drain_live_queue` in active mode:
+/// events for another repository are discarded during draining, while active-repository
+/// events reach the socket. Coverage of `drain_milestone_queue` alone cannot detect
+/// a missing live gate or a gate that rejects all live events.
 #[test]
 fn m2_4c_active_mode_live_queue_filters_other_repo_session_and_sends_active_repo_session() {
     let room = "0123456789abcdef0123456789abcdef";

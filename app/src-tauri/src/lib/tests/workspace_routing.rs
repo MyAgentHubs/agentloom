@@ -569,9 +569,9 @@ fn resolve_member_wt_routes_active_local_default_in_place() {
     }
 }
 
-/// 方案 A 纯解析函数直测（R-B1 项 3 拆分后）：local-default 落 per-session 子目录路径
-/// （但**不建目录**——纯解析不该有磁盘副作用）；普通 repo 会话项目根不变；同一会话两次
-/// 解析幂等同路径。
+/// Pure path resolution must isolate local-default sessions in stable session
+/// subdirectories without creating them. Real repository sessions must retain
+/// their project root, and repeated resolution must return the same path.
 #[test]
 fn inplace_session_workdir_scopes_local_default_but_not_real_repos() {
     let _home_env_guard = crate::worktree::test_home_lock();
@@ -640,8 +640,8 @@ fn inplace_session_workdir_scopes_local_default_but_not_real_repos() {
     }
 }
 
-/// `ensure_inplace_session_workdir`（R-B1 项 3 新增确保存在版）直测：真正建目录、幂等、
-/// 且与纯解析版算出同一条路径——只是多做了 `create_dir_all` 这一步磁盘副作用。
+/// Directory creation must use the same path as pure resolution and remain
+/// idempotent so repeated startup can safely ensure the workspace exists.
 #[test]
 fn ensure_inplace_session_workdir_creates_directory_idempotently() {
     let _home_env_guard = crate::worktree::test_home_lock();
@@ -686,10 +686,10 @@ fn ensure_inplace_session_workdir_creates_directory_idempotently() {
     }
 }
 
-/// R-B1 项 2 端到端：同一个 local-default 会话里，一个「老 run」的 checkpoint 挂在项目根
-/// 前缀（方案 A 引入 per-session 子目录之前落的），一个「新 run」的 checkpoint 挂在
-/// per-session 子目录前缀——`run_landing_info_inner` 对两个 run 分别调用都必须把展示路径
-/// strip 成项目相对路径，不能有一条因为只试了单一前缀而退化成宿主机绝对路径漏给前端。
+/// A session can contain legacy checkpoints rooted at the project directory
+/// and newer checkpoints under its session subdirectory. Landing information
+/// must render relative paths for both layouts rather than exposing absolute
+/// host paths when only one prefix matches.
 #[test]
 fn run_landing_info_strips_both_legacy_root_and_new_session_subdir_checkpoint_runs() {
     let _home_env_guard = crate::worktree::test_home_lock();

@@ -1,5 +1,5 @@
 //! files_scope/forbidden_scope 的词法路径规范化 + 重叠判定（纯词法·不碰文件系统）。
-//! 1b 写入闸复用（review F5/B5）。
+//! Shared path rules keep plan validation and the write gate consistent.
 
 /// 规范化一个 scope 路径。Err(reason) = 不合法（reason 进评审闸 reasons）。
 /// 拒绝：空 / 绝对 / `..` / glob 字符；归一 `./`、`.`、重复 `/`、尾 `/`。

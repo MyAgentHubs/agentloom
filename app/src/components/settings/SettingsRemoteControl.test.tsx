@@ -1118,7 +1118,7 @@ describe("SettingsRemoteControl", () => {
         repoId: "repo-2",
       }),
     );
-    // B2 的反例：从「未设置」首次带出项目没有旧房间可断，不该弹出重新扫码提示。
+    // Counter-case: the first project carried over from "unset" has no prior room to disconnect, so the re-scan prompt should not appear.
     expect(
       screen.queryByText(
         "伺服项目已切换，房间也随之变了——手机端需要重新扫码才能连接。",

@@ -1,4 +1,4 @@
-//! T1 图片附件：planner goal 消息构造。拆出单独文件——避免 `run_plan.rs` 继续超出
+//! Isolate planner goal messages with image attachments to keep `run_plan.rs` within its existing file-size allowance.
 //! 文件大小门禁的基线历史额度。
 
 use crate::provider::ChatMessage;

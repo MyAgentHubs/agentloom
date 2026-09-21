@@ -21,7 +21,7 @@ fn kind_str(state: &UpdaterState) -> &'static str {
     }
 }
 
-// --- wire fixture：Rust 序列化/反序列化与 T4/U5 前端对拍（U3 返工 P2-4） --
+// --- Wire fixtures keep Rust serialization and deserialization compatible with the frontend ---
 
 #[derive(Deserialize)]
 struct Fixture {

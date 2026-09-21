@@ -3,7 +3,7 @@
 use super::*;
 
 // -----------------------------------------------------------------------------------------
-// T5 I5：收尾序全支路——ack commit < slot release < drain。测试名带 `delivery_order` 子串。
+// All completion paths must commit the ack before releasing the slot, then drain; test names include `delivery_order`.
 // -----------------------------------------------------------------------------------------
 
 /// ★ack commit < slot release 的核心证明：writer ack「晚到」时，`resolve_stdin_ack` 必须
@@ -43,7 +43,7 @@ fn delivery_order_ack_commit_waits_for_late_writer_then_marks_delivered_and_acks
     let writer_ack = ack_join.join().unwrap();
     assert_eq!(writer_ack, Ok(()));
 
-    // T8 P1-②：真相源改为 assembly.included_answer_ids（同线程直接捕获）——这里的裸
+    // Use `assembly.included_answer_ids`, captured on the same thread, as the source of truth for the answers included in this round.
     // `_with_conn`/`ack_pending_answers` 单测不经过完整 runner 线程，直接用一个本地字面量
     // 表示「本轮组装实际纳入的答案 id」，不再靠全局侧信道 record/take。
     let in_flight_ids = vec![7i64];
@@ -125,7 +125,7 @@ fn delivery_order_writer_err_leaves_report_pending_and_answers_unacked() {
     );
 }
 
-/// T8-fix：`is_delivery_round_empty_but_pending` 的查询本身失败（DB 损坏/表缺失等）不能被
+/// Query failures in `is_delivery_round_empty_but_pending` (such as database corruption or missing tables) must not be mistaken for an absence of pending work.
 /// `.unwrap_or(false)` 悄悄吞成「查出来没有 pending」——那样会把「读失败」误判成「读到真没
 /// 有」，进而把这一轮当成正常成功清零退避，真正卡住的 session 反而看起来风平浪静。查询 Err
 /// 必须走 `decide_delivery_outcome` 的保守未交付分支（`UndeliveredPendingQueryError`）。
@@ -185,7 +185,7 @@ fn delivery_order_ack_db_unavailable_is_treated_as_ack_failure() {
     );
 }
 
-/// T8 P1-①：本轮零纳入（既没交付新报告也没确认答案）但该 session 在 DB 里仍有 pending
+/// A round that delivers no new reports and acknowledges no answers must remain undelivered if the session still has pending reports in the database.
 /// 报告行——「run 发生了」但什么都没消化掉，必须判定为未交付（不能清零退避，否则真正卡住
 /// 的 session 会被误判成已经交付、autofeed 再也不会重试）。
 #[test]
@@ -300,7 +300,7 @@ fn delivery_order_nonempty_round_is_never_treated_as_undelivered_even_with_other
 /// `note_resume_failure`、成功分支（`DeliveryOutcome::Success`）必须调用
 /// `note_resume_success`——源码断言锁住这道分流，防止有人把判定写好了却忘记接进生产
 /// wrapper（同 `delivery_order_prespawn_and_spawn_failures_...` 那种“逻辑对但没接线”回归）。
-/// T8-fix：判定结果收进 `DeliveryOutcome` 枚举再 match——枚举分支互斥，不再是旧版 `if` guard
+/// Matching mutually exclusive `DeliveryOutcome` variants lets each branch action be checked independently, without relying on the order of `if` guards.
 /// 那种需要判先后顺序的写法，这里改成分别核两条分支各自接对了动作。
 #[test]
 fn delivery_order_wrapper_wires_empty_but_pending_check_before_unconditional_success() {
@@ -394,7 +394,7 @@ fn delivery_order_prespawn_and_spawn_failures_install_backoff_before_slot_releas
         "match agent::spawn_with_stdin_prompt_ack(&mut cmd, stdin_prompt.as_ref())",
         "ProcessStart",
     );
-    // T8 P2-④：组装失败（Autofeed/LateAnswer 分流的 I2 中止分支）同样必须
+    // Assembly failures that abort Autofeed/LateAnswer runs must also preserve the failure, slot release, and drain ordering below.
     // note_resume_failure < emit_lead_error_and_release < drain_after_run_release。
     assert_order(
         "let assembled_prompt: String = match assembly_outcome {",
@@ -402,7 +402,7 @@ fn delivery_order_prespawn_and_spawn_failures_install_backoff_before_slot_releas
     );
 }
 
-/// T8 P2-④/I2：组装失败时，自动来源（Autofeed/LateAnswer）绝不能只喂兜底句起跑——那等于
+/// After assembly failure, Autofeed/LateAnswer must abort rather than start with only a fallback prompt, which would mistake a run occurring for a delivery.
 /// 把「run 发生了」包装成「run 交付了」；必须中止本轮（不 spawn 后续 command/child）。
 /// UserMessage 来源保留旧行为：兜底句 + 留日志，正常继续起跑（用户主动发的消息不能被吞）。
 #[test]
@@ -445,7 +445,7 @@ fn autofeed_context_assembly_failure_aborts_without_fallback_prompt_for_autofeed
         "组装失败中止分支的收尾序必须是 note_resume_failure < emit_lead_error_and_release < \
              drain_after_run_release < return"
     );
-    // T8 P1-③：组装失败轮绝不能 ack 答案——`commit_lead_run_delivery`/`ack_pending_answers`
+    // Assembly failure must leave answers pending for retry, so neither `commit_lead_run_delivery` nor `ack_pending_answers` may be called.
     // 都必须完全没被调用到，答案仍留在 `pending_answer_ids` 里等下一轮重试。
     assert!(
         !autofeed_arm.contains("commit_lead_run_delivery(")
@@ -581,7 +581,7 @@ fn delivery_order_runner_thread_builder_spawn_err_handles_before_disarm() {
     );
 }
 
-/// T5-fix B：runner OS 线程创建失败（`std::thread::Builder::spawn` 返回 `Err`）之后，
+/// A runner OS thread creation failure (`std::thread::Builder::spawn` returning `Err`) must propagate an error instead of falling through to shared success.
 /// `match spawn_result { ... }` 必须是 `start_lead_session` 的尾表达式、且 `Err` 分支必须
 /// 真正产出 `Err(...)`——旧 bug 的形状是这个 match 只是一条语句，两个分支都收口于共享的
 /// `Ok(())`（写在 match 之后），于是调用方（`try_resume_pending_with_gate`）看到的永远是
@@ -699,7 +699,7 @@ fn delivery_order_stopped_handoff_skips_backoff_but_abort_handoff_installs_it() 
     );
 }
 
-/// T5-fix D：`running.0` 锁 poisoned 时，旧实现 `map_err(...)?` 提前 return——从未拿到
+/// When `running.0` is poisoned, an early return through `map_err(...)?` skips acquiring the guard and removing the slot before the caller drains.
 /// guard，也就从未 `slots.remove`，外层调用方（:14554 附近）却仍会在 `Err(_)` 分支照样
 /// `drain_after_run_release`，违反「slot release < drain」顺序不变量。修复后 poisoned
 /// 分支必须借 `PoisonError::into_inner` 拿回 guard，按 Abort 同款真摘槽 + 装退避，再把

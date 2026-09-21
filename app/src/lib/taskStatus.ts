@@ -93,9 +93,9 @@ export function taskRowView(m: MemberUnit): TaskRowView {
   };
 }
 
-/** coding 闭环 phase → 任务行视图（块 B v3·替 T5 的 as-any 合成 MemberUnit·codex/opus 折）。
- * phase 精确映射 5 态〔ask_*=等你确认 / 中间步=进行中 / applied=已完成 / shelved=已搁置 / error=失败〕·
- * 进展位显 PHASE_LABEL（spec「coding 细分阶段显进展位」）。 */
+/** Map coding-loop phases precisely onto five task-row states: ask_* = awaiting your confirmation,
+ * intermediate steps = in progress, applied = done, shelved = shelved, and error = failed.
+ * Show PHASE_LABEL in the progress position to retain the specific phase within each state. */
 const CODING_PHASE_VIEW: Record<
   CodingPhase,
   { dotClass: string; label: I18nKey; progress: I18nKey }

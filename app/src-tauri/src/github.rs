@@ -299,7 +299,7 @@ pub fn run_install_gh() -> Result<(), String> {
     Ok(())
 }
 
-/// MVP gate 用：darwin 且 brew 可定位才算可一键装（T8 算 canBrewInstall · 对齐 D7）。
+/// One-click install gate: only true when running on darwin and brew can be located.
 pub fn detect_brew_available() -> bool {
     cfg!(target_os = "macos")
         && crate::detect::which_or_fallback(

@@ -1,0 +1,492 @@
+{
+  "observed": "2026-09-21 Asia/Tokyo",
+  "source_tree": "d1fe4ad35dba13adce82ce8615e20e9583a33946",
+  "counts": {
+    "all": 60,
+    "public": 43,
+    "external": 17
+  },
+  "debt_lines": 83501,
+  "files": [
+    {
+      "path": "app/src-tauri/src/agent.rs",
+      "lines": 1348,
+      "cap": 800,
+      "excess": 548,
+      "availability": "public",
+      "sha256": "7fdc256fc5ad1dde97ce1f9fbe6f028b7e6ab1070642833009070343eea9149f"
+    },
+    {
+      "path": "app/src-tauri/src/agent_event.rs",
+      "lines": 1229,
+      "cap": 800,
+      "excess": 429,
+      "availability": "public",
+      "sha256": "987bbff2eafd87abe5383a64b004f5adaf9cc6780c4935616af9764b5e37aaa8"
+    },
+    {
+      "path": "app/src-tauri/src/checkpoint_hook.rs",
+      "lines": 1503,
+      "cap": 800,
+      "excess": 703,
+      "availability": "public",
+      "sha256": "20975d71f3ccec892ae81193eaba9b7f03b342810bd43166283137a58e65cf6d"
+    },
+    {
+      "path": "app/src-tauri/src/commit_broker.rs",
+      "lines": 893,
+      "cap": 800,
+      "excess": 93,
+      "availability": "public",
+      "sha256": "46d47edee0a7fd9bc9b6df0bad1219e0c02d3103b459c2d5db904dd32ab24dd1"
+    },
+    {
+      "path": "app/src-tauri/src/continuation.rs",
+      "lines": 1004,
+      "cap": 800,
+      "excess": 204,
+      "availability": "public",
+      "sha256": "2230a85f68c4e483eb72f18389c8c889aab8c545c654d57761e26c5b32f66d19"
+    },
+    {
+      "path": "app/src-tauri/src/db.rs",
+      "lines": 5814,
+      "cap": 800,
+      "excess": 5014,
+      "availability": "public",
+      "sha256": "4976e232fef8b4149071adb5729293ff21bf1232f7e1a9003538ccac516713fe"
+    },
+    {
+      "path": "app/src-tauri/src/detect.rs",
+      "lines": 940,
+      "cap": 800,
+      "excess": 140,
+      "availability": "public",
+      "sha256": "71ca2cac65cf89b73d71236a468985ca4b85ce5f474d0f5f2986934b0e1c95f4"
+    },
+    {
+      "path": "app/src-tauri/src/event_transport.rs",
+      "lines": 902,
+      "cap": 800,
+      "excess": 102,
+      "availability": "public",
+      "sha256": "a7ef7c8d0e63a28c3370e20943843207a81a3d91a903be0a77b2a8ab9c11394d"
+    },
+    {
+      "path": "app/src-tauri/src/github.rs",
+      "lines": 987,
+      "cap": 800,
+      "excess": 187,
+      "availability": "public",
+      "sha256": "c39c9eedd09d9ef593b2bb08560aa857c7f7928c1726f83332f34dd832c0e2d1"
+    },
+    {
+      "path": "app/src-tauri/src/lead_step.rs",
+      "lines": 814,
+      "cap": 800,
+      "excess": 14,
+      "availability": "public",
+      "sha256": "7ee1b40f510410e67b930de70287be2c421accebc5873d92f9f0e1900e8998e4"
+    },
+    {
+      "path": "app/src-tauri/src/lead_tools.rs",
+      "lines": 1148,
+      "cap": 800,
+      "excess": 348,
+      "availability": "public",
+      "sha256": "37e2f608138b16eb2fd634b072483754805b93da01417997053eb16040a1187b"
+    },
+    {
+      "path": "app/src-tauri/src/lib.rs",
+      "lines": 16735,
+      "cap": 800,
+      "excess": 15935,
+      "availability": "public",
+      "sha256": "62e9cc9760a2f129c17ba8787f53b4370c4471530ee2436f4fda74a6585abc65"
+    },
+    {
+      "path": "app/src-tauri/src/member_runner.rs",
+      "lines": 2782,
+      "cap": 800,
+      "excess": 1982,
+      "availability": "public",
+      "sha256": "79c2d41c7b81008defab394f76a5c20a70dfa3eafccc1051eb868559acd98bf6"
+    },
+    {
+      "path": "app/src-tauri/src/remote_gateway.rs",
+      "lines": 6868,
+      "cap": 800,
+      "excess": 6068,
+      "availability": "public",
+      "sha256": "4ec4dccd3f2ec100345948028a0bc2fc4fe66a37e08dbacb4b85dac850098b8b"
+    },
+    {
+      "path": "app/src-tauri/src/remote_pairing.rs",
+      "lines": 1563,
+      "cap": 800,
+      "excess": 763,
+      "availability": "public",
+      "sha256": "032c8d9bddc42e3a0088903c188c8101105cd4e2ea55b77b5809dbd7d9bf555f"
+    },
+    {
+      "path": "app/src-tauri/src/sandbox.rs",
+      "lines": 1228,
+      "cap": 800,
+      "excess": 428,
+      "availability": "public",
+      "sha256": "c4ab36d155f81aba8b742dc2c0a382ac9b5a4d1605e71ef2c65b57fafd068e9f"
+    },
+    {
+      "path": "app/src-tauri/src/updater.rs",
+      "lines": 2505,
+      "cap": 800,
+      "excess": 1705,
+      "availability": "public",
+      "sha256": "0426d37310f5a82c4ab7e993868b7e9ffd275bd88c485bf79e086f1772979ea4"
+    },
+    {
+      "path": "app/src-tauri/src/updater_install.rs",
+      "lines": 1598,
+      "cap": 800,
+      "excess": 798,
+      "availability": "public",
+      "sha256": "ee8eb2a9315a3207b826ea32a97b859d0f95f829a6f2acc674b5cd50f14f4859"
+    },
+    {
+      "path": "app/src-tauri/src/worktree.rs",
+      "lines": 4367,
+      "cap": 800,
+      "excess": 3567,
+      "availability": "public",
+      "sha256": "9e797ac30e0f336d598d875a16ad4dab60c2943cd865fd149143c419025cf75f"
+    },
+    {
+      "path": "app/src/App.tsx",
+      "lines": 7105,
+      "cap": 500,
+      "excess": 6605,
+      "availability": "public",
+      "sha256": "c997967e6b3771c2cbe71cd2eaf3e632d1dd8ea1b0bd8b6029a9cabcdb5b17b0"
+    },
+    {
+      "path": "app/src/components/FilesPanel.tsx",
+      "lines": 635,
+      "cap": 500,
+      "excess": 135,
+      "availability": "public",
+      "sha256": "0d09931b7268c9e3ca4479a781ced55ee03fb4bd11438650f8926a7704634914"
+    },
+    {
+      "path": "app/src/components/InputArea.tsx",
+      "lines": 830,
+      "cap": 500,
+      "excess": 330,
+      "availability": "public",
+      "sha256": "e463d2f9cc18ed1a91f8245452406a04df5e4cf1dd38d708bb9839123156bbe2"
+    },
+    {
+      "path": "app/src/components/MessageContent.tsx",
+      "lines": 1136,
+      "cap": 500,
+      "excess": 636,
+      "availability": "public",
+      "sha256": "fe9939f78b776aa34e9dd57c565a9d3b6bfbd5aa427556d0bd8f95fe73385a29"
+    },
+    {
+      "path": "app/src/components/MessageStream.tsx",
+      "lines": 702,
+      "cap": 500,
+      "excess": 202,
+      "availability": "public",
+      "sha256": "0f7cc50028ed792468e8fae3545d5d77092505965b43a4470022747a4116bade"
+    },
+    {
+      "path": "app/src/components/OverviewHome.tsx",
+      "lines": 759,
+      "cap": 500,
+      "excess": 259,
+      "availability": "public",
+      "sha256": "473648899c3074de410ce08d65edd7f1d6164921097bd7dd0064084c0f9a30a2"
+    },
+    {
+      "path": "app/src/components/Sidebar.tsx",
+      "lines": 518,
+      "cap": 500,
+      "excess": 18,
+      "availability": "public",
+      "sha256": "340188eba258d898312bc6fd4a20ccf713429f7b24c7c50937ae106102eb2352"
+    },
+    {
+      "path": "app/src/components/UndoReviewPanel.tsx",
+      "lines": 700,
+      "cap": 500,
+      "excess": 200,
+      "availability": "public",
+      "sha256": "17035e9bcdbbf58a969957e08f0791920c5902db41ad3d370b9547a30adb7e15"
+    },
+    {
+      "path": "app/src/components/settings/AgentForm.tsx",
+      "lines": 1989,
+      "cap": 500,
+      "excess": 1489,
+      "availability": "public",
+      "sha256": "20ee89cf878e6e6e0d3baf65579b0a44703becae2b9c5af56258d5833652e0ef"
+    },
+    {
+      "path": "app/src/components/settings/SettingsRemoteControl.tsx",
+      "lines": 1284,
+      "cap": 500,
+      "excess": 784,
+      "availability": "public",
+      "sha256": "376201ee15101ed9c538168afb065acf2123c2df06a9bf7a159ccc16e9541dd1"
+    },
+    {
+      "path": "app/src/components/settings/SettingsSearch.tsx",
+      "lines": 522,
+      "cap": 500,
+      "excess": 22,
+      "availability": "public",
+      "sha256": "d956ee7e6d1907dfd066c4e7a509bf24fa6d881219556a53928e23de11e55f76"
+    },
+    {
+      "path": "app/src/components/settings/agentFormHelpers.ts",
+      "lines": 696,
+      "cap": 500,
+      "excess": 196,
+      "availability": "public",
+      "sha256": "56d3222aa9ace5c1ecb13103db433b356a3e35dda538942c3fc545ccc1eb7440"
+    },
+    {
+      "path": "app/src/styles/global.css",
+      "lines": 10645,
+      "cap": 800,
+      "excess": 9845,
+      "availability": "public",
+      "sha256": "89d8f6e005a320483a843bb624658f4559ddbdf374e756f0afba884e6eb3cc42"
+    },
+    {
+      "path": "app/src/types/agent.ts",
+      "lines": 725,
+      "cap": 500,
+      "excess": 225,
+      "availability": "public",
+      "sha256": "38f7036043f058c0a85190647cb9a126115a6960b1413d183d14979b9f228b8c"
+    },
+    {
+      "path": "harness-agent/src/cli.rs",
+      "lines": 1924,
+      "cap": 800,
+      "excess": 1124,
+      "availability": "public",
+      "sha256": "60d621bb455698325efee7a27ad8a54aad93e33ded4c793b506ef7ad7820a957"
+    },
+    {
+      "path": "harness-agent/src/evaluator.rs",
+      "lines": 1905,
+      "cap": 800,
+      "excess": 1105,
+      "availability": "public",
+      "sha256": "b516ac43cc91d271250a26d07a20ff0ff286cd86c30a12e8eac027df203dcbaf"
+    },
+    {
+      "path": "harness-agent/src/exec/controlled/mod.rs",
+      "lines": 960,
+      "cap": 800,
+      "excess": 160,
+      "availability": "public",
+      "sha256": "ed00ba6c0fecc152a1497ed47e020236643098e136e8550582d96ddfa4b0651d"
+    },
+    {
+      "path": "harness-agent/src/orchestrator/probe_runner.rs",
+      "lines": 1488,
+      "cap": 800,
+      "excess": 688,
+      "availability": "public",
+      "sha256": "026335d47e2d49031006bdec859011a313d6593a49d94216b4e63d36135dff29"
+    },
+    {
+      "path": "harness-agent/src/orchestrator/tests.rs",
+      "lines": 8910,
+      "cap": 1500,
+      "excess": 7410,
+      "availability": "public",
+      "sha256": "f9fd967840517c1aff8a1f3ecf906aebd9c203a0c536f4bb638293ef0f525b5c"
+    },
+    {
+      "path": "harness-agent/src/plan/contract.rs",
+      "lines": 1138,
+      "cap": 800,
+      "excess": 338,
+      "availability": "public",
+      "sha256": "d9bb789334c89880c9deead10bde9b6bb73716b8c26da06a1307f99712d2b9d0"
+    },
+    {
+      "path": "harness-agent/src/plan/replan.rs",
+      "lines": 1023,
+      "cap": 800,
+      "excess": 223,
+      "availability": "public",
+      "sha256": "9f81f6d024c802f7739433c19028ee7eaabbbd261ca46633a7221d75096a9a3f"
+    },
+    {
+      "path": "harness-agent/src/plan/run_plan.rs",
+      "lines": 4114,
+      "cap": 800,
+      "excess": 3314,
+      "availability": "public",
+      "sha256": "c8b5e506c0bc4e420bc0ebaddd4474f1c5304742fd7a353ddb561c013cad7946"
+    },
+    {
+      "path": "harness-agent/src/plan/write_audit.rs",
+      "lines": 1031,
+      "cap": 800,
+      "excess": 231,
+      "availability": "public",
+      "sha256": "7e56921fd8d883979bd48db8b9e14fc8ffec14155aa92ebd8105b5cad960e07e"
+    },
+    {
+      "path": "harness-agent/src/provider/openai_compatible.rs",
+      "lines": 1054,
+      "cap": 800,
+      "excess": 254,
+      "availability": "public",
+      "sha256": "f6f26fe6ff33156551f579971e09538e9be8fc98fcf715bb210ce0a349b99d81"
+    },
+    {
+      "path": "remote-relay/src/room-do.js",
+      "lines": 2296,
+      "cap": 500,
+      "excess": 1796,
+      "availability": "external",
+      "sha256": "89e2681dce1ff9f9bb6c9c7e06821290b18e7e8487c2dc88f6c0c2ebe8355eed"
+    },
+    {
+      "path": "remote-relay/src/room-store.js",
+      "lines": 1349,
+      "cap": 500,
+      "excess": 849,
+      "availability": "external",
+      "sha256": "cb0f365216a6297d7f50a8b77fb93705fd7b02e9ec8c8f44fab3f37274a2ac78"
+    },
+    {
+      "path": "remote-relay/test/g8-message-rate-limit.test.js",
+      "lines": 965,
+      "cap": 500,
+      "excess": 465,
+      "availability": "external",
+      "sha256": "45ea146ed84604218b1939e3933f3cea763254de953647de9db14c93a52861b0"
+    },
+    {
+      "path": "remote-relay/test/msg-reply-route.test.js",
+      "lines": 621,
+      "cap": 500,
+      "excess": 121,
+      "availability": "external",
+      "sha256": "679e848643dd81343a809e1e0f145aee9e20639d1c15db0367975a167983c50a"
+    },
+    {
+      "path": "remote-relay/test/room-do.test.js",
+      "lines": 1616,
+      "cap": 500,
+      "excess": 1116,
+      "availability": "external",
+      "sha256": "3a19a2b06e9ee69336fa8561551c2988ea31142ed6c0b6aa24173fc14f8bf9a5"
+    },
+    {
+      "path": "remote-relay/test/room-lifecycle-fixture.test.js",
+      "lines": 826,
+      "cap": 500,
+      "excess": 326,
+      "availability": "external",
+      "sha256": "03a805301c968ec63c4ad9573c5b1e988a170dbb2debf22e51b6be68be60424a"
+    },
+    {
+      "path": "remote-relay/test/room-store.test.js",
+      "lines": 565,
+      "cap": 500,
+      "excess": 65,
+      "availability": "external",
+      "sha256": "f770198d87f4ff8c6a80342ac5678bffc214abb7a0f33815d1dfe099f77d4b67"
+    },
+    {
+      "path": "remote-relay/test/s1d-fixture.test.js",
+      "lines": 868,
+      "cap": 500,
+      "excess": 368,
+      "availability": "external",
+      "sha256": "72489f92d6dbc8252df38192473e26c412cf2fa38bb8bcf78b589801b508ed40"
+    },
+    {
+      "path": "remote-relay/test/s1i2-fixture.test.js",
+      "lines": 855,
+      "cap": 500,
+      "excess": 355,
+      "availability": "external",
+      "sha256": "837f040888039a7ba1dd11098450c4c4581c6000f5583bbffd7a26aa1c97eb31"
+    },
+    {
+      "path": "remote-relay/test/s1ja-fake-mobile-e2e.test.js",
+      "lines": 790,
+      "cap": 500,
+      "excess": 290,
+      "availability": "external",
+      "sha256": "9bf170743fb4dc711ec1bc3a2490ea8aeaa42e892f42f18a79ecbd1e02b1b60d"
+    },
+    {
+      "path": "remote-relay/test/wire-fixture.test.js",
+      "lines": 724,
+      "cap": 500,
+      "excess": 224,
+      "availability": "external",
+      "sha256": "8cbcca591782d2691e53ac71d55e7ada789f00d543dd6e9d8d903fef042ca758"
+    },
+    {
+      "path": "remote-web/src/app/AppRuntime.e2e.test.tsx",
+      "lines": 1985,
+      "cap": 1500,
+      "excess": 485,
+      "availability": "external",
+      "sha256": "b926cf2a8606ad24e178520e771cf324d615742b6e71e6f0e210aea36172e961"
+    },
+    {
+      "path": "remote-web/src/app/AppRuntime.tsx",
+      "lines": 1470,
+      "cap": 500,
+      "excess": 970,
+      "availability": "external",
+      "sha256": "906900198c4e8a45e5cde0161b7e65a6f2480cde3d958845a3908ad58f42ff9b"
+    },
+    {
+      "path": "remote-web/src/app/commandChannel.ts",
+      "lines": 774,
+      "cap": 500,
+      "excess": 274,
+      "availability": "external",
+      "sha256": "6b70462df8ec9537660cdb8943fb182bf0a7ec9670f9cd005ad4169c16e8d82a"
+    },
+    {
+      "path": "remote-web/src/connection/connectionSession.ts",
+      "lines": 931,
+      "cap": 500,
+      "excess": 431,
+      "availability": "external",
+      "sha256": "61337a67adde9b39fbdead58f92146b9c510236233714cffbb92697ab9a10c72"
+    },
+    {
+      "path": "remote-web/src/events/parseFrame.ts",
+      "lines": 876,
+      "cap": 500,
+      "excess": 376,
+      "availability": "external",
+      "sha256": "fd59888d993d589c1042b84d0ced9da709e2df80a87394b9987c36d1361c5dbd"
+    },
+    {
+      "path": "remote-web/src/ui/stream/SessionStreamScreen.tsx",
+      "lines": 669,
+      "cap": 500,
+      "excess": 169,
+      "availability": "external",
+      "sha256": "b4bbe296ce361c4d9948e747b654695d7edcbbf83b81d1f731331b146d49ebcb"
+    }
+  ]
+}

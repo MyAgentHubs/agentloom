@@ -463,7 +463,6 @@ export function UndoReviewPanel({
     };
     // A new target remounts this state. initialResult is the persisted snapshot
     // for that target and intentionally does not restart loading after submit.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, runId]);
 
   const diffs = useMemo(

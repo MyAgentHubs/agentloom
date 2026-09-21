@@ -64,9 +64,9 @@ fn new_run_reservation_rejects_active_team_members_and_recovers_after_finish() {
     assert!(running.0.lock().unwrap().contains_key("s-team-active"));
 }
 
-/// M1-T1（remote control M0 §4c）：占槽咽喉——`reserve_new_session_run` 是 solo/lead 共用的
-/// send_message 唯一占槽成功出口，成功后必须落一条 session_runtime running 行（run_id 此刻
-/// 还没现场生成，写 None——调用方稍后自己回填）。
+/// Solo and lead startup share this reservation path. A successful reservation
+/// must publish running state immediately, before a run ID is available;
+/// the caller fills in the run ID later.
 #[test]
 fn reserve_new_session_run_writes_session_runtime_running() {
     let conn = Connection::open_in_memory().unwrap();
@@ -96,10 +96,9 @@ fn reserve_new_session_run_writes_session_runtime_running() {
     assert_eq!(row.status, "running");
 }
 
-/// idlefix-T1 缺口①（round-trip）：`reserve_new_session_run` 占槽写 run_id=None 之后，
-/// `start_lead_session` 现在会在拿到真实 run_id 后用同一个 `db::set_session_runtime` 回填
-/// （lead 分支，仿 solo lib.rs:11058 的写法）——这里直接验证这条 UPSERT 序列本身：
-/// None → Some(run_id) 生效，不会被 `run_id = excluded.run_id` 的 UPSERT 语义卡在 NULL。
+/// Reservation initially stores a null run ID. Verify that the subsequent
+/// runtime UPSERT replaces it with the generated ID so startup can associate
+/// live events with the reserved run.
 #[test]
 fn session_runtime_run_id_backfill_after_reserve_overwrites_null() {
     let conn = Connection::open_in_memory().unwrap();
@@ -169,9 +168,9 @@ fn reserve_new_session_run_does_not_write_session_runtime_on_rejection() {
     );
 }
 
-// M1 修复轮 P1-1（opus 深审·2026-08-11）：`compute_session_runtime` 纯函数单测——
-// 验收要求的四条口径：solo 槽在→running；全空→idle；槽已释放但 dispatch intent 仍在
-// →running（P1-1 窗口，最关键的一条）；team member 在→running。
+// Runtime state must remain running while a solo slot, dispatch intent, or team
+// member is active, including the gap after slot release with dispatch pending.
+// Only the absence of all three may produce idle.
 
 #[test]
 fn compute_session_runtime_running_when_solo_slot_present() {

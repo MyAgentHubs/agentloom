@@ -1,9 +1,9 @@
 //! repos 表 CRUD（与 db.rs 同层、纯数据层、无业务逻辑）。
 //! 项目注册与交互业务落在 lib.rs IPC 入口；项目目录不要求是 git 仓库。
 
-// T22：project_path 挂在这里（而非 lib.rs 顶层新增 `mod`）是刻意的——lib.rs 行数已顶到
-// check_file_size.py 门禁基线（净增必须 ≤ 0），新命令挪一层挂靠可以不碰 lib.rs 的 mod 列表，
-// 只需在 lib.rs 既有 generate_handler! 列表行上追加一个 token（同行、不增行）。
+// project_path hangs off this module rather than lib.rs's top-level `mod` list on purpose:
+// lib.rs already sits at the file-size gate ceiling (net line growth must stay <= 0), so new
+// commands attach here and only need one token appended to an existing generate_handler! line.
 pub mod project_path;
 
 use rusqlite::{Connection, OptionalExtension};
@@ -133,9 +133,9 @@ pub fn rename_repo(conn: &Connection, id: &str, name: &str) -> rusqlite::Result<
     Ok(())
 }
 
-/// T22：编辑项目「换工作目录」——更新 path + last_used_at；所属会话记录不改（cwd 靠
-/// repo_id 关联解析，见 `resolve_session_workspace`）。校验（存在/可写/不嵌套/github 需
-/// git 仓）由 `project_path::update_project_path_business` 负责，此函数只做 UPDATE。
+/// Edit a project's working directory: update path + last_used_at only; sessions keep resolving
+/// cwd via repo_id (see `resolve_session_workspace`) so they need no change. Validation (exists/
+/// writable/not nested/github requires a git repo) lives in `project_path::update_project_path_business`; this function only does the UPDATE.
 pub fn update_repo_path(conn: &Connection, id: &str, path: &str) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE repos SET path = ?2, last_used_at = strftime('%s','now') WHERE id = ?1",

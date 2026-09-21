@@ -56,7 +56,7 @@ pub struct RunState {
     pub worklist: Vec<PlanTask>,
     /// 总验收 = 目标 criteria ∪ per-language 全局不变量（1c 填）。
     pub checks: Vec<Criterion>,
-    /// 计划级总预算已消耗的步数（任务执行次数·B5·持久化撑跨崩溃 resume·#[serde(default)] 兼容旧落盘）。
+    /// Persist task executions charged to the plan budget across crash recovery; serde defaults keep older saved states readable.
     #[serde(default)]
     pub steps_used: usize,
     #[serde(default)]

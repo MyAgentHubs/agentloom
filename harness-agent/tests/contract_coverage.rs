@@ -171,8 +171,8 @@ struct DynamicEmitSite {
 
 const DYNAMIC_EMIT_WHITELIST: &[DynamicEmitSite] = &[
     DynamicEmitSite {
-        file: "src/orchestrator/run_loop.rs",
-        line: 236,
+        file: "src/orchestrator/run_loop/evidence_probe.rs",
+        line: 230,
         possible_values: &[
             "evidence.probe.green",
             "evidence.probe.still_red",
@@ -181,14 +181,14 @@ const DYNAMIC_EMIT_WHITELIST: &[DynamicEmitSite] = &[
         ],
     },
     DynamicEmitSite {
-        file: "src/orchestrator/run_loop.rs",
-        line: 487,
+        file: "src/orchestrator/run_loop/evidence_probe.rs",
+        line: 449,
         possible_values: &["evidence.probe.registered", "evidence.probe.rejected"],
     },
     DynamicEmitSite {
         file: "src/plan/run_plan.rs",
         // 行号会随合并漂移，后续应改为按锚点注释匹配。
-        line: 980,
+        line: 866,
         possible_values: &[
             "plan.preflight.pre_green",
             "plan.preflight.refine_requested",

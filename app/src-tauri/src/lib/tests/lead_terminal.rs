@@ -273,12 +273,10 @@ fn lead_production_source_wires_synthetic_error_and_blocked_needs_decision_witne
     );
 }
 
-/// G3-A T2 结构钉子（同款手法：`lead_production_source_wires_synthetic_error_and_
-/// blocked_needs_decision_witnesses`）：`start_lead_session` 是巨型 `#[tauri::command]`
-/// 闭包·真跑一次要 spawn 真进程，测不动其内部逐行 wiring，只能钉源码切片。
-/// 钉两件事：① lead 自己 stdout 里的 Completed usage 必须被捕获进 `lead_completed_usage`
-/// （不能被静默删掉退回「lead run 恒 0」）；② 收尾处必须真调 `add_session_usage` 落库
-/// （且只应出现一次——双记账钉在下面的计数断言）。
+/// Source checks protect usage accounting without spawning a real lead process.
+/// Completed usage from lead stdout must be captured in `lead_completed_usage`,
+/// then persisted through exactly one `add_session_usage` call at shutdown.
+/// This prevents both silently recording zero usage and double-counting a run.
 #[test]
 fn lead_production_source_wires_usage_capture_and_persist() {
     let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));

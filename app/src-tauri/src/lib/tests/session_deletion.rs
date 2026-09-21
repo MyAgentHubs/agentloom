@@ -198,29 +198,13 @@ fn restore_inplace_child_rejects_deleted_parent_without_touching_user_git() {
     );
 }
 
-/// M4b（2026-07-29 opus 对抗审补测·**执行中发现审单前提跟当前代码不符，如实记录**）：
-/// 原始诉求是「github_org 会话经 `delete_session_inner` 端到端删完，断言 `deleted_at IS NOT
-/// NULL` 且 trash ref 存在」。写这条测时发现：`delete_session_inner` 的
-/// `Ok(SessionWorkspace::Repo(repo)) => { trash_session_workspace... }` 这条分支在当前代码下对
-/// **任何**会话都到不了——`session_is_in_place`（`repo_id_is_in_place` = `repo_id.is_some()`）
-/// 只要 session 绑了 `repo_id` 就直接判定"in-place"、在 `match workspace` 之前就早返回纯 DB 墓碑
-/// 路径；而 `resolve_session_workspace` 要返回 `SessionWorkspace::Repo(_)` 同样需要
-/// `resolve_repo_path_for_session` 读到 `repo_id.is_some()`。这两个条件用的是同一个字段、同一
-/// 份读取——不存在"repo_id 绑了、但 session_is_in_place 判 false"的中间态，所以
-/// `match workspace { Ok(SessionWorkspace::Repo(repo)) => ... }` 这条臂在 `delete_session_inner`
-/// 里是结构性死代码（跟具体测试数据无关，是这两个函数当前定义决定的）。真跑了一遍验证：给
-/// github_org 会话绑 `repo_id` + `ensure_workspace` 建出真分支后调 `delete_session_inner`，
-/// 结果直接走了纯墓碑早返回分支，heads 分支纹丝不动——证实了这个结论（现有
-/// `setup_trashed_parent_with_trashed_child` 同款用法多半也一直是这条路，"trashed" 这个名字名不
-/// 副实）。
-///
-/// 既然经 `delete_session_inner` 走不到，但 `trash_session_workspace` +
-/// `finalize_session_trash`（本刀 H2 手术改的正是它）仍然是真实存在、会被编译进产物的代码——
-/// 这条测改成直接调这两个底层原语（等价于"如果 `delete_session_inner` 的 Repo 分支真的被触发,
-/// 它会做什么"），端到端断言 `deleted_at IS NOT NULL` + trash ref 存在 + heads 已经不在，覆盖住
-/// H2 改动本身涉及的真实代码路径。`delete_session_inner` 顶层现在到不了这条分支这件事本身，
-/// 已经如实写在这里——不是本刀职权范围内该顺手修的架构问题，留给看到这条注释的人判断要不要
-/// 另开工单。
+/// Exercise the repository trash primitives directly to verify that successful deletion
+/// records a tombstone, creates the trash ref, and removes the original heads ref.
+/// `delete_session_inner` cannot currently reach its repository branch: a non-NULL
+/// repo_id selects the in-place tombstone-only path before workspace resolution,
+/// while resolving a repository workspace requires that same non-NULL repo_id.
+/// Calling `trash_session_workspace` and `finalize_session_trash` directly protects
+/// their filesystem/database contract without claiming coverage of that unreachable branch.
 #[test]
 fn delete_session_repo_branch_end_to_end_tombstones_and_trashes_ref() {
     let _home_lock = crate::worktree::test_home_lock();
@@ -321,17 +305,11 @@ fn delete_session_repo_branch_end_to_end_tombstones_and_trashes_ref() {
     assert!(ref_exists(&trash), "删完 trash ref 应该真的存在");
 }
 
-/// 必改①的红绿证明（2026-07-29 opus 对抗审揪出的回归）：`finalize_session_trash` 重新拿锁那步
-/// 如果锁已经中毒（某处持锁 panic 留下的 poison 状态），旧写法是裸 `db.0.lock()...?`——直接
-/// `?` 跳过 C3 补偿返回。这时 `trash_session_workspace` 已经真的把 worktree 挪进了 trash ref：
-/// 墓碑永远落不了库 = 永久孤儿（再删被 `wt.cleanup.trashRefExists` 顶回、purge 因
-/// `deleted_at IS NULL` 拒绝、gc 也扫不到）。
-///
-/// 不必真起线程赢竞态：`trash_session_workspace` 先真跑一遍（此时锁还没坏），再照
-/// `lead_tools.rs::dispatch_worker_recovers_from_poisoned_ledger_lock` 的手法人为毒化 db 锁
-/// （另起线程持锁 panic），最后单独调 `finalize_session_trash` 验证补偿分支——断言：① 返回值
-/// 不是"看起来什么都没发生"的静默失败，是明确的错误；② trash ref 已经被补偿路径挪回 heads
-/// （不是永久孤儿）。
+/// A poisoned database lock during trash finalization must report an error and restore
+/// the trash ref to heads. Otherwise the workspace remains orphaned without a tombstone,
+/// preventing deletion retries and leaving it ineligible for purge or garbage collection.
+/// Trash the workspace first, then poison the lock before finalization to exercise
+/// compensation deterministically without depending on a concurrent race.
 #[test]
 fn delete_session_repo_relock_poisoned_still_compensates_trash() {
     let _home_lock = crate::worktree::test_home_lock();

@@ -247,9 +247,9 @@ describe("App", () => {
     );
   });
 
-  // T4 trust-land 反转：旧契约「无 verifier → 阻断落地（已阻止·不 merge/apply）」。
-  // 新契约：in-place 会话 finalize 即落地（后端已置 merged + 记 LandingCommit）→ 直达 applied·
-  // 不进 verify/merge/apply，landedHead 取 finalize 结果。
+  // The old contract blocked landing without a verifier. For in-place sessions, finalize is landing:
+  // the backend already marks the run merged and records a LandingCommit, so it goes straight to applied,
+  // skipping verify/merge/apply; landedHead comes from the finalize result.
   it("无 verifier 时 in-place 会话信任落地·直达 applied·不 verify/merge/apply（T4 trust-land）", async () => {
     mockBasicApp();
     const defaultInvoke = invokeMock.getMockImplementation();
@@ -266,7 +266,7 @@ describe("App", () => {
           activeTaskId: null,
           lastEventCursor: null,
         });
-      // T7：finalize 返回 artifact_id（run-…）；landedHead 由 run_landing_info 给真 git sha。
+      // finalize returns an artifact_id (run-…); run_landing_info supplies the real Git SHA for landedHead.
       if (cmd === "finalize_member_artifact")
         return Promise.resolve("run-no-v-0001");
       if (cmd === "run_landing_info")

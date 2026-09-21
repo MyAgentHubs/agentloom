@@ -49,7 +49,7 @@ pub struct OpenAiCompatibleConfig {
 pub struct OpenAiCompatibleProvider {
     config: OpenAiCompatibleConfig,
     client: reqwest::Client,
-    images_disabled_at_runtime: std::sync::Arc<std::sync::atomic::AtomicBool>, // T19 出线自愈
+    images_disabled_at_runtime: std::sync::Arc<std::sync::atomic::AtomicBool>, // self-heals once a wire-level image rejection is detected
 }
 
 impl OpenAiCompatibleProvider {
@@ -639,7 +639,7 @@ struct ToolCallAccumulator {
 
 /// 中断收尾时判一个 tool 的 arguments 是否可安全保留：非空且是合法 JSON 对象。
 /// 挡掉半截(`{"a":`) / scalar/数组(null/[]/"x"/5) / 空串——这些丢掉、靠模型下一轮重发。
-/// `{}` 算完整(用户拍定·风险低·危险工具缺必填字段会被工具层自己挡)。
+/// `{}` counts as complete (low risk: a dangerous tool missing required fields is caught by the tool layer itself).
 fn tool_args_complete(args: &str) -> bool {
     !args.is_empty() && serde_json::from_str::<serde_json::Map<String, Value>>(args).is_ok()
 }

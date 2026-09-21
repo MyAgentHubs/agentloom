@@ -93,7 +93,7 @@ describe("formatRelativeTime", () => {
 });
 
 describe("formatLocalDayLabel", () => {
-  const now = new Date(2026, 6, 18, 23, 0, 0); // 2026-07-18 23:00 本地时间
+  const now = new Date(2026, 6, 18, 23, 0, 0); // Fixed reference instant used by the tests below.
 
   it("今天 / 昨天用人话，不用日期数字", () => {
     expect(formatLocalDayLabel("2026-07-18", "zh", now)).toBe("今天");

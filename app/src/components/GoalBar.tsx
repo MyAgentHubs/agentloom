@@ -6,7 +6,7 @@ type Props = {
   goal: GoalContract;
   expanded: boolean;
   onToggle: () => void;
-  /** T10 的 GoalCriteriaPanel·原位向下 accordion 展开（非飘浮浮层）。折叠时不渲染。 */
+  /** GoalCriteriaPanel expands in place as an accordion, not a floating overlay; renders nothing while collapsed. */
   expandedSlot: React.ReactNode;
   topbar?: boolean;
   running?: boolean;

@@ -111,8 +111,8 @@ fn truncate_utf8_respects_byte_limit_and_character_boundary() {
 
 #[test]
 fn truncate_utf8_with_marker_appends_marker_only_when_truncation_actually_happens() {
-    // msgfix1 T7 B2：真正发生截断时，总字节数恒 ≤ max_bytes（标记计入预算之内，不会把
-    // 消息顶超），且结果以固定标记收尾。
+    // Truncation must end with the fixed marker and stay within max_bytes,
+    // including the marker itself in the byte budget.
     let oversized = "x".repeat(OUTPUT_TRUNCATE_BYTES + 17);
     let truncated = truncate_utf8_with_marker(&oversized, OUTPUT_TRUNCATE_BYTES);
     assert!(truncated.len() <= OUTPUT_TRUNCATE_BYTES);
@@ -134,15 +134,15 @@ fn truncate_utf8_with_marker_appends_marker_only_when_truncation_actually_happen
 }
 
 // ========================================================================================
-// msgfix1 T3（设计稿 §A）：超限消息块级 preview + content_ref 纯函数覆盖。
+// Pure-function coverage for oversized block previews and content_ref preservation.
 // ========================================================================================
 
 #[test]
 fn is_actionable_block_type_matches_approval_decision_card_and_scope_change_only() {
     assert!(is_actionable_block_type("approval"));
     assert!(is_actionable_block_type("decision_card"));
-    // msgfix1 T3 返修 P0-1：scope_change 来自 NeedsDecision、UI 有「接受并继续」用户
-    // 行动，语义上与 approval/decision_card 同级，必须一起判定为 actionable。
+    // scope_change represents a NeedsDecision action that can be accepted to continue,
+    // so it must be actionable alongside approval and decision_card.
     assert!(is_actionable_block_type("scope_change"));
     for benign in [
         "text",

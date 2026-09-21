@@ -40,9 +40,9 @@ type RunGroup = {
   codingTask: CodingTaskBlock | null;
   decisionCards: DecisionCardBlock[];
   verdict: LeadSummaryBlock | null;
-  /** 决策打扰收敛刀 T4：消息级 agent_name_snapshot（决策卡/回显/归约消息落库时带的身份）——
-   * 优先于 team_run block 的 `lead` 字段（后者在纯 MCP 派单路径下往往压根没有 team_run block）。
-   * 先到先得（同一 run 理应全程同一个 lead）。 */
+  /** Prefer message-level agent_name_snapshot, the identity persisted with a decision card, echo, or reduced message,
+   * over the team_run block's lead field, often entirely absent on pure-MCP dispatch paths.
+   * The first snapshot wins because a run is expected to retain the same lead throughout. */
   leadNameSnapshot: string | null;
 };
 
@@ -155,9 +155,9 @@ export function buildLeadTurns(
         consumed = true;
         const group = ensureGroup(groups, block.source_run_id, index);
         applyLeadNameSnapshot(group, message);
-        // 决策打扰收敛刀 T1·症状 B：chosen 卡不再从组里过滤——DecisionCard 组件现在给 chosen
-        // 态渲一行紧凑「已选：」回执（不再 return null），组里得留着它才能渲出来；否则
-        // turn 判空的 `decisionCards.length === 0` 检查也会连带把这个 turn 一起扔掉。
+        // Keep chosen cards in the group so DecisionCard can render its compact selected receipt instead of returning null.
+        // Removing the card would prevent that receipt from rendering at all and could also make
+        // the decisionCards.length === 0 emptiness check discard the entire turn.
         group.decisionCards.push(block);
         return;
       }

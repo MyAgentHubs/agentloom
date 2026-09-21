@@ -7,7 +7,7 @@ use serial_test::serial;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-struct GoodProvider; // 同 T8·回一条会过硬闸的候选
+struct GoodProvider; // Returns one candidate response that passes the hard gate.
 #[async_trait]
 impl ProviderClient for GoodProvider {
     async fn next_turn(

@@ -47,11 +47,11 @@ fn milestone_replay_uses_shared_msg_completed_client_msg_id_derivation() {
 #[test]
 fn replay_batch_oversized_message_and_live_publish_are_downgraded_to_preview_and_counted() {
     let oversized_text = "x".repeat(SNAPSHOT_SEND_BUDGET_BYTES + 1024);
-    // msgfix1 T3 返修 P1-2：raw content 故意手写成非规范形态（多余空白 + 键顺序与
-    // `serde_json::to_string` 默认输出相反）——钉死"sha256/total_bytes 必须对 DB
-    // 原文字节计算"而非对 content_json 重序列化取哈希；下面额外断言 ref 对"重序列化
-    // 后的规范形式"不成立，正反双向锁死这条契约（否则"误改成重序列化 Value 取哈希"
-    // 这类回归所有语料都来自同一 Value 的序列化，会全绿放过）。
+    // Use raw JSON with extra whitespace and a different key order from
+    // `serde_json::to_string` so the reference must describe the original database bytes.
+    // Check both the raw byte hash and length, and reject the canonical reserialization.
+    // Fixtures built only by serializing a Value would hide accidental reserialization
+    // when computing content references.
     let replay_content_raw = format!(
         "[ {{ \"text\":  {text_json} ,  \"type\":\"text\" }} ]",
         text_json = serde_json::to_string(&oversized_text).unwrap()
@@ -81,8 +81,8 @@ fn replay_batch_oversized_message_and_live_publish_are_downgraded_to_preview_and
     );
     let generation = inner.state.advance_generation_and_set_gate(true);
 
-    // msgfix1 T3（设计稿 §A）：超预算消息不再静默丢弃——降级为 preview + content_ref
-    // 后仍然入队送达，`replay_oversized_dropped` 计数器语义改为"降级为 preview 的次数"。
+    // Oversized replay messages must still be delivered as previews with content_ref;
+    // `replay_oversized_dropped` counts preview downgrades rather than discarded messages.
     publish_milestone_replay_batch_on_connect(&inner, generation);
     let (_, replay_item) = milestone_rx
         .try_recv()
@@ -99,8 +99,8 @@ fn replay_batch_oversized_message_and_live_publish_are_downgraded_to_preview_and
         replay_ref["content_sha256"],
         sha256_hex_lower(replay_content_raw.as_bytes())
     );
-    // msgfix1 T3 返修 P1-2（反向钉死）：ref 绝不能对"重序列化后的规范形式"成立——
-    // 如果生产代码退化成对 content_json 重新序列化取哈希/长度，这两条会立刻转红。
+    // The reference must not match canonical reserialization: these negative assertions
+    // detect computing the hash or length from content_json instead of the raw bytes.
     assert_ne!(
         replay_ref["total_bytes"],
         canonical_reserialized.len() as u64,
@@ -195,8 +195,8 @@ fn replay_batch_normal_message_is_enqueued_unchanged() {
     assert_eq!(item_generation, generation);
     assert_eq!(item.t, "msg.completed");
     assert_eq!(item.payload["blocks"], blocks);
-    // msgfix1 T3（M0 §10.6「可选字段」）：非超预算消息顶层不带 content_ref，内部
-    // ref-source 私有键也不得泄漏到 wire。
+    // Messages within budget must omit the optional content_ref field, and private
+    // reference-source metadata must never leak onto the wire.
     assert!(item.payload.get("content_ref").is_none());
     assert!(item.payload.get(MSG_COMPLETED_REF_SOURCE_KEY).is_none());
     assert!(milestone_rx.try_recv().is_err());
@@ -242,8 +242,8 @@ fn replay_batch_tool_output_truncation_makes_message_sendable() {
     assert_eq!(item.t, "msg.completed");
     let truncated_output = item.payload["blocks"][0]["output"].as_str().unwrap();
     assert_eq!(truncated_output.len(), OUTPUT_TRUNCATE_BYTES);
-    // msgfix1 T7 B2：msg.completed 口截断必须带可见化标记——不能让远端读者以为内容天然
-    // 就在这里结束。
+    // Truncated msg.completed tool output must carry a visible marker so the remote
+    // reader can distinguish truncation from the natural end of the output.
     assert!(
         truncated_output.ends_with(TOOL_OUTPUT_TRUNCATION_MARKER),
         "截断的工具输出必须带 {TOOL_OUTPUT_TRUNCATION_MARKER:?} 标记"
@@ -447,10 +447,10 @@ fn milestone_replay_rebuilds_resolved_and_pending_decision_cards() {
     );
 }
 
-/// idlefix-T1 缺口②：连接后补发批必须追加 `run.status` 现状帧——手机顶栏唯一数据源就是它，
-/// 此前只在状态变化时 publish 一次、连接后补发批没有它，中途接入/错过一帧顶栏就永久卡在
-/// Idle。这里断言补发批（session.index 之后）含一帧 `run.status`，值来自
-/// `session_runtime_replay_provider`，且 client_msg_id 走确定性推导（不是每次重连都变）。
+/// Connection replay must include current `run.status` after the session index so a
+/// client joining mid-run or missing a transition can populate its status display.
+/// The status must come from `session_runtime_replay_provider`, and client_msg_id must
+/// be derived deterministically so reconnecting does not change the event identity.
 #[test]
 fn milestone_replay_batch_includes_run_status_current_state_frame() {
     let runtime_row = crate::db::SessionRuntimeReplayRow {

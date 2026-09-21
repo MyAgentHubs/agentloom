@@ -408,7 +408,7 @@ fn drops_oldest_turns_when_folding_not_enough_and_marks() {
     assert_eq!(last_tool.content.as_ref().unwrap().len(), 200);
 }
 
-// 语义变更 2026-08-06：单条巨型工具结果现在剪中段而不是投降；head 本身超窗口的 Overflow 由 overflow_only_when_head_alone_exceeds_budget 守。
+// A giant single tool result is now truncated in the middle instead of surrendering outright; overflow_only_when_head_alone_exceeds_budget still guards the case where the head alone exceeds the window.
 #[test]
 fn giant_single_tool_now_fits_after_middle_truncation() {
     let limits = tight_limits(3_500, 2, 1);

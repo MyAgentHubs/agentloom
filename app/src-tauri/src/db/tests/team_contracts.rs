@@ -221,7 +221,7 @@ fn goal_contract_roundtrips_assignments_json() {
 #[test]
 fn freeze_team_contract_flips_status_and_replaces_criteria() {
     let conn = mem();
-    // 先落一个 draft 契约 + 2 条 draft criteria（模拟 B1 propose 的产物）
+    // Seed a draft contract and two draft criteria to simulate the output of proposing a goal contract.
     insert_goal_contract(
         &conn,
         &GoalContract {
@@ -379,7 +379,7 @@ fn migration_adds_assignments_json_to_old_goal_contracts() {
 
 #[test]
 fn migration_adds_goal_title_to_old_goal_contracts() {
-    // B1（codex/opus 双审 P1）：旧库（有 assignments_json 但无 goal_title 列）→ init_schema 迁移加列·nullable·幂等。
+    // For an old database with assignments_json but no goal_title, init_schema must add a nullable goal_title column idempotently.
     let c = Connection::open_in_memory().unwrap();
     // 手建「旧 schema」goal_contracts（无 goal_title 列）
     c.execute(
@@ -582,7 +582,7 @@ fn block_lead_summary_round_trips() {
                 source_spans: vec![],
             },
             // 第二个 section 走 skip_serializing_if 的「跳过」反面（None body + 非空 findings/source_spans）·
-            // 连带 SourceSpan/SourceLoc/text_span 元组的全字段 round-trip（防 reload 丢字段·M1b T3 老坑钉）。
+            // Round-trip every field of the SourceSpan/SourceLoc/text_span tuple to guard against dropping fields on reload.
             SummarySection {
                 heading: "证据".into(),
                 body_richtext: None,

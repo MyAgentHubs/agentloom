@@ -1,0 +1,692 @@
+{
+  "observed": "2026-09-21",
+  "method": "ESLint CLI --rule override; config/source not modified; both commands exit 1 because real violations found",
+  "counts": {
+    "app_files": 35,
+    "app_functions": 42,
+    "remote_web_files": 4,
+    "remote_web_functions": 4
+  },
+  "files": [
+    {
+      "id": "LF01",
+      "path": "app/src/App.tsx",
+      "functions": 6,
+      "diagnostics": [
+        {
+          "line": 534,
+          "column": 1,
+          "endLine": 534,
+          "endColumn": 20,
+          "message": "Function 'AppContent' has too many lines (5985). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        },
+        {
+          "line": 2494,
+          "column": 3,
+          "endLine": 2494,
+          "endColumn": 29,
+          "message": "Function 'handleLeadOutcome' has too many lines (226). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        },
+        {
+          "line": 3386,
+          "column": 16,
+          "endLine": 3386,
+          "endColumn": 18,
+          "message": "Arrow function has too many lines (529). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        },
+        {
+          "line": 3390,
+          "column": 7,
+          "endLine": 3390,
+          "endColumn": 9,
+          "message": "Arrow function has too many lines (485). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        },
+        {
+          "line": 3490,
+          "column": 26,
+          "endLine": 3490,
+          "endColumn": 28,
+          "message": "Async arrow function has too many lines (155). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        },
+        {
+          "line": 5161,
+          "column": 3,
+          "endLine": 5161,
+          "endColumn": 30,
+          "message": "Function 'sendSoloForSession' has too many lines (189). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF02",
+      "path": "app/src/__tests__/helpers/appTestFixtures.ts",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 8,
+          "column": 8,
+          "endLine": 8,
+          "endColumn": 38,
+          "message": "Function 'createAppTestFixtures' has too many lines (251). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF03",
+      "path": "app/src/__tests__/helpers/appTestMocks.ts",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 6,
+          "column": 8,
+          "endLine": 6,
+          "endColumn": 35,
+          "message": "Function 'createAppTestMocks' has too many lines (281). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF04",
+      "path": "app/src/__tests__/helpers/appTestReviewScenarios.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 16,
+          "column": 8,
+          "endLine": 16,
+          "endColumn": 45,
+          "message": "Function 'createAppTestReviewScenarios' has too many lines (281). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF05",
+      "path": "app/src/components/AboutDialog.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 20,
+          "column": 8,
+          "endLine": 20,
+          "endColumn": 28,
+          "message": "Function 'AboutDialog' has too many lines (153). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF06",
+      "path": "app/src/components/ComposerAgentSelector.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 119,
+          "column": 8,
+          "endLine": 119,
+          "endColumn": 38,
+          "message": "Function 'ComposerAgentSelector' has too many lines (282). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF07",
+      "path": "app/src/components/ContinuationBriefPanel.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 46,
+          "column": 8,
+          "endLine": 46,
+          "endColumn": 39,
+          "message": "Function 'ContinuationBriefPanel' has too many lines (166). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF08",
+      "path": "app/src/components/FilesPanel.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 208,
+          "column": 8,
+          "endLine": 208,
+          "endColumn": 27,
+          "message": "Function 'FilesPanel' has too many lines (409). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF09",
+      "path": "app/src/components/GateCard.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 28,
+          "column": 8,
+          "endLine": 28,
+          "endColumn": 25,
+          "message": "Function 'GateCard' has too many lines (260). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF10",
+      "path": "app/src/components/GlobalSearch.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 84,
+          "column": 8,
+          "endLine": 84,
+          "endColumn": 29,
+          "message": "Function 'GlobalSearch' has too many lines (292). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF11",
+      "path": "app/src/components/InputArea.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 236,
+          "column": 8,
+          "endLine": 236,
+          "endColumn": 26,
+          "message": "Function 'InputArea' has too many lines (558). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF12",
+      "path": "app/src/components/MarkdownBody.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 58,
+          "column": 40,
+          "endLine": 58,
+          "endColumn": 61,
+          "message": "Function 'MarkdownBody' has too many lines (154). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF13",
+      "path": "app/src/components/MemberDrillIn.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 116,
+          "column": 8,
+          "endLine": 116,
+          "endColumn": 30,
+          "message": "Function 'MemberDrillIn' has too many lines (226). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF14",
+      "path": "app/src/components/MessageContent.tsx",
+      "functions": 3,
+      "diagnostics": [
+        {
+          "line": 245,
+          "column": 1,
+          "endLine": 245,
+          "endColumn": 28,
+          "message": "Function 'ImageContextTarget' has too many lines (206). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        },
+        {
+          "line": 747,
+          "column": 1,
+          "endLine": 747,
+          "endColumn": 28,
+          "message": "Function 'MessageContentImpl' has too many lines (361). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        },
+        {
+          "line": 876,
+          "column": 16,
+          "endLine": 876,
+          "endColumn": 18,
+          "message": "Arrow function has too many lines (202). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF15",
+      "path": "app/src/components/MessageStream.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 415,
+          "column": 41,
+          "endLine": 415,
+          "endColumn": 63,
+          "message": "Function 'MessageStream' has too many lines (270). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF16",
+      "path": "app/src/components/NewProjectSheet.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 37,
+          "column": 8,
+          "endLine": 37,
+          "endColumn": 32,
+          "message": "Function 'NewProjectSheet' has too many lines (272). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF17",
+      "path": "app/src/components/OverviewHome.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 245,
+          "column": 1,
+          "endLine": 245,
+          "endColumn": 31,
+          "message": "Function 'RecentActivitySection' has too many lines (158). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF18",
+      "path": "app/src/components/RepoList.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 26,
+          "column": 8,
+          "endLine": 26,
+          "endColumn": 25,
+          "message": "Function 'RepoList' has too many lines (333). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF19",
+      "path": "app/src/components/RepoManagePanel.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 173,
+          "column": 8,
+          "endLine": 173,
+          "endColumn": 32,
+          "message": "Function 'RepoManagePanel' has too many lines (252). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF20",
+      "path": "app/src/components/RepoSwitcherDropdown.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 30,
+          "column": 8,
+          "endLine": 30,
+          "endColumn": 37,
+          "message": "Function 'RepoSwitcherDropdown' has too many lines (175). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF21",
+      "path": "app/src/components/RightPanel.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 136,
+          "column": 8,
+          "endLine": 136,
+          "endColumn": 27,
+          "message": "Function 'RightPanel' has too many lines (220). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF22",
+      "path": "app/src/components/RunCard.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 11,
+          "column": 8,
+          "endLine": 11,
+          "endColumn": 24,
+          "message": "Function 'RunCard' has too many lines (187). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF23",
+      "path": "app/src/components/SessionMain.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 116,
+          "column": 39,
+          "endLine": 116,
+          "endColumn": 59,
+          "message": "Function 'SessionMain' has too many lines (237). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF24",
+      "path": "app/src/components/SessionMenu.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 31,
+          "column": 8,
+          "endLine": 31,
+          "endColumn": 28,
+          "message": "Function 'SessionMenu' has too many lines (262). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF25",
+      "path": "app/src/components/SessionRow.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 66,
+          "column": 8,
+          "endLine": 66,
+          "endColumn": 27,
+          "message": "Function 'SessionRow' has too many lines (254). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF26",
+      "path": "app/src/components/Sidebar.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 135,
+          "column": 35,
+          "endLine": 135,
+          "endColumn": 51,
+          "message": "Function 'Sidebar' has too many lines (369). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF27",
+      "path": "app/src/components/SurfaceHeader.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 66,
+          "column": 8,
+          "endLine": 66,
+          "endColumn": 30,
+          "message": "Function 'SurfaceHeader' has too many lines (155). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF28",
+      "path": "app/src/components/UndoReviewPanel.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 386,
+          "column": 8,
+          "endLine": 386,
+          "endColumn": 32,
+          "message": "Function 'UndoReviewPanel' has too many lines (298). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF29",
+      "path": "app/src/components/UpdateButton.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 116,
+          "column": 8,
+          "endLine": 116,
+          "endColumn": 29,
+          "message": "Function 'UpdateButton' has too many lines (202). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF30",
+      "path": "app/src/components/settings/AgentForm.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 639,
+          "column": 8,
+          "endLine": 639,
+          "endColumn": 26,
+          "message": "Function 'AgentForm' has too many lines (1282). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF31",
+      "path": "app/src/components/settings/SettingsAgents.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 158,
+          "column": 8,
+          "endLine": 158,
+          "endColumn": 31,
+          "message": "Function 'SettingsAgents' has too many lines (193). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF32",
+      "path": "app/src/components/settings/SettingsRemoteControl.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 443,
+          "column": 8,
+          "endLine": 443,
+          "endColumn": 38,
+          "message": "Function 'SettingsRemoteControl' has too many lines (767). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF33",
+      "path": "app/src/components/settings/SettingsSearch.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 158,
+          "column": 8,
+          "endLine": 158,
+          "endColumn": 31,
+          "message": "Function 'SettingsSearch' has too many lines (318). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF34",
+      "path": "app/src/components/settings/UpdateSection.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 28,
+          "column": 8,
+          "endLine": 28,
+          "endColumn": 30,
+          "message": "Function 'UpdateSection' has too many lines (199). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF35",
+      "path": "app/src/lib/useTeamConfig.ts",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 194,
+          "column": 8,
+          "endLine": 194,
+          "endColumn": 30,
+          "message": "Function 'useTeamConfig' has too many lines (205). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "public"
+    },
+    {
+      "id": "LF36",
+      "path": "remote-web/src/app/AppRuntime.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 177,
+          "column": 1,
+          "endLine": 177,
+          "endColumn": 29,
+          "message": "Function 'AppRuntimeConnected' has too many lines (814). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "source_not_in_observed_public_tree"
+    },
+    {
+      "id": "LF37",
+      "path": "remote-web/src/app/RootRouter.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 161,
+          "column": 8,
+          "endLine": 161,
+          "endColumn": 27,
+          "message": "Function 'RootRouter' has too many lines (168). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "source_not_in_observed_public_tree"
+    },
+    {
+      "id": "LF38",
+      "path": "remote-web/src/app/pairingTransport.ts",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 89,
+          "column": 8,
+          "endLine": 89,
+          "endColumn": 43,
+          "message": "Function 'createRealPairingTransport' has too many lines (152). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "source_not_in_observed_public_tree"
+    },
+    {
+      "id": "LF39",
+      "path": "remote-web/src/ui/stream/SessionStreamScreen.tsx",
+      "functions": 1,
+      "diagnostics": [
+        {
+          "line": 177,
+          "column": 8,
+          "endLine": 177,
+          "endColumn": 37,
+          "message": "Function 'SessionStreamContent' has too many lines (188). Maximum allowed is 150.",
+          "ruleId": "max-lines-per-function"
+        }
+      ],
+      "availability": "source_not_in_observed_public_tree"
+    }
+  ]
+}

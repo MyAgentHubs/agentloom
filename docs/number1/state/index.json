@@ -1,0 +1,341 @@
+{
+  "schema_version": 1,
+  "publication": "approved_preflight_running",
+  "active_claims": [],
+  "nodes": {
+    "P0": {
+      "status": "done",
+      "evidence": [
+        "维护者在本次会话逐项批准方案；本次只发布 public agentloom"
+      ]
+    },
+    "P1": {
+      "status": "pending_publication_verification"
+    },
+    "BOOT": {
+      "status": "planned"
+    },
+    "REC-L2B6": {
+      "status": "ready_after_publication"
+    },
+    "REC-C1": {
+      "status": "ready_after_publication"
+    },
+    "W2-CLOSE": {
+      "status": "planned"
+    },
+    "F01": {
+      "status": "planned"
+    },
+    "F02": {
+      "status": "planned"
+    },
+    "F03": {
+      "status": "planned"
+    },
+    "F04": {
+      "status": "planned"
+    },
+    "F05": {
+      "status": "planned"
+    },
+    "F06": {
+      "status": "planned"
+    },
+    "F07": {
+      "status": "planned"
+    },
+    "F08": {
+      "status": "planned"
+    },
+    "F09": {
+      "status": "planned"
+    },
+    "F10": {
+      "status": "planned"
+    },
+    "F11": {
+      "status": "planned"
+    },
+    "F12": {
+      "status": "planned"
+    },
+    "F13": {
+      "status": "planned"
+    },
+    "F14": {
+      "status": "planned"
+    },
+    "F15": {
+      "status": "planned"
+    },
+    "F16": {
+      "status": "planned"
+    },
+    "F17": {
+      "status": "planned"
+    },
+    "F18": {
+      "status": "planned"
+    },
+    "F19": {
+      "status": "planned"
+    },
+    "F20": {
+      "status": "planned"
+    },
+    "F21": {
+      "status": "planned"
+    },
+    "F22": {
+      "status": "planned"
+    },
+    "F23": {
+      "status": "planned"
+    },
+    "F24": {
+      "status": "planned"
+    },
+    "F25": {
+      "status": "planned"
+    },
+    "F26": {
+      "status": "planned"
+    },
+    "F27": {
+      "status": "planned"
+    },
+    "F28": {
+      "status": "planned"
+    },
+    "F29": {
+      "status": "planned"
+    },
+    "F30": {
+      "status": "planned"
+    },
+    "F31": {
+      "status": "planned"
+    },
+    "F32": {
+      "status": "planned"
+    },
+    "F33": {
+      "status": "planned"
+    },
+    "F34": {
+      "status": "planned"
+    },
+    "F35": {
+      "status": "planned"
+    },
+    "F36": {
+      "status": "planned"
+    },
+    "F37": {
+      "status": "planned"
+    },
+    "F38": {
+      "status": "planned"
+    },
+    "F39": {
+      "status": "planned"
+    },
+    "F40": {
+      "status": "planned"
+    },
+    "F41": {
+      "status": "planned"
+    },
+    "F42": {
+      "status": "planned"
+    },
+    "F43": {
+      "status": "planned"
+    },
+    "F44": {
+      "status": "deferred_by_maintainer"
+    },
+    "F45": {
+      "status": "deferred_by_maintainer"
+    },
+    "F46": {
+      "status": "deferred_by_maintainer"
+    },
+    "F47": {
+      "status": "deferred_by_maintainer"
+    },
+    "F48": {
+      "status": "deferred_by_maintainer"
+    },
+    "F49": {
+      "status": "deferred_by_maintainer"
+    },
+    "F50": {
+      "status": "deferred_by_maintainer"
+    },
+    "F51": {
+      "status": "deferred_by_maintainer"
+    },
+    "F52": {
+      "status": "deferred_by_maintainer"
+    },
+    "F53": {
+      "status": "deferred_by_maintainer"
+    },
+    "F54": {
+      "status": "deferred_by_maintainer"
+    },
+    "F55": {
+      "status": "deferred_by_maintainer"
+    },
+    "F56": {
+      "status": "deferred_by_maintainer"
+    },
+    "F57": {
+      "status": "deferred_by_maintainer"
+    },
+    "F58": {
+      "status": "deferred_by_maintainer"
+    },
+    "F59": {
+      "status": "deferred_by_maintainer"
+    },
+    "F60": {
+      "status": "deferred_by_maintainer"
+    },
+    "SHARED-CHECK": {
+      "status": "planned"
+    },
+    "EXTERNAL-ACCESS": {
+      "status": "deferred_by_maintainer"
+    },
+    "CLASSIFY-JS": {
+      "status": "deferred_by_maintainer"
+    },
+    "CLOSE-PUBLIC": {
+      "status": "planned"
+    },
+    "CLOSE-ALL": {
+      "status": "deferred_by_maintainer"
+    },
+    "LF01": {
+      "status": "planned"
+    },
+    "LF02": {
+      "status": "planned"
+    },
+    "LF03": {
+      "status": "planned"
+    },
+    "LF04": {
+      "status": "planned"
+    },
+    "LF05": {
+      "status": "planned"
+    },
+    "LF06": {
+      "status": "planned"
+    },
+    "LF07": {
+      "status": "planned"
+    },
+    "LF08": {
+      "status": "planned"
+    },
+    "LF09": {
+      "status": "planned"
+    },
+    "LF10": {
+      "status": "planned"
+    },
+    "LF11": {
+      "status": "planned"
+    },
+    "LF12": {
+      "status": "planned"
+    },
+    "LF13": {
+      "status": "planned"
+    },
+    "LF14": {
+      "status": "planned"
+    },
+    "LF15": {
+      "status": "planned"
+    },
+    "LF16": {
+      "status": "planned"
+    },
+    "LF17": {
+      "status": "planned"
+    },
+    "LF18": {
+      "status": "planned"
+    },
+    "LF19": {
+      "status": "planned"
+    },
+    "LF20": {
+      "status": "planned"
+    },
+    "LF21": {
+      "status": "planned"
+    },
+    "LF22": {
+      "status": "planned"
+    },
+    "LF23": {
+      "status": "planned"
+    },
+    "LF24": {
+      "status": "planned"
+    },
+    "LF25": {
+      "status": "planned"
+    },
+    "LF26": {
+      "status": "planned"
+    },
+    "LF27": {
+      "status": "planned"
+    },
+    "LF28": {
+      "status": "planned"
+    },
+    "LF29": {
+      "status": "planned"
+    },
+    "LF30": {
+      "status": "planned"
+    },
+    "LF31": {
+      "status": "planned"
+    },
+    "LF32": {
+      "status": "planned"
+    },
+    "LF33": {
+      "status": "planned"
+    },
+    "LF34": {
+      "status": "planned"
+    },
+    "LF35": {
+      "status": "planned"
+    },
+    "LF36": {
+      "status": "deferred_by_maintainer"
+    },
+    "LF37": {
+      "status": "deferred_by_maintainer"
+    },
+    "LF38": {
+      "status": "deferred_by_maintainer"
+    },
+    "LF39": {
+      "status": "deferred_by_maintainer"
+    }
+  },
+  "resume_rule": "只读 index、当前节点、直接依赖证据和对应文件；不用重读整个会话"
+}

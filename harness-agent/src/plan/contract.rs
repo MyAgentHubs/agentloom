@@ -108,7 +108,7 @@ struct WorklistSpec {
 
 /// acceptance shell 命令 → harness-approved 可执行 Criterion。
 /// authored_by=User + approval=Approved 镜像 goal::parse_criteria：
-/// is_executable_verifiable() 判「Verifiable 且 approval==Approved」，故 evaluator 不跳过（B3）。
+/// Verifiable with approval == Approved satisfies is_executable_verifiable(), ensuring the evaluator runs the check.
 fn harness_approved_criterion(task_id: &str, cmd: &str) -> Criterion {
     Criterion {
         id: format!("{task_id}_acc"),

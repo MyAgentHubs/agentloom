@@ -635,8 +635,8 @@ fn apply_run_to_current_branch_records_landing_commit() {
     assert_eq!(got.3, 1);
 }
 
-/// Slice B Task B2：staging_diff_stats 返「停在 staging、未落地」的本轮改动统计。
-/// 有 merge_candidate(merged_sha=staged) → Some(files/+/-)；无 merge_candidate 的 run → None。
+/// Staging statistics must expose changes awaiting landing: a merge candidate with
+/// merged_sha returns file/addition/deletion counts, while a run without one returns None.
 #[test]
 fn staging_diff_stats_returns_counts_when_merged_into_staging() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -729,9 +729,9 @@ fn staging_diff_stats_returns_counts_when_merged_into_staging() {
     assert!(none.is_none(), "无 merge_candidate 的 run 应返 None");
 }
 
-/// ④ D32 卫生：apply 落地后必须收尾清 agentloom/* 命名空间——
-/// 删本轮 staging 分支 `agentloom/run/<run>` + 逐成员清 member worktree/分支/base ref。
-/// 现状（修前）：apply 只 ff-merge + 记 LandingCommit，命名空间分支全留 → D32 违反。
+/// After `apply` lands changes, it must clean up everything created for this run
+/// in the agentloom/ namespace: the staging branch and each member's worktree,
+/// branch, and base ref.
 #[test]
 fn apply_run_cleans_staging_and_member_workspaces() {
     let _home_env_guard = crate::worktree::test_home_lock();
@@ -843,7 +843,7 @@ fn apply_run_cleans_staging_and_member_workspaces() {
     let landed = apply_run_to_current_branch_inner(&conn, "s1", "r1").unwrap();
     assert_eq!(landed, staged, "ff-merge 落地点不变");
 
-    // D32 收尾：命名空间分支/worktree 全清。
+    // Cleanup: every namespaced branch and worktree must be gone.
     assert!(
         !ref_exists("refs/heads/agentloom/run/r1"),
         "落地后应删 staging 分支"

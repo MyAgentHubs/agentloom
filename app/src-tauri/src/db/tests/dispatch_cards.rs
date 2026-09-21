@@ -314,7 +314,7 @@ fn update_dispatch_card_terminal_only_changes_message_with_matching_assignment()
     );
 }
 
-// msgfix1 T2（M0 §10.7）：messages.revision 是内容版本唯一真相源。
+// messages.revision is the single source of truth for content versioning.
 
 #[test]
 fn messages_revision_migration_backfills_existing_rows_to_one() {

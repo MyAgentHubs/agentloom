@@ -27,7 +27,7 @@ fn lead_step_drains_before_propagating_join_error() {
 
 #[test]
 fn deliver_remote_inbox_entry_has_team_and_solo_routes_and_releases_gate_lock() {
-    // M1-T1 死锁红线：team 判门锁必须收在内层 block，不能跨进会再次 db.0.lock() 的
+    // 死锁红线：team 判门锁必须收在内层 block，不能跨进会再次 db.0.lock() 的
     // start_lead_session；同时固定复用既有纯判门，且两条投递路由各只出现一次。
     let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
     let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
@@ -147,12 +147,9 @@ fn deliver_remote_inbox_entry_team_route_matches_composer_message_arguments() {
     );
     assert!(
             team_branch.contains(
-                "member_agent_ids,\n            None,\n            Some(StartOrigin::UserMessage),\n            Some(display_reduce::remote_input_key(command_id)),\n            // T5-fix C：这是一条全新用户消息投递，不携带待续答的答案 id 快照。\n            None,\n        );"
+                "member_agent_ids,\n            None,\n            Some(StartOrigin::UserMessage),\n            Some(display_reduce::remote_input_key(command_id)),\n            // A brand-new user message delivery carries no snapshot of pending answer ids to resume.\n            None,\n        );"
             ),
-            "member_agent_ids 后的 reasoning_tier 必须传 None，再传 Some(StartOrigin::UserMessage)\
-             （T3 StartOrigin 穿线），再后必须把 command_id 派生的 user_dedup_key 传给\
-             start_lead_session（P0-c command_id 穿线），末尾 resume_answer_ids 必须传 None\
-             （T5-fix C：全新用户消息投递不携带待续答的答案 id 快照）"
+            "after member_agent_ids: reasoning_tier must be None, then Some(StartOrigin::UserMessage), then the command_id-derived dedup key must be passed to start_lead_session, and finally resume_answer_ids must be None (a brand-new user message delivery carries no snapshot of pending answer ids to resume)"
         );
 }
 

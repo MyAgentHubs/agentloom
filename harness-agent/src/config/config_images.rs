@@ -1,4 +1,4 @@
-//! T1 图片附件：provider `supports_images` 覆盖值解析（env var 优先，其次落盘配置）。
+//! Resolve provider `supports_images` overrides, prioritizing env vars over persisted config.
 //! 拆出单独文件——避免 `config.rs` 继续超出文件大小门禁的基线历史额度。
 
 use crate::error::{HarnessError, Result};

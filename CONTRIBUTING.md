@@ -4,6 +4,17 @@ Thanks for being here. AgentLoom is built by a very small team, so this
 document is blunt about how we work — the goal is that contributions you spend
 time on actually land.
 
+## Accepted #1 debt-repayment campaign
+
+On branch `myagenthubs/number1-debt-graph`, the maintainer has accepted the
+public AgentLoom scope in [the task graph](docs/number1/START.md). Contributors
+may claim one ready, in-scope node without opening another proposal issue.
+This exception covers behavior-preserving refactoring only; follow the graph's
+review and verification gates and target this campaign branch, not `main`.
+Changes outside a node, policy changes, dependencies, security/protocol changes,
+or extending the campaign to other repositories still require maintainer approval.
+The one-PR-per-contributor rule and human responsibility for PR prose still apply.
+
 ## Talk first, code second
 
 Reviewing a patch costs us more than writing one. A pull request that arrives

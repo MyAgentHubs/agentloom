@@ -27,7 +27,7 @@ export async function advanceCodingLoop(
       });
       const phase = phaseAfterFinalize(s.verifyCmd, s.isInPlace);
       // in-place finalize 即落地·phase 直达 applied·apply 段被跳过。
-      // T7：finalize 返回的是 artifact_id（run-…）·不是 git sha；landedHead 须取后端 run_landing_info
+      // Finalize returns an artifact id, not a git SHA, so landedHead must use the real landed_head from run_landing_info.
       // 的真 landed_head。app 域受管 workspace 走 merging→applying，landedHead 由 apply 段填。
       if (s.isInPlace && phase === "applied") {
         // 落地已物理完成（in-place）。run_landing_info 仅解析真 git sha（cosmetic）：

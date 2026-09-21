@@ -637,7 +637,7 @@ describe("App", () => {
 
     await clickDecisionOption("让 deepseek 写后半段");
 
-    // T5：先确认卡·一键确认才真派单。
+    // Show a confirmation card first; dispatch fires only once confirmed.
     const confirmDispatch = await findInlineDecisionButton(/确认派单/);
     fireEvent.click(confirmDispatch);
 
@@ -887,7 +887,7 @@ describe("App", () => {
 
     await clickDecisionOption("让 codex-safe 写冷笑话");
 
-    // T5：先确认卡·一键确认才真派单。
+    // Show a confirmation card first; dispatch fires only once confirmed.
     const confirmDispatch = await findInlineDecisionButton(/确认派单/);
     fireEvent.click(confirmDispatch);
 

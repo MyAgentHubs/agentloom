@@ -331,7 +331,7 @@ describe("App", () => {
       });
       cardHandler({ payload: askCardPayload() });
     });
-    // T15 的会话级运行状态不因决策卡临时隐藏。
+    // Session-level run state must not be hidden just because a decision card is temporarily shown.
     await waitFor(() => expect(screen.getByText("工作中")).toBeInTheDocument());
     // 点选项 B（A 带"推荐"pill·B 纯文本好定位）
     fireEvent.click(inlineDecisionCard().getByText("B"));

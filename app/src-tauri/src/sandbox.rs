@@ -2,45 +2,40 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// mac Seatbelt profile：读全开、写默认全开，只拒 AgentLoom 自己的域
-/// （`~/.agentloom` + app 数据目录）。所有插入 profile 的路径都必须转义。
-/// 2026-07-23 用户拍板：安全归用户和 agent，app 只护自己的域。
-/// 已知残留（m2-A Spike 2 实测·2026-06-09·诚实标·勿当已关死）：本 profile `(allow process*)`+`(allow network*)`，
-/// 不挡 worker 经 Bash 的 OS 级逃逸——实测 mac 上 `setsid` 未装、`nohup` 留进程组内（killpg 杀得掉），
-/// 但 `crontab` / `at` 成功落系统 spool（用户 crontab、`/private/var/at`）·活过 worker 且 killpg 动不了。
-/// 治理 = ① `--tools` allowlist 关内建逃逸工具（硬·worker-only·Spike 1 实测 default-deny + nested 子 agent 继承皆生效）
-/// ② 一次性 system prompt 软框 ③ 需长任务诚实软档。shell 级 OS 逃逸（crontab/at）留自研 CLI 直接设计掉 / codex 单独验。
-/// 别声称「已硬挡 shell 逃逸」。
+/// mac Seatbelt: reads and writes default wide open; only AgentLoom's own domain (`~/.agentloom` + app data directory) is denied.
+/// Escape every path inserted into the profile. Safety is the user's and agent's responsibility; the app only guards its own domain.
+/// Residual gap: `(allow process*)` + `(allow network*)` cannot block a worker's OS-level escapes via Bash.
+/// Observed on macOS: `setsid` is usually absent; `nohup` stays in the process group, so `killpg` can still kill it.
+/// But `crontab` / `at` persist tasks in system spools (user crontab, `/private/var/at`), outliving the worker beyond `killpg`'s reach.
+/// Mitigations: (1) a hard `--tools` allowlist disables built-in escape tools under default-deny; nested sub-agents inherit it;
+/// (2) a one-time system-prompt soft guardrail; (3) an honest soft warning for long tasks.
+/// Shell-level OS escapes (crontab/at) remain for dedicated CLI design or separate verification; do not claim they are hard-blocked.
 ///
-/// 2026-07-25 实机 dogfood 定罪：SBPL 里 `signal` 是与 `process*` 平级的独立顶层操作类，
-/// `(allow process*)` 不覆盖它，会落进 `(deny default)`——run_verifier_in_place 里 vitest
-/// 主进程收 worker 时 tinypool 的 kill() 因此被拒（EPERM）、触发 unhandled rejection 非零退出，
-/// verdict 只看退出码误判 failed。已加 `(allow signal (target same-sandbox))` 修复
-/// （对照 /System/Library/Sandbox/Profiles/application.sb 用的就是这条，而非裸 `(allow signal)`）。
+/// SBPL `signal` is an independent top-level operation class alongside `process*`; `(allow process*)` does not cover it, so `(deny default)` applies.
+/// Thus `run_verifier_in_place`'s vitest parent `kill()` on a worker (via tinypool) was denied (EPERM), causing an unhandled rejection
+/// and non-zero exit that an exit-code-only verdict misreports as failed. Fix: `(allow signal (target same-sandbox))`,
+/// matching `/System/Library/Sandbox/Profiles/application.sb`, rather than bare `(allow signal)`.
 ///
-/// 2026-07-30 实机定罪：hdiutil 造/挂磁盘映像需要 IOKit open 与 mount/unmount。
-/// `makehybrid` 缺 `iokit-open` 时撞 `(deny default)` 会以 exit 139（SIGSEGV）退出；
-/// `attach` / `detach` 缺挂载放行时则会干净地报 `Permission denied`。收窄 IOKit 权限时已测
-/// `IOHDIXControllerUserClient` / `IOHDIXController` / `AppleDiskImageControllerUserClient` /
-/// `DIDeviceIOUserClient` / `iokit-registry-entry-class` 这 5 种表达式，均无法打通出包链。
-/// 当前选择通用老算子 `iokit-open`：已知在 macOS 26.3 实测；13 / 14 未实测，选通用老算子
-/// 是为降低系统下限风险。
+/// hdiutil image creation/mounting needs IOKit open and mount/unmount permissions. Without `iokit-open`, `makehybrid` hits
+/// `(deny default)` and exits 139 (SIGSEGV); without mount permission, `attach` / `detach` cleanly report `Permission denied`.
+/// Five narrower expressions failed to unblock packaging: `IOHDIXControllerUserClient`, `IOHDIXController`,
+/// `AppleDiskImageControllerUserClient`, `DIDeviceIOUserClient`, and `iokit-registry-entry-class`.
+/// The generic legacy operator `iokit-open` was verified on the current macOS release; older releases remain unverified.
+/// Choosing the generic operator reduces risk on older systems.
 ///
-/// 2026-07-30 实机定罪：挂载是向下遮蔽整棵子树的语义，与写权限逐路径生效不同。只拒护栏域
-/// 自身的 mount 挡不住挂载其祖先后整体遮蔽护栏域，因此挂载采用 `(deny default)` 兜底默认禁，
-/// 仅白名单放行 canonical 后的 `std::env::temp_dir()`、`/private/tmp`、`/Volumes` 与 workspace。
-/// Seatbelt 规则字符串不解析 symlink，白名单 canonicalize 失败就整条跳过；任何候选若等于或是
-/// 任一护栏域的祖先也不放行，避免一条祖先 mount allow 重新打开整体遮蔽缺口。
+/// Mounts shadow entire subtrees downward, unlike per-path write permissions. Denying mounts only on a guardrail domain cannot
+/// prevent mounting an ancestor to shadow it wholesale, so mounts default to `(deny default)`. Allow only canonicalized
+/// `std::env::temp_dir()`, `/private/tmp`, `/Volumes`, and workspace. Seatbelt rule strings do not resolve symlinks:
+/// skip any candidate entirely if canonicalization fails, or if it equals or is an ancestor of any guardrail domain,
+/// to avoid reopening the wholesale-shadowing gap.
 ///
-/// `workspace` = agent 的真实工作目录（**必须 canonical**）。它只在「工作区正好落在上面某条
-/// deny 域内部」时才在 profile 尾部补一条精确 allow —— 开箱即用的默认项目
-/// `~/.agentloom/local/default`、以及 `~/.agentloom/worktrees/*` 就是这种情况，
-/// 不补回来的话 agent 能读不能写（2026-07-24 实测 P0）。普通用户项目（`~/Code/foo`）
-/// 本来就被全局 `(allow file-write*)` 覆盖，不发这条、不白扩攻击面。
+/// `workspace` is the agent's real working directory and **must be canonical**. Append a precise allow at the profile's end only
+/// when it lies inside a deny domain above, as with the default project `~/.agentloom/local/default` and `~/.agentloom/worktrees/*`.
+/// Without this exception the agent can read but cannot write. Ordinary user projects (e.g. `~/Code/foo`) are already covered
+/// by global `(allow file-write*)`; omit the exception there to avoid needlessly expanding the attack surface.
 pub fn seatbelt_profile(home: &Path, app_data_dir: Option<&Path>, workspace: &Path) -> String {
     seatbelt_profile_inner(home, app_data_dir, workspace, true)
 }
-
 /// 与 `seatbelt_profile` 完全同一套写策略（写默认全开 + 只 deny app 域·canonical + 严格真子路径
 /// 才补尾部 workspace allow），唯一区别 = **断网**（`(deny network*)` 取代 `(allow network*)`）。
 /// verifier 契约要求就地跑但保持 offline，propose_verifier 就地化（方案 A）用此变体——
@@ -52,7 +47,6 @@ pub fn seatbelt_profile_no_network(
 ) -> String {
     seatbelt_profile_inner(home, app_data_dir, workspace, false)
 }
-
 fn seatbelt_profile_inner(
     home: &Path,
     app_data_dir: Option<&Path>,
@@ -173,17 +167,14 @@ fn seatbelt_path(path: &Path) -> String {
         .replace('\r', "\\r")
 }
 
-/// 2026-07-25 实机 dogfood 定罪：`which git` 在 launchd 最小 PATH（或没装 homebrew git 的机器上）
-/// 会解析到 `/usr/bin/git`——这不是符号链接，是 macOS 自带的 Xcode 命令行工具「转发壳」
-/// （真 Mach-O 二进制，`canonicalize` 救不了：`readlink`/`canonicalize` 都直接返回它自身）。
-/// 这个壳在真正跑的时候会按 `xcode-select` 当前指向的开发目录（Xcode.app 或
-/// CommandLineTools）内部再 `exec` 一次真正的 git（如
-/// `/Applications/Xcode.app/Contents/Developer/usr/bin/git`）。
-/// `git_write_seatbelt_profile_for_bin` 的沙箱 profile 只放行一条精确 `process-exec` 字面量，
-/// 若把这个壳交给它，壳内部那次二次 `exec` 会被 `(deny default)` 拒绝
-/// （`git: error: can't exec '.../git' (errno=Operation not permitted)`）。
-/// 修法：探测到壳后改用 `xcrun --find git` 直接问出最终真实二进制，把*那个*路径交给沙箱、
-/// 调用时也直接执行那个路径（不再经过壳、壳的二次 exec 也就无从被拒）。
+/// Under launchd's minimal PATH (or without Homebrew git), `which git` can resolve to `/usr/bin/git`: macOS's built-in Xcode
+/// command-line-tools forwarding shim, not a symlink. It is a real Mach-O binary; `canonicalize`/`readlink` return itself and cannot help.
+/// At runtime it re-`exec`s real git inside the developer directory selected by `xcode-select` (Xcode.app or CommandLineTools),
+/// e.g. `/Applications/Xcode.app/Contents/Developer/usr/bin/git`.
+/// `git_write_seatbelt_profile_for_bin` allows only one exact `process-exec` literal; passing the shim makes its internal re-exec
+/// hit `(deny default)`, reporting `git: error: can't exec '.../git' (errno=Operation not permitted)`.
+/// Fix: on detecting the shim, use `xcrun --find git` to obtain the final real binary path; pass that path to the sandbox and
+/// execute it directly, bypassing the shim so its internal re-exec never occurs and cannot be denied.
 pub(crate) fn resolve_git_bin() -> Result<PathBuf, String> {
     let detected = crate::detect::detect_git()
         .path
@@ -405,7 +396,7 @@ fn resolve_claude_bin_from(
             return c;
         }
     }
-    "claude".into() // 兜底(GUI 极端下可能 spawn 失败、由前端报错; 强化留 B2.5)
+    "claude".into() // fallback: spawn can fail in edge-case GUI environments and surface as a frontend error; consider hardening further later
 }
 
 /// mac：(claude_bin, argv) 包进 sandbox-exec；非 mac：None(回退)。
@@ -429,6 +420,8 @@ pub fn wrap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod profile_tests;
 
     #[test]
     fn git_write_profile_has_exact_metadata_write_and_git_exec_grants() {
@@ -694,7 +687,7 @@ mod tests {
         assert_eq!(resolve_claude_bin(), missing.to_string_lossy());
     }
 
-    // ── resolve_git_bin：Xcode 转发壳检测 + 穿透（2026-07-25 dogfood 定罪修复） ──
+    // ── resolve_git_bin: detecting and piercing the Xcode forwarding shim ──
 
     #[test]
     fn is_xcode_forwarding_shim_matches_only_usr_bin_prefix() {
@@ -887,179 +880,6 @@ mod tests {
                 !profile.lines().any(|l| l.trim() == "(allow signal)"),
                 "严禁裸 (allow signal)（会放行跨沙箱杀进程）：{profile}"
             );
-        }
-    }
-
-    #[test]
-    fn profile_scopes_mount_to_allowlist_in_both_network_variants() {
-        let app_data_dir = Path::new("/Users/x/Library/Application Support/AgentLoom");
-        let workspace_dir = tempfile::tempdir().unwrap();
-        let workspace = workspace_dir.path().join("project");
-        std::fs::create_dir(&workspace).unwrap();
-        let net = seatbelt_profile(Path::new("/Users/x"), Some(app_data_dir), &workspace);
-        let no_net =
-            seatbelt_profile_no_network(Path::new("/Users/x"), Some(app_data_dir), &workspace);
-
-        let mut expected_allow_dirs = Vec::new();
-        for candidate in [
-            std::env::temp_dir(),
-            PathBuf::from("/private/tmp"),
-            PathBuf::from("/Volumes"),
-            workspace,
-        ] {
-            let canonical = std::fs::canonicalize(candidate).unwrap();
-            if !expected_allow_dirs.contains(&canonical) {
-                expected_allow_dirs.push(canonical);
-            }
-        }
-
-        for profile in [&net, &no_net] {
-            assert!(
-                !profile
-                    .lines()
-                    .any(|line| line.trim() == "(allow file-mount)"),
-                "严禁全局放行 file-mount：{profile}"
-            );
-            assert!(
-                !profile
-                    .lines()
-                    .any(|line| line.trim() == "(allow file-unmount)"),
-                "严禁全局放行 file-unmount：{profile}"
-            );
-            assert_eq!(
-                profile
-                    .lines()
-                    .filter(|line| line.trim() == "(allow iokit-open)")
-                    .count(),
-                1,
-                "造磁盘映像所需的 iokit-open 须且只能放行一次：{profile}"
-            );
-            for wildcard in ["(allow iokit*)", "(allow file*)"] {
-                assert!(
-                    !profile.lines().any(|line| line.trim() == wildcard),
-                    "profile 不得用通配操作 {wildcard} 过度放宽：{profile}"
-                );
-            }
-
-            let mount_allow_paths = profile
-                .lines()
-                .filter_map(|line| {
-                    line.strip_prefix("(allow file-mount (subpath \"")
-                        .and_then(|suffix| suffix.strip_suffix("\"))"))
-                        .map(PathBuf::from)
-                })
-                .collect::<Vec<_>>();
-            let unmount_allow_paths = profile
-                .lines()
-                .filter_map(|line| {
-                    line.strip_prefix("(allow file-unmount (subpath \"")
-                        .and_then(|suffix| suffix.strip_suffix("\"))"))
-                        .map(PathBuf::from)
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                mount_allow_paths, unmount_allow_paths,
-                "mount / unmount 必须使用同一份白名单：{profile}"
-            );
-            for expected in &expected_allow_dirs {
-                assert!(
-                    mount_allow_paths.contains(expected),
-                    "canonical 白名单路径 {} 必须同时放行 mount / unmount：{profile}",
-                    expected.display()
-                );
-            }
-            for (index, path) in mount_allow_paths.iter().enumerate() {
-                assert!(
-                    !mount_allow_paths[..index].contains(path),
-                    "同一 canonical 路径不得重复发 mount 放行：{}\n{profile}",
-                    path.display()
-                );
-            }
-
-            let denied_write_paths = profile
-                .lines()
-                .filter_map(|line| {
-                    line.strip_prefix("(deny file-write* (subpath \"")
-                        .and_then(|suffix| suffix.strip_suffix("\"))"))
-                        .map(PathBuf::from)
-                })
-                .collect::<Vec<_>>();
-            assert!(
-                !denied_write_paths.is_empty(),
-                "profile 必须保留 AgentLoom 护栏域：{profile}"
-            );
-            for mount_path in &mount_allow_paths {
-                for denied_path in &denied_write_paths {
-                    assert!(
-                        !denied_path.starts_with(mount_path),
-                        "mount 白名单 {} 不得等于或作为护栏域 {} 的祖先：{profile}",
-                        mount_path.display(),
-                        denied_path.display()
-                    );
-                }
-            }
-        }
-
-        let guarded_home = tempfile::tempdir().unwrap();
-        let nested_workspace = guarded_home.path().join(".agentloom/local/default");
-        std::fs::create_dir_all(&nested_workspace).unwrap();
-        let canonical_nested_workspace = std::fs::canonicalize(&nested_workspace).unwrap();
-        let nested_net = seatbelt_profile(guarded_home.path(), None, &nested_workspace);
-        let nested_no_net =
-            seatbelt_profile_no_network(guarded_home.path(), None, &nested_workspace);
-        for profile in [&nested_net, &nested_no_net] {
-            for operation in ["file-mount", "file-unmount"] {
-                let expected = format!(
-                    "(allow {operation} (subpath \"{}\"))",
-                    seatbelt_path(&canonical_nested_workspace)
-                );
-                assert!(
-                    profile.contains(&expected),
-                    "落在护栏域内部的 canonical workspace 必须精确放行 {operation}：{profile}"
-                );
-            }
-        }
-
-        let canonical_guarded_home = std::fs::canonicalize(guarded_home.path()).unwrap();
-        let ancestor_net = seatbelt_profile(guarded_home.path(), None, guarded_home.path());
-        let ancestor_no_net =
-            seatbelt_profile_no_network(guarded_home.path(), None, guarded_home.path());
-        for profile in [&ancestor_net, &ancestor_no_net] {
-            for operation in ["file-mount", "file-unmount"] {
-                let forbidden = format!(
-                    "(allow {operation} (subpath \"{}\"))",
-                    seatbelt_path(&canonical_guarded_home)
-                );
-                assert!(
-                    !profile.contains(&forbidden),
-                    "workspace 是护栏域祖先时不得放行 {operation}：{profile}"
-                );
-            }
-        }
-
-        let overlapping_workspace = std::fs::canonicalize("/private/tmp").unwrap();
-        let overlapping_net = seatbelt_profile(
-            Path::new("/Users/x"),
-            Some(app_data_dir),
-            &overlapping_workspace,
-        );
-        let overlapping_no_net = seatbelt_profile_no_network(
-            Path::new("/Users/x"),
-            Some(app_data_dir),
-            &overlapping_workspace,
-        );
-        for profile in [&overlapping_net, &overlapping_no_net] {
-            for operation in ["file-mount", "file-unmount"] {
-                let expected = format!(
-                    "(allow {operation} (subpath \"{}\"))",
-                    seatbelt_path(&overlapping_workspace)
-                );
-                assert_eq!(
-                    profile.lines().filter(|line| *line == expected).count(),
-                    1,
-                    "workspace 与固定白名单重合时 {operation} 只能发一次：{profile}"
-                );
-            }
         }
     }
 

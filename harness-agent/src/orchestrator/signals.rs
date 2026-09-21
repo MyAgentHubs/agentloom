@@ -134,13 +134,15 @@ pub(crate) fn emit_no_progress_needs_decision(
 /// 不复用 `decide().halt` 取反：预算耗尽这条路只在没触发停机时才走到·取反恒真会误标所有跑。
 /// 不加 `consecutive_stale_turns`：预算耗尽时它恒「未停机」·且阈值=0 时会部分重启被禁用的安全行为。
 ///
-/// P2（2026-07-26 与 P1 三概念分家同刀）：`turns_since_last_real_edit` 现在只被真编辑
-/// （非 MCP 写工具）清零——修完 P1 后，全程没有 fs_write/fs_edit 可用的 run（例如全靠
-/// mcp__agentloom__* 派单的 lead，`--disallow-tools fs_edit,fs_write,shell_exec`）无论干了
-/// 多少活、`turns_since_last_real_edit` 恒等于 `turns`，会被这条判定误标成 "no_progress"。
-/// `write_tools_offered`（run 全程恒定，见 run_loop.rs 顶部计算）为 false 时，「没编辑过」
-/// 不能当作 no_progress 的依据——但也不能因此瞎猜「还在干活」，只能落回既有词表里最接近
-/// 「说不清、留给下游/人看」的取值：`budget_exhausted_still_progressing`（不新增词表值）。
+/// A companion to the turn-concept split above: `turns_since_last_real_edit` is now zeroed only
+/// by a genuine edit (not an MCP write tool). A run with no fs_write/fs_edit tool available at all
+/// (e.g. a lead dispatching entirely via mcp__agentloom__* with
+/// `--disallow-tools fs_edit,fs_write,shell_exec`) would otherwise have `turns_since_last_real_edit`
+/// stuck equal to `turns` regardless of progress, mislabeling it `no_progress`. When
+/// `write_tools_offered` (constant for the run, computed at the top of run_loop.rs) is false,
+/// "never edited" cannot prove no_progress, but should not be guessed as "still working" either—it
+/// falls back to the closest existing vocabulary value, `budget_exhausted_still_progressing` (no
+/// new vocabulary value is added).
 fn budget_exhausted_blocked_reason(
     progress: &crate::run_progress::RunProgress,
     write_tools_offered: bool,

@@ -30,7 +30,7 @@ type Props = {
   activeRepoId: string | null;
   reposInActiveNs: RepoMeta[];
   repoGroupExpanded: Record<string, boolean>;
-  /** B3：0 repo namespace 时 disable「+ 新会话」+ hover tip */
+  /** Disable "+ New session" (with a hover tip) when the namespace has zero repos. */
   newDisabled: boolean;
   onSelect: (id: string) => void;
   onNew: () => void;

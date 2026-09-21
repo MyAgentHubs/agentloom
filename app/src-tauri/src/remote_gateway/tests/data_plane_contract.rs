@@ -111,15 +111,15 @@ fn data_plane_v1_session_index_variants_match_fixture_and_drive_builders() {
     );
 }
 
-/// B1（backlog 跟进）：`session_index_full`/`session_index_created` 样张只钉了 `repo`/
-/// `repo_name` 恒 `null` 的形状——填充态（字段真有值）两端各自造语料测，样张对拍缺口，
-/// 字段改名可能「Rust 自测红、手机端全绿」地悄悄裂开。本测试用同一份共享样张的填充态
-/// case（`session_index_full_with_repo_name`/`session_index_created_with_repo_name`）
-/// 覆盖：sessions 数组仍抄自 `db::SessionIndexSnapshotRow` 的真实 Serialize 输出（不是
-/// 手打 JSON），`repo_name` 这次是 `Some(..)`；顶层 `repo` 摘要是 `{id, name}` 均非 null
-/// 的 `Value`（构造层面等价于 `active_repo_summary_for_snapshot` 在有名字时会产出的形状，
-/// 不经过那个函数本身——同 `data_plane_v1_session_index_variants_match_fixture_and_drive_
-/// builders` 只探 builder 契约、不探 `Inner` 状态装配的既有分工）。
+/// Check populated repository metadata against shared fixtures as well as `null` fields.
+/// `session_index_full` and `session_index_created` must preserve the `repo` summary and
+/// `repo_name` field names expected by both ends of the protocol. The populated cases,
+/// `session_index_full_with_repo_name` and `session_index_created_with_repo_name`,
+/// use actual `db::SessionIndexSnapshotRow` serialization with `repo_name` set to `Some(..)`.
+/// The top-level `repo` is a `Value` with non-null `{id, name}`, matching the named shape
+/// of `active_repo_summary_for_snapshot` without invoking that state-dependent helper.
+/// Like `data_plane_v1_session_index_variants_match_fixture_and_drive_
+/// builders`, this checks builder contracts rather than `Inner` state assembly.
 #[test]
 fn data_plane_v1_session_index_filled_variant_matches_fixture_and_drives_builders() {
     let fixture = load_data_plane_v1_fixture();
@@ -196,9 +196,9 @@ fn data_plane_v1_msg_completed_matches_fixture_and_drives_builder() {
         },
     ];
     let blocks_json = serde_json::to_value(&blocks).expect("blocks must serialize");
-    // 显示当前 agent（MA1）：样张的 assistant case 带 "agent": "Claude"（Some 分支）。
-    // msgfix1 T3：revision/content_raw 只喂给内部私有 ref-source 键（供超预算降级消费），
-    // 正常大小消息的 wire 形状不受影响——比对前先剥掉它，同生产路径入队前必经的一步。
+    // The assistant fixture includes the populated agent field with the value Claude.
+    // Revision and raw content feed private reference metadata used for oversized previews.
+    // Strip it before comparing normal wire payloads, as the production enqueue path does.
     let payload = milestone_payload(
         "msg.completed",
         strip_ref_source(build_msg_completed_payload(

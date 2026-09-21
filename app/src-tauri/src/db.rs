@@ -14,9 +14,8 @@ pub struct GeneratedRepoDocument {
     pub generated_at: i64,
     pub head_sha: String,
 }
-
 /// 统一取秒（R7）。fake runner / 将来落库的 created_at 用；与表里 strftime('%s','now') 同语义。
-#[allow(dead_code)] // 调用点在 T4 fake_runner。
+#[allow(dead_code)] // Retained for fake_runner to obtain timestamps in seconds.
 pub fn now_secs() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -24,7 +23,6 @@ pub fn now_secs() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
-
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -73,7 +71,7 @@ pub enum Block {
         exit_code: Option<i64>,
         output: Option<String>,
     },
-    /// plan B3：内联变更卡（auto-apply 知情）· 随 assistant 消息持久。
+    /// Persist the inline change card with the assistant message to keep automatically applied changes visible.
     /// 字段镜像 AgentEvent::Completed 的 commit 结构化字段（spec §4）。
     RunCard {
         run_id: String,
@@ -271,7 +269,7 @@ pub struct SourceSpan {
 pub struct SourceLoc {
     pub run_id: String,
     pub assignment_id: String,
-    /// MemberSnapshot.blocks 下标（B5：Block 只 Tool 有稳定 id·故用位置）
+    /// Index into `MemberSnapshot.blocks`; use position because only Tool blocks have stable IDs.
     pub block_index: u32,
 }
 
@@ -321,7 +319,7 @@ pub struct Message {
     pub engine: Option<String>,
     pub agent_id: Option<String>,
     pub agent_name_snapshot: Option<String>,
-    /// msgfix1 T2（M0 §10.7）：该消息内容版本唯一真相源，新建行默认 1。
+    /// Authoritative persisted content version for this message; newly inserted rows default to 1.
     pub revision: i64,
 }
 
@@ -398,7 +396,7 @@ pub struct SessionAgentConfig {
     pub member_agent_ids: Vec<String>,
 }
 
-#[allow(dead_code)] // 调用点在 T4 fake_runner。
+#[allow(dead_code)] // Retained for fake_runner to represent persisted goal contracts.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GoalContract {
     pub id: String,
@@ -406,14 +404,14 @@ pub struct GoalContract {
     pub run_id: String,
     pub goal: String,
     pub lead_participant_id: String,
-    /// 'draft' | 'frozen'（M1a 只产 frozen·深水-B1 产 draft）
+    /// Contract state is 'draft' or 'frozen'; direct creation uses 'frozen', while editable drafts use 'draft'.
     pub status: String,
     /// gate A4：assignment 草案（每单元 subtask+assignee+scope_files+acceptance）·JSON 数组·DEFAULT '[]'。
     pub assignments_json: String,
     pub created_at: i64,
 }
 
-#[allow(dead_code)] // 调用点在 T4 fake_runner。
+#[allow(dead_code)] // Retained for fake_runner to represent acceptance criteria.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AcceptanceCriterion {
     pub id: String,
@@ -432,7 +430,7 @@ pub struct AcceptanceCriterion {
     pub created_at: i64,
 }
 
-#[allow(dead_code)] // 调用点在 T4 fake_runner。
+#[allow(dead_code)] // Retained for fake_runner to persist goal contracts.
 pub fn insert_goal_contract(conn: &Connection, g: &GoalContract) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO goal_contracts
@@ -452,7 +450,7 @@ pub fn insert_goal_contract(conn: &Connection, g: &GoalContract) -> rusqlite::Re
     Ok(())
 }
 
-/// 幂等插 draft 契约（B2 手动填重试用）：唯一/主键冲突 DO NOTHING·其余约束（NOT NULL/CHECK）照常报错。
+/// Insert draft contracts idempotently for manual retries: unique/primary-key conflicts do nothing; NOT NULL/CHECK failures propagate.
 /// 与 insert_goal_contract 区别 = ON CONFLICT DO NOTHING（只对已存在幂等·不掩盖 schema 级真错）。
 #[allow(dead_code)]
 pub fn insert_goal_contract_if_absent(conn: &Connection, g: &GoalContract) -> rusqlite::Result<()> {
@@ -475,7 +473,7 @@ pub fn insert_goal_contract_if_absent(conn: &Connection, g: &GoalContract) -> ru
     Ok(())
 }
 
-#[allow(dead_code)] // 调用点在 T4 fake_runner。
+#[allow(dead_code)] // Retained for fake_runner to read the goal contract for a run.
 pub fn get_goal_contract_by_run(
     conn: &Connection,
     session_id: &str,
@@ -503,7 +501,7 @@ pub fn get_goal_contract_by_run(
     }
 }
 
-/// B2-gatecard: set run-level goal short summary (lead-generated, shown in topbar, does not touch GoalContract struct).
+/// Set the lead-generated run-level goal summary for the top bar without changing the `GoalContract` struct.
 #[allow(dead_code)]
 pub fn set_goal_title_for_run(
     conn: &rusqlite::Connection,
@@ -518,7 +516,7 @@ pub fn set_goal_title_for_run(
     Ok(())
 }
 
-/// B2-gatecard: get run-level goal short summary. Row absent -> Ok(None); row exists but goal_title is NULL -> Ok(None).
+/// Read the run-level goal summary; both a missing row and a NULL `goal_title` return `Ok(None)`.
 #[allow(dead_code)]
 pub fn goal_title_for_run(
     conn: &rusqlite::Connection,
@@ -535,7 +533,7 @@ pub fn goal_title_for_run(
     .map(|opt| opt.flatten())
 }
 
-#[allow(dead_code)] // 调用点在 T4 fake_runner。
+#[allow(dead_code)] // Retained for fake_runner to persist acceptance criteria.
 pub fn insert_acceptance(conn: &Connection, c: &AcceptanceCriterion) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO acceptance_criteria
@@ -589,7 +587,7 @@ pub fn insert_acceptance_if_absent(
     Ok(())
 }
 
-#[allow(dead_code)] // 调用点在 T4 fake_runner。
+#[allow(dead_code)] // Retained for fake_runner to read run acceptance criteria.
 pub fn list_acceptance_by_run(
     conn: &Connection,
     session_id: &str,
@@ -622,7 +620,7 @@ pub fn list_acceptance_by_run(
 
 /// 冻结一刻把编辑后的契约一把事务落库：UPDATE goal_contracts(goal/assignments_json/status=frozen)
 /// + 替换该 run 的全部 acceptance（DELETE 旧 + INSERT 编辑后的）。draft→frozen 单向（守 §A5 状态机）。
-#[allow(dead_code)] // 调用点在 lib.rs freeze_team_plan command（T2 接）。
+#[allow(dead_code)] // Retained for the `freeze_team_plan` command in lib.rs to persist the frozen contract.
 pub fn freeze_team_contract(
     conn: &Connection,
     session_id: &str,
@@ -1011,1033 +1009,7 @@ pub fn set_active_search_backend(conn: &Connection, backend: &str) -> Result<(),
 }
 
 pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS app_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            total_input_tokens INTEGER NOT NULL DEFAULT 0,
-            total_output_tokens INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS session_agent_configs (
-            session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
-            lead_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
-            member_agent_ids TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(member_agent_ids))
-        );
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL CHECK (json_valid(content)),
-            engine TEXT,
-            agent_id TEXT,
-            agent_name_snapshot TEXT,
-            -- 刀 R P0-2：防重复写键（可空·NULL 不参与下方部分唯一索引）。
-            dedup_key TEXT,
-            -- msgfix1 T2（M0 §10.7）：该消息内容版本唯一真相源。新建行默认 1，每次 content 原地更新点原子 +1（见 update_dispatch_card_terminal / update_decision_card_status）。
-            revision INTEGER NOT NULL DEFAULT 1,
-            created_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
-        CREATE INDEX IF NOT EXISTS idx_messages_history
-            ON messages(session_id, id DESC)
-            WHERE role IN ('user','assistant');
-        CREATE TABLE IF NOT EXISTS member_report_delivery (
-            session_id TEXT NOT NULL,
-            message_id INTEGER NOT NULL,
-            assignment_id TEXT,
-            delivered_at INTEGER,
-            PRIMARY KEY (session_id, message_id)
-        );
-        CREATE TABLE IF NOT EXISTS attachments (
-            id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            sha256 TEXT NOT NULL,
-            media_type TEXT,
-            byte_size INTEGER,
-            rel_path TEXT NOT NULL,
-            width INTEGER,
-            height INTEGER,
-            created_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_attachments_sha ON attachments(sha256);
-        -- cluster L 新增（plan 1）：repos 表
-        CREATE TABLE IF NOT EXISTS repos (
-            id TEXT PRIMARY KEY,
-            source TEXT NOT NULL DEFAULT 'local'
-                CHECK (source IN ('local', 'github')),
-            owner TEXT,
-            name TEXT NOT NULL,
-            path TEXT NOT NULL UNIQUE,
-            status TEXT NOT NULL DEFAULT 'active'
-                CHECK (status IN ('active', 'archived', 'invalid')),
-            added_at INTEGER NOT NULL,
-            last_used_at INTEGER
-        );
-        -- cluster L Phase 2 新增：namespaces 表（spec §3.2）
-        CREATE TABLE IF NOT EXISTS namespaces (
-            id TEXT PRIMARY KEY,
-            kind TEXT NOT NULL
-                CHECK (kind IN ('local', 'github_org')),
-            name TEXT NOT NULL,
-            is_builtin INTEGER NOT NULL DEFAULT 0,
-            last_active_repo_id TEXT,
-            added_at INTEGER NOT NULL,
-            last_used_at INTEGER
-        );
-        -- cluster L Phase 3 plan C2-A：Local virtual groups 持久层
-        CREATE TABLE IF NOT EXISTS session_groups (
-            id TEXT PRIMARY KEY,
-            namespace_id TEXT NOT NULL REFERENCES namespaces(id) ON DELETE CASCADE,
-            repo_id TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
-            name TEXT NOT NULL,
-            position INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL
-        );
-        -- plan B1 §1：run_commits ledger（每轮一行 · 轮账本 + 内联卡数据源）
-        CREATE TABLE IF NOT EXISTS run_commits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            run_id TEXT NOT NULL,
-            engine TEXT NOT NULL,
-            pre_head TEXT NOT NULL,
-            post_head TEXT,
-            commit_sha TEXT,
-            files_changed INTEGER,
-            insertions INTEGER,
-            deletions INTEGER,
-            interrupted INTEGER NOT NULL DEFAULT 0,
-            state TEXT NOT NULL DEFAULT 'running'
-                CHECK (state IN ('running', 'active', 'failed', 'undone', 'kept', 'discarded')),
-            created_at INTEGER NOT NULL,
-            UNIQUE (session_id, run_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_run_commits_session ON run_commits(session_id, id);
-        CREATE TABLE IF NOT EXISTS run_commit_intents (
-            session_id TEXT NOT NULL,
-            run_id TEXT NOT NULL,
-            expected_head TEXT NOT NULL,
-            previous_state TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            PRIMARY KEY (session_id, run_id)
-        );
-        CREATE TABLE IF NOT EXISTS checkpoint_entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            run_id TEXT NOT NULL,
-            member_id TEXT,
-            file_path TEXT NOT NULL,
-            existed INTEGER NOT NULL,
-            blob_sha TEXT,
-            file_mode INTEGER,
-            is_symlink INTEGER NOT NULL DEFAULT 0,
-            pre_xattrs BLOB,
-            allowed_root TEXT,
-            post_sha TEXT,
-            post_missing INTEGER NOT NULL DEFAULT 0,
-            post_file_type TEXT,
-            post_mode INTEGER,
-            post_nlink INTEGER,
-            post_inode INTEGER,
-            post_xattr_sha TEXT,
-            post_tainted INTEGER NOT NULL DEFAULT 0,
-            undone_at INTEGER,
-            created_at INTEGER NOT NULL,
-            UNIQUE (session_id, run_id, file_path)
-        );
-        CREATE INDEX IF NOT EXISTS idx_checkpoint_entries_run
-            ON checkpoint_entries(session_id, run_id);
-        -- Agent Team M2 §5.3：team run 启动锚点（崩溃恢复 + member cleanup 数据源）。
-        CREATE TABLE IF NOT EXISTS team_run_pending (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            run_id TEXT NOT NULL UNIQUE,
-            goal TEXT,
-            lead_participant_id TEXT,
-            assignments_json TEXT NOT NULL DEFAULT '[]',
-            started_at INTEGER NOT NULL,
-            state TEXT NOT NULL DEFAULT 'running' CHECK (state IN ('running','interrupted','done')),
-            created_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_team_run_pending_session ON team_run_pending(session_id, id);
-        CREATE TABLE IF NOT EXISTS decision_ledger (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            run_id TEXT,
-            source_assignment_id TEXT,
-            text TEXT NOT NULL,
-            source_refs_json TEXT NOT NULL DEFAULT '[]',
-            supersedes_json TEXT NOT NULL DEFAULT '[]',
-            source_kind TEXT,
-            confidence TEXT,
-            created_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_decision_ledger_session ON decision_ledger(session_id, id);
-        CREATE TABLE IF NOT EXISTS memory_entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            category TEXT NOT NULL,
-            text TEXT NOT NULL,
-            source_refs_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(source_refs_json)),
-            supersedes_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(supersedes_json)),
-            source TEXT,
-            confidence TEXT,
-            pinned INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_memory_entries_session ON memory_entries(session_id, id);
-
-        -- 刀2.1（spec §6.1）：Lead Decision Loop 会话级持久游标。crash 重启据此续。
-        -- autonomy 是安全档位·后端 lead_step 要读 → 落 DB（非 localStorage）。
-        CREATE TABLE IF NOT EXISTS lead_loop_state (
-            session_id TEXT PRIMARY KEY,
-            autonomy TEXT NOT NULL DEFAULT 'cautious'
-                CHECK (autonomy IN ('cautious','handsfree','auto')),
-            active_run_id TEXT,
-            active_task_id TEXT,
-            last_event_cursor TEXT,
-            updated_at INTEGER NOT NULL
-        );
-
-        -- coding 闭环 刀1（spec §1.7）：持久 Task Graph 状态机·落 app 域·守 D32。
-        CREATE TABLE IF NOT EXISTS artifacts (
-            id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            run_id TEXT NOT NULL,
-            member_assignment_id TEXT NOT NULL,
-            branch TEXT NOT NULL,
-            base_sha TEXT NOT NULL,
-            commit_sha TEXT,
-            files_changed INTEGER NOT NULL DEFAULT 0,
-            state TEXT NOT NULL DEFAULT 'finalizing'
-                CHECK (state IN ('finalizing','ready','merged','discarded')),
-            created_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(session_id, run_id);
-        -- 幂等（review 折入·codex#6/opus）：同一 member 同一 run 只一条 artifact·重复 finalize 命中既有。
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_member ON artifacts(session_id, run_id, member_assignment_id);
-        CREATE TABLE IF NOT EXISTS verifications (
-            id TEXT PRIMARY KEY,
-            artifact_id TEXT NOT NULL,
-            cmd TEXT NOT NULL,
-            artifact_sha TEXT NOT NULL,
-            exit_code INTEGER,
-            output_ref TEXT,
-            verdict TEXT NOT NULL DEFAULT 'pending'
-                CHECK (verdict IN ('pending','passed','failed')),
-            created_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_verifications_artifact ON verifications(artifact_id);
-        CREATE TABLE IF NOT EXISTS reviews (
-            id TEXT PRIMARY KEY,
-            artifact_id TEXT NOT NULL,
-            reviewer_agent TEXT NOT NULL,
-            advisory INTEGER NOT NULL DEFAULT 1,
-            verdict TEXT NOT NULL DEFAULT 'pending'
-                CHECK (verdict IN ('pending','pass','fail')),
-            notes TEXT,
-            created_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_reviews_artifact ON reviews(artifact_id);
-        CREATE TABLE IF NOT EXISTS merge_candidates (
-            id TEXT PRIMARY KEY,
-            artifact_id TEXT NOT NULL UNIQUE,
-            staging_branch TEXT NOT NULL,
-            state TEXT NOT NULL DEFAULT 'pending'
-                CHECK (state IN ('pending','merged','rejected')),
-            merged_sha TEXT,
-            created_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_merge_candidates_artifact ON merge_candidates(artifact_id);
-        CREATE TABLE IF NOT EXISTS landing_commits (
-            id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            run_id TEXT NOT NULL,
-            artifact_id TEXT,
-            pre_head TEXT NOT NULL,
-            landed_head TEXT NOT NULL,
-            commit_count INTEGER NOT NULL DEFAULT 0,
-            files_changed INTEGER NOT NULL DEFAULT 0,
-            insertions INTEGER NOT NULL DEFAULT 0,
-            deletions INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL,
-            UNIQUE(session_id, run_id, landed_head)
-        );
-        CREATE INDEX IF NOT EXISTS idx_landing_commits_session ON landing_commits(session_id, id);
-
-        -- Agent Team M1a（缝5·§三.1）：run 级目标契约。只 draft/frozen 两态——
-        -- M1a 的 frozen 是假冻结、不引状态机；真冻结 = Plan&Acceptance Gate 归 M2。
-        CREATE TABLE IF NOT EXISTS goal_contracts (
-            id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            run_id TEXT NOT NULL UNIQUE,
-            goal TEXT NOT NULL,
-            lead_participant_id TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'frozen')),
-            assignments_json TEXT NOT NULL DEFAULT '[]',
-            created_at INTEGER NOT NULL,
-            goal_title TEXT
-        );
-
-        -- Agent Team M1a（缝5·§三.2）：验收标准 day-1 存住（claim/verifier/evidence/status/scope）。
-        -- contract_id 关联 goal_contracts；scope 区分整 team 的(run) vs 单任务的(task)。
-        -- 本里程碑只存取，不跑验证、不做 roll-up（M2/M3/期2）。
-        CREATE TABLE IF NOT EXISTS acceptance_criteria (
-            id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            run_id TEXT NOT NULL,
-            task_id TEXT NOT NULL,
-            contract_id TEXT,
-            scope TEXT NOT NULL DEFAULT 'task' CHECK (scope IN ('run', 'task')),
-            claim TEXT NOT NULL,
-            verifier TEXT,
-            evidence TEXT,
-            status TEXT NOT NULL DEFAULT 'pending'
-                CHECK (status IN ('pending', 'passed', 'failed', 'waived')),
-            waiver TEXT,
-            created_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_acceptance_run ON acceptance_criteria(session_id, run_id);
-        CREATE TABLE IF NOT EXISTS agents (
-            id TEXT NOT NULL PRIMARY KEY,
-            name TEXT NOT NULL,
-            access TEXT NOT NULL
-                CHECK (access IN ('native', 'borrow', 'harness')),
-            provider TEXT NOT NULL,
-            primary_model TEXT,
-            endpoint TEXT,
-            auth_mode TEXT
-                CHECK (auth_mode IS NULL OR auth_mode IN ('bearer', 'x_api_key')),
-            model_opus TEXT,
-            model_sonnet TEXT,
-            model_haiku TEXT,
-            model_subagent TEXT,
-            reasoning_default TEXT NOT NULL DEFAULT 'auto'
-                CHECK (reasoning_default IN ('auto', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')),
-            max_output_tokens INTEGER,
-            api_timeout_ms INTEGER,
-            compat_disable_betas INTEGER NOT NULL DEFAULT 0,
-            compat_disable_nonessential INTEGER NOT NULL DEFAULT 0,
-            compat_disable_thinking INTEGER NOT NULL DEFAULT 0,
-            compat_proxy TEXT,
-            custom_headers TEXT,
-            extra_body TEXT,
-            cap_reasoning TEXT,
-            cap_computer_use TEXT,
-            cap_lead TEXT,
-            has_key INTEGER NOT NULL DEFAULT 0,
-            is_builtin INTEGER NOT NULL DEFAULT 0,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            sort_order INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS memory_blocks (
-            session_id TEXT NOT NULL,
-            slot TEXT NOT NULL,
-            text TEXT NOT NULL,
-            title TEXT,
-            anchor_refs_json TEXT NOT NULL DEFAULT '[]',
-            updated_by TEXT,
-            updated_at INTEGER NOT NULL,
-            revision INTEGER NOT NULL DEFAULT 0,
-            updated_run_id TEXT,
-            PRIMARY KEY (session_id, slot)
-        );",
-    )?;
-
-    // Generated documents never touch the repository worktree. This versioned migration upgrades
-    // old app databases once; CREATE IF NOT EXISTS also makes an interrupted upgrade retry-safe.
-    let user_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if user_version < GENERATED_REPORTS_SCHEMA_VERSION {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS project_intro (
-                repo_id TEXT PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,
-                content TEXT NOT NULL,
-                generated_at INTEGER NOT NULL,
-                head_sha TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS daily_report (
-                repo_id TEXT PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,
-                content TEXT NOT NULL,
-                generated_at INTEGER NOT NULL,
-                head_sha TEXT NOT NULL
-            );
-            PRAGMA user_version = 1;",
-        )?;
-    }
-
-    // Checkpoint path/preimage/undo columns (idempotent legacy migration). The post_* columns are
-    // retained only for database compatibility; undo no longer reads or writes them.
-    let checkpoint_entry_cols = {
-        let mut stmt = conn.prepare("PRAGMA table_info(checkpoint_entries)")?;
-        let columns = stmt
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        columns
-    };
-    for (column, declaration) in [
-        ("allowed_root", "TEXT"),
-        ("pre_xattrs", "BLOB"),
-        ("post_sha", "TEXT"),
-        ("post_missing", "INTEGER NOT NULL DEFAULT 0"),
-        ("post_file_type", "TEXT"),
-        ("post_mode", "INTEGER"),
-        ("post_nlink", "INTEGER"),
-        ("post_inode", "INTEGER"),
-        ("post_xattr_sha", "TEXT"),
-        ("post_tainted", "INTEGER NOT NULL DEFAULT 0"),
-        ("undone_at", "INTEGER"),
-    ] {
-        if !checkpoint_entry_cols
-            .iter()
-            .any(|existing| existing == column)
-        {
-            conn.execute(
-                &format!("ALTER TABLE checkpoint_entries ADD COLUMN {column} {declaration}"),
-                [],
-            )?;
-        }
-    }
-
-    // agent pool Task 6：messages 归属字段（旧库 migration）。
-    let message_cols = {
-        let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
-        let cols = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        cols
-    };
-    if !message_cols.iter().any(|c| c == "agent_id") {
-        conn.execute("ALTER TABLE messages ADD COLUMN agent_id TEXT", [])?;
-    }
-    if !message_cols.iter().any(|c| c == "agent_name_snapshot") {
-        conn.execute(
-            "ALTER TABLE messages ADD COLUMN agent_name_snapshot TEXT",
-            [],
-        )?;
-    }
-
-    let memory_block_cols = {
-        let mut stmt = conn.prepare("PRAGMA table_info(memory_blocks)")?;
-        let cols = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        cols
-    };
-    if !memory_block_cols.iter().any(|c| c == "revision") {
-        conn.execute(
-            "ALTER TABLE memory_blocks ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
-    if !memory_block_cols.iter().any(|c| c == "updated_run_id") {
-        conn.execute(
-            "ALTER TABLE memory_blocks ADD COLUMN updated_run_id TEXT",
-            [],
-        )?;
-    }
-
-    let agent_cols = {
-        let mut stmt = conn.prepare("PRAGMA table_info(agents)")?;
-        let cols = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        cols
-    };
-    if !agent_cols.iter().any(|c| c == "cap_lead") {
-        conn.execute("ALTER TABLE agents ADD COLUMN cap_lead TEXT", [])?;
-    }
-    {
-        let agents_sql: Option<String> = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agents'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if agents_sql.as_deref().is_some_and(|sql| {
-            sql.contains("reasoning_default IN ('auto', 'low', 'medium', 'high')")
-        }) {
-            let fk_was_on: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
-            if fk_was_on != 0 {
-                conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-            }
-            conn.execute_batch(
-                r#"
-                ALTER TABLE agents RENAME TO agents_old_reasoning_check;
-                CREATE TABLE agents (
-                    id TEXT NOT NULL PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    access TEXT NOT NULL
-                        CHECK (access IN ('native', 'borrow', 'harness')),
-                    provider TEXT NOT NULL,
-                    primary_model TEXT,
-                    endpoint TEXT,
-                    auth_mode TEXT
-                        CHECK (auth_mode IS NULL OR auth_mode IN ('bearer', 'x_api_key')),
-                    model_opus TEXT,
-                    model_sonnet TEXT,
-                    model_haiku TEXT,
-                    model_subagent TEXT,
-                    reasoning_default TEXT NOT NULL DEFAULT 'auto'
-                        CHECK (reasoning_default IN ('auto', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')),
-                    max_output_tokens INTEGER,
-                    api_timeout_ms INTEGER,
-                    compat_disable_betas INTEGER NOT NULL DEFAULT 0,
-                    compat_disable_nonessential INTEGER NOT NULL DEFAULT 0,
-                    compat_disable_thinking INTEGER NOT NULL DEFAULT 0,
-                    compat_proxy TEXT,
-                    custom_headers TEXT,
-                    extra_body TEXT,
-                    cap_reasoning TEXT,
-                    cap_computer_use TEXT,
-                    cap_lead TEXT,
-                    has_key INTEGER NOT NULL DEFAULT 0,
-                    is_builtin INTEGER NOT NULL DEFAULT 0,
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    sort_order INTEGER NOT NULL DEFAULT 0,
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
-                );
-                INSERT INTO agents (
-                    id, name, access, provider, primary_model, endpoint, auth_mode,
-                    model_opus, model_sonnet, model_haiku, model_subagent,
-                    reasoning_default, max_output_tokens, api_timeout_ms,
-                    compat_disable_betas, compat_disable_nonessential,
-                    compat_disable_thinking, compat_proxy, custom_headers, extra_body,
-                    cap_reasoning, cap_computer_use, cap_lead, has_key, is_builtin,
-                    enabled, sort_order, created_at, updated_at
-                )
-                SELECT
-                    id, name,
-                    CASE WHEN access IN ('native', 'harness') THEN access ELSE 'borrow' END,
-                    provider, primary_model, endpoint,
-                    CASE WHEN auth_mode IN ('bearer', 'x_api_key') THEN auth_mode ELSE NULL END,
-                    model_opus, model_sonnet, model_haiku, model_subagent,
-                    reasoning_default, max_output_tokens, api_timeout_ms,
-                    compat_disable_betas, compat_disable_nonessential,
-                    compat_disable_thinking, compat_proxy, custom_headers, extra_body,
-                    cap_reasoning, cap_computer_use, cap_lead, has_key, is_builtin,
-                    enabled, sort_order, created_at, updated_at
-                FROM agents_old_reasoning_check;
-                DROP TABLE agents_old_reasoning_check;
-                "#,
-            )?;
-            if fk_was_on != 0 {
-                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-            }
-        }
-    }
-    recover_agents_old_reasoning_check(conn)?;
-    migrate_agents_access_allow_harness(conn)?;
-    reset_session_agent_configs_if_bad_fk(conn)?;
-
-    // cluster L plan 2a：给 sessions 表加 repo_id 列（旧库 migration · plan 1 引入）
-    // 用 PRAGMA table_info 探测是否已有，避免 ALTER TABLE 重复加列报错。
-    let has_repo_id = {
-        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
-        let cols: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<_>>()?;
-        cols.iter().any(|c| c == "repo_id")
-    };
-    if !has_repo_id {
-        conn.execute(
-            "ALTER TABLE sessions ADD COLUMN repo_id TEXT REFERENCES repos(id) ON DELETE SET NULL",
-            [],
-        )?;
-    }
-
-    // 深水-B1：goal_contracts 加 assignments_json（gate A4·assignment 落契约层·旧库 migration）。
-    {
-        let mut stmt = conn.prepare("PRAGMA table_info(goal_contracts)")?;
-        let has_col = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .filter_map(Result::ok)
-            .any(|name| name == "assignments_json");
-        drop(stmt);
-        if !has_col {
-            conn.execute(
-                "ALTER TABLE goal_contracts ADD COLUMN assignments_json TEXT NOT NULL DEFAULT '[]'",
-                [],
-            )?;
-        }
-    }
-
-    // B2-gatecard: goal_contracts add goal_title (lead short summary, topbar display, old DB migration).
-    {
-        let mut stmt = conn.prepare("PRAGMA table_info(goal_contracts)")?;
-        let has_col = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .filter_map(Result::ok)
-            .any(|name| name == "goal_title");
-        drop(stmt);
-        if !has_col {
-            conn.execute("ALTER TABLE goal_contracts ADD COLUMN goal_title TEXT", [])?;
-        }
-    }
-
-    // 项目标识从 color 迁移为 icon；保留非 hex 值，旧颜色值清空后由前端回落默认图标。
-    let repo_columns = {
-        let mut stmt = conn.prepare("PRAGMA table_info(repos)")?;
-        let cols = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
-        cols
-    };
-    if !repo_columns.iter().any(|c| c == "icon") {
-        if repo_columns.iter().any(|c| c == "color") {
-            conn.execute("ALTER TABLE repos RENAME COLUMN color TO icon", [])?;
-            conn.execute("UPDATE repos SET icon = NULL WHERE icon LIKE '#%'", [])?;
-        } else {
-            conn.execute("ALTER TABLE repos ADD COLUMN icon TEXT", [])?;
-        }
-    }
-
-    let has_repo_ns_id = {
-        let mut stmt = conn.prepare("PRAGMA table_info(repos)")?;
-        let cols: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<_>>()?;
-        cols.iter().any(|c| c == "namespace_id")
-    };
-    let has_session_ns_id = {
-        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
-        let cols: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<_>>()?;
-        cols.iter().any(|c| c == "namespace_id")
-    };
-
-    // SQLite 不允许在 foreign_keys=ON 时用 ALTER TABLE 添加「REFERENCES + 非 NULL DEFAULT」列。
-    // 这里短暂关闭 FK 只为执行 schema migration；启动 seed 会紧接着补 Local namespace。
-    let needs_fk_alter = !has_repo_ns_id || !has_session_ns_id;
-    let fk_was_on: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
-    if needs_fk_alter {
-        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-    }
-    if !has_repo_ns_id {
-        conn.execute(
-            "ALTER TABLE repos ADD COLUMN namespace_id TEXT NOT NULL DEFAULT 'local' REFERENCES namespaces(id) ON DELETE CASCADE",
-            [],
-        )?;
-    }
-
-    // cluster L Phase 2 plan A Task 2：给 sessions 表加 namespace_id 列（冗余 · spec §3.2 line 240）
-    // ON DELETE SET NULL（删 namespace 不丢 session 历史 · 同 plan 1 repo_id 既有策略）
-    // DEFAULT 'local' 让 plan 1 + plan 2a 旧 row 自动归 Local（migration 用）
-    // 注：SQLite ALTER 加 NOT NULL 列必须有 DEFAULT · 这里 DEFAULT 'local'
-    if !has_session_ns_id {
-        conn.execute(
-            "ALTER TABLE sessions ADD COLUMN namespace_id TEXT DEFAULT 'local' REFERENCES namespaces(id) ON DELETE SET NULL",
-            [],
-        )?;
-    }
-    if needs_fk_alter && fk_was_on != 0 {
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-    }
-
-    // cluster L Phase 3 plan C2-A Task 1：sessions.group_id · NULL = Ungrouped。
-    let has_group_id = {
-        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
-        let cols: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<_>>()?;
-        cols.iter().any(|c| c == "group_id")
-    };
-    if !has_group_id {
-        let fk_was_on: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
-        if fk_was_on != 0 {
-            conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-        }
-        conn.execute(
-            "ALTER TABLE sessions ADD COLUMN group_id TEXT REFERENCES session_groups(id) ON DELETE SET NULL",
-            [],
-        )?;
-        if fk_was_on != 0 {
-            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        }
-    }
-
-    // plan B1 §1：sessions.git_state 列（enum：clean | running | commit_failed | diverged）
-    // 默认 'clean'；SQLite ALTER 加 NOT NULL 列必须有 DEFAULT。无 REFERENCES → 不需关 FK。
-    // 注：SQLite 的 ALTER TABLE ADD COLUMN 不支持带 CHECK 约束的列（只 CREATE TABLE 时能写 CHECK），
-    // 故 git_state 的 enum（clean/running/commit_failed/diverged）靠业务层（set_git_state 调用方）约束，
-    // 非 schema CHECK。run_commits.state 是建表时写的列，所以那个能带 CHECK。
-    let has_git_state = {
-        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
-        let cols: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<_>>()?;
-        cols.iter().any(|c| c == "git_state")
-    };
-    if !has_git_state {
-        conn.execute(
-            "ALTER TABLE sessions ADD COLUMN git_state TEXT NOT NULL DEFAULT 'clean'",
-            [],
-        )?;
-    }
-
-    // M2 dispatch runtime spine Task 3：sessions.parent_session_id reserve seam（nullable，占位）。
-    let has_parent_session_id = {
-        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
-        let cols: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<_>>()?;
-        cols.iter().any(|c| c == "parent_session_id")
-    };
-    if !has_parent_session_id {
-        conn.execute("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT", [])?;
-    }
-
-    // continuation MVP：sessions.continued_to_session_id（nullable parent -> live child pointer）。
-    let has_continued_to_session_id = {
-        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
-        let cols: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<_>>()?;
-        cols.iter().any(|c| c == "continued_to_session_id")
-    };
-    if !has_continued_to_session_id {
-        conn.execute(
-            "ALTER TABLE sessions ADD COLUMN continued_to_session_id TEXT",
-            [],
-        )?;
-    }
-
-    // sessions 生命周期 flag 与累计 token 列。
-    // 沿用本文件逐列 PRAGMA table_info 探测 + ALTER 幂等模式（无 REFERENCES → 不需关 FK）。
-    // SQLite ALTER ADD COLUMN 允许 NOT NULL DEFAULT 常量；archived_at nullable 无 DEFAULT。
-    for (col, decl) in [
-        ("pinned", "INTEGER NOT NULL DEFAULT 0"),
-        ("unread", "INTEGER NOT NULL DEFAULT 0"),
-        ("archived", "INTEGER NOT NULL DEFAULT 0"),
-        ("archived_at", "INTEGER"),
-        ("deleted_at", "INTEGER"),
-        ("total_input_tokens", "INTEGER NOT NULL DEFAULT 0"),
-        ("total_output_tokens", "INTEGER NOT NULL DEFAULT 0"),
-    ] {
-        let has = {
-            let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
-            let cols: Vec<String> = stmt
-                .query_map([], |r| r.get::<_, String>(1))?
-                .collect::<rusqlite::Result<_>>()?;
-            cols.iter().any(|c| c == col)
-        };
-        if !has {
-            conn.execute(&format!("ALTER TABLE sessions ADD COLUMN {col} {decl}"), [])?;
-        }
-    }
-
-    // R-B2 项 1（隔离刀返工二·祖父条款）：sessions.workspace_scope（nullable）——`'root'` =
-    // 老行为（工作目录=项目根，方案 A per-session 子目录之前 local-default 会话的写法）；
-    // NULL/其它 = 新行为（per-session 子目录）。存量 local-default 会话的旧产物都散落在
-    // 项目根，方案 A 的沙箱只放行 per-session 子目录会让它们连自己以前写过的文件都碰不到——
-    // 只在列刚创建的这一刻（`!has_workspace_scope`）把**当时已存在**的 local-default 会话
-    // 全部回填 'root'，新建会话（列已存在之后才 INSERT 的）留 NULL 走新行为。这个回填只能
-    // 绑在“列刚创建”这个时间点上：若做成每次启动都跑一遍的独立 migration 函数，WHERE
-    // repo_id='local-default' AND workspace_scope IS NULL 会在下一次启动把新建的正常 NULL
-    // 会话也误判成祖父条款、错误打回项目根——所以就地内联在 ALTER 门里，列已存在之后的启动
-    // 会整段跳过，不会误伤后续正常产生的 NULL 行。
-    let has_workspace_scope = {
-        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
-        let cols: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<_>>()?;
-        cols.iter().any(|c| c == "workspace_scope")
-    };
-    // R-B3 项 3（Minor-2·迁移原子性）：加列 + 回填必须是同一个事务——SQLite 的
-    // `ALTER TABLE ADD COLUMN` 本身是可事务的 DDL，不包一层会让「加列成功、回填 UPDATE 没跑完
-    // 就崩溃（I/O 错误 / 进程被杀）」这类中途失败留下半吊子状态：下次启动 `has_workspace_scope`
-    // 已经是 true（列已存在），上面的加列门直接整段跳过，回填永远补不上——静默丢失祖父条款，
-    // 存量 local-default 会话的旧产物从此再也碰不到。`unchecked_transaction` 是本仓已有的
-    // migration 原子写惯例（见本文件其它加事务的迁移/写入函数）。
-    if !has_workspace_scope {
-        let tx = conn.unchecked_transaction()?;
-        tx.execute("ALTER TABLE sessions ADD COLUMN workspace_scope TEXT", [])?;
-        tx.execute(
-            "UPDATE sessions SET workspace_scope = 'root' WHERE repo_id = 'local-default'",
-            [],
-        )?;
-        tx.commit()?;
-    }
-
-    // T1 migration: session_groups.repo_id（降到 repo 级）· 幂等·处理旧库
-    {
-        let has_sg_repo_id = {
-            let mut stmt = conn.prepare("PRAGMA table_info(session_groups)")?;
-            let cols: Vec<String> = stmt
-                .query_map([], |r| r.get::<_, String>(1))?
-                .collect::<rusqlite::Result<_>>()?;
-            cols.iter().any(|c| c == "repo_id")
-        };
-        if !has_sg_repo_id {
-            // nullable 加列（SQLite ALTER TABLE ADD COLUMN NOT NULL 无 DEFAULT 不允许）
-            conn.execute(
-                "ALTER TABLE session_groups ADD COLUMN repo_id TEXT REFERENCES repos(id)",
-                [],
-            )?;
-            // 回填 1：local namespace 的组 → local-default
-            conn.execute(
-                "UPDATE session_groups SET repo_id = 'local-default' WHERE namespace_id = 'local' AND repo_id IS NULL",
-                [],
-            )?;
-            // 回填 2：namespace 恰好只有 1 个 repo → 归该 repo
-            conn.execute(
-                "UPDATE session_groups SET repo_id = (
-                    SELECT r.id FROM repos r
-                    WHERE r.namespace_id = session_groups.namespace_id
-                    GROUP BY r.namespace_id HAVING COUNT(*) = 1
-                    LIMIT 1
-                ) WHERE repo_id IS NULL",
-                [],
-            )?;
-            // 回填 3：仍 NULL → 先把 sessions.group_id 归 NULL，再删无法映射的组
-            conn.execute(
-                "UPDATE sessions SET group_id = NULL WHERE group_id IN (
-                    SELECT id FROM session_groups WHERE repo_id IS NULL
-                )",
-                [],
-            )?;
-            conn.execute("DELETE FROM session_groups WHERE repo_id IS NULL", [])?;
-        }
-    }
-
-    // 刀2.1：旧库 decision_ledger.run_id 是 NOT NULL → 重建为 nullable。
-    // decision_ledger 从没接线·无生产数据·重建安全。SQLite 不支持 ALTER COLUMN 去 NOT NULL。
-    let decision_run_id_notnull = {
-        let mut stmt = conn.prepare("PRAGMA table_info(decision_ledger)")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?)))?;
-        let mut notnull = false;
-        for row in rows {
-            let (name, nn) = row?;
-            if name == "run_id" && nn == 1 {
-                notnull = true;
-            }
-        }
-        notnull
-    };
-    if decision_run_id_notnull {
-        conn.execute_batch(
-            // DROP IF EXISTS：堵「上次重建崩在 CREATE new 之后、DROP old 之前」遗留的孤儿表撞名（终审两路建议）。
-            "DROP TABLE IF EXISTS decision_ledger_new;
-            CREATE TABLE decision_ledger_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                run_id TEXT,
-                source_assignment_id TEXT,
-                text TEXT NOT NULL,
-                source_refs_json TEXT NOT NULL DEFAULT '[]',
-                supersedes_json TEXT NOT NULL DEFAULT '[]',
-                source_kind TEXT,
-                confidence TEXT,
-                created_at INTEGER NOT NULL
-            );
-            INSERT INTO decision_ledger_new
-                (id, session_id, run_id, source_assignment_id, text, source_refs_json, supersedes_json, source_kind, confidence, created_at)
-                SELECT id, session_id, run_id, source_assignment_id, text, source_refs_json, supersedes_json, source_kind, confidence, created_at
-                FROM decision_ledger;
-            DROP TABLE decision_ledger;
-            ALTER TABLE decision_ledger_new RENAME TO decision_ledger;
-            CREATE INDEX IF NOT EXISTS idx_decision_ledger_session ON decision_ledger(session_id, id);",
-        )?;
-    }
-
-    // 刀 R P0-2：给 messages 表加 dedup_key 列（旧库 migration，幂等）+ 建部分唯一索引。
-    // 新库走上方 CREATE TABLE 里的列定义；这里补旧库缺列的路，并统一在此建索引——索引须放在
-    // 列已确定存在之后（新旧库跑到这里时 dedup_key 列都已在）。
-    let has_dedup_key = {
-        let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
-        let cols: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<_>>()?;
-        cols.iter().any(|c| c == "dedup_key")
-    };
-    if !has_dedup_key {
-        conn.execute("ALTER TABLE messages ADD COLUMN dedup_key TEXT", [])?;
-    }
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_dedup \
-         ON messages(session_id, dedup_key) WHERE dedup_key IS NOT NULL",
-        [],
-    )?;
-
-    // msgfix1 T2（M0 §10.7）：给 messages 表加 revision 列（旧库 migration，幂等）。
-    // 新库走上方 CREATE TABLE 里的列定义（DEFAULT 1）；这里补旧库缺列的路——
-    // ADD COLUMN ... DEFAULT 1 对存量行同样回填为 1，无需额外 UPDATE 回填。
-    let has_revision = {
-        let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
-        let cols: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<_>>()?;
-        cols.iter().any(|c| c == "revision")
-    };
-    if !has_revision {
-        conn.execute(
-            "ALTER TABLE messages ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
-            [],
-        )?;
-    }
-
-    // M1-T1（remote control M0 §4c）：会话运行态独立表——不加列到 sessions（实勘裁决：
-    // 加列不如独立表），不做数据迁移（新表天然从空开始）。四咽喉（solo 占槽/释放 · team
-    // 注册/清空）与启动 reconcile 共用同一份 helper（下方 set_session_runtime）。
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS session_runtime (
-            session_id TEXT PRIMARY KEY,
-            status TEXT NOT NULL CHECK (status IN ('running', 'idle')),
-            run_id TEXT,
-            updated_at INTEGER NOT NULL
-        )",
-        [],
-    )?;
-
-    // T-4b（remote control M0 §3/§4b）：忙时入队本地表——桌面收到 input.send 撞
-    // SESSION_ALREADY_RUNNING 时不回错，落一条 pending 到这里；会话释放槽位后由
-    // `drain_after_run_release`（lib.rs）自动续投。`command_id` UNIQUE 是幂等去重键
-    // （relay 侧超时重发 / 桌面重连补发都可能重复投同一条）。不声明到 sessions 的 FK
-    // （与 session_runtime 同款先例：这张表只是运行期镜像，允许会话已删但行还没来得及清）。
-    // delivered/failed 行同时也是 `command_id` 去重账本；将来若做 GC/清理，必须配独立的
-    // 去重保留窗口，不得裸删这些终态行，否则 relay 重发会被当成新消息再次投递。
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS remote_inbox (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            command_id TEXT NOT NULL UNIQUE,
-            kind TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            delivered_at INTEGER,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            failed_at INTEGER,
-            last_error TEXT
-        )",
-        [],
-    )?;
-    // rc-4b 早期旧库的 remote_inbox 缺少以下三列；幂等补齐，避免 failed_at 查询触发
-    // no such column 后被调用方 `.ok()` 静默 fail-open。
-    let remote_inbox_cols = {
-        let mut stmt = conn.prepare("PRAGMA table_info(remote_inbox)")?;
-        let columns = stmt
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        columns
-    };
-    for (column, declaration) in [
-        ("attempts", "INTEGER NOT NULL DEFAULT 0"),
-        ("failed_at", "INTEGER"),
-        ("last_error", "TEXT"),
-    ] {
-        if !remote_inbox_cols.iter().any(|existing| existing == column) {
-            conn.execute(
-                &format!("ALTER TABLE remote_inbox ADD COLUMN {column} {declaration}"),
-                [],
-            )?;
-        }
-    }
-    conn.execute("DROP INDEX IF EXISTS idx_remote_inbox_pending", [])?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_remote_inbox_pending \
-         ON remote_inbox(session_id, id) \
-         WHERE delivered_at IS NULL AND failed_at IS NULL",
-        [],
-    )?;
-
-    // T5e2（remote control M0 §5）：配对完成后落地的设备清单表——K_room/设备 K_pair 这类
-    // 真密钥留钥匙串（remote_pairing.rs::store，W1 ADR：钥匙串只放真密钥），这里只落「设备
-    // 清单 + 令牌哈希」。token_hash/refresh_hash 是 remote_pairing::TokenBook 同款 sha256
-    // hex 字符串，绝不落明文令牌；revoked_at 为 NULL 表示仍有效。
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS remote_devices (
-            device_id TEXT PRIMARY KEY,
-            name TEXT NOT NULL DEFAULT '',
-            token_hash TEXT NOT NULL,
-            refresh_hash TEXT NOT NULL,
-            access_expires_at INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
-            revoked_at INTEGER
-        )",
-        [],
-    )?;
-
-    // S1c（remote control M0 §9.2/§9.6）：remote_devices 令牌面列族。
-    // 这里的到期时间一律是 unix 毫秒；S1c2 会在补齐列族后把旧 access_expires_at 秒值
-    // 幂等回填成毫秒，避免应用启动后出现秒/毫秒混合消费窗口。
-    let remote_device_cols = {
-        let mut stmt = conn.prepare("PRAGMA table_info(remote_devices)")?;
-        let columns = stmt
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        columns
-    };
-    for (column, declaration) in [
-        ("room_id", "TEXT"),
-        ("generation", "INTEGER"),
-        ("refresh_until", "INTEGER"),
-        ("journal_request_id", "TEXT"),
-        ("journal_generation", "INTEGER"),
-        ("journal_prev_generation", "INTEGER"),
-        ("journal_prev_access_hash", "TEXT"),
-        ("journal_prev_refresh_hash", "TEXT"),
-        ("journal_response_ct", "TEXT"),
-        ("journal_response_n", "TEXT"),
-        ("journal_prev_expires_at", "INTEGER"),
-        ("journal_response_expires", "INTEGER"),
-    ] {
-        if !remote_device_cols.iter().any(|existing| existing == column) {
-            conn.execute(
-                &format!("ALTER TABLE remote_devices ADD COLUMN {column} {declaration}"),
-                [],
-            )?;
-        }
-    }
-    conn.execute(
-        "UPDATE remote_devices \
-            SET access_expires_at = access_expires_at * 1000 \
-          WHERE access_expires_at > 0 AND access_expires_at < ?1",
-        [ACCESS_EXPIRES_MILLIS_THRESHOLD],
-    )?;
-    // S1f2 P1-1：旧版本只有一个全局房间，因而 NULL 行可安全、幂等地回填到当前配置房间。
-    // 没有配置过 remote_room_id 时子查询无行，保持 NULL 并在所有房间快照中 fail-closed。
-    conn.execute(
-        "UPDATE remote_devices \
-            SET room_id = (SELECT value FROM app_settings WHERE key = 'remote_room_id') \
-          WHERE room_id IS NULL \
-            AND EXISTS (SELECT 1 FROM app_settings WHERE key = 'remote_room_id')",
-        [],
-    )?;
-
-    // §9.2 generation/revision 的桌面权威领号源；每房间 next_generation 只增不减。
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS remote_registry_counter (
-            room_id TEXT PRIMARY KEY,
-            next_generation INTEGER NOT NULL CHECK (next_generation > 0)
-        )",
-        [],
-    )?;
-
-    // M2-4a（remote control M2-4 §0.5 决策 1：单活跃房间模型第一刀）：per-project room
-    // 映射——「新世界」schema，不是数据搬家。旧全局房间（app_settings 里的
-    // `remote_room_id` 单值 key，见 lib.rs `resolve_remote_room_id`）不迁移、不删除，
-    // 继续原样只读存在，直到 M2-4b 把网关消费源切过来为止；这张表与旧全局 key 平行
-    // 并存，两者互不回填。room_id 形状与旧全局房间同源（128-bit CSPRNG → 32 位小写
-    // hex，见 `remote_pairing::generate_room_id`）。
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS project_remote_rooms (
-            project_id TEXT PRIMARY KEY,
-            room_id TEXT NOT NULL UNIQUE,
-            created_at_ms INTEGER NOT NULL
-        )",
-        [],
-    )?;
-    search_index::migrate(conn)?;
-    Ok(())
+    schema::apply_all(conn)
 }
 
 /// M2-4a：per-project room 只查表，查无返回 `None`。**不回落全局 `remote_room_id`**——
@@ -2770,14 +1742,14 @@ pub fn update_remote_device_tokens(
     Ok(changed > 0)
 }
 
-/// P3-1（2026-08-11 M1 修复轮）：`session_runtime.status` 只有这两个取值（CHECK 约束同款字面量），
+/// These are the only valid `session_runtime.status` values, matching the database CHECK constraint literals.
 /// 抽成 const 供全 crate 写口引用，别再各自散落裸字符串。
 pub const SESSION_RUNTIME_RUNNING: &str = "running";
 pub const SESSION_RUNTIME_IDLE: &str = "idle";
 
-/// M1-T1：`set_session_runtime` 是「reserve」类咽喉专用——占槽/run_id 现场已知时显式写一条完整行
+/// `set_session_runtime` is reserved for slot reservation paths that can explicitly write the full status and known run ID.
 /// （solo `reserve_new_session_run` 占槽 + 事后 run_id 回填、team `start_team_run` 注册）。
-/// 2026-08-11 M1 修复轮（opus P1-1/P1-2）：**release/摘槽类**写口不再调这个函数——那类场景
+/// Release paths must not call this full-row setter: whether the session is idle requires a fresh runtime reconciliation.
 /// 「当前是否真的 idle」不能只看本次调用方手头的局部信息（例如 lead 释放了 Running 槽，但
 /// 队员 dispatch intent 可能还在途），必须统一走 `crate::refresh_session_runtime` 重算真相后
 /// 调下面的 `upsert_session_runtime_status`。调用方一律 `let _ =`/`eprintln!` 静默失败（不挡
@@ -3895,13 +2867,13 @@ pub struct MsgCompletedMilestone {
     role: String,
     blocks_value: serde_json::Value,
     agent_name_snapshot: Option<String>,
-    /// msgfix1 T3（M0 §10.6）：该消息落库时 `messages.content` 列的原始 JSON 字符串——
+    /// Keep the original JSON string written to `messages.content` so hashes and byte counts use the persisted bytes.
     /// content_ref 的 `content_sha256`/`total_bytes` 必须对这份原文字节计算，不能用
     /// `serde_json::to_value` 重序列化后的 `blocks_value`（`Value`→`Map` 默认按 key 排序，
     /// 字节不保证与原文相同）。
     content_raw: String,
-    /// msgfix1 T3（M0 §10.7）：`append_message_dedup` 是本结构体唯一构造点，且只在紧随
-    /// 这一次 INSERT 成功之后构造——新插入的行 revision 恒为 schema `DEFAULT 1`（T2
+    /// `append_message_dedup` is the sole constructor of this struct and constructs it only after a successful insert.
+    /// Construction follows a successful INSERT, so the new row's revision is always the schema `DEFAULT 1` (also used by the
     /// migration），不存在"插入后又在同一调用内被别处 UPDATE"的路径，因此这里是结构性
     /// 事实而非猜测值。
     revision: i64,
@@ -4067,7 +3039,7 @@ where
     if let Some(milestone) = milestone {
         publish(milestone);
     }
-    // msgfix1 T5（缺口④）：dispatch_card 终态改写已经提交——重读该消息、以新 revision 重发
+    // The dispatch card's terminal rewrite is committed; reread the message and republish with its new revision.
     // msg.completed（client_msg_id 带 revision，relay 视为新事件必广播），让远端知道这张卡
     // 翻成了终态。重发失败不回滚上面已经成功的 DB 改写（best-effort：漏发靠补发批/history
     // 兜底），只记日志。
@@ -4104,9 +3076,9 @@ pub fn pending_member_report_message_ids(
     rows.collect()
 }
 
-/// T5 M3：真正 I/O ack 之后，把本轮纳入 prompt 台账段的报告 message_id 逐条置
+/// Only after actual I/O acknowledgement, mark each report included in this prompt's ledger section as delivered via
 /// `delivered_at`——短事务，任一条 `UPDATE` 失败整体回滚（不留「部分已交付」的幽灵态）。
-/// `message_ids` 为空是 no-op（T6 尚未接线「本轮纳入」选择逻辑前，调用方恒传空集合）。
+/// An empty `message_ids` collection is a no-op, allowing callers without prompt report selection to pass an empty set.
 /// 只更新仍是 `delivered_at IS NULL` 的行——已交付的行不重复打时间戳。
 pub fn mark_member_reports_delivered(
     conn: &Connection,
@@ -4144,7 +3116,7 @@ pub fn update_dispatch_card_terminal(
     )
 }
 
-/// msgfix1 T5（缺口④）：`update_dispatch_card_terminal` 的内核——与该函数逐字节同一份逻辑，
+/// Shared implementation of `update_dispatch_card_terminal`, preserving the wrapper's update behavior.
 /// 唯一差异是把"是否改写过"从 `bool` 换成"改写了哪些 message_id"，供调用方
 /// （`persist_member_report_atomic_with_publish`）在提交后拿着这些 id 重读消息、以新
 /// revision 重发 msg.completed（M0 §10.7）。`update_dispatch_card_terminal` 是这里的薄壳，
@@ -4233,7 +3205,7 @@ fn update_dispatch_card_terminal_ids(
     Ok(changed_ids)
 }
 
-/// msgfix1 T5（缺口④）：按 (session_id, message_id) 重读一条消息，供终态改写
+/// Reread a message by `(session_id, message_id)` so committed terminal-state rewrites can be republished with the new revision.
 /// （`update_dispatch_card_terminal`/`update_decision_card_status`）提交后以新 revision
 /// 重发 msg.completed。要求该行 `dedup_key` 非空——能被这两个函数命中改写的消息，落库时
 /// 必然经 `append_message_dedup*` 系列写入（带 dedup_key），理论不可达"命中改写但
@@ -4288,7 +3260,7 @@ pub(crate) fn get_message_for_republish(
 /// `last_insert_rowid()` 在 upsert 命中 UPDATE 分支时不会更新（SQLite 语义：只有真正 INSERT
 /// 才推进它），因此不能靠它判断 message_id，写完必须显式按 `(session_id, dedup_key)` 重查。
 ///
-/// msgfix2 U1b（第三轮审查 B1/G1-b）：UPDATE 分支的 `revision` 只在 `content` 真的变化时才
+/// The UPDATE branch advances `revision` only when `content` changes, keeping identical retries version-stable.
 /// bump——写线程失败重试（见 `flush_activity_summary` 文档）不保证"上一次真的没落库"：如果失败
 /// 发生在这条 SQL 之后、`get_message_for_republish_by_dedup_key` 重查之前（例如那次 SELECT 报
 /// 错），内容其实已经提交，下一轮 tick 用同样的计数重试就会在这里对同一份内容再 bump 一次
@@ -4610,7 +3582,7 @@ pub fn delete_session(conn: &Connection, id: &str) -> rusqlite::Result<()> {
         "DELETE FROM session_agent_configs WHERE session_id = ?1",
         [id],
     )?;
-    // P2-2（M1 修复轮 opus 深审）：session_runtime 是 M1-T1 新增的独立运行态镜像表，同样按
+    // Delete the independent `session_runtime` mirror by the same session key to prevent orphaned runtime state after purge.
     // session_id 键——漏了这行会在 purge 后留一条永久孤儿行（远端 session.index 汇总流会看到
     // 一个已经不存在的 session 却仍标着 running/idle）。
     tx.execute("DELETE FROM session_runtime WHERE session_id = ?1", [id])?;
@@ -4839,7 +3811,7 @@ pub fn update_decision_card_status(
     .is_some())
 }
 
-/// msgfix1 T5（缺口④）：`update_decision_card_status` 的内核——与该函数逐字节同一份逻辑，
+/// Shared implementation of `update_decision_card_status`, preserving the wrapper's update behavior.
 /// 唯一差异是把"是否改写过"从 `bool` 换成"改写了哪个 message_id"（decision_id 会话内唯一，
 /// 命中即停，至多一个），供调用方（`prompt_user`/`commit_late_answer`/`choose_decision_card`）
 /// 在改写提交后拿着这个 id 重读消息、以新 revision 重发 msg.completed（M0 §10.7）。
@@ -4926,7 +3898,7 @@ pub(crate) fn update_decision_card_status_message_id(
     Ok(None) // 没找到该 decision_id
 }
 
-/// 决策打扰收敛刀 T1：按 decision_id 找卡的 (question, status)（不改任何状态·只读）。
+/// Read a decision card's `(question, status)` by `decision_id` without changing any state.
 /// 迟到答案落地时用它取回问题原文拼进转喂 lead 的用户消息；也用它判「已重启/内存已空但
 /// DB 卡仍 pending」——此时按迟到路径处理，卡已 chosen 则维持 NO_PENDING_QUESTION 语义。
 /// 扫描方式镜像 update_decision_card_status（同一份「按 messages.content 找 decision_card 块」认知）。
@@ -4985,7 +3957,7 @@ pub fn get_session_repo_id(
     }
 }
 
-/// R-B2 项 1（祖父条款）：查会话的 workspace_scope——`'root'` = 老行为（工作目录=项目根，
+/// Read `workspace_scope`; `'root'` preserves the legacy project-root working directory for existing sessions.
 /// 方案 A per-session 子目录隔离刀落地前就已存在的 local-default 会话，一次性迁移回填）；
 /// NULL/其它 = 新行为（per-session 子目录）。会话不存在时返回 `Ok(None)`（与其它
 /// `get_session_*` 查询同一容错口径），由调用方按「找不到会话」的既有路径处理。
@@ -5002,7 +3974,7 @@ pub fn get_session_workspace_scope(
     }
 }
 
-/// R-B2 项 1（祖父条款）：续会话继承父会话的 workspace_scope——父会话是老 `'root'` 会话，
+/// Continuation sessions inherit the parent's `workspace_scope` so legacy `'root'` sessions retain project-root access.
 /// 续篇也该继续在项目根干活（否则祖父条款只护住了父会话、续篇又被打回子目录形同虚设）；
 /// 父会话是新会话（NULL）则续篇也留 NULL，与新建会话同口径。
 pub fn set_session_workspace_scope(
@@ -5031,7 +4003,7 @@ pub fn get_session_namespace_id(
     }
 }
 
-/// plan B1 §1：run_commits 一行（ledger 轮账本 · 也是 B3 内联卡数据源）。
+/// A `run_commits` ledger row also supplies the persisted data for the inline change card.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct RunCommitRow {
     pub session_id: String,
@@ -5072,7 +4044,7 @@ fn map_run_commit_row(r: &rusqlite::Row) -> rusqlite::Result<RunCommitRow> {
 }
 
 /// Agent Team M2 §5.3：team_run_pending 一行（recover 后 cleanup / reload 渲染用）。
-/// M2 Phase 0 地基：消费者接线在 T7（recover 启动调用）/ T8（cleanup）/ T12（reload 渲染）。
+/// Pending team run rows support startup recovery, cleanup, and rendering after reload.
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct TeamRunPendingRow {
@@ -5116,14 +4088,14 @@ pub struct DecisionRow {
 
 const RUN_COMMIT_COLS: &str =
     "session_id, run_id, engine, pre_head, post_head, commit_sha, files_changed, insertions, deletions, interrupted, state";
-#[allow(dead_code)] // T7 接线后由 recover/list 使用
+#[allow(dead_code)] // Keep a shared column order for pending team run recovery and listing.
 const TEAM_RUN_PENDING_COLS: &str =
     "session_id, run_id, goal, lead_participant_id, assignments_json";
 const DECISION_LEDGER_COLS: &str = "id, session_id, run_id, source_assignment_id, text, source_refs_json, supersedes_json, source_kind, confidence, created_at";
 const MEMORY_ENTRY_COLS: &str =
     "id, session_id, category, text, source_refs_json, supersedes_json, source, confidence, pinned, created_at";
 
-#[allow(dead_code)] // T7 接线后由 recover 使用
+#[allow(dead_code)] // Retained to map pending team run rows during recovery.
 fn map_team_run_pending_row(r: &rusqlite::Row) -> rusqlite::Result<TeamRunPendingRow> {
     Ok(TeamRunPendingRow {
         session_id: r.get(0)?,
@@ -5730,7 +4702,7 @@ fn map_landing_commit_row(r: &rusqlite::Row) -> rusqlite::Result<LandingCommit> 
     })
 }
 
-/// T3 撤销用：读某 session/run 最近一次落地记录（撤销锚点 pre_head/landed_head）。
+/// Read the latest landing record for a session/run to obtain the `pre_head` and `landed_head` undo anchors.
 /// id 单调递增（idx_landing_commits_session 即按 id），按 id DESC 取最新。只读。
 pub fn latest_landing_commit(
     conn: &Connection,
@@ -5970,7 +4942,7 @@ pub fn latest_verification_for_artifact(
 }
 
 /// team run 启动前写 pending row（state='running'）。
-#[allow(dead_code)] // T7 start_team_run 接线后调用
+#[allow(dead_code)] // Retained for `start_team_run` wiring to persist the pending run.
 pub fn insert_team_run_pending(
     conn: &Connection,
     session_id: &str,
@@ -6009,7 +4981,7 @@ pub fn team_run_pending_assignments(
 }
 
 /// team run 全队员终态：标 done，后续 recover 不再处理。
-#[allow(dead_code)] // T7 全员 done hook 接线后调用
+#[allow(dead_code)] // Retained for the hook that marks a run done when all members finish.
 pub fn mark_team_run_done(
     conn: &Connection,
     session_id: &str,
@@ -6024,7 +4996,7 @@ pub fn mark_team_run_done(
 }
 
 /// 启动恢复：扫所有 running team run，先返回行数据，再标 interrupted；幂等。
-#[allow(dead_code)] // T7 启动调用点接线后使用
+#[allow(dead_code)] // Retained for startup recovery wiring.
 pub fn recover_interrupted_team_runs(
     conn: &Connection,
 ) -> rusqlite::Result<Vec<TeamRunPendingRow>> {
@@ -6620,12 +5592,12 @@ pub struct MilestoneReplayRow {
     pub message_id: i64,
     pub role: String,
     pub content_json: serde_json::Value,
-    /// msgfix1 T3（M0 §10.6）：`content_json` 之外原样保留的原始 DB `content` 字符串——
+    /// Preserve the original database `content` string alongside `content_json` so byte-based hashes and sizes remain exact.
     /// content_ref 的 sha256/total_bytes 必须对这份原文字节计算，不能用重新序列化过的
     /// `content_json`（`Value`→`Map` 默认按 key 排序，字节不保证与原文相同）。
     pub content: String,
     pub dedup_key: String,
-    /// msgfix1 T3（M0 §10.7）：该消息当前的 `messages.revision`。
+    /// The message's current `messages.revision`, read from the database.
     pub revision: i64,
 }
 
@@ -6636,7 +5608,7 @@ pub struct SessionHistoryRow {
     pub message_id: i64,
     pub role: String,
     pub content: String,
-    /// msgfix1 T3（M0 §10.7）：该消息当前的 `messages.revision`。
+    /// The message's current `messages.revision`, read from the database.
     pub revision: i64,
 }
 
@@ -6664,7 +5636,7 @@ pub fn list_session_history_rows(
     rows.collect()
 }
 
-/// msgfix1 T4（M0 §10.9 联合授权闸）：按精确 `(session_id, message_id)` 查一条消息用于 `msg.fetch`
+/// Fetch by the exact `(session_id, message_id)` pair for `msg.fetch`, preserving ownership, deletion state, and raw content.
 /// 全文拉取——与 `list_session_history_rows` 不同，那条查询把 `JOIN sessions ... deleted_at IS
 /// NULL` 直接写进 WHERE，会把「消息不存在」与「消息存在但所属 session 已软删」在 SQL 层面合并成
 /// 同一个空结果，调用方拿不到区分 `not_found`/`soft_deleted` 所需的信息；`get_message_by_id` 又
@@ -6712,7 +5684,7 @@ pub fn get_message_for_fetch(
             session_deleted: session_deleted_at.is_some(),
         });
     }
-    // msgfix1 T4 返修①（存在性 oracle）：兜底探测原先是 `SELECT 1 FROM messages WHERE id=?1`
+    // Keep fallback existence checks within the same repository; an unscoped message lookup would expose a global existence oracle.
     // ——不限定归属，等于把「这个 message_id 在全库任何 repo 下是否存在」暴露成一个可探测的
     // 全局 oracle（他 repo 的合法 id 回 `forbidden`，纯捏造的 id 回 `not_found`，二者响应不同
     // 即可枚举）。收紧为**同 repo 维度**：只有当 `message_id` 存在，且它所属 session 与调用方
@@ -6794,14 +5766,14 @@ pub fn list_recent_milestone_replay_rows(
     Ok(rows)
 }
 
-/// idlefix-T1 缺口②：连接后补发批用——`run.status` 现状帧的真相源。手机顶栏唯一数据源就是
+/// Reconnect replay reads the current `run.status` snapshot here to restore the mobile top bar's authoritative state.
 /// `run.status` 里程碑（remote-web `streamSource.ts`），但它只在状态变化时 publish 一次、
 /// gate 关闭即丢不重投；连接后补发批此前只重建 msg.completed/card.*，没有它——中途接入/错过
 /// 一帧就会让顶栏卡在上一次看到的状态上（同 `session.index` 行 status 走的会话列表绿点脱节）。
 /// 这里把 `session_runtime` 全表现状（排除软删会话，同 `list_session_index_snapshot_rows` 口径）
 /// 交给调用方逐行重建 `run.status` 帧重发；status 恒非 NULL（CHECK 约束），run_id 可空。
 ///
-/// idlefix-T1 补针 D：会话数一大就有丢帧风险——`enqueue_milestone_with_generation` 落在有界
+/// Large session counts risk dropped replay frames because `enqueue_milestone_with_generation` uses a bounded channel.
 /// channel 上，补发批一次性塞太多条目会把 channel 挤满、连本该优先送达的 running 现状帧也一起
 /// 被挤丢。这里补两条护栏，口径对齐 msg/card 那半补发（`list_recent_milestone_replay_rows` +
 /// `RECENT_MILESTONE_REPLAY_LIMIT`，见上）：① `ORDER BY` 让 running 行排在最前——channel 真被
@@ -6835,6 +5807,7 @@ pub fn list_session_runtime_replay_rows(
     rows.collect()
 }
 
+mod schema;
 pub(crate) mod search_backfill;
 pub(crate) mod search_index;
 #[cfg(test)]

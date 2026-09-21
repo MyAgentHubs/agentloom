@@ -103,8 +103,8 @@ fn lead_context_prompt_language_reminder_is_symmetric() {
     );
 }
 
-/// 新项 A（2026-07-09·opus 审折入）：花名册渲染进 AGENTLOOM-DATA fence 数据区，
-/// 且语言提醒 + case-card upkeep nudge 两条末位杠杆仍压 prompt 末尾（在 roster 之后）。
+/// The roster renders inside the AGENTLOOM-DATA fenced data block, and the language
+/// reminder plus case-card upkeep nudge still stay pinned at the very end of the prompt, after the roster.
 #[test]
 fn lead_context_prompt_roster_inside_fence_and_end_levers_stay_last() {
     let conn = Connection::open_in_memory().unwrap();
@@ -162,8 +162,8 @@ fn lead_context_prompt_roster_inside_fence_and_end_levers_stay_last() {
         "upkeep nudge 仍压 prompt 末尾"
     );
 
-    // 空池 = fence 内仍明确渲染花名册节（防续聊旧花名册残留·2026-07-09 GUI 实测修）；
-    // goal 文本本身含「花名册」三字，断言用整节标签「可派 worker 花名册」区分。
+    // Empty pool still renders an explicit roster section inside the fence, guarding
+    // against a stale roster lingering; the assertion matches the full section label.
     let p_empty = build_lead_context_prompt(
         &conn,
         "sroster",
@@ -331,9 +331,9 @@ fn recent_messages_include_agent_team_worker_report() {
 
 #[test]
 fn recent_messages_exclude_decision_echo_but_keep_real_user_messages() {
-    // 决策打扰收敛刀 T1：ask_user 准点路径的点击回显（engine=decision-echo）落库可见，
-    // 但绝不能进 build_recent_messages / build_lead_context_prompt 的输出——那会把
-    // 已经从工具返回值给过 lead 的答案再喂一遍。迟到路径的真实 user 消息不受影响。
+    // The on-time ask_user click echo (engine=decision-echo) is visible in storage but must
+    // never reach build_recent_messages / build_lead_context_prompt -- that would feed the
+    // lead an answer already delivered via the tool return value. Late real user messages are unaffected.
     let conn = Connection::open_in_memory().unwrap();
     crate::db::init_schema(&conn).unwrap();
     crate::db::append_message(
@@ -401,9 +401,9 @@ fn recent_messages_exclude_decision_echo_but_keep_real_user_messages() {
 
 #[test]
 fn recent_messages_exclude_verifier_result_echo() {
-    // 决策打扰收敛刀 T2：propose_verifier Auto 直跑后的可见结果信息卡
-    // （engine=VERIFIER_RESULT_ENGINE_TAG）同样不能进 build_recent_messages/
-    // build_lead_context_prompt——verdict/output 已经从工具返回值直接给了 lead。
+    // The visible result card after an Auto-run propose_verifier call
+    // (engine=VERIFIER_RESULT_ENGINE_TAG) must likewise stay out of build_recent_messages/
+    // build_lead_context_prompt -- verdict/output already reached the lead via the tool return value.
     let conn = Connection::open_in_memory().unwrap();
     crate::db::init_schema(&conn).unwrap();
     crate::db::append_message(

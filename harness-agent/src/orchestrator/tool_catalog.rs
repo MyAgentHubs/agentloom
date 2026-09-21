@@ -188,7 +188,7 @@ fn update_working_state_def() -> serde_json::Value {
     })
 }
 
-/// 原生服务端搜索 Active 时追加到内置 web_search description 的注明（防双份改保底·B2 候选①）。
+/// Appended to the built-in web_search description while native server-side search is active, as a fallback note in case both search paths end up wired in.
 pub const NATIVE_SEARCH_PREFERENCE_NOTE: &str = "Note: this provider may also run native server-side web search; when native search results are already in context, prefer them and only call this tool if you still lack the information.";
 
 /// 组装「这一轮给模型的工具清单」：模型不会调工具→空；否则 = 登记处(按联网过滤) + inline 提议工具。

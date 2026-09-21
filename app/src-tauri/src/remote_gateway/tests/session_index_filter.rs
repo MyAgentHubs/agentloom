@@ -1,14 +1,14 @@
 #![cfg(test)]
 
 use super::*;
-/// M24DR 返工·项 7：⑥（上面这条测试）只盖了快照（a）与逐条里程碑（b）两面，唯独漏了
-/// session.index **增量** diff 这第三面——`filter_session_index_incremental_for_active_repo`
-/// 顶部 `let active_repo_id = lock(&state.active_repo_id_for_gating).clone()?;` 这个提前
-/// 返回此前完全没有专门测试顶着。用 `renamed` op（B1 四路里唯一"正常情况下会查库"的一
-/// 路）+ 一个"被调用就 panic"的 `session_repo_provider`：active 缺失时函数必须在触碰
-/// `op` 分支之前就整条丢弃，provider 连一次都不该被摸到——如果哪天有人把这个 `?` 改成别
-/// 的什么（比如误当"没有 active 限制=放行"），这条测试要么因 provider 被调用而 panic，
-/// 要么因帧被送上线而断言失败。
+/// With no active repository, `filter_session_index_incremental_for_active_repo`
+/// must discard incremental events before inspecting their operation or consulting
+/// attribution. Its `let active_repo_id = lock(&state.active_repo_id_for_gating).clone()?;`
+/// early return must not treat missing state as unrestricted access. Use a `renamed`
+/// `op`, which normally queries attribution, and make `session_repo_provider` panic
+/// if called. This detects a bypass of the `?` guard through either an unexpected
+/// provider call or an event reaching the socket. Snapshot and individual milestone
+/// coverage cannot establish this invariant for the incremental path.
 #[test]
 fn m2_4c_active_mode_session_index_incremental_is_filtered_without_active_repo() {
     let room = "0123456789abcdef0123456789abcdef";
@@ -61,10 +61,10 @@ fn m2_4c_active_mode_session_index_incremental_is_filtered_without_active_repo()
     server.join().unwrap();
 }
 
-// ---- M2-4c(B1)：session.index 增量 diff 四路分治 --------------------------------------
+// ---- Each session.index operation must apply its repository attribution rules. ----
 
-/// B1「created」：payload 里现成的 `session.repo_id` 直接跟 active repo 比——不匹配的整条
-/// 丢，匹配的正常出线；`session_repo_provider` 传入即 panic，证明这一路真的是零查库。
+/// For creation, compare payload `session.repo_id` directly with the active repository.
+/// Drop mismatches and pass matches; a panicking `session_repo_provider` proves no query occurs.
 #[test]
 fn m2_4c_active_mode_session_index_created_uses_payload_repo_id_without_querying() {
     let room = "0123456789abcdef0123456789abcdef";
@@ -145,8 +145,8 @@ fn m2_4c_active_mode_session_index_created_uses_payload_repo_id_without_querying
     server.join().unwrap();
 }
 
-/// B1「renamed」：payload 只有 `{id, title}`，行还在——查 `session_repo_provider`（走同一份
-/// 连接缓存）；不属于就整条丢（**连 title 一起丢**，不是只脱敏 title）。
+/// Rename payloads contain only `{id, title}`, so query `session_repo_provider` via the
+/// connection cache. Drop the entire event, including its title, for another repository.
 #[test]
 fn m2_4c_active_mode_session_index_renamed_drops_other_repo_session_and_keeps_title() {
     let room = "0123456789abcdef0123456789abcdef";
@@ -217,8 +217,8 @@ fn m2_4c_active_mode_session_index_renamed_drops_other_repo_session_and_keeps_ti
     server.join().unwrap();
 }
 
-/// B1「archived/unarchived」：payload 是 `{ids: [...]}`，行都还在——逐 id 查、重写 `ids`
-/// 数组只留 active repo 的；全部被过滤掉时整条丢（不发一个空 `ids` 出去）。
+/// For archive changes with `{ids: [...]}`, query each existing row and rewrite `ids`
+/// to contain only active-repository sessions; discard the event if `ids` becomes empty.
 #[test]
 fn m2_4c_active_mode_session_index_archived_rewrites_ids_to_active_repo_only() {
     let room = "0123456789abcdef0123456789abcdef";
@@ -307,9 +307,9 @@ fn m2_4c_active_mode_session_index_archived_rewrites_ids_to_active_repo_only() {
     server.join().unwrap();
 }
 
-/// B1「deleted」：行已经被删，查不到归属——显式放行、不查库（`session_repo_provider`
-/// 传入即 panic，证明真的没有调用）。这条是审查点名过的"错误补法"陷阱：deleted 事件若被
-/// 当成"查不到就丢"处理，手机端会永远挂着一个已经不存在的幽灵会话。
+/// Deletion must pass without an attribution query because the row no longer exists.
+/// A panicking `session_repo_provider` proves the lookup is skipped. Dropping the event
+/// when attribution is unavailable would leave a deleted session visible remotely.
 #[test]
 fn m2_4c_active_mode_session_index_deleted_passes_through_without_querying() {
     let room = "0123456789abcdef0123456789abcdef";
@@ -503,12 +503,12 @@ fn m2_4c_active_mode_session_index_deleted_drops_when_id_is_missing_or_not_a_str
     server.join().unwrap();
 }
 
-// ---- M2-4c(B3)：session→repo 归属不可变假设证伪后的缓存失效 ---------------------------
+// ---- Session repository reassignment must invalidate cached attribution. ----
 
-/// B3：`sessions.repo_id` 不是真正不可变的——`update_session_repo` 能在会话生命周期内把它
-/// 改绑到另一个 repo。这条测试直接钉 `upstream_session_allowed` 的缓存失效行为：改绑
-/// 发生并调用 `note_session_repo_reassignment()` 之后，同一份连接缓存不能继续吃里面那份
-/// 已经作废的旧归属，必须现查一次并得到新结果。
+/// `sessions.repo_id` can change during a session through `update_session_repo`.
+/// After reassignment and `note_session_repo_reassignment()`, the same connection's
+/// `upstream_session_allowed` check must query the new repository instead of reusing
+/// stale cached attribution, so access decisions reflect the new assignment.
 #[test]
 fn m2_4c_upstream_session_repo_cache_invalidates_after_mid_connection_reassignment() {
     let state = GatewayInnerState::default();

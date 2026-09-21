@@ -1,9 +1,9 @@
 import type { Block } from "../types/agent";
 
-// V1（2026-08-26·刀②「桌面 chat verbose 分级」）：从 MessageContent.tsx:120-150
-// 原样迁出的路径级图片抽取 + 去重，供 MessageContent 与 foldByVerbosity 共用一份。
-// 只承诺「路径字符串/后缀/首现」去重——按图片内容判重与加载后择优仍是
-// ImageArtifactChips 组件本地 state 的事（不搬进这份纯函数，见设计稿 §2A）。
+// Share path-level image extraction and de-duplication between MessageContent and foldByVerbosity.
+// Only path strings, extensions, and first occurrence determine de-duplication here.
+// Image-content de-duplication and post-load preference remain local state in ImageArtifactChips,
+// intentionally outside this pure-function module because they depend on loaded images.
 
 const IMAGE_PATH_TOKEN_BOUNDARY = /[\s"'`<>|]+/u;
 const IMAGE_PATH_EXTENSION = /\.(?:png|jpe?g|gif|webp|bmp|svg)$/i;
@@ -15,7 +15,7 @@ const MAX_IMAGE_PATHS_PER_TOOL_BLOCK = 8;
 
 // 搜索/列举类工具的输出是「路径列表」，不是「图片产物」——命中一堆 .png/.svg
 // 路径不代表 agent 生成/保存了图片，别当图片附件渲染成缩略图卡。名单核对自
-// lib/toolLabel.ts 的工具名映射表（claude 原名 / myagent 名，2026-07-27）。
+// Cross-checked against lib/toolLabel.ts to cover both original Claude tool names and myagent tool names.
 const SEARCH_TOOLS: ReadonlySet<string> = new Set([
   "Grep",
   "Glob",

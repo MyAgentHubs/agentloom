@@ -53,7 +53,6 @@ export class FatalErrorBoundary extends Component<
     const err = error instanceof Error ? error : new Error(String(error));
     reportFatalError("ErrorBoundary", err.message);
     if (import.meta.env.DEV) {
-      // eslint-disable-next-line no-console
       console.error("[FatalErrorBoundary]", err, info.componentStack);
     }
   }

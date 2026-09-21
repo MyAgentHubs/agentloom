@@ -46,21 +46,31 @@ fn member_production_sources_do_not_emit_legacy_agent_event() {
             "{function} must be exclusive to EventTransport"
         );
     }
+
+    let single_worker_source = include_str!("../single_worker.rs");
+    let single_worker_stripped = strip_comments_and_strings(single_worker_source);
+    let dispatch_body = extract_fn_body(
+        &single_worker_stripped,
+        "fn dispatch_single_worker_run(",
+        "dispatch_single_worker_run",
+    );
+    assert!(
+        !dispatch_body.contains("emit_agent_event("),
+        "dispatch_single_worker_run must be exclusive to EventTransport"
+    );
 }
 
-/// G3-A T2 结构钉子（同款手法：lib.rs 的
-/// `lead_production_source_wires_usage_capture_and_persist`）：`run_single_worker` 是
-/// 队长 `dispatch_worker` MCP 工具当前真实派单入口（lib.rs:7849 调用点），队员消耗要并入
-/// 会话账必须走它的 `emit_fn` 捕获 + 收尾落库两步——两步都可能被静默删掉退回「队员消耗
-/// 恒不入账」，钉源码切片防回归。
+/// Worker usage must reach session accounting through the dispatch entry point,
+/// `dispatch_single_worker_run`. Check its source for terminal usage capture in `emit_fn`
+/// and exactly one persistence call so usage is neither lost nor double-counted.
 #[test]
 fn run_single_worker_source_wires_member_usage_capture_and_persist() {
-    let source = include_str!("../../member_runner.rs");
+    let source = include_str!("../single_worker.rs");
     let body = source
-        .split("pub fn run_single_worker(")
+        .split("fn dispatch_single_worker_run(")
         .nth(1)
         .and_then(|tail| tail.split("\n}\n").next())
-        .expect("run_single_worker source slice");
+        .expect("dispatch_single_worker_run source slice");
 
     assert!(
         body.contains("member_usage.set(Some((*input_tokens, *output_tokens)))"),
@@ -166,13 +176,11 @@ fn spawn_member_source_releases_team_run_slot_on_run_done() {
         );
 }
 
-/// M1-T1（remote control M0 §4c）+ M1 修复轮 P1-1（2026-08-11）：team 注册/清空咽喉——
-/// `start_team_run` 起跑占槽成功后必须紧跟着写 session_runtime running；两条清空路径
-/// （`start_team_run` 同步全失败分支 / `spawn_member` 异步 run_done 分支）都必须紧跟
-/// `release_team_run_slot` 重算 session_runtime（P1-1 修复后不再硬编码 idle 字面量，
-/// 改走 `crate::refresh_session_runtime` 统一重算写口）。同上两条 G1 钉子一样，
-/// `start_team_run`/`spawn_member` 是 `#[tauri::command]`/需要真实 AppHandle 的函数，
-/// 仓库没有 mock Tauri app 测试设施，只能源码切片钉住「调了 + 调用顺序对」。
+/// Team slot reservation must publish running state, and both synchronous startup
+/// failure and asynchronous completion must refresh runtime state after release.
+/// Recompute state instead of forcing idle so other active work remains visible.
+/// These entry points require a real AppHandle; without a mock app fixture,
+/// source checks protect the required calls and their ordering.
 #[test]
 fn m1t1_team_run_source_writes_session_runtime_at_reserve_and_release() {
     let source = include_str!("../../member_runner.rs");
@@ -229,13 +237,10 @@ fn m1t1_team_run_source_writes_session_runtime_at_reserve_and_release() {
     );
 }
 
-/// P1 不变量钉子（opus 对抗审·实证反例=老 Team spawn_member 路径漏改·2026-07-25 回炉）：
-/// 「任何 Failed 终态事件必带非空 failure_reason」——生产代码里只要出现
-/// `member_terminal_event(..., StatusTransition::Failed, None, None)` 这个字面 shape，
-/// 就是「Failed 但 result=None」的回归（前端拿不到 failure_reason，退回「worker 未返回
-/// 结果」那条本刀点名过的误导文案）。人肉 review 已经漏过一次（run_single_worker 那三条
-/// 修了、spawn_member 那条漏了）——用源码切片钉死，别再指望人眼。空白全部剥掉再比对，
-/// 不受换行/缩进格式影响。
+/// Failed terminal events need a failure reason so the frontend can explain
+/// the failure instead of reporting a missing result. Reject the literal call
+/// shape that passes no result on any production path, including spawn_member.
+/// Normalize whitespace so line wrapping cannot bypass this source check.
 #[test]
 fn member_production_source_never_emits_failed_terminal_with_none_result() {
     let source = include_str!("../../member_runner.rs");
@@ -314,21 +319,28 @@ fn task_pack_run_single_worker_uses_member_goal_title() {
 #[test]
 fn member_report_delivery_production_wiring_uses_atomic_family_for_all_five_branches() {
     let source = include_str!("../../member_runner.rs");
+    let single_worker_source = include_str!("../single_worker.rs");
     let production = source
         .split("\n#[cfg(test)]\nmod tests;")
         .next()
         .expect("production source slice");
     let stripped = strip_comments_and_strings(production);
+    let single_worker_stripped = strip_comments_and_strings(single_worker_source);
     let run_body = extract_fn_body(
         &stripped,
         "pub fn run_single_worker(",
         "run_single_worker member report wiring",
     );
+    let dispatch_body = extract_fn_body(
+        &single_worker_stripped,
+        "fn dispatch_single_worker_run(",
+        "dispatch_single_worker_run member report wiring",
+    );
 
     let lifecycle_call = extract_call(
-        run_body,
+        dispatch_body,
         "run_single_worker_lifecycle(",
-        "run_single_worker lifecycle wiring",
+        "dispatch_single_worker_run lifecycle wiring",
     );
     for (helper, label) in [
         ("persist_member_result_message(", "正常结果"),
@@ -397,5 +409,9 @@ fn member_report_delivery_production_wiring_uses_atomic_family_for_all_five_bran
     assert!(
         !run_body.contains("append_message_dedup_and_publish("),
         "run_single_worker 的 [Worker report] 生产接线不得直接调用旧 helper"
+    );
+    assert!(
+        !dispatch_body.contains("append_message_dedup_and_publish("),
+        "dispatch_single_worker_run 的 [Worker report] 生产接线不得直接调用旧 helper"
     );
 }

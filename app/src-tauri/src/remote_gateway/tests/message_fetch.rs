@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-// ---- msgfix1 T4：handle_msg_fetch_at 校验链——每个 error code 一条正例 + 成功路径 ----
+// ---- Exercise each handle_msg_fetch_at validation error and the successful fetch path. ----
 
 fn msg_fetch_error_reply(inner: &Inner) -> Value {
     lock(&inner.state.reply_queue)
@@ -251,9 +251,9 @@ fn handle_msg_fetch_busy_when_gateway_wide_byte_budget_is_exhausted() {
     );
 }
 
-/// msgfix1 T7 B1（opus 整盘审 P1-2 后半）：改口径为 gateway 全局聚合后，两个不同 session
-/// 交替拉取也必须共享同一份 8MiB/60s 预算——旧的 per-session 分桶写法这里会各自放行、
-/// 合计 16MiB 越过 relay 单连接 16MiB 固定窗；新写法第二个 session 的满额请求必须吃 busy。
+/// Different sessions must share the gateway-wide byte budget within the same window.
+/// After one session exhausts it, another session's full-size request must return busy;
+/// independent per-session budgets would allow aggregate traffic to exceed the limit.
 #[test]
 fn handle_msg_fetch_busy_when_two_sessions_together_exhaust_the_gateway_wide_budget() {
     let big_content = "x".repeat(MSG_FETCH_TOTAL_BYTES_LIMIT);
@@ -425,7 +425,7 @@ fn handle_msg_fetch_double_saturation_drops_and_releases_inflight_when_even_the_
     );
 }
 
-// ---- msgfix1 T4：handle_frame 端到端——msg.fetch 字段缺失是协议违例，不是业务拒绝 ----
+// ---- Missing msg.fetch fields must fail handle_frame protocol validation. ----
 
 #[test]
 fn handle_frame_msg_fetch_malformed_fields_are_protocol_failures_not_business_errors() {
@@ -463,9 +463,9 @@ fn handle_frame_msg_fetch_malformed_fields_are_protocol_failures_not_business_er
     );
 }
 
-// ---- msgfix1 T4：wire fixture 形状比对（data-plane-v1.json / wire-v1.json——T6/T1 已把
-// *-v1.9-pending.json 合入这两份正式文件并删除 pending 版，这里改指正式文件；样张条目名
-// 未变，仍按名字查找，不依赖下标/总条数）----
+// ---- Compare fetch payloads against the shared data-plane and wire fixtures.
+// Look up entries by name so fixture ordering and unrelated additions do not affect
+// these wire-shape assertions. ----
 
 #[test]
 fn data_plane_v1_msg_fetch_family_matches_our_wire_shapes() {
@@ -570,7 +570,7 @@ fn wire_v1_reply_envelope_shape_and_aad_match_our_seal_path() {
     }
 }
 
-// ---- msgfix1 T4：drain_reply_queue 端到端——真实 socket 收发 + 重组 + 单飞行释放 ----
+// ---- Real socket replies must reassemble and release single-flight state on the final chunk. ----
 
 #[test]
 fn drain_reply_queue_sends_real_reply_frames_that_reassemble_and_release_inflight_on_final_chunk() {
@@ -665,7 +665,7 @@ fn drain_reply_queue_sends_real_reply_frames_that_reassemble_and_release_infligh
     );
 }
 
-// ---- msgfix1 T4 返修①-④（skeptic 补审四条修单）----
+// ---- Check command reuse protection and queued-reply lifecycle boundaries. ----
 
 // ---- 返修②：command_id 复用生命周期 ----
 
@@ -937,11 +937,11 @@ fn handle_msg_fetch_offset_exactly_at_total_bytes_still_succeeds_with_a_terminal
     assert_eq!(item.payload["offset"], total_bytes as u64);
 }
 
-/// msgfix1 T4：`handle_msg_fetch`/`handle_msg_fetch_at` 测试专用——`message_fetch_provider`
-/// 可控，session 归属恒放行到 `TEST_DEFAULT_ACTIVE_REPO_ID`（同 `with_default_active_repo`
-/// 既有姿势）。返回值带真实 `upstream_rx`/`milestone_rx`（虽然 msg.fetch 走的是
-/// `reply_queue`、不经这两条队列，但保持跟其它 `test_inner_for_*` 同一返回形状，调用方不
-/// 需要就直接 `_` 丢弃）。
+/// Provide a controllable `message_fetch_provider` for `handle_msg_fetch` and
+/// `handle_msg_fetch_at`, with attribution fixed to `TEST_DEFAULT_ACTIVE_REPO_ID`
+/// through `with_default_active_repo`. Return real `upstream_rx` and `milestone_rx`
+/// receivers to match the `test_inner_for_*` helper shape, although fetch replies use
+/// `reply_queue`; callers can discard unused receivers with `_`.
 fn test_inner_for_msg_fetch(
     message_fetch_provider: impl Fn(&str, i64) -> Result<MessageForFetchResult, String>
         + Send

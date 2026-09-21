@@ -16,14 +16,14 @@ pub enum ReviewVerdict {
 pub fn review_worklist(tasks: &[PlanTask]) -> ReviewVerdict {
     let mut reasons = Vec::new();
 
-    // B1：空 worklist。
+    // An empty worklist cannot make progress toward the goal.
     if tasks.is_empty() {
         return ReviewVerdict::Bounce {
             reasons: vec!["worklist 为空：目标没拆出任何原子任务".to_string()],
         };
     }
 
-    // B2：id 非空 + 全局唯一。
+    // Nonempty, globally unique IDs keep task references unambiguous.
     let mut seen: HashSet<&str> = HashSet::new();
     for t in tasks {
         if t.id.trim().is_empty() {

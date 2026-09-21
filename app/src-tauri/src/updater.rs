@@ -60,11 +60,10 @@ pub enum DisabledReason {
     Dev,
     /// 非 macOS 构建（Windows/Linux 在线更新本刀不做）。
     Platform,
-    /// `tauri.conf.json` 的 `plugins.updater.pubkey` 是占位串或空——正式公钥还没
-    /// 生成前，状态机永不调用插件（设计 §2D「屏蔽」+ 用户拍板决策点 5）。
+    /// When `tauri.conf.json`'s `plugins.updater.pubkey` is a placeholder or empty, the
+    /// production signing key is not ready yet, so the state machine never invokes the plugin.
     Unsigned,
 }
-
 /// `Error` 状态下「重试」按钮应执行的动作。旧版 wire 没有 `retry` 字段时，
 /// serde 默认回到普通的重新检查。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -1065,6 +1064,9 @@ fn check_recovery_gate_decision(
 // =======================================================================
 
 #[cfg(target_os = "macos")]
+mod download_install;
+
+#[cfg(target_os = "macos")]
 mod mac_shell {
     use super::{CheckOutcome, DisabledReason, Machine, UpdaterSnapshot, UpdaterState};
     use std::path::{Path, PathBuf};
@@ -1092,9 +1094,9 @@ mod mac_shell {
     /// `Available`、再补写 `Update`，中间那道缝隙让手动刷新可能撞见「新版本号
     /// 已经显示，但 pending 还是上一轮旧 Update」）。所有会同时影响两者的操作
     /// （检查结果落定、skip、下载前取用）都在一次 `lock()` 里做完。
-    struct Runtime {
-        machine: Machine,
-        pending: Option<Update>,
+    pub(super) struct Runtime {
+        pub(super) machine: Machine,
+        pub(super) pending: Option<Update>,
         /// React 首帧与关键初始化完成后由 `updater_mark_healthy` 置位。只在
         /// 进程内有效，不能让上次启动的健康结论泄漏到本次启动。
         healthy_confirmed: bool,
@@ -1112,7 +1114,7 @@ mod mac_shell {
     /// 和调用它们的路径同一级；这里的子模块只装实现细节（状态、纯 helper、真正
     /// 干活的 async 函数），顶层命令函数薄薄地转调过来。
     pub struct UpdaterHandle {
-        runtime: Mutex<Runtime>,
+        pub(super) runtime: Mutex<Runtime>,
         /// 启动期恢复完不完成的信号——所有检查共用 recovery gate；手动检查
         /// 未完成时直接返回，自动检查等待或超时放行。
         /// 不需要 `Arc`：`UpdaterHandle` 本身已经被 Tauri 的 state 容器以共
@@ -1134,14 +1136,14 @@ mod mac_shell {
             .unwrap_or(false)
     }
 
-    /// U4 返工 P2-3：`cfg(debug_assertions)` 下，显式设
-    /// `AGENTLOOM_UPDATER_FORCE_ENABLE=1` 时跳过 `Disabled{dev}`——**只在
-    /// debug 构建生效，release 无此闸**。存在的唯一理由是 T0/T6 的确定性故
-    /// 障注入实测：`AGENTLOOM_UPDATER_FAULT=relaunch` 这类注入要在真实交换/
-    /// 重启路径上验证，而那条路径只有走到 `Ready` 才可能触发——不加这个开
-    /// 关，调试构建永远停在 `Disabled{dev}`，`relaunch`/`swap` 故障注入的生
-    /// 产代码路径根本没法被跑到。不影响 `Disabled{Unsigned}`——那一档要求
-    /// T0/T6 自己另外配好临时公钥。
+    /// Under `cfg(debug_assertions)`, explicitly setting
+    /// `AGENTLOOM_UPDATER_FORCE_ENABLE=1` skips `Disabled{dev}` (debug builds only,
+    /// never in release). This exists solely so deterministic fault injection —
+    /// e.g. `AGENTLOOM_UPDATER_FAULT=relaunch` — can be exercised: those faults only
+    /// fire on the real swap/relaunch path, which is unreachable before `Ready`.
+    /// Without this escape hatch a debug build stays stuck at `Disabled{dev}` and the
+    /// relaunch/swap fault-injection code paths can never run. It does not affect
+    /// `Disabled{Unsigned}`, which still requires a real temporary signing key.
     fn force_enabled_for_fault_injection() -> bool {
         if cfg!(debug_assertions) {
             std::env::var("AGENTLOOM_UPDATER_FORCE_ENABLE").as_deref() == Ok("1")
@@ -1158,7 +1160,7 @@ mod mac_shell {
 
     /// `current_exe()` 形如 `AgentLoom.app/Contents/MacOS/AgentLoom`；向上三级
     /// （MacOS → Contents → AgentLoom.app）拿到 bundle 根，再取 realpath。
-    fn resolve_bundle_path() -> Result<PathBuf, String> {
+    pub(super) fn resolve_bundle_path() -> Result<PathBuf, String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let bundle = exe
             .parent()
@@ -1168,13 +1170,13 @@ mod mac_shell {
         std::fs::canonicalize(bundle).map_err(|e| e.to_string())
     }
 
-    fn emit_state(app: &AppHandle, snapshot: &UpdaterSnapshot) {
+    pub(super) fn emit_state(app: &AppHandle, snapshot: &UpdaterSnapshot) {
         if let Err(e) = app.emit("updater://state", snapshot) {
             eprintln!("updater: emit updater://state 失败（忽略）：{e}");
         }
     }
 
-    fn marker_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    pub(super) fn marker_dir(app: &AppHandle) -> Result<PathBuf, String> {
         let dir = app
             .path()
             .app_data_dir()
@@ -1195,14 +1197,14 @@ mod mac_shell {
         )
     }
 
-    fn installed_target_awaiting_reopen(app: &AppHandle) -> bool {
+    pub(super) fn installed_target_awaiting_reopen(app: &AppHandle) -> bool {
         let running_version = app.package_info().version.to_string();
         marker_dir(app)
             .map(|dir| installed_target_awaiting_reopen_in(&dir, &running_version))
             .unwrap_or(false)
     }
 
-    fn awaiting_reopen_snapshot(runtime: &mut Runtime) -> UpdaterSnapshot {
+    pub(super) fn awaiting_reopen_snapshot(runtime: &mut Runtime) -> UpdaterSnapshot {
         runtime.pending = None;
         runtime
             .machine
@@ -1541,7 +1543,7 @@ mod mac_shell {
         }
     }
 
-    enum DownloadOutcome {
+    pub(super) enum DownloadOutcome {
         Bytes(Vec<u8>),
         WatchdogTimeout,
         PluginError(String),
@@ -1554,7 +1556,7 @@ mod mac_shell {
     /// 一起被 drop，之后**绝不可能再被 poll**——`on_chunk` 闭包物理上叫不到了
     /// （U3 返工 P1：旧实现 `spawn` 出去只是不再 `.await` 那个 `JoinHandle`，
     /// Tokio 语义是 detach，下载线程照跑不误）。
-    async fn download_with_watchdog(
+    pub(super) async fn download_with_watchdog(
         mut update: Update,
         app: AppHandle,
         gen: u64,
@@ -1621,236 +1623,16 @@ mod mac_shell {
 
     pub async fn download_and_install(app: &AppHandle) -> UpdaterSnapshot {
         let handle = app.state::<UpdaterHandle>();
-
-        // 一次锁内完成：① 校验单飞（必须 Available）；② P2-2 防线——`pending`
-        // 里缓存的 Update 版本必须和 Available 展示的版本一致；③ preflight；
-        // ④ 用 `begin_download_gate` 原子决定进 Downloading 还是直接 Error
-        // （P2-1：preflight 失败绝不经过 Downloading）；⑤ 按落定的最终状态决定
-        // 是否清空 pending。
-        let gate_result: Result<(UpdaterSnapshot, u64, PathBuf, Update), UpdaterSnapshot> = {
-            let mut rt = handle.runtime.lock().expect("updater runtime poisoned");
-
-            let current_state = rt.machine.snapshot().state;
-            if !matches!(current_state, UpdaterState::Available { .. }) {
-                return rt.machine.snapshot();
-            }
-
-            // 状态门之后、进入 Downloading 之前再做同一判定，堵住旧前端仍把
-            // 「重试」接到 download_and_install 的路径。
-            if installed_target_awaiting_reopen(app) {
-                let snapshot = awaiting_reopen_snapshot(&mut rt);
-                drop(rt);
-                emit_state(app, &snapshot);
-                return snapshot;
-            }
-
-            let pending_version = rt.pending.as_ref().map(|u| u.version.as_str());
-            if !super::pending_matches_available(&current_state, pending_version) {
-                eprintln!(
-                    "updater: pending Update 缺失或版本与 Available 不一致，拒绝下载（防御性拦截，正常路径不该到这）"
-                );
-                return rt.machine.snapshot();
-            }
-
-            let preflight = resolve_bundle_path()
-                .and_then(|b| crate::updater_install::preflight(&b).map_err(|e| e.to_string()));
-
-            let outcome = match &preflight {
-                Ok(_) => super::begin_download_gate(&mut rt.machine, Ok(())),
-                Err(reason) => super::begin_download_gate(&mut rt.machine, Err(reason.clone())),
-            };
-
-            let result = match outcome {
-                super::DownloadGate::Proceed { snapshot, gen } => {
-                    let real_bundle = preflight.expect("Proceed implies preflight succeeded");
-                    let update = rt
-                        .pending
-                        .clone()
-                        .expect("pending_matches_available checked above guarantees Some");
-                    Ok((snapshot, gen, real_bundle, update))
-                }
-                other => Err(other.snapshot()),
-            };
-
-            if !super::should_retain_pending(&rt.machine.snapshot().state) {
-                rt.pending = None;
-            }
-            result
+        let prepared = match super::download_install::prepare_download(app, &handle) {
+            Ok(prepared) => prepared,
+            Err(snapshot) => return snapshot,
         };
-
-        let (downloading_snapshot, gen, real_bundle, update) = match gate_result {
-            Ok(v) => v,
-            Err(snap) => {
-                emit_state(app, &snap);
-                return snap;
-            }
+        let staged = match super::download_install::download_and_stage(app, &handle, prepared).await
+        {
+            Ok(staged) => staged,
+            Err(snapshot) => return snapshot,
         };
-        emit_state(app, &downloading_snapshot);
-
-        let outcome = download_with_watchdog(update.clone(), app.clone(), gen).await;
-
-        let bytes = match outcome {
-            DownloadOutcome::Bytes(bytes) => bytes,
-            DownloadOutcome::WatchdogTimeout => {
-                let snap = {
-                    let mut rt = handle.runtime.lock().expect("updater runtime poisoned");
-                    rt.machine
-                        .on_download_error(
-                            gen,
-                            crate::ui_msg::al_err("updater.download_timeout", &[]),
-                        )
-                        .unwrap_or_else(|| rt.machine.snapshot())
-                };
-                emit_state(app, &snap);
-                return snap;
-            }
-            DownloadOutcome::PluginError(detail) => {
-                let snap = {
-                    let mut rt = handle.runtime.lock().expect("updater runtime poisoned");
-                    rt.machine
-                        .on_download_error(
-                            gen,
-                            crate::ui_msg::al_err("updater.check_failed", &[("detail", detail)]),
-                        )
-                        .unwrap_or_else(|| rt.machine.snapshot())
-                };
-                emit_state(app, &snap);
-                return snap;
-            }
-        };
-
-        let staging_snapshot = {
-            let mut rt = handle.runtime.lock().expect("updater runtime poisoned");
-            rt.machine
-                .begin_staging(gen)
-                .unwrap_or_else(|| rt.machine.snapshot())
-        };
-        emit_state(app, &staging_snapshot);
-
-        let version = update.version.clone();
-        let bundle_for_stage = real_bundle.clone();
-        let old_marker_dir = marker_dir(app);
-        let stage_result = tauri::async_runtime::spawn_blocking(move || {
-            let parent = bundle_for_stage
-                .parent()
-                .ok_or_else(|| "bundle path has no parent directory".to_string())?;
-            super::stage_after_old_marker_lookup(old_marker_dir, parent, || {
-                crate::updater_install::stage_bytes(
-                    &bundle_for_stage,
-                    &bytes,
-                    &version,
-                    &crate::updater_install::default_verify,
-                )
-                .map_err(|e| e.to_string())
-            })
-        })
-        .await;
-
-        let staged_path = match stage_result {
-            Ok(Ok(path)) => path,
-            Ok(Err(install_err)) => {
-                let snap = {
-                    let mut rt = handle.runtime.lock().expect("updater runtime poisoned");
-                    rt.machine
-                        .on_download_error(
-                            gen,
-                            crate::ui_msg::al_err(
-                                "updater.stage_failed",
-                                &[("detail", install_err)],
-                            ),
-                        )
-                        .unwrap_or_else(|| rt.machine.snapshot())
-                };
-                emit_state(app, &snap);
-                return snap;
-            }
-            Err(join_err) => {
-                let snap = {
-                    let mut rt = handle.runtime.lock().expect("updater runtime poisoned");
-                    rt.machine
-                        .on_download_error(
-                            gen,
-                            crate::ui_msg::al_err(
-                                "updater.stage_failed",
-                                &[("detail", join_err.to_string())],
-                            ),
-                        )
-                        .unwrap_or_else(|| rt.machine.snapshot())
-                };
-                emit_state(app, &snap);
-                return snap;
-            }
-        };
-
-        let marker = crate::updater_install::TxnMarker {
-            target_version: update.version.clone(),
-            bundle_path: real_bundle.clone(),
-            staged_path: staged_path.clone(),
-            stage: crate::updater_install::Stage::Staged,
-        };
-
-        // P2-3：marker 写失败必须清掉暂存、绝不能报 Ready——`finalize_marker`
-        // 把这条规则收在一个纯函数里（见文件顶部单测），这里只是把真实的
-        // `write_marker`/`cleanup_staged` 通过 closure 接进去。
-        let marker_outcome = super::finalize_marker(
-            || {
-                marker_dir(app).and_then(|dir| {
-                    crate::updater_install::write_marker(&dir, &marker)
-                        .map(|_| ())
-                        .map_err(|e| e.to_string())
-                })
-            },
-            || {
-                real_bundle
-                    .parent()
-                    .ok_or_else(|| "bundle path has no parent directory".to_string())
-                    .and_then(|parent| {
-                        crate::updater_install::cleanup_staged(parent, &staged_path)
-                            .map_err(|e| e.to_string())
-                    })
-            },
-        );
-
-        match marker_outcome {
-            super::MarkerOutcome::Written => {
-                let snap = {
-                    let mut rt = handle.runtime.lock().expect("updater runtime poisoned");
-                    rt.machine
-                        .on_staged(
-                            gen,
-                            update.version.clone(),
-                            staged_path.display().to_string(),
-                        )
-                        .unwrap_or_else(|| rt.machine.snapshot())
-                };
-                emit_state(app, &snap);
-                snap
-            }
-            super::MarkerOutcome::Failed {
-                write_error,
-                cleanup_ok,
-            } => {
-                if !cleanup_ok {
-                    eprintln!(
-                        "updater: marker 写失败且清理暂存也失败，遗留暂存目录待下次启动人工核实"
-                    );
-                }
-                let snap = {
-                    let mut rt = handle.runtime.lock().expect("updater runtime poisoned");
-                    rt.machine
-                        .on_download_error(
-                            gen,
-                            crate::ui_msg::al_err(
-                                "updater.stage_failed",
-                                &[("detail", write_error)],
-                            ),
-                        )
-                        .unwrap_or_else(|| rt.machine.snapshot())
-                };
-                emit_state(app, &snap);
-                snap
-            }
-        }
+        super::download_install::finalize_staged(app, &handle, staged)
     }
 
     /// `open -n <bundle_path>` —— LaunchServices 重启（不用 `app.restart()`：

@@ -949,9 +949,9 @@ mod tests {
         assert!(files.is_empty());
     }
 
-    /// R-B1 项 2：老 checkpoint 落在项目根（local-default 引入 per-session 子目录之前记的
-    /// 绝对路径），新 checkpoint 落在会话实际 cwd（per-session 子目录）——两种前缀混在同一个
-    /// 会话的账本里，strip 都要能剥成相对路径，不能有一条退化成宿主机绝对路径漏进交接文档。
+    /// Old checkpoints recorded paths rooted at the project root (before per-session
+    /// subdirectories existed); new ones use the session's actual cwd instead. Both prefixes can
+    /// appear in one session's ledger, so every strip must yield a relative path — never leak a raw host absolute path into the continuation payload.
     #[test]
     fn continuation_checkpoint_files_strip_dual_prefix_root_and_session_subdir() {
         let c = mem();

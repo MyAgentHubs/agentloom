@@ -78,8 +78,8 @@ fn wait_for_answer_cancels_when_session_not_running() {
 
 #[test]
 fn wait_for_answer_bounded_times_out_and_downgrades_slot_to_timed_out() {
-    // 决策打扰收敛刀 T1：有界等待窗口耗尽·没人来答 → 返回 TimedOut，handler 体面退出；
-    // 槽位不是被 remove 掉，而是降级成 TimedOut——留给随后姗姗来迟的答案认出「这是迟到答案」。
+    // Exhausting the bounded wait must return TimedOut while retaining a timed-out
+    // slot so subsequent answers can be recognized and handled as late arrivals.
     let q = LeadQuestions::default();
     let running = Running::default();
     running
@@ -221,8 +221,8 @@ fn answer_question_inner_late_path_commits_chosen_status_and_user_message() {
     let msgs = db::get_messages(&conn, "s-late").unwrap();
     // 消息①=DecisionCard（已翻 chosen），消息②=迟到答案的真实 user 消息。
     assert_eq!(msgs.len(), 2, "应新增一条落库消息: {msgs:?}");
-    // T3：返回值必须是刚落库那条完整消息（供外层 emit "lead-message-appended"），
-    // 不是 None（emit 就无从谈起）。
+    // Return the newly persisted message so the caller can emit
+    // "lead-message-appended" with the actual late answer.
     assert_eq!(
         result.appended.as_ref().map(|m| m.id),
         Some(msgs[1].id),

@@ -422,9 +422,9 @@ fn truncate_verifier_output_head_tail_preserves_head_and_tail_with_marker() {
 #[cfg(target_os = "macos")]
 #[test]
 fn truncate_verifier_output_head_tail_is_utf8_safe_on_multibyte_chars() {
-    // 中文字符 3 字节/个：8_193 = 3×2731 恰好落在字符边界上——两条退让循环一次都不会
-    // 执行，测试形同虚设（2026-07-25 opus 对抗审揪出的假绿·静默 fail-open 同款形状）。
-    // 8_194 = 3×2731+1 才真落在字符中间，能压出退让分支真正执行。
+    // Each character occupies three bytes, so an 8_193-byte cut is already aligned
+    // and would never exercise either character-boundary adjustment loop.
+    // Use 8_194-byte cuts to require both ends to retreat to valid UTF-8 boundaries.
     let s = "中".repeat(20_000); // 60,000 bytes，远超头尾预算之和
     let out = truncate_verifier_output_head_tail(&s, 8_194, 8_194); // 真落在多字节字符中间
     assert!(
@@ -509,9 +509,9 @@ fn seatbelt_verifier_profile_shape() {
         profile.contains("/tmp/agentloom-verify-test-root"),
         "profile must contain write_root subpath: {profile}"
     );
-    // S1（2026-07-25 opus 对抗审顺手）：旧 run_verifier 路径经 lib.rs 仍可达，且同样接了
-    // 头尾截断，理应享有跟 run_verifier_in_place 一样的 same-sandbox signal 放行——否则
-    // 这条路径下 verifier 命令自己 kill 自己的子进程照样会被吞成 EPERM。
+    // The verifier path exposed through lib.rs must allow same-sandbox signals,
+    // just like run_verifier_in_place, so commands can terminate their own child
+    // processes without EPERM while signals across sandbox boundaries remain denied.
     assert!(
         profile.contains("(allow signal (target same-sandbox))"),
         "profile 须放行 same-sandbox signal：{profile}"

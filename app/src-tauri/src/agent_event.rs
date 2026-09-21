@@ -1,6 +1,26 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod parse_claude;
+use parse_claude::{
+    parse_claude_assistant_event, parse_claude_result_event, parse_claude_stream_event,
+    parse_claude_system_event, parse_claude_user_event,
+};
+mod parse_harness;
+use parse_harness::{
+    parse_harness_agent_note_delta_event, parse_harness_agent_reasoning_delta_event,
+    parse_harness_approval_requested_event, parse_harness_approval_resolved_event,
+    parse_harness_completion_evaluated_event, parse_harness_error_event,
+    parse_harness_goal_created_event, parse_harness_goal_updated_event,
+    parse_harness_orchestration_step_completed_event, parse_harness_plan_event,
+    parse_harness_run_blocked_event, parse_harness_run_completed_event,
+    parse_harness_run_failed_event, parse_harness_run_interrupted_event,
+    parse_harness_run_needs_decision_event, parse_harness_run_started_event,
+    parse_harness_tool_completed_event, parse_harness_tool_failed_event,
+    parse_harness_tool_started_event, parse_harness_tool_stderr_delta_event,
+    parse_harness_tool_stdout_delta_event, parse_harness_unknown_event,
+};
+
 pub(crate) const AUTH_RETRY_MAX: u32 = 2;
 
 pub(crate) fn is_auth_error(message: &str) -> bool {
@@ -19,14 +39,12 @@ pub(crate) fn is_auth_error(message: &str) -> bool {
     .iter()
     .any(|marker| normalized.contains(marker))
 }
-
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum CardKind {
     Command,
     Compact,
 }
-
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolStatus {
@@ -81,7 +99,7 @@ pub enum AgentEvent {
         final_text: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<Box<MemberResult>>,
-        // plan B1 §3.1：结构化 commit 字段（全 Option 保后向兼容 · 空轮全 None → 前端不渲染卡）
+        // Structured commit fields: every field stays Option so old payloads without them still deserialize, and an empty round (all None) renders no card on the frontend.
         run_id: Option<String>,
         commit_sha: Option<String>,
         files_changed: Option<u64>,
@@ -100,7 +118,7 @@ pub enum AgentEvent {
     /// 方案 A：一次 run 的「目标确立/冻结」事件，作为 run 开场推给前端（带 dispatch.run_id）。
     /// goal/status/criteria 是 run 级目标契约的快照；前端 reducer 收进 TeamRun.goal。
     /// M1a status 恒为 "frozen"（假冻结·不引状态机）。
-    /// day-1：构造点在 T4 fake_runner（GoalDeclared 开场事件）；T1 单独看尚无构造 → 同 StatusTransition 加 allow。
+    /// No construction site exists yet outside the fake runner used for local exercising, so this variant is allowed to stay unconstructed like StatusTransition.
     #[allow(dead_code)]
     GoalDeclared {
         goal: String,
@@ -662,7 +680,7 @@ const HARNESS_BLOCKED_REASON_CODES: [&str; 3] = [
 ///   `orchestrator/signals.rs`）完全不是同一处代码。这条 emit 的 payload 没有
 ///   `blocked_reason` 字段，也没有 `trigger` 字段——顶层 `reason` 直接就是硬编码字面量
 ///   `"context_budget_exhausted"`，不读取任何运行时输入。
-/// - **伪造面实勘（本刀，2026-07-28）**：grep 了 harness-agent/src 下全部 "run.needs_decision"
+/// - **Forgery-surface audit**: grepped every "run.needs_decision"
 ///   emit 点（`orchestrator/run_loop.rs` / `orchestrator/signals.rs` / `plan/run_plan.rs`），
 ///   顶层 `reason` 唯一等于这个字面值的地方就是上面这一处；其余全是别的硬编码字面量
 ///   （"blocked_questions" / "resume_missing_driver" / "plan_budget_exhausted" / ...）。
@@ -848,32 +866,6 @@ pub fn parse_claude_line(line: &str) -> Vec<AgentEvent> {
     parse_claude_line_for_locale(line, crate::Locale::Zh)
 }
 
-/// G3-A T1：claude usage 真实输入 token 口径修正。
-///
-/// 自查结论（Anthropic 官方文档 · platform.claude.com/docs/en/build-with-claude/prompt-caching）：
-/// `usage.input_tokens` 只统计**未命中缓存的**输入 token——缓存命中的输入走
-/// `cache_read_input_tokens`（读缓存，约 0.1x 价）与 `cache_creation_input_tokens`
-/// （写缓存，约 1.25x/2x 价）两个独立字段，三者互不重叠。文档原话："`input_tokens` is the
-/// uncached remainder only. Total prompt size = input_tokens + cache_creation_input_tokens +
-/// cache_read_input_tokens." 因此真实总输入 token = 三者相加，不存在重复计数风险——之前
-/// 只读 `input_tokens` 会在缓存命中率高时严重低报真实输入消耗（例如 `in=69 / out=27012`
-/// 这种明显失真的数字：绝大部分输入其实来自缓存命中，只是没被计入）。
-///
-/// 三个字段任一缺失按 0 处理（serde 容错，不当错误）；三者都缺失才返回 `None`（保持
-/// 「usage 对象整体缺失/不含输入侧字段」与「输入侧确实为 0」两种语义的既有区分，
-/// 对应调用点用 `is_some()` 判断是否该推 UsageDelta）。
-fn combined_input_tokens(usage: Option<&Value>) -> Option<u64> {
-    let field = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_u64);
-    let base = field("input_tokens");
-    let cache_read = field("cache_read_input_tokens");
-    let cache_creation = field("cache_creation_input_tokens");
-    if base.is_none() && cache_read.is_none() && cache_creation.is_none() {
-        None
-    } else {
-        Some(base.unwrap_or(0) + cache_read.unwrap_or(0) + cache_creation.unwrap_or(0))
-    }
-}
-
 pub(crate) fn parse_claude_line_for_locale(line: &str, locale: crate::Locale) -> Vec<AgentEvent> {
     let Ok(v): Result<Value, _> = serde_json::from_str(line) else {
         return vec![];
@@ -882,170 +874,11 @@ pub(crate) fn parse_claude_line_for_locale(line: &str, locale: crate::Locale) ->
         return vec![];
     };
     match kind {
-        "system" => match v.get("subtype").and_then(Value::as_str) {
-            Some("init") => match v.get("session_id").and_then(Value::as_str) {
-                Some(id) => vec![AgentEvent::SessionStarted {
-                    conversation_id: id.to_string(),
-                }],
-                None => vec![],
-            },
-            _ => vec![],
-        },
-        "stream_event" => {
-            let Some(delta) = v
-                .get("event")
-                .filter(|e| e.get("type").and_then(Value::as_str) == Some("content_block_delta"))
-                .and_then(|e| e.get("delta"))
-            else {
-                return vec![];
-            };
-            match delta.get("type").and_then(Value::as_str) {
-                Some("text_delta") => match delta.get("text").and_then(Value::as_str) {
-                    Some(t) => vec![AgentEvent::TextDelta {
-                        text: t.to_string(),
-                    }],
-                    None => vec![],
-                },
-                _ => vec![],
-            }
-        }
-        "assistant" => {
-            let mut out = vec![];
-            if let Some(content) = v
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(Value::as_array)
-            {
-                for block in content {
-                    if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                        let id = block
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
-                        let summary = if name == "Bash" {
-                            block
-                                .get("input")
-                                .and_then(|i| i.get("command"))
-                                .and_then(Value::as_str)
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| name.to_string())
-                        } else {
-                            block
-                                .get("input")
-                                .map(|i| tool_summary(name, i))
-                                .unwrap_or_else(|| name.to_string())
-                        };
-                        out.push(AgentEvent::ToolStarted {
-                            id,
-                            tool: name.to_string(),
-                            summary,
-                            card: claude_card(name),
-                        });
-                    }
-                    if block.get("type").and_then(Value::as_str) == Some("thinking") {
-                        let text = block
-                            .get("thinking")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        out.push(AgentEvent::ThinkingDelta { text });
-                    }
-                }
-            }
-            let usage = v.get("message").and_then(|m| m.get("usage"));
-            let input_tokens = combined_input_tokens(usage);
-            let output_tokens = usage
-                .and_then(|u| u.get("output_tokens"))
-                .and_then(Value::as_u64);
-            if input_tokens.is_some() || output_tokens.is_some() {
-                out.push(AgentEvent::UsageDelta {
-                    input_tokens,
-                    output_tokens,
-                });
-            }
-            out // 纯 text 且无 usage 的 assistant（无 tool_use）→ 空 vec
-        }
-        "user" => {
-            let mut out = vec![];
-            if let Some(content) = v
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(Value::as_array)
-            {
-                for block in content {
-                    if block.get("type").and_then(Value::as_str) == Some("tool_result") {
-                        let id = block
-                            .get("tool_use_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        let is_error = block
-                            .get("is_error")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                        let output = block
-                            .get("content")
-                            .and_then(tool_result_text)
-                            .map(|s| truncate_output_for_locale(&s, 32 * 1024, locale));
-                        out.push(AgentEvent::ToolCompleted {
-                            id,
-                            status: if is_error {
-                                ToolStatus::Failed
-                            } else {
-                                ToolStatus::Ok
-                            },
-                            exit_code: None,
-                            output,
-                        });
-                    }
-                }
-            }
-            out
-        }
-        "result" => {
-            let is_error = match v.get("is_error") {
-                Some(serde_json::Value::Bool(b)) => *b,
-                // is_error 缺失或非 bool：fail-closed——只有 subtype 显式 "success" 才算成功
-                _ => !matches!(
-                    v.get("subtype").and_then(serde_json::Value::as_str),
-                    Some("success")
-                ),
-            };
-            if is_error {
-                vec![AgentEvent::Error {
-                    message: v
-                        .get("result")
-                        .and_then(Value::as_str)
-                        .unwrap_or(match locale {
-                            crate::Locale::Zh => "未知错误",
-                            crate::Locale::En => "Unknown error",
-                        })
-                        .to_string(),
-                }]
-            } else {
-                let usage = v.get("usage");
-                vec![AgentEvent::Completed {
-                    cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
-                    input_tokens: combined_input_tokens(usage),
-                    output_tokens: usage
-                        .and_then(|u| u.get("output_tokens"))
-                        .and_then(Value::as_u64),
-                    final_text: v
-                        .get("result")
-                        .and_then(Value::as_str)
-                        .map(|s| s.to_string()),
-                    result: None,
-                    run_id: None,
-                    commit_sha: None,
-                    files_changed: None,
-                    insertions: None,
-                    deletions: None,
-                    interrupted: None,
-                }]
-            }
-        }
+        "system" => parse_claude_system_event(&v),
+        "stream_event" => parse_claude_stream_event(&v),
+        "assistant" => parse_claude_assistant_event(&v),
+        "user" => parse_claude_user_event(&v, locale),
+        "result" => parse_claude_result_event(&v, locale),
         _ => vec![],
     }
 }
@@ -1143,300 +976,31 @@ pub(crate) fn parse_harness_line_for_locale(line: &str, locale: crate::Locale) -
         return vec![];
     };
     let payload = v.get("payload").cloned().unwrap_or(Value::Null);
-    let s = |key: &str| payload.get(key).and_then(Value::as_str);
     match v.get("type").and_then(Value::as_str) {
-        Some("run.started") => {
-            let id = v
-                .get("run_id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            vec![AgentEvent::SessionStarted {
-                conversation_id: id,
-            }]
-        }
-        Some("agent.note.delta") => match s("text") {
-            Some(t) => vec![AgentEvent::TextDelta {
-                text: t.to_string(),
-            }],
-            None => vec![],
-        },
-        Some("agent.reasoning.delta") => match s("text") {
-            Some(t) => vec![AgentEvent::ThinkingDelta {
-                text: t.to_string(),
-            }],
-            None => vec![],
-        },
-        Some("goal.created") => {
-            let Some(criteria_values) = payload.get("criteria").and_then(Value::as_array) else {
-                return vec![];
-            };
-            if criteria_values.is_empty() {
-                return vec![];
-            }
-            let criteria = criteria_values.iter().map(parse_goal_criterion).collect();
-            vec![AgentEvent::GoalDeclared {
-                goal: s("objective").unwrap_or("").to_string(),
-                status: "frozen".into(),
-                lead: None,
-                criteria,
-            }]
-        }
-        Some("goal.updated") => {
-            let criteria = payload
-                .get("criteria")
-                .and_then(Value::as_array)
-                .map(|arr| arr.iter().map(parse_goal_criterion).collect())
-                .unwrap_or_default();
-            vec![AgentEvent::GoalUpdated { criteria }]
-        }
-        Some("run.needs_decision") => {
-            if s("reason") != Some("scope_change") {
-                return vec![AgentEvent::Blocked {
-                    message: harness_needs_decision_message(locale, &payload),
-                    reason: harness_needs_decision_reason(&payload).map(str::to_string),
-                }];
-            }
-            let changes: Vec<ScopeChange> = payload
-                .get("changes")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .map(|c| {
-                            let detail = c.get("detail");
-                            ScopeChange {
-                                proposal_id: c
-                                    .get("proposal_id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string(),
-                                kind: c
-                                    .get("kind")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string(),
-                                detail_text: detail
-                                    .and_then(|d| d.get("text"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string(),
-                                detail_summary: detail
-                                    .and_then(|d| d.get("summary"))
-                                    .and_then(Value::as_str)
-                                    .map(str::to_string),
-                            }
-                        })
-                        .filter(|c| !c.detail_text.trim().is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
-            if changes.is_empty() {
-                return vec![];
-            }
-            let run_id = v
-                .get("run_id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            vec![AgentEvent::NeedsDecision {
-                run_id,
-                reason: "scope_change".to_string(),
-                changes,
-            }]
-        }
-        Some("completion.evaluated") => {
-            let criteria = payload
-                .get("criteria")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .map(|c| GoalCriterionUpdate {
-                            id: c
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            status: c
-                                .get("status")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            evidence: c
-                                .get("evidence_ref")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            vec![AgentEvent::CriteriaUpdated { criteria }]
-        }
-        Some("tool.started") => {
-            if is_check_cmd_tool_event(&payload) {
-                return vec![];
-            }
-            let tool = s("tool").unwrap_or("").to_string();
-            let id = s("tool_call_id").unwrap_or("").to_string();
-            let summary = s("command")
-                .or_else(|| s("path"))
-                .unwrap_or(&tool)
-                .to_string();
-            let card = if tool == "shell_exec" {
-                CardKind::Command
-            } else {
-                CardKind::Compact
-            };
-            vec![AgentEvent::ToolStarted {
-                id,
-                tool,
-                summary,
-                card,
-            }]
-        }
-        Some("tool.completed") => {
-            if is_check_cmd_tool_event(&payload) {
-                return vec![];
-            }
-            let id = s("tool_call_id").unwrap_or("").to_string();
-            let exit_code = payload.get("exit_code").and_then(Value::as_i64);
-            let status = if exit_code.unwrap_or(0) == 0 {
-                ToolStatus::Ok
-            } else {
-                ToolStatus::Failed
-            };
-            vec![AgentEvent::ToolCompleted {
-                id,
-                status,
-                exit_code,
-                output: None,
-            }]
-        }
-        Some("tool.failed") => {
-            if is_check_cmd_tool_event(&payload) {
-                return vec![];
-            }
-            let id = s("tool_call_id").unwrap_or("").to_string();
-            let output = s("error").map(|e| e.to_string());
-            vec![AgentEvent::ToolCompleted {
-                id,
-                status: ToolStatus::Failed,
-                exit_code: None,
-                output,
-            }]
-        }
-        Some("tool.stdout.delta") => {
-            if is_check_cmd_tool_event(&payload) {
-                return vec![];
-            }
-            let id = s("tool_call_id").unwrap_or("").to_string();
-            let text = s("text").unwrap_or("").to_string();
-            vec![AgentEvent::ToolOutputDelta { id, text }]
-        }
-        Some("tool.stderr.delta") => {
-            if is_check_cmd_tool_event(&payload) {
-                return vec![];
-            }
-            let id = s("tool_call_id").unwrap_or("").to_string();
-            let text = s("text").unwrap_or("").to_string();
-            vec![AgentEvent::ToolOutputDelta { id, text }]
-        }
+        Some("run.started") => parse_harness_run_started_event(&v),
+        Some("agent.note.delta") => parse_harness_agent_note_delta_event(&payload),
+        Some("agent.reasoning.delta") => parse_harness_agent_reasoning_delta_event(&payload),
+        Some("goal.created") => parse_harness_goal_created_event(&payload),
+        Some("goal.updated") => parse_harness_goal_updated_event(&payload),
+        Some("run.needs_decision") => parse_harness_run_needs_decision_event(&v, &payload, locale),
+        Some("completion.evaluated") => parse_harness_completion_evaluated_event(&payload),
+        Some("tool.started") => parse_harness_tool_started_event(&payload),
+        Some("tool.completed") => parse_harness_tool_completed_event(&payload),
+        Some("tool.failed") => parse_harness_tool_failed_event(&payload),
+        Some("tool.stdout.delta") => parse_harness_tool_stdout_delta_event(&payload),
+        Some("tool.stderr.delta") => parse_harness_tool_stderr_delta_event(&payload),
         Some("orchestration.step.completed") => {
-            // T7a：头部超限截断只认 solo.compact 这一步；数值字段（original/truncated/
-            // budget_tokens）不参与判定，缺了也照常出事件。其余 outcome 走原路不变。
-            if s("outcome") == Some("head_truncated_continue") {
-                if s("step_id") != Some("solo.compact") {
-                    return vec![];
-                }
-                return vec![AgentEvent::HeadTruncated {}];
-            }
-            if s("outcome") != Some("objective_compacted") {
-                return vec![];
-            }
-            let Some(summary) = s("summary").filter(|summary| !summary.is_empty()) else {
-                return vec![];
-            };
-            let Some(through_message_id) =
-                payload.get("through_message_id").and_then(Value::as_i64)
-            else {
-                return vec![];
-            };
-            vec![AgentEvent::ContextCompacted {
-                summary: summary.to_string(),
-                through_message_id,
-            }]
+            parse_harness_orchestration_step_completed_event(&payload)
         }
-        Some("run.completed") => vec![AgentEvent::Completed {
-            cost_usd: None,
-            input_tokens: payload
-                .get("usage")
-                .and_then(|u| u.get("input_tokens"))
-                .and_then(Value::as_u64),
-            output_tokens: payload
-                .get("usage")
-                .and_then(|u| u.get("output_tokens"))
-                .and_then(Value::as_u64),
-            final_text: None,
-            result: None,
-            run_id: None,
-            commit_sha: None,
-            files_changed: None,
-            insertions: None,
-            deletions: None,
-            interrupted: None,
-        }],
-        Some("run.failed") | Some("error") => {
-            let msg = s("error")
-                .or_else(|| s("message"))
-                .unwrap_or("error")
-                .to_string();
-            vec![AgentEvent::Error { message: msg }]
-        }
-        Some("run.blocked") => {
-            vec![AgentEvent::Blocked {
-                message: harness_blocked_message(locale, &payload),
-                reason: None,
-            }]
-        }
-        Some("run.interrupted") => {
-            vec![AgentEvent::Blocked {
-                message: harness_interrupted_message(locale, &payload),
-                reason: None,
-            }]
-        }
-        Some("approval.requested") => {
-            let p = &v["payload"];
-            let command_str = p["command"].as_str().unwrap_or_default().to_string();
-            let summary_str = p["summary"].as_str().unwrap_or(&command_str).to_string();
-            vec![AgentEvent::ApprovalRequested {
-                approval_id: p["approval_id"].as_str().unwrap_or_default().to_string(),
-                run_id: v["run_id"].as_str().unwrap_or_default().to_string(),
-                tool: p["tool"].as_str().unwrap_or_default().to_string(),
-                command: command_str,
-                summary: summary_str,
-                cwd: p["cwd"].as_str().unwrap_or_default().to_string(),
-                request_kind: p["request_kind"].as_str().map(str::to_string),
-                proposal_id: p["proposal_id"].as_str().map(str::to_string),
-            }]
-        }
-        Some("approval.resolved") => {
-            let p = &v["payload"];
-            vec![AgentEvent::ApprovalResolved {
-                approval_id: p["approval_id"].as_str().unwrap_or_default().to_string(),
-                decision: p["decision"].as_str().unwrap_or_default().to_string(),
-                reason: p["reason"].as_str().map(|s| s.to_string()),
-            }]
-        }
-        Some(t) if t.starts_with("plan.") => plan_progress_text(locale, t, &payload)
-            .map(|text| vec![AgentEvent::TextDelta { text }])
-            .unwrap_or_default(),
-        other => {
-            if let Some(t) = other {
-                if !KNOWN_HARNESS_EVENT_TYPES.contains(&t) {
-                    eprintln!("harness: 未知事件类型已丢弃（CONTRACT §9）: {t}");
-                }
-            }
-            vec![]
-        }
+        Some("run.completed") => parse_harness_run_completed_event(&payload),
+        Some("run.failed") => parse_harness_run_failed_event(&payload),
+        Some("error") => parse_harness_error_event(&payload),
+        Some("run.blocked") => parse_harness_run_blocked_event(&payload, locale),
+        Some("run.interrupted") => parse_harness_run_interrupted_event(&payload, locale),
+        Some("approval.requested") => parse_harness_approval_requested_event(&v),
+        Some("approval.resolved") => parse_harness_approval_resolved_event(&v),
+        Some(t) if t.starts_with("plan.") => parse_harness_plan_event(locale, t, &payload),
+        other => parse_harness_unknown_event(other),
     }
 }
 

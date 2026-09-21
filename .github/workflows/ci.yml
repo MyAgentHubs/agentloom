@@ -5,9 +5,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, myagenthubs/number1-debt-graph]
   pull_request:
-    branches: [main]
+    branches: [main, myagenthubs/number1-debt-graph]
 
 permissions:
   contents: read
@@ -29,27 +29,62 @@ jobs:
         id: pin
         env:
           SIZE_GATE_BEFORE: ${{ github.event.before }}
+          SIZE_GATE_PR_BASE: ${{ github.event.pull_request.base.sha }}
         shell: bash
         run: |
           set -euo pipefail
-          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
-            # A push can contain multiple commits: HEAD^ would miss earlier growth.
-            # Never compare a main push to the just-pushed origin/main.
-            if [[ ! "$SIZE_GATE_BEFORE" =~ ^[0-9a-f]{40}$ || "$SIZE_GATE_BEFORE" == 0000000000000000000000000000000000000000 ]]; then
-              echo "ERROR: no pre-push baseline; first import requires a reviewed baseline, never HEAD or skip." >&2
+          zero=0000000000000000000000000000000000000000
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)
+              baseline="$SIZE_GATE_PR_BASE"
+              ;;
+            push)
+              baseline="$SIZE_GATE_BEFORE"
+              if [[ "$baseline" == "$zero" ]]; then
+                if [[ "$GITHUB_REF" == refs/heads/myagenthubs/number1-debt-graph ]]; then
+                  # Maintainer-approved immutable public main snapshot for this
+                  # branch's first push only. Other first imports fail closed.
+                  baseline=16db362c93724d352272972c28d1a09dab470813
+                else
+                  echo "ERROR: first push has no reviewed baseline for this branch." >&2
+                  exit 1
+                fi
+              fi
+              ;;
+            *)
+              echo "ERROR: unsupported event for file size baseline." >&2
               exit 1
-            fi
-            git fetch --no-tags origin "$SIZE_GATE_BEFORE"
-            git rev-parse --verify "${SIZE_GATE_BEFORE}^{commit}"
-            git update-ref refs/remotes/origin/main "$SIZE_GATE_BEFORE"
+              ;;
+          esac
+          if [[ ! "$baseline" =~ ^[0-9a-f]{40}$ || "$baseline" == "$zero" ]]; then
+            echo "ERROR: file size baseline must be a nonzero 40-character commit SHA." >&2
+            exit 1
           fi
-          echo "baseline=$(git rev-parse 'refs/remotes/origin/main^{commit}')" >> "$GITHUB_OUTPUT"
+          # A multi-commit push must use event.before; a PR must use its base SHA.
+          # Never compare against candidate HEAD or a moving origin/main.
+          git fetch --no-tags origin "$baseline"
+          resolved=$(git rev-parse --verify "${baseline}^{commit}")
+          if [[ "$resolved" != "$baseline" ]]; then
+            echo "ERROR: selected baseline is not a commit." >&2
+            exit 1
+          fi
+          git update-ref refs/remotes/origin/main "$baseline"
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
       - name: Check file sizes before candidate execution
         # -I prevents candidate Python modules / sitecustomize from shadowing stdlib.
         run: python3 -I scripts/check_file_size.py
       - name: Test gate regressions
         run: python3 -I scripts/test_file_size_gate.py
+      - name: Test CI baseline selection
+        run: python3 -I docs/number1/tools/test_ci_baseline.py
+      - name: Check number 1 graph
+        run: python3 -I docs/number1/tools/check_graph.py
+      - name: Test number 1 graph validation
+        run: python3 -I docs/number1/tools/test_graph.py
+      - name: Check comment conventions
+        run: python3 -I scripts/check_conventions.py
+      - name: Test comment conventions
+        run: python3 -I scripts/test_check_conventions.py
 
   frontend:
     needs: file-size-gate
@@ -67,7 +102,12 @@ jobs:
         working-directory: .
         run: |
           set -euo pipefail
+          if [[ ! "$SIZE_GATE_BASELINE" =~ ^[0-9a-f]{40}$ || "$SIZE_GATE_BASELINE" == 0000000000000000000000000000000000000000 ]]; then
+            echo "ERROR: invalid pinned file size baseline." >&2
+            exit 1
+          fi
           git fetch --no-tags origin "$SIZE_GATE_BASELINE"
+          git rev-parse --verify "${SIZE_GATE_BASELINE}^{commit}"
           git update-ref refs/remotes/origin/main "$SIZE_GATE_BASELINE"
       - uses: actions/setup-node@v4
         with:
@@ -123,7 +163,12 @@ jobs:
         working-directory: .
         run: |
           set -euo pipefail
+          if [[ ! "$SIZE_GATE_BASELINE" =~ ^[0-9a-f]{40}$ || "$SIZE_GATE_BASELINE" == 0000000000000000000000000000000000000000 ]]; then
+            echo "ERROR: invalid pinned file size baseline." >&2
+            exit 1
+          fi
           git fetch --no-tags origin "$SIZE_GATE_BASELINE"
+          git rev-parse --verify "${SIZE_GATE_BASELINE}^{commit}"
           git update-ref refs/remotes/origin/main "$SIZE_GATE_BASELINE"
       - uses: dtolnay/rust-toolchain@stable
         with:

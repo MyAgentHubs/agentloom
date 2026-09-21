@@ -41,13 +41,15 @@ fn send_entries_call_shared_new_session_reservation_boundary() {
 
 #[test]
 fn lead_step_spawn_closure_releases_db_lock_before_spawning_child() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_step_cmd.rs"
+    ));
     let body = production
         .split("let mut spawn = |prompt: &str, hint: Option<&str>| -> Result<String, String> {")
         .nth(1)
         .unwrap()
-        .split("\n        let (action, decision_card) = lead_step::run_lead_step(")
+        .split("\n    let (action, decision_card) = lead_step::run_lead_step(")
         .next()
         .unwrap();
     assert_spawn_after_lock_released(body, "lead_step 的 spawn 闭包");
@@ -187,7 +189,7 @@ fn finalize_session_trash_body_reacquires_db_lock() {
     );
 }
 
-// ---- P0-2（opus delta 复核·2026-08-11）：两处「guard 在 db 临界区内 drop」重入死锁回归钉子 ----
+// Guard refresh must be attached after database locks are released to prevent reentrant deadlocks.
 //
 // 复用上面 `strip_comments_and_strings` / `extract_fn_body` 这套源码切片基建——运行时单测
 // 测不出「锁持有时长跨越了 guard 的 refresh 触发点」这种时序属性（单线程跑，死锁与不死锁
@@ -351,12 +353,14 @@ fn lead_summarize_resolves_search_creds_with_lock_released() {
 
 #[test]
 fn start_repo_generation_resolves_search_creds_with_lock_released() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/repo_generation.rs"
+    ));
     assert_search_creds_resolved_after_prior_locks(
         production,
-        "\nfn start_repo_generation(",
-        "start_repo_generation",
+        "\npub(super) fn build_generation_command(",
+        "build_generation_command",
     );
 }
 
@@ -384,23 +388,27 @@ fn propose_team_plan_resolves_search_creds_with_lock_released() {
 
 #[test]
 fn lead_step_resolves_search_creds_with_lock_released() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_step_cmd.rs"
+    ));
     assert_search_creds_resolved_after_prior_locks(
         production,
-        "\nasync fn lead_step(",
+        "\npub(crate) fn lead_step_blocking(",
         "lead_step",
     );
 }
 
 #[test]
 fn start_repo_generation_resolves_member_key_with_lock_released() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/repo_generation.rs"
+    ));
     assert_member_key_resolved_after_prior_locks(
         production,
-        "\nfn start_repo_generation(",
-        "start_repo_generation",
+        "\npub(super) fn build_generation_command(",
+        "build_generation_command",
     );
 }
 
@@ -417,9 +425,15 @@ fn propose_team_plan_resolves_member_key_with_lock_released() {
 
 #[test]
 fn lead_step_resolves_member_key_with_lock_released() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    assert_member_key_resolved_after_prior_locks(production, "\nasync fn lead_step(", "lead_step");
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_step_cmd.rs"
+    ));
+    assert_member_key_resolved_after_prior_locks(
+        production,
+        "\npub(crate) fn lead_step_blocking(",
+        "lead_step",
+    );
 }
 
 #[test]
@@ -446,12 +460,14 @@ fn start_continuation_session_resolves_member_key_with_lock_released() {
 
 #[test]
 fn start_repo_generation_keeps_keychain_ipc_out_of_db_lock_scopes() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/repo_generation.rs"
+    ));
     assert_no_keychain_ipc_in_db_lock_scopes(
         production,
-        "\nfn start_repo_generation(",
-        "start_repo_generation",
+        "\npub(super) fn build_generation_command(",
+        "build_generation_command",
     );
 }
 
@@ -468,9 +484,15 @@ fn propose_team_plan_keeps_keychain_ipc_out_of_db_lock_scopes() {
 
 #[test]
 fn lead_step_keeps_keychain_ipc_out_of_db_lock_scopes() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    assert_no_keychain_ipc_in_db_lock_scopes(production, "\nasync fn lead_step(", "lead_step");
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_step_cmd.rs"
+    ));
+    assert_no_keychain_ipc_in_db_lock_scopes(
+        production,
+        "\npub(crate) fn lead_step_blocking(",
+        "lead_step",
+    );
 }
 
 #[test]
@@ -540,19 +562,19 @@ fn reserve_lead_start_after_globalstop_never_attaches_refresh_itself() {
 /// 才能完整覆盖「早退」分支（函数内部的 drop(guard) 此刻压根没有 refresh 句柄，天然安全）。
 #[test]
 fn start_lead_session_attaches_refresh_only_after_reservation_lock_released() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_session/gate.rs"
+    ));
     let stripped = strip_comments_and_strings(production);
-    let label = "start_lead_session";
-    let body = extract_fn_body(&stripped, "\nfn start_lead_session(", label);
-    assert_call_after_lock_released(body, "db.0.lock()", ".with_refresh(", "db.0.lock()", label);
+    let label = "reserve_lead_slot";
+    let body = extract_fn_body(&stripped, "\npub(crate) fn reserve_lead_slot(", label);
+    assert_lock_scope_closed_before_marker(body, "db.0.lock()", ".with_refresh(", label);
 }
 
-/// idlefix-T1 缺口①：`reserve_lead_start_after_globalstop`（经 `reserve_new_session_run`，
-/// lib.rs:2390）把 session_runtime 写成 running(run_id=None)（占槽当时 run_id 还没现场生
-/// 成）；solo 路径在 lib.rs:11058 有回填，lead 起跑路径此前没有——这条测试钉住
-/// `start_lead_session` 函数体必须仿 solo 写法回填 run_id，否则手机端 appRuntimeCore.ts 的
-/// `runId===null` 守卫会把这个会话之后所有 live delta 全部丢弃。
+/// Reservation publishes running state before a run ID exists. Lead startup
+/// must backfill session_runtime.run_id once available so the mobile runtime
+/// does not discard subsequent live deltas because the run ID is still null.
 #[test]
 fn start_lead_session_backfills_session_runtime_run_id() {
     let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
@@ -590,7 +612,7 @@ fn start_continuation_solo_closure_attaches_refresh_only_after_conn_scopes_close
     assert_lock_scope_closed_before_marker(body, ".0.lock()", ".with_refresh(", label);
 }
 
-// ---- 2026-07-29 opus 对抗审：把审计实测出的三组假阴性固化成 helper 自身的单测 ----
+// Test the source-check helpers against false negatives so hidden lock-scope violations are rejected.
 
 /// 假阴性①复现：锁块内的注释含孤立 `}`，且这次 guard **真的**活过了慢活调用（`drop(conn)` 在
 /// `slow_call(` 之后）——不剥注释的旧实现会把注释里的 `}` 当成 block 收尾，提前判定"已释放"，

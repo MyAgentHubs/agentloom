@@ -9,13 +9,13 @@ use std::sync::{atomic::AtomicBool, Arc, Mutex};
 /// 后者对「已取消/已消费的 MCP 卡」会误判成 legacy 卡、回退 lead_step（整支终审 opus Important）。
 pub const MCP_LEAD_DECISION_PREFIX: &str = "mcp-lead";
 
-/// 决策打扰收敛刀 T1：准点路径点击回显消息的 `messages.engine` 标记。
+/// Marks decision-click echoes so context assembly can exclude answers already returned by the tool.
 /// 回显必须可见落库（症状 A 根修）但绝不能被喂回 lead 上下文——答案已经从 ask_user 的
 /// 工具返回值直接给了 lead，这条消息纯粹是给用户看的确认，不是第二次投喂。
 /// `lead_step::build_recent_messages` 认这个 tag 做排除（唯一认知源，见该函数注释）。
 pub const DECISION_ECHO_ENGINE_TAG: &str = "decision-echo";
 
-/// 决策打扰收敛刀 T2：propose_verifier 去确认弹卡·Auto 直跑后，跑完在聊天区留一条可见的
+/// Marks visible verifier results so tool output is not fed back into the lead context twice.
 /// 结果信息卡（`messages.engine` 标记）。verdict/output 已经从工具返回值直接给了 lead，
 /// 这条消息同 DECISION_ECHO_ENGINE_TAG 一样纯粹给用户看，绝不能被喂回 lead 上下文（重复投喂）。
 /// `lead_step::build_recent_messages` 同样认这个 tag 做排除。
@@ -32,7 +32,7 @@ pub struct AskUserArgs {
 #[derive(Debug)]
 pub struct ProposeVerifierArgs {
     pub cmd: String,
-    /// T2：Auto 直跑后不再用于确认卡文案，但仍是 MCP 工具入参契约的一部分（lead 传了就收）——
+    /// Keep this accepted MCP argument for schema compatibility even though automatic execution does not use it.
     /// 保留字段只是不读，不改对外 schema。
     #[allow(dead_code)]
     pub rationale: Option<String>,
@@ -55,7 +55,7 @@ fn validate_propose_verifier_args(args: &ProposeVerifierArgs) -> Result<(), Stri
     Ok(())
 }
 
-/// 决策打扰收敛刀 T2 改款（fold-default）：propose_verifier 跑完后落进聊天区的可见结果
+/// Keep the visible verifier result concise; the full command belongs in the expandable tool card.
 /// 信息卡——短摘要行（双语），配合折叠默认命令卡展示；完整命令收进卡片可展开区
 /// （见 `verifier_result_block`），不再把长命令原样平铺进正文。
 fn verifier_result_summary_text(locale: crate::Locale, verdict: &str) -> String {
@@ -71,7 +71,7 @@ fn verifier_result_summary_text(locale: crate::Locale, verdict: &str) -> String 
 
 /// 纯函数：把一次 propose_verifier 结果组装成折叠默认的命令卡块（`Block::Tool`）。
 /// 抽成纯函数是为了不依赖 `tauri::AppHandle` 就能单测（本仓无 AppHandle 测试基础设施，
-/// 同 T2/T4 一带注释）。工具名固定 `"verifier"`（跨刀协调已定：前端配套按这个名字识别，
+/// Use the fixed tool name `"verifier"` because the frontend relies on it to recognize these cards.
 /// 别改名）。summary 走双语短摘要；完整命令放进 `output`（可展开区）；verdict "passed"/
 /// "failed" 映射到 `BlockToolStatus::Ok`/`Failed`；exit_code 原样透传。
 fn verifier_result_block(
@@ -143,7 +143,7 @@ pub struct LeadCtx {
 /// 派单幂等键 P1：单条指纹账目状态。`Running` = 仍在跑（含超时后返回、后台续跑的分支）；
 /// `Finished` = 已成功跑完终态——原文重派仍拒（`already_dispatched_and_finished`），这正是
 /// 假超时雪崩里「迟到重复单落在 worker 跑完之后」的防线本体。
-/// 2026-07-25 opus 对抗审收尾·P1 语义修正：失败（含 panic）不进 `Finished`——见
+/// Failures, including panics, must not enter `Finished`; removing their entries permits unchanged retries.
 /// `LedgerFinishGuard`，失败/panic 直接把账本条目整条移除，放行原文重试（重试失败任务是
 /// 正常动作，不该逼 agent 改写 task 文本才能重派）。因此 `Finished` 这个变体在本设计下
 /// 天然只代表成功，不需要额外挂 `{ ok: bool }` payload。
@@ -245,8 +245,8 @@ pub struct DispatchArgs {
 }
 
 /// 单个 pool 成员的人类可读展示——dispatch_worker 工具 description / lead 上下文花名册
-/// 小节共用同一份格式（同一份认知·别造两种写法·新项 A·2026-07-09）。
-/// **不要**把这份格式用在 agent_hint 报错文案里——2026-07-25 P1 修：报错让模型「choose
+/// Share one display format between the tool description and the context roster to keep them consistent.
+/// Do not use display labels as error candidates: copying a label cannot satisfy exact hint matching.
 /// one」时若给的是这个全角格式，模型照抄整串回填必然再次不匹配（`pool_hint_matches`
 /// 全等比较）；报错候选表用 `agent_hint_candidates`（裸 agent_id，可直接粘贴）。
 fn format_pool_member(m: &PoolMember) -> String {
@@ -270,7 +270,7 @@ fn agent_hint_candidates(pool: &[PoolMember]) -> String {
 }
 
 /// dispatch_worker 工具的 description 文案：把当前启用成员花名册直接拼进去，
-/// 让 lead 不必先派错一次（撞上 agent_hint 不匹配）才看见谁在池子里（新项 A·2026-07-09）。
+/// Expose available members up front so the lead need not discover the pool through a failed dispatch.
 pub fn dispatch_worker_description(pool: &[PoolMember]) -> String {
     const BASE: &str = "Dispatch a worker to perform a task and return the worker's result. Parameters: task(string, required), agent_hint(string, optional), goal_title(string, optional)=a short, few-word title for this run's overall goal (shown in the top bar; pass the same one with every dispatch). Workers are stateless and cannot see your thinking, drafts, or the conversation history — the task text you pass is ALL they get. When dispatching verification or refinement of something you already drafted, include the full draft and acceptance criteria in the task text";
     if pool.is_empty() {
@@ -286,13 +286,13 @@ pub fn dispatch_worker_description(pool: &[PoolMember]) -> String {
     s
 }
 
-/// 给 lead 上下文 prompt 的 AGENTLOOM-DATA fence 内用的花名册行（新项 A·2026-07-09·opus 审
+/// Place roster rows inside the AGENTLOOM-DATA fence to contain editable names and preserve footer placement.
 /// 折入：进 fence 数据区、不追加在 prompt 末尾——保证语言提醒 + case-card upkeep nudge 这两条
 /// 「必须压末尾」的杠杆原样收尾；name 是用户可编辑字段·进 fence 后注入面同步收敛）。
 /// 与 dispatch_worker 工具 description 共用 pool_summary 的同一份格式认知。
 /// pool 为空时也要明确渲染「空」这一行，不能整节省略：lead 会话是续聊（resume），
 /// 若首轮花名册（如含 GLM）已留在对话历史里，之后用户把成员全关、新一轮 prompt 里
-/// 这节若直接消失，lead 会依旧信旧历史答「还是只有 GLM 一个」——GUI 实测复现（2026-07-09）。
+/// Omitting the empty roster would let stale conversation history misrepresent the currently available members.
 /// 空池分支措辞与 dispatch_worker_description 的空池分支保持同一份认知。
 pub fn member_roster_prompt_section(pool: &[PoolMember], locale: crate::Locale) -> String {
     if pool.is_empty() {
@@ -329,7 +329,7 @@ fn extract_hint_id_candidate(raw: &str) -> String {
     s.trim().to_string()
 }
 
-/// 2026-07-25 P1 修·宽松匹配：先按原有逻辑做精确匹配（agent_id/name/provider 全等，
+/// Try exact agent_id, name, or provider matches before considering a uniquely matching identifier prefix.
 /// 外加剥壳后的 `extract_hint_id_candidate` 也算一次精确匹配——救回「模型照抄了展示格式」
 /// 这种输入）；精确匹配全落空再退化到 agent_id 前缀匹配，且要求唯一命中（多命中留给
 /// 上层报 ambiguous，不在这里替模型瞎猜）。
@@ -376,7 +376,7 @@ fn json_value_type_name(v: &serde_json::Value) -> &'static str {
     }
 }
 
-/// 2026-07-25 P1 修·改动二·③：`args.get("agent_hint").and_then(|v| v.as_str())` 会把数组/
+/// Reject non-string hints explicitly; `as_str()` alone would silently treat arrays and objects as absent.
 /// 对象型 agent_hint 静默变 None——上层误报「requires agent_hint」，模型摸不着头脑。这里
 /// 明确区分「没传/传了 null」（= None，正常）与「传了但不是字符串」（= 诚实报错，带上
 /// 实际 JSON 类型）。lib.rs 的 dispatch_worker 工具 handler 调这个函数代替原来内联的
@@ -392,7 +392,7 @@ pub fn parse_agent_hint_arg(args: &serde_json::Value) -> Result<Option<String>, 
     }
 }
 
-/// 2026-07-25 P1 修·改动二·④：dispatch_worker 工具注册的 input_schema——pool 里有多于一个
+/// Require an agent_hint from the current pool when multiple members are available to prevent ambiguous dispatch.
 /// 成员时 agent_hint 进 `required` 并收窄成当前池子合法 agent_id 的 `enum`（给模型硬约束，
 /// 不必等运行时报错才发现漏传/传错）；pool==1 时维持可选（唯一成员可省略，见
 /// `dispatch_worker_description`）。lib.rs 的工具注册处调这个函数代替原来内联的 schema 字面量。
@@ -522,7 +522,7 @@ fn dispatch_worker_inner(
             }
         }
 
-        // T2 防重派闸（造 assignment 之前）：同 session 已有存活 worker（含上一次派单超时后
+        // Reject a second dispatch while this session has a live worker, including one still running after a timeout.
         // 仍在后台跑的）就拒绝二次派单——否则两个 worker 会在同一 in-place 工作树并发写文件。
         // 只挡「同 session 并发第二个 dispatch」，worker 结束后 intent/member 槽自然释放·
         // 不影响正常下一次派单。
@@ -561,7 +561,7 @@ fn dispatch_worker_inner(
     };
     let assignment_id = member_input.assignment_id.clone();
 
-    // T1 有界等待：worker 跑在后台线程；主 handler 至多等 DISPATCH_WORKER_WAIT。
+    // Bound handler latency by DISPATCH_WORKER_WAIT while the worker continues on its background thread.
     // 等到 → 旧三键 {worker_final_text, changed_files, status} 不变，追加
     // {assignment_id, member_name, agent_id, sub}；
     // 超时 → 立即返回 running_in_background（后台线程继续跑·member 终态事件/落库路径不依赖本应答）。
@@ -650,13 +650,13 @@ pub fn finish(ctx: &LeadCtx, _args: FinishArgs) -> Result<serde_json::Value, Str
 /// 才可能产生 Pending；`wait: None`——旧的无界等待——恒不返回 Pending，只会 Answered 或 Err）。
 enum PromptOutcome {
     /// (答案, decision_id)——decision_id 供 `ask_user_bounded` 的准点回显给
-    /// `decision_echo:<decision_id>` 拼稳定 dedup_key（msgfix1 T5·缺口③；msgfix1 T7 B4
+    /// Use `decision_echo:<decision_id>` as a stable deduplication key so replaying an answer cannot duplicate its echo.
     /// 把分隔符从 `|` 改 `:`——见 `append_decision_card_message` doc）。
     Answered(String, String),
     Pending,
 }
 
-/// msgfix1 T5（缺口③·决策卡承载）：`prompt_user` 落决策卡消息的纯 DB 内核（同
+/// Keep decision-card persistence in a pure database helper so it can be tested without an AppHandle.
 /// `append_decision_echo_message`/`append_verifier_result_echo` 一样拆成纯 `&Connection`
 /// 函数，不依赖 `AppHandle`——本仓无 AppHandle 测试基础设施，拆出来才能单测）。
 /// 改走 append_message_dedup + 统一 publish 链路——旧版 `append_message` 从不发布
@@ -665,7 +665,7 @@ enum PromptOutcome {
 /// decision_id 在本次 prompt_user 调用内全程稳定（函数顶部生成一次、贯穿 CAS/echo），同一
 /// 决策事件重放得同一个 key；与另一决策事件（新 decision_id）天然不冲突。
 ///
-/// msgfix1 T7 B4（opus 整盘审 P2-12）：分隔符用 `:` 不用 `|`——`derive_msg_completed_client_msg_id`
+/// Use `:` rather than `|` inside deduplication keys to preserve the field boundaries used to derive client message IDs.
 /// 把这个 dedup_key 整段拼进 `msg.completed|{session_id}|{dedup_key}` 再派生 client_msg_id，
 /// `|` 本身就是那个外层拼接的字段分隔符；若 dedup_key 内部也含 `|`，理论上能构造出两个不同
 /// `(session_id, dedup_key)` 拼出同一个中间字符串（字段边界错位），派生出同一个 client_msg_id
@@ -696,8 +696,8 @@ fn append_decision_card_message(
 /// 校验 → 插决策卡到 DB → emit 前端事件 → 等答案（`wait` 决定有界/无界）→ 落卡态 → 返答案。
 ///
 /// `wait: None` = 旧行为·除非 session 停了否则一直等（propose_verifier / 内部复用的旧版
-/// ask_user 走这条路·T1 明确不改它们的行为）。
-/// `wait: Some(d)` = 决策打扰收敛刀 T1 的有界等待：顶到 `d` 仍未收到答案就体面返回
+/// Internal ask_user callers retain this unbounded wait so confirmation remains blocking.
+/// `wait: Some(d)` bounds the wait and returns a pending outcome when no answer arrives by the deadline.
 /// PromptOutcome::Pending，不再阻塞 handler（只有 `ask_user_bounded` 走这条路）。
 #[allow(clippy::too_many_arguments)]
 fn prompt_user(
@@ -746,7 +746,7 @@ fn prompt_user(
 
         let mut card_milestone = None;
         if let Some(b) = &card {
-            // 决策打扰收敛刀 T4：决策卡带上 lead 身份快照——旧版落库 agent_id/name 恒 None，
+            // Snapshot the lead identity on the decision card so live and restored author labels remain meaningful.
             // 导致前端作者行显「Lead·Lead」（live）或重启后回退成内部 tag「agent-team」（persisted）。
             card_milestone = append_decision_card_message(
                 &conn,
@@ -795,7 +795,7 @@ fn prompt_user(
         wait,
     )? {
         crate::WaitOutcome::Answered(opt) => {
-            // msgfix1 T5（缺口④）：CAS 赢家分支改走 `update_decision_card_status_message_id`
+            // The winning compare-and-swap must obtain the updated message ID so its new revision can be republished.
             // ——除了原有的 changed bool，还拿到被改写的 message_id，供下面重读该消息、以新
             // revision 重发 msg.completed（旧 API 只返回 bool，够不到 message_id）。
             let (changed, republish) = {
@@ -844,16 +844,16 @@ fn prompt_user(
     }
 }
 
-/// 决策打扰收敛刀 T1：`prompt_user` 无界等待时绝不应产出 Pending（wait=None 时 wait_for_answer
+/// An unbounded `prompt_user` call must never return Pending because its answer wait cannot time out.
 /// 恒不超时）；出现即视为内部不变量破裂，诚实报错而不是静默吞掉或 panic。
 fn unbounded_prompt_never_pending() -> String {
     "prompt_user: unexpected Pending outcome for an unbounded (wait=None) call".to_string()
 }
 
 /// 旧行为·内部复用点专用（仅剩 commit 提交前预览确认）：无界等待，恒返回
-/// {"answer": ...}。solo 交付确认已按 2026-07-31 单A 用户拍板切到 `ask_user_bounded`；
+/// Return {"answer": ...}; solo delivery confirmation uses `ask_user_bounded` to avoid an unbounded wait.
 /// commit 预览仍继续无界阻塞，不产生 pending_user。
-/// `agent_id`/`agent_name`：决策打扰收敛刀 T4 新增·调用方若知道当下身份（lead/solo agent）
+/// Accept `agent_id`/`agent_name` when the caller knows the active identity so the card can retain a snapshot.
 /// 就传进来落进决策卡快照；commit 预览确认暂无自然身份来源，传 None 即维持旧行为
 /// （前端兜底链兜住，见 lead_tools.rs 顶部 DECISION_ECHO_ENGINE_TAG 一带注释）。
 pub fn ask_user(
@@ -880,7 +880,7 @@ pub fn ask_user(
     }
 }
 
-/// 决策打扰收敛刀 T1：真正暴露给 lead 的 `ask_user` MCP 工具用这个——240 秒有界等待
+/// Bound the lead-facing ask_user tool to a 240-second wait so an unanswered decision does not stall the handler.
 /// （`lead_tools::DISPATCH_WORKER_WAIT`，镜像 bug2 止血刀验证过的 dispatch_worker 有界等待模式）。
 /// 窗口内答了 → {"answer": <选项>}（并在聊天区落一条可见回显·见 DECISION_ECHO_ENGINE_TAG 注释，
 /// 这条回显绝不喂回 lead 上下文——答案已经从这次工具返回值直接给了 lead）。
@@ -926,14 +926,14 @@ pub fn ask_user_bounded(
     }
 }
 
-/// 决策打扰收敛刀 T1·症状 A 根修：准点路径的点击回显——用户点击后必须在聊天区留下可见
+/// Persist a visible click echo so choosing an answer still leaves feedback after the decision card disappears.
 /// 痕迹（原来 DecisionCard 一进 chosen 态整条从 UI 消失，前端 leadTurns.ts 把 chosen 卡从
 /// 分组里过滤掉、整个 run turn 判空后连消息都不渲染，等于点击石沉大海）。
 /// engine=DECISION_ECHO_ENGINE_TAG 是唯一的排除标记：`lead_step::build_recent_messages`
 /// 认这个 tag 跳过——这条消息只为用户可见，绝不二次喂给 lead（答案已经从工具返回值给过它了）。
 /// best-effort：写失败不影响已经成功的 ask_user 调用本身（用户拿到的答案已经落库/送达）。
 ///
-/// 决策打扰收敛刀 T1·症状 B 根修：写库成功后必须 emit `"lead-message-appended"`，供前端
+/// Emit `"lead-message-appended"` after persistence so the frontend shows the echo without reopening the session.
 /// 在停留当前进程时即时把这条回显插进消息流——原来这条消息只在下次打开会话 `get_messages`
 /// 全量拉取时才会出现，当场点击后连"石沉大海"式的静默感都没有可见反馈。payload 形状故意
 /// 与 `get_messages` 单条消息完全一致（完整 `db::Message`，含 id），前端按 `(session_id,
@@ -979,10 +979,10 @@ fn append_decision_echo(
 /// `append_decision_echo` 的纯 DB 内核：落一条回显消息，成功则读回刚插入的完整
 /// `db::Message`（供调用方 emit）。写失败（含读回失败）返回 `None`——best-effort 语义不变，
 /// 不影响已经成功的 ask_user 调用本身。
-/// msgfix1 T5（缺口③·决策回显）：改走 append_message_dedup + 统一 publish 链路——旧版
+/// Use append_message_dedup and the shared publish path so decision echoes also reach mobile clients.
 /// append_message 从不发布 msg.completed，这条回显对手机端不可见。dedup_key =
 /// `decision_echo:<decision_id>`：decision_id 在本次 prompt_user 调用内全程稳定（函数顶部
-/// 生成一次），同一决策事件重放得同一个 key，不同决策事件天然不冲突。msgfix1 T7 B4：分隔符
+/// Generate the key once per decision: replays share it, while distinct decisions remain independent.
 /// 用 `:` 不用 `|`——理由见 `append_decision_card_message` doc。
 fn append_decision_echo_message(
     conn: &rusqlite::Connection,
@@ -1020,13 +1020,13 @@ fn clip_chars(s: &str, max: usize) -> String {
     out
 }
 
-/// 决策打扰收敛刀 T2：propose_verifier 跑完后的可见结果信息卡——同 append_decision_echo
+/// Persist a visible verifier result using the same echo pattern so the result remains visible in chat.
 /// 一样落一条纯用户可见消息（engine=VERIFIER_RESULT_ENGINE_TAG，lead_step 认这个 tag 排除，
 /// 不二次投喂——verdict/output 已经从工具返回值直接给了 lead）。fold-default 改款：落库块
 /// 从 `Block::Text` 换成折叠默认的命令卡（`Block::Tool`，见 `verifier_result_block`），别再
 /// 把长命令原样平铺进正文。best-effort：写失败不影响已经成功跑完的验证结果本身（lead 已经
 /// 拿到 verdict）。
-/// msgfix1 T5（缺口③·验证回执）：改走 append_message_dedup + 统一 publish 链路——旧版
+/// Use append_message_dedup and the shared publish path so verifier result cards also reach mobile clients.
 /// append_message 从不发布 msg.completed，这条验证结果卡对手机端不可见。dedup_key 复用
 /// `verifier_result_block` 自己生成的块 id（`Block::Tool.id`，`format!("verifier-{}",
 /// crate::new_run_id())`）——同一次 propose_verifier 调用只构造这一个块、只落这一条消息，
@@ -1063,7 +1063,7 @@ fn append_verifier_result_echo(
 /// 块、只落这一条消息，块 id 与消息 dedup_key 一一对应；不像 decision_id/command_id 那样有
 /// 天然的、跨越更大生命周期的业务标识可复用（propose_verifier 没有 assignment_id/run_id
 /// 入参），沿用块自身已经生成的一次性 id 是最小改动、且不会与其他 propose_verifier 调用碰撞。
-/// msgfix1 T7 B4：分隔符用 `:` 不用 `|`——理由见 `append_decision_card_message` doc。
+/// Use `:` rather than `|` in the key to avoid collisions in the enclosing client-message identifier fields.
 fn append_verifier_result_message(
     conn: &rusqlite::Connection,
     session_id: &str,
@@ -1087,7 +1087,7 @@ fn append_verifier_result_message(
     )
 }
 
-/// 决策打扰收敛刀 T2：propose_verifier 去确认弹卡·改 Auto 直跑——这版本本来就是 Auto
+/// Run propose_verifier directly under the automatic permission policy while retaining verifier safety boundaries.
 /// 默认（composer 上「Permission: Auto」静态 pill 描述的正是这个行为），不造开关/存储、
 /// 不问用户，直接执行。安全边界一行不动：断网 seatbelt 沙箱、跑前后内容级核账、动树即
 /// failed 诚实回显、会话集成锁、非 macOS fail-closed——全在 `run_verifier_in_place` 内部

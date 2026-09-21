@@ -94,14 +94,14 @@ fn project_first_migration_renames_color_to_icon_and_clears_hex() {
     assert_eq!(emoji.as_deref(), Some("📕"));
 }
 
-/// R-B2 项 1（隔离刀返工二·祖父条款）迁移测试：模拟老 DB（本列刚加时那一刻）——
-/// 迁移前已存在的 local-default 会话必须回填 `workspace_scope='root'`；同一时刻已存在的
-/// 非 local-default 会话不受祖父条款影响，留 NULL；迁移**之后**新建的 local-default 会话
-/// 必须留 NULL（走新行为 · per-session 子目录）；再跑一次 `init_schema`（列已存在）必须
-/// 是纯 no-op，不得把刚建的正常新会话误判成祖父、回填成 root。
-/// R-B3 项 3（Minor-2·迁移原子性）确认：加列 + 回填现已包进 `unchecked_transaction`——
-/// 事务只改变「中途崩溃是否留半吊子状态」这一失败路径，不改变成功路径的可观察结果，所以
-/// 本测试原有的「加列→回填→幂等复跑」断言链本身就是事务化后行为的回归覆盖，未新增用例。
+/// Simulate an old database when workspace_scope is first added: preexisting local-default sessions
+/// must be backfilled to `workspace_scope='root'`. Preexisting non-local-default sessions are exempt
+/// from this grandfather rule and stay NULL. New local-default sessions created after migration must
+/// stay NULL to use per-session subdirectories. Rerunning `init_schema` with the column already present
+/// must be a pure no-op, never misclassifying a newly created normal session as grandfathered and backfilling root.
+/// Adding the column and backfilling are wrapped in `unchecked_transaction` to prevent half-done state after a crash.
+/// The transaction changes crash behavior only, leaving the observable success path unchanged; the existing
+/// add-column -> backfill -> idempotent-rerun assertions therefore cover the transactional behavior without a new case.
 #[test]
 fn workspace_scope_migration_backfills_only_sessions_that_predate_the_column() {
     let c = mem();

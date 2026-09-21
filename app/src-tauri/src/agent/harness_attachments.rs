@@ -1,6 +1,6 @@
 //! myagent（harness backend）起进程时要传给引擎的图片附件与只读附件目录。
 //!
-//! 附件来源走 prompt 文本回退路径（见 T3 brief）：只认 app 自己写进 prompt 里的
+//! Attachment discovery falls back to scanning prompt text: it only recognizes an app-written
 //! 粘贴图片 markdown 引用 `![alt](<path>)` / `![alt](path)`，且 path 必须落在允许的
 //! 附件根目录下、扩展名属于图片白名单，按出现顺序返回，供 `--image` 参数使用。附件根目录
 //! 有两个——会话工作区 `<wt>/.agentloom/attachments/`（新会话落这）+ 旧版

@@ -1,0 +1,36 @@
+[
+  {
+    "id": "L2B6",
+    "file": "patches/L2B6.patch",
+    "sha256": "2e53b34935e1ecd55e02e070961ff08fedc2d67cc9a961707e1eaa65742cd819",
+    "source_commit": "47d38bd3202b632db77085ab1261520d5c58d238",
+    "status": "needs_independent_review",
+    "files": [
+      "app/src-tauri/src/lib.rs",
+      "app/src-tauri/src/lib/lead_session.rs",
+      "app/src-tauri/src/lib/lead_session/runner_thread.rs",
+      "app/src-tauri/src/lib/lead_session/stream_closeout.rs",
+      "app/src-tauri/src/lib/tests/delivery_order.rs",
+      "app/src-tauri/src/lib/tests/lead_terminal.rs",
+      "app/src-tauri/src/lib/tests/resume_pending.rs",
+      "app/src-tauri/src/lib/tests/run_closeout.rs",
+      "app/src-tauri/tests/clippy_allow_ratchet.rs"
+    ]
+  },
+  {
+    "id": "C1",
+    "file": "patches/C1.patch",
+    "sha256": "ac53d722d199d51dab01f27183bcedd5b80581e82e73516fd5653409b87ecc38",
+    "source_commit": "c4e0e36fa605480a21c5e689f18dd649e92419f8",
+    "status": "reviewed_needs_apply_and_verify",
+    "files": [
+      "harness-agent/src/plan/contract.rs",
+      "harness-agent/src/plan/contract/tests.rs",
+      "harness-agent/src/plan/replan.rs",
+      "harness-agent/src/plan/replan/tests.rs",
+      "harness-agent/src/plan/write_audit.rs",
+      "harness-agent/src/plan/write_audit/tests.rs",
+      "harness-agent/tests/file_size_ratchet.rs"
+    ]
+  }
+]

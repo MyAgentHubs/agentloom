@@ -291,11 +291,14 @@ fn finalizer_owner_wait_auth_retry_cleanup_is_bounded_once_for_handoff_failures(
     assert!(helper.contains("finalizer_owner_wait("));
     assert!(helper.contains("Instant::now() + FINALIZER_OWNER_WAIT_TIMEOUT"));
 
-    let solo = source
-        .split("fn spawn_and_stream(")
-        .nth(1)
-        .and_then(|tail| tail.split("\n#[tauri::command]").next())
-        .expect("spawn_and_stream source slice");
+    let solo = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/solo_stream.rs"
+    ))
+    .split("fn retry_auth(")
+    .nth(1)
+    .and_then(|tail| tail.split("\nfn emit_codex_images(").next())
+    .expect("spawn_and_stream source slice");
     assert_eq!(
         solo.matches("wait_for_child_cleanup_bounded(&mut retry_child, retry_pid)")
             .count(),
@@ -338,11 +341,14 @@ fn finalizer_owner_wait_repairs_poisoned_running_slot_before_closeout() {
         })
     ));
 
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/solo_stream.rs"
+    ));
     let solo = source
-        .split("fn spawn_and_stream(")
+        .split("fn wait_for_attempt(")
         .nth(1)
-        .and_then(|tail| tail.split("\n#[tauri::command]").next())
+        .and_then(|tail| tail.split("\nfn record_attempt_errors(").next())
         .expect("spawn_and_stream source slice");
     let transition = solo
         .find("transition_stdout_closed_to_finalizing(&running_t, &session_id)")
@@ -504,11 +510,14 @@ fn finalizer_owner_wait_completed_event_is_wired_into_closeout_success() {
 
 #[test]
 fn finalizer_owner_wait_production_passes_pending_completed_to_closeout() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/solo_stream.rs"
+    ));
     let solo = source
-        .split("fn spawn_and_stream(")
+        .split("fn wait_for_attempt(")
         .nth(1)
-        .and_then(|tail| tail.split("\n#[tauri::command]").next())
+        .and_then(|tail| tail.split("\nfn record_attempt_errors(").next())
         .expect("spawn_and_stream source slice");
     let closeout_call = solo
         .split("prepare_finalizer_closeout(")
@@ -531,11 +540,14 @@ fn finalizer_owner_wait_stderr_timeout_keeps_full_bounded_tail() {
         "one\ntwo\nthree\nfour\nfive"
     );
 
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/solo_stream.rs"
+    ));
     let solo = source
-        .split("fn spawn_and_stream(")
+        .split("fn wait_for_attempt(")
         .nth(1)
-        .and_then(|rest| rest.split("\n#[tauri::command]").next())
+        .and_then(|rest| rest.split("\nfn record_attempt_errors(").next())
         .expect("spawn_and_stream source slice");
     assert!(solo.contains("finalizer_stderr_tail_after_owner_wait(outcome, &stderr_live_tail)"));
 }

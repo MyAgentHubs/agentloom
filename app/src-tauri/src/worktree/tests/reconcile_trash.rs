@@ -270,7 +270,8 @@ fn release_keeps_branch_and_reattach_rebuilds() {
         "🔴 归档应留会话分支"
     );
 
-    // 取消归档重建(re-attach·T1)·内容完整
+    // Reattaching an archived session must rebuild its worktree from the preserved
+    // branch without resetting the branch or losing committed content.
     let wt2 = ensure_worktree_in(&default_root(), &repo, "ar1").unwrap();
     assert!(
         wt2.join("a.txt").exists(),

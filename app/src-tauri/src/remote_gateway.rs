@@ -21,6 +21,10 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Error as WebSocketError, Message};
 use zeroize::Zeroizing;
 
+mod command_envelope;
+mod connection_request;
+mod msg_fetch;
+
 /// 官方公共中继。relay 地址留空时的缺省值；用户填自建 wss:// 地址可覆盖。
 pub(crate) const DEFAULT_PUBLIC_RELAY_URL: &str = "wss://agentloom.myagenthubs.com";
 
@@ -33,7 +37,6 @@ pub(crate) fn effective_relay_url(raw: Option<String>) -> Option<String> {
         _ => Some(DEFAULT_PUBLIC_RELAY_URL.to_owned()),
     }
 }
-
 const SETTINGS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_millis(500);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -113,15 +116,15 @@ const HISTORY_PAGE_MAX_ROWS: usize = 50;
 /// 收敛丢块后插在 blocks 最前的截断提示——复用 `db::Block::Text` 既有形状，不加新字段。
 /// 缺口②：文案带被淘汰块数（"(N 块折叠)"），拼接见 `snapshot_truncated_notice_text`。
 const SNAPSHOT_TRUNCATED_NOTICE: &str = "（快照已截断，仅含最近内容）";
-/// msgfix1 T3（设计稿 §A）：超预算 `msg.completed`/history row 降级为 preview 时，text 块保留
+/// Limit the retained text prefix in oversized `msg.completed` and history previews using UTF-8 bytes, consistent with content-reference byte counts.
 /// 的首段字节数——与 content_ref 的 `total_bytes` 同口径按 UTF-8 字节数量，不是字符数。
 const OVERSIZED_PREVIEW_TEXT_HEAD_BYTES: usize = 512;
-/// msgfix1 T3（设计稿 §A）：preview 截断提示，追加在保留的首段文本之后（与
+/// Append the preview truncation notice after the retained text prefix, matching the canonical fixture referenced below.
 /// `remote-relay/fixtures/data-plane-v1.json` 里 `msg_completed_with_content_ref`
-/// 样张的 `blocks[0].text` 尾部逐字节一致——msgfix1 T7 B5：pending 版已随 T6 合入正式文件并
+/// The suffix must match the fixture sample at `blocks[0].text` byte for byte to keep preview text consistent with the canonical fixture.
 /// 删除，改指正式文件）。
 const OVERSIZED_PREVIEW_TRUNCATION_NOTICE: &str = "内容较长，已截断——点击加载全文查看完整报告。";
-/// msgfix1 T3：`build_msg_completed_payload` 把预计算好的 content_ref 临时挂在这个私有键下；
+/// `build_msg_completed_payload` stages a precomputed content reference under this private key, which must be removed before measurement or transmission.
 /// `enqueue_milestone_item` 在测量/发送前必须无条件 `remove` 掉——不管消息最终是否超预算，这
 /// 个键都绝不能流到 wire（非超预算消息本就不该带 `content_ref`，§10.6「可选字段」）。之所以
 /// 不直接把 content_ref 摆进 payload 顶层：`content_ref` 只有在真正降级为 preview 时才附加，
@@ -150,7 +153,7 @@ const CLIENT_MSG_ID_NAMESPACE: uuid::Uuid =
 /// M0 §10.9：`msg.fetch` 目标消息 `total_bytes` 上限——超过直接回 `too_large`，不进入分片流程。
 const MSG_FETCH_TOTAL_BYTES_LIMIT: usize = 4 * 1024 * 1024;
 
-/// msgfix1 T4（M0 §10.8，机制钉死·数值由本刀生成式测量定）：`msg.chunk` 每片裸内容字节数
+/// Raw content bytes per `msg.chunk`, sized using measured worst-case encrypted wire frames to retain margin below the relay limit.
 /// （切片前的原始字节，不是 base64 后的长度）。
 ///
 /// **测量方法**（见 `tests::msg_chunk_raw_bytes_worst_case_wire_frame_stays_under_relay_limit_
@@ -175,7 +178,7 @@ const MSG_FETCH_TOTAL_BYTES_LIMIT: usize = 4 * 1024 * 1024;
 /// `REPLY_QUEUE_CAPACITY` 的关系见该常量文档。
 const CHUNK_RAW_BYTES: usize = 24 * 1024;
 
-/// msgfix1 T4：`reply` 独立有界队列容量（M0 §10.9「满→回 busy 终态、不静默」）。单飞行闸
+/// Bound reply queue capacity; saturation returns a terminal busy error when possible rather than silently discarding the fetch.
 /// （`msg_fetch_inflight`，见 `GatewayInnerState` doc）保证同一时刻只有一个 session 的 chunk
 /// 序列在往这条队列里塞；一次满额 4MiB fetch 按 `CHUNK_RAW_BYTES`（24KiB）切片产生
 /// ⌈4194304/24576⌉=171 片。容量取 256——覆盖单次满额 fetch 的全部分片并留约 50% 冗余（应对
@@ -184,7 +187,7 @@ const CHUNK_RAW_BYTES: usize = 24 * 1024;
 /// 并发预留更多（单飞行闸已经排除了并发）。
 const REPLY_QUEUE_CAPACITY: usize = 256;
 
-/// msgfix1 T4（M0 §10.9 单飞行 + 超时释放）：一次 `msg.fetch` 在途最长存活时间——超过后单飞行
+/// Maximum in-flight lifetime of a `msg.fetch`; expiry releases the session slot so a stalled fetch cannot block later requests indefinitely.
 /// 闸判定该占用已释放，允许同 session 的新请求进来（"超时即终止该次拉取并释放占用"）。量级
 /// 推导：一次满额 4MiB fetch（171 片）按 `MAX_DRAIN_ITEMS_PER_ROUND`（64 片/轮）需要 ≥3 轮
 /// `drain_reply_queue`，每轮最迟卡在 `READ_TIMEOUT`（500ms，读循环没有新帧到达时的最长阻塞）
@@ -192,7 +195,7 @@ const REPLY_QUEUE_CAPACITY: usize = 256;
 /// 以上的余量给真实网络往返/relay 排队，同时不会让一个真正卡死的连接把单飞行槽位锁死太久。
 const MSG_FETCH_INFLIGHT_TIMEOUT_MS: u64 = 30_000;
 
-/// msgfix1 T4（M0 §10.9 滥用闸，桌面侧独立第二层）；msgfix1 T7 B1（opus 整盘审 P1-2
+/// Independent desktop abuse guard aggregates fetch bytes across the gateway so concurrent sessions cannot multiply the connection budget.
 /// 后半）改口径：**gateway 全局聚合**的 60 秒滑动窗口字节预算，不再按 session 分桶——relay
 /// 自己在 §9.8/§10.3 是 per-subject（单连接维度）字节计费，桌面若仍按 session 分桶，同一部
 /// 桌面下的多个 session 各自领一份 8MiB/60s，叠加起来能远超 relay 那边单连接 16MiB 的固定窗
@@ -207,7 +210,7 @@ const MSG_FETCH_INFLIGHT_TIMEOUT_MS: u64 = 30_000;
 const MSG_FETCH_BYTE_BUDGET_PER_WINDOW: u64 = 8 * 1024 * 1024;
 const MSG_FETCH_BYTE_BUDGET_WINDOW_MS: u64 = 60_000;
 
-/// msgfix1 T4 返修②（skeptic 补审）：`msg_fetch_command_ledger` 的容量——见
+/// Bound `msg_fetch_command_ledger` memory usage while retaining recent command identities; see
 /// `MsgFetchCommandLedger` doc。量级：单飞行闸决定同一 session 任意时刻至多 1 条在途 fetch，
 /// 一次典型会话在 `MSG_FETCH_INFLIGHT_TIMEOUT_MS`（30s）的时间尺度上不太可能提交远超几十个
 /// 不同 command_id 的 fetch 请求；512 覆盖全部当前活跃 session 的正常换页/重试流量并留出充足
@@ -239,7 +242,7 @@ pub(crate) type SessionIndexSnapshotProvider =
 /// background thread, short DB read only, returns `None` on failure without panicking.
 pub(crate) type MilestoneReplayProvider =
     Box<dyn Fn() -> Option<Vec<crate::db::MilestoneReplayRow>> + Send + Sync>;
-/// idlefix-T1 缺口②：连接后补发批用——短锁 DB 读取全部（未软删会话的）`session_runtime`
+/// Read current `session_runtime` rows for all sessions not soft-deleted under a short DB lock for replay after connection.
 /// 现状行，供 `publish_milestone_replay_batch_on_connect` 把 `run.status` 现状帧一并塞进补发批
 /// （不新增帧类型，复用 `publish_run_status_milestone` 同款帧构造）。Provider 契约同上：只在
 /// `remote-index-snapshot` 后台线程跑，失败返回 `None`，不 panic。
@@ -258,11 +261,11 @@ pub(crate) struct SessionHistoryRow {
     pub message_id: i64,
     pub role: String,
     pub content_json: Value,
-    /// msgfix1 T3（M0 §10.6）：`content_json` 之外原样保留的原始 DB `content` 字符串——
+    /// Preserve the original DB `content` string alongside `content_json` so hashes and byte counts use stored bytes rather than reserialized JSON.
     /// content_ref 的 sha256/total_bytes 必须对这份原文字节计算，不能用重新序列化过的
     /// `content_json`（`Value` 内部 `Map` 默认按 key 排序，字节不保证与原文相同）。
     pub content_raw: String,
-    /// msgfix1 T3（M0 §10.7）：该消息当前的 `messages.revision`。
+    /// Current `messages.revision` for this message, preserving the stored revision in history responses.
     pub revision: i64,
 }
 /// `control.history` 的短锁 DB provider：结果保持 `message_id DESC`，组页层负责预算收敛与
@@ -270,7 +273,7 @@ pub(crate) struct SessionHistoryRow {
 pub(crate) type SessionHistoryProvider =
     Box<dyn Fn(&str, Option<i64>, i64) -> Result<Vec<SessionHistoryRow>, String> + Send + Sync>;
 
-/// msgfix1 T4（M0 §10.9 联合授权闸）：`msg.fetch` 校验链第①步的 DB provider——按精确
+/// DB provider for the first `msg.fetch` authorization check: look up the exact `(session, message_id)` pair and fail closed on lookup errors.
 /// `(session, message_id)` 查询单条消息用于全文拉取。三态镜像 `db::MessageForFetch`（生产实现
 /// 见 lib.rs `remote_gateway_message_fetch_provider` 包一层 `db::get_message_for_fetch`），这里
 /// 单独定义一份而不是直接引用 db.rs 的类型——同 `SessionHistoryRow`/`SessionRepoProvider` 既有
@@ -291,7 +294,6 @@ pub(crate) enum MessageForFetchResult {
     /// `message_id` 完全不存在。
     NotFound,
 }
-
 pub(crate) type MessageFetchProvider =
     Box<dyn Fn(&str, i64) -> Result<MessageForFetchResult, String> + Send + Sync>;
 pub(crate) type PairHelloHandler =
@@ -310,7 +312,6 @@ pub(crate) struct RefreshForwardFrame {
     pub ct: String,
     pub n: String,
 }
-
 /// token.ack 到达后要回放的 refresh 回执——挂在对应的 outbox `token.put` 项上，ack 消费时
 /// 一并吐出（§9.6 第 250 行「put → ack → 回执」固定顺序）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -957,14 +958,14 @@ pub(crate) struct PairDoneFrame {
 
 static GATEWAY: OnceLock<Arc<Inner>> = OnceLock::new();
 
-/// M2-4c(B3)：`sessions.repo_id` 并不是真正不可变的——`update_session_repo`（lib.rs）是一条
+/// `sessions.repo_id` is mutable through the registered `update_session_repo` IPC in `lib.rs`, so ownership caches require an invalidation epoch.
 /// 已注册运行时改绑 IPC（当前前端生产代码没有调用点，但保留给未来"挪会话到别的项目"功能，
 /// 且它是普通内核函数，测试 / 未来功能都能直接触发）。这个进程级代号在每次改绑成功后 +1；
 /// `upstream_session_allowed` 把它跟这条连接记录的基线比对，一旦不一致就整表清空
 /// `session_repo_cache` 重建，防止缓存里的旧归属在同一条远端连接的生命周期内继续被当真。
 static SESSION_REPO_EPOCH: AtomicU64 = AtomicU64::new(0);
 
-/// M2-4c(B3)：`update_session_repo` 改绑成功后调用，语义见 `SESSION_REPO_EPOCH` 文档。
+/// Call after successful `update_session_repo` reassignment to advance `SESSION_REPO_EPOCH` and invalidate cached ownership.
 pub(crate) fn note_session_repo_reassignment() {
     SESSION_REPO_EPOCH.fetch_add(1, Ordering::Release);
 }
@@ -1014,7 +1015,7 @@ struct Inner {
     /// `Some`），这个 provider 就会被调用。
     session_repo_provider: SessionRepoProvider,
     session_history_provider: SessionHistoryProvider,
-    /// msgfix1 T4：`msg.fetch` 校验链第①步用——见 `MessageFetchProvider` doc。
+    /// DB provider for the first `msg.fetch` validation step, checking exact message ownership; see `MessageFetchProvider`.
     message_fetch_provider: MessageFetchProvider,
     state: GatewayInnerState,
     shutdown: AtomicBool,
@@ -1112,23 +1113,23 @@ struct GatewayInnerState {
     /// P0-b 返工·v1.8.12 ③ 发送侧兜底：`build_snapshot_payload` 收敛后仍超
     /// `SNAPSHOT_SEND_BUDGET_BYTES` 而被跳过发送的计数——只护 snapshot 这一条路径。
     snapshot_oversized_dropped: AtomicU64,
-    /// msgfix1 T3：工具 output 截断后，单条 history 消息仍超过发送预算——**不再整条丢弃**，
+    /// Count history messages still over budget after tool-output truncation; preserve them as previews with content references when they fit.
     /// 降级为块级 preview + content_ref（设计稿 §A）。该计数器语义随之从"丢弃条数"改为"降级
     /// 为 preview 的条数"（极端兜底——连 preview+ref 单条页都装不下——仍如实丢弃，同样计入）。
     history_oversized_dropped: AtomicU64,
-    /// msgfix1 T3：`msg.completed` 工具 output 截断后，完整明文帧仍超过发送预算——**不再
+    /// Count `msg.completed` frames still over budget after tool-output truncation; use preview plus content reference when available instead of silently dropping.
     /// 静默丢弃**，降级为块级 preview + content_ref（设计稿 §A）。连接回放与 live 发布共用
     /// 同一入队闸和同一计数；语义同上改为"降级为 preview 的条数"（无 content_ref 来源的防御性
     /// 兜底分支仍保留旧的丢弃语义，同样计入本计数器）。
     replay_oversized_dropped: AtomicU64,
-    /// idlefix-T1 补针 C（TOCTOU）：`publish_run_status_replay_rows`（连接后补发批读 DB + 逐行
+    /// Serialize the DB read and enqueue phase of `publish_run_status_replay_rows` with live status enqueues to preserve replay-before-live ordering.
     /// 入队 `run.status` 现状帧）与 `enqueue_run_status_milestone_with_gate`（真实运行时
     /// `publish_run_status_milestone` 的实时入队路径）共享这把锁——保证"该连接的 run.status
     /// 现状补发帧必须先于其后任何实时 run.status 帧入队"这一顺序不变量：补发批持锁跨越整个
     /// "读 DB + 入队"过程，期间任何真实状态翻转要么在读之前已落库（读到的就是新值，天然一致），
     /// 要么必须等补发批放锁后才能把新状态入队（必然排在补发帧之后，不会被陈旧帧倒灌覆盖）。
     run_status_replay_gate: Mutex<()>,
-    /// msgfix1 T4（M0 §10.9「reply 独立有界队列」）：`msg.chunk`/`msg.fetch.error` 出帧专属队列
+    /// Independent bounded queue for `msg.chunk` and `msg.fetch.error` frames prevents reply and event traffic from sharing capacity.
     /// ——与 event/live（`upstream_tx`/`milestone_tx`）完全独立，互不挤占容量。`drain_reply_
     /// queue` 每轮连接主循环先于 milestone/live 排空这里（见 `drain_upstream_with_budget`）。
     /// 之所以挂在 `GatewayInnerState`（一个 `Mutex<VecDeque<_>>`）而不是像 `upstream_tx`/
@@ -1141,7 +1142,7 @@ struct GatewayInnerState {
     /// 诊断：`reply_queue` 已满且连兜底的 `msg.fetch.error{busy}` 本身也塞不进去时的丢弃计数
     /// （双重饱和的极端情形，见 `handle_msg_fetch` 里 chunk 入队失败后的兜底分支）。
     reply_queue_dropped: AtomicU64,
-    /// msgfix1 T4 返修③（skeptic 补审·对照 `upstream_stale_generation_dropped`）：出队时二次
+    /// Count replies rejected by the dequeue-time connection-generation recheck separately from upstream event drops.
     /// 复核 `connection_generation` 不匹配（跨连接残留）而丢弃的 reply 条数——单开一对新计数器
     /// 而不是复用 `upstream_stale_generation_dropped`/`upstream_repo_filtered`，避免混淆那两个
     /// 计数器"上行里程碑 + live 事件"的既有文档语义（见 `drain_reply_queue` doc）。
@@ -1152,7 +1153,7 @@ struct GatewayInnerState {
     /// 返修②（skeptic 补审）：单飞行槽位超时被新请求接管时，从 `reply_queue` 里整体清掉的
     /// "上一个 generation 还没发出的残片"条数——见 `purge_stale_reply_queue_generation`。
     reply_queue_stale_generation_purged: AtomicU64,
-    /// msgfix1 T4（M0 §10.9 单飞行闸）：session → 在途 fetch 记账。任务书 §3④明确按 **session**
+    /// Track in-flight fetches by session so each session serves at most one fetch at a time, regardless of message identity.
     /// 维度（比 §10.9 条文字面的 `(session, message_id)` 更严——同一 session 同时只服务一条
     /// fetch，无论 message_id 是否相同），键为 session id。条目在 `drain_reply_queue` 真正送出
     /// 该 fetch 最后一帧时清除，或被 `MSG_FETCH_INFLIGHT_TIMEOUT_MS` 超时后新请求接管。
@@ -1161,12 +1162,12 @@ struct GatewayInnerState {
     /// 语义搬去独立的 `msg_fetch_command_ledger`（原设计里两者共用一张表，会在同 command_id
     /// 复用时把"新占用者的身份"和"旧 command_id 是否用过"这两个不同问题绑在同一条记录上）。
     msg_fetch_inflight: Mutex<HashMap<String, MsgFetchInflightEntry>>,
-    /// msgfix1 T4：桌面侧 60 秒滑动窗口字节预算——第二层防滥用闸（relay 已有 §9.8/§10.3 的
-    /// per-subject 字节计费；这层独立生效，不依赖 relay 是否正确执行）。msgfix1 T7 B1 改口径为
+    /// Desktop-side byte budget over a sliding 60-second window provides an independent abuse guard in addition to relay accounting.
+    /// Relay per-subject byte accounting does not replace this independent desktop guard; aggregate usage across the entire gateway.
     /// **gateway 全局聚合**（不再按 session 分桶）——见 `MSG_FETCH_BYTE_BUDGET_PER_WINDOW`
     /// 定义处的量级推导。
     msg_fetch_byte_budget: Mutex<VecDeque<(u64, usize)>>,
-    /// msgfix1 T4 返修②（skeptic 补审）：`msg.fetch` 每次被 `handle_msg_fetch_at` 接受处理
+    /// Allocate a globally increasing generation for each `msg.fetch` accepted by `handle_msg_fetch_at`, including requests ending in errors.
     /// （无论最终成功还是走某个 error code）就从这里领一个全局单调递增的新值，写进
     /// `MsgFetchInflightEntry.generation`/`ReplyQueueItem.generation`。见
     /// `clear_msg_fetch_inflight_if_matches` doc——generation 保证"同一 session 先后两次接受
@@ -1174,7 +1175,7 @@ struct GatewayInnerState {
     /// 兜底（`msg_fetch_command_ledger` 是行为兜底，容量满了会被淘汰失效；generation 判定
     /// 不依赖容量、恒正确）。
     msg_fetch_generation_counter: AtomicU64,
-    /// msgfix1 T4 返修②（skeptic 补审）：`(session, command_id)` 终态账本——见
+    /// Terminal-command ledger keyed by `(session, command_id)` rejects recent reuse; see
     /// `msg_fetch_command_ledger_admit`。
     msg_fetch_command_ledger: Mutex<MsgFetchCommandLedger>,
     /// msgfix2 U1（设计稿 v4.1 §4.1）：L1 活动摘要聚合器的输入端——`extract_tool_milestones`
@@ -1193,7 +1194,7 @@ struct GatewayInnerState {
     activity_summary_dropped: AtomicU64,
 }
 
-/// msgfix1 T4：`GatewayInnerState::msg_fetch_inflight` 单条记账。返修②（skeptic 补审）新增
+/// One `GatewayInnerState::msg_fetch_inflight` entry separates timeout tracking from fetch ownership through its acceptance generation.
 /// `generation`——`accepted_at_ms` 仍是超时判定唯一依据；`generation` 是"这个占用到底是不是
 /// 我这次接受的那个"唯一判据（`command_id` 不再可靠，见 `clear_msg_fetch_inflight_if_matches`
 /// doc：client 复用同一 command_id 时两次接受的 `command_id` 逐字节相同，只有 `generation`
@@ -1205,7 +1206,7 @@ struct MsgFetchInflightEntry {
     generation: u64,
 }
 
-/// msgfix1 T4（M0 §10.9）：`reply` 独立有界队列的一条待发条目——`drain_reply_queue` 逐条取出、
+/// Pending entry in the independent bounded reply queue; `drain_reply_queue` removes entries individually for sealing and transmission.
 /// seal 成 `reply` kind 信封发出。
 #[derive(Clone, Debug, PartialEq)]
 struct ReplyQueueItem {
@@ -1218,19 +1219,19 @@ struct ReplyQueueItem {
     /// 送达/终态"，而不是"一入队就当作已完成"，避免客户端在还有大量分片排队等发时就抢发新
     /// 一轮 fetch 把队列灌爆。
     final_frame: bool,
-    /// msgfix1 T4 返修②（skeptic 补审）：这条 reply 条目所属的那次 `msg.fetch` 接受的
+    /// Identify the accepted `msg.fetch` that owns this reply by generation so stale frames cannot release a newer fetch slot.
     /// generation——`final_frame` 帧真正发出时用它（不是 `command_id`）去匹配/清除
     /// `msg_fetch_inflight`，见 `clear_msg_fetch_inflight_if_matches` doc。同时也是
     /// `purge_stale_reply_queue_generation` 精确清除"被新请求接管前那次接受"残片的判据。
     generation: u64,
-    /// msgfix1 T4 返修③（skeptic 补审）：入队那一刻的 `connection_generation`
+    /// Capture `connection_generation` at enqueue time so replies left over from an earlier connection are rejected during draining.
     /// （`GatewayInnerState::connection_generation_snapshot`）——`drain_reply_queue` 出队时
     /// 与当前连接的 generation 比对，跨连接的残片（断线重连后仍在队列里的旧数据）判过期丢弃，
     /// 对照 milestone/live 既有的 `(u64, Item)` generation 标记同一套机制。
     connection_generation: u64,
 }
 
-/// msgfix1 T4 返修②（skeptic 补审·M0 §10.9「command_id 账本」）：`(session, command_id)`
+/// Bounded terminal-command ledger keyed by `(session, command_id)` prevents recent command reuse from creating ambiguous fetch ownership.
 /// 终态账本——`handle_msg_fetch_at` 每接受一次请求（无论最终成功还是走某个 error code）就把
 /// 这次的 `(session, command_id)` 记进来；下次同一 `(session, command_id)` 再来一次
 /// `msg.fetch`，一律拒绝（回 `busy`，引导客户端换一个新 command_id）——从根上避免"同一
@@ -2389,7 +2390,7 @@ fn publish_session_index_snapshot_on_connect(inner: &Inner, connection_generatio
             // 摘要取自过滤后（截尾前）的行：截尾只会从尾部丢行，首行（摘要取名字的来源）
             // 在正常数据规模下恒存活，摘要不需要等截尾完成才能算。
             let repo = active_repo_summary_for_snapshot(inner, &sessions);
-            // B2（backlog 跟进）：过滤后、组装 payload 前的发送前尺寸闸——见
+            // Enforce the send-size budget after filtering and before payload assembly; see the row truncation helper below.
             // truncate_session_index_snapshot_rows 文档。
             let (sessions, truncated) =
                 truncate_session_index_snapshot_rows(sessions, SNAPSHOT_SEND_BUDGET_BYTES);
@@ -2425,7 +2426,7 @@ fn publish_session_index_snapshot_on_connect(inner: &Inner, connection_generatio
 /// 不允许另起拼接逻辑（防漂移，见函数级测试）。generation 语义同
 /// publish_session_index_snapshot_on_connect：调用方捕获的 connection_generation 原样透传给
 /// enqueue_milestone_with_generation，这里不重读"当前"值。
-/// idlefix-T1 缺口②追加：msg.completed/card.* 之外，同一批还追加 `run.status` 现状帧（见下面
+/// Include current `run.status` frames alongside message and card replay, with independent providers and failure handling.
 /// `publish_run_status_replay_rows`）——拆成两个子函数，各自独立 provider、独立失败。
 fn publish_milestone_replay_batch_on_connect(inner: &Inner, connection_generation: u64) {
     publish_msg_and_card_replay_rows(inner, connection_generation);
@@ -2519,13 +2520,13 @@ fn publish_msg_and_card_replay_rows(inner: &Inner, connection_generation: u64) {
     }
 }
 
-/// idlefix-T1 缺口②：连接后补发批追加——除了 msg.completed/card.*，把 `session_runtime`
+/// Replay current `session_runtime` state on connection alongside `msg.completed` and card events so clients recover missed status updates.
 /// 现状也逐会话重建成 `run.status` 帧一并塞进补发批（不新增帧类型/不改帧结构，只是把既有类型
 /// 的现状帧加进这批）。手机顶栏唯一数据源就是 `run.status` 里程碑，此前只在状态变化时 publish
 /// 一次、错过就永久卡住——现在中途接入也能补到当前状态，与会话列表绿点（session.index 行
 /// status，同样连接后必补发）同源，不会再灰绿不一致。
 fn publish_run_status_replay_rows(inner: &Inner, connection_generation: u64) {
-    // idlefix-T1 补针 C（TOCTOU）：持锁跨越"读 DB + 逐行入队"整个过程，不是只护入队循环——见
+    // Hold the gate across both the DB read and all enqueues so stale replay rows cannot overtake live status updates.
     // `run_status_replay_gate` 字段头注的顺序不变量论证；`enqueue_run_status_milestone_with_gate`
     // 是唯一另一个持有同一把锁的调用方。
     let _replay_gate = lock(&inner.state.run_status_replay_gate);
@@ -2975,59 +2976,8 @@ fn run_connection_request(
     milestone_rx: &Receiver<(u64, MilestoneItem)>,
     k_room: Option<&Zeroizing<[u8; 32]>>,
 ) -> Result<ConnectionExit, ConnectionFailure> {
-    // M2-4c/M2-4d：把这次连接解析出的 active repo 上下文"带进"归属判定用的共享状态，越早越
-    // 好——必须抢在下面的 `request_session_index_snapshot` 之前完成，否则后台 snapshot worker
-    // 可能用上一条连接（甚至上一个 project）遗留的 gating 状态构建快照。下行
-    // `handle_command_envelope`、上行 drain 与 snapshot provider 全部只读这份值，不再各自
-    // 重读 `remote_active_repo_id` 设置（避免设置的"当前"值与这条连接实际连的房间产生
-    // 双真相）。单活跃房间模型下 `active_repo_id` 恒 `Some`（`GatewayConfig` 能被构造出来就
-    // 意味着 active 解析成功了），命令归属闸恒启用，不再需要一个独立的开关布尔量。
-    *lock(&inner.state.active_repo_id_for_gating) = connected_config.active_repo_id.clone();
-
-    let pairing_k_room_is_staged = lock(&inner.registry).pairing_k_room_is_staged();
-    let mut active_k_room = if pairing_k_room_is_staged {
-        None
-    } else {
-        k_room.cloned()
-    };
-    // Never accept tungstenite's much larger defaults: a bad relay must not allocate huge frames.
-    let config = WebSocketConfig::default()
-        .max_message_size(Some(MAX_INCOMING_BYTES))
-        .max_frame_size(Some(MAX_INCOMING_BYTES));
-    // Known limitation: DNS, TCP, TLS, and WebSocket handshakes do not yet have a timeout.
-    let (mut socket, _) = match connect_with_config(request, Some(config), WS_MAX_REDIRECTS) {
-        Ok(connection) => connection,
-        Err(WebSocketError::Http(response))
-            if response.status() == tungstenite::http::StatusCode::UNAUTHORIZED =>
-        {
-            return Err(ConnectionFailure::Unauthorized);
-        }
-        Err(WebSocketError::Http(response))
-            if response.status() == tungstenite::http::StatusCode::GONE =>
-        {
-            return Err(ConnectionFailure::Tombstoned);
-        }
-        Err(error) => return Err(ConnectionFailure::Other(format!("connect failed: {error}"))),
-    };
-
-    // Blocking tungstenite has no cancellation primitive. A TCP read timeout lets this thread
-    // wake periodically to observe shutdown without adding an async runtime or a wake-up socket.
-    set_read_timeout(socket.get_ref(), Some(READ_TIMEOUT))
-        .map_err(|error| format!("failed to set read timeout: {error}"))?;
-    set_write_timeout(socket.get_ref(), Some(WRITE_TIMEOUT))
-        .map_err(|error| format!("failed to set write timeout: {error}"))?;
-    // §9.4 registry_ready: token.sync is the first desktop application frame, and no existing
-    // activation side effect is published until the matching ack (including any rebase loop).
-    synchronize_registry(&mut socket, inner, &connected_config.room_id)?;
-    lock(&inner.registry).prepare_outbox_for_reconnect();
-    drain_registry_outbox(&mut socket, inner).map_err(ConnectionFailure::Other)?;
-    set_status(&inner.state, GatewayState::Connected, None);
-    // Generation and gate are published together in a single AtomicU64 store so that a sink
-    // reading upstream_state in one Acquire load can never observe a (gate, generation) pair
-    // that spans two different connections.
-    let connection_generation = inner
-        .state
-        .advance_generation_and_set_gate(active_k_room.is_some());
+    let (mut socket, mut active_k_room, connection_generation) =
+        connection_request::prepare_connection(inner, request, connected_config, k_room)?;
     // Generation filtering makes disconnect-time queue draining unnecessary, while this guard
     // closes the gate on both ordinary returns and panic unwinds.
     let _upstream_gate_guard = UpstreamGateGuard::new(&inner.state.upstream_state);
@@ -3046,7 +2996,7 @@ fn run_connection_request(
     let mut registry_resync_pending_since: Option<Instant> = None;
     // M2-4c：连接生命周期内的 session → repo 归属缓存——放在这里（而不是每轮 drain 内部）
     // 是因为它要跨多轮 `drain_upstream` 调用累积命中，否则每轮清空就退化成逐条查询。
-    // **`sessions.repo_id` 不是真正不可变**（B3 修正：`update_session_repo`〔lib.rs〕是已注册
+    // `sessions.repo_id` can change through the registered `update_session_repo` IPC in `lib.rs`; cached ownership must be invalidated.
     // 的运行时改绑 IPC，当前前端生产代码零调用点，但保留给未来"挪会话到别的项目"功能，且是
     // 普通内核函数，测试 / 未来功能都能直接触发——早先"实勘=不可变"的结论是错的，写死的
     // 安全不变量比没写更危险）。真正兜底的是下面这个局部变量记的 `SESSION_REPO_EPOCH` 基线
@@ -3066,135 +3016,31 @@ fn run_connection_request(
     // 类型必须一致。
     (|| -> Result<ConnectionExit, ConnectionFailure> {
         loop {
-            if inner.shutdown.load(Ordering::Acquire) {
-                let _ = socket.close(None);
-                drain_close(&mut socket);
-                return Ok(ConnectionExit::ClosedByPeer);
-            }
-            if inner.reload_requested.swap(false, Ordering::AcqRel) {
-                let _ = socket.close(None);
-                drain_close(&mut socket);
-                return Ok(ConnectionExit::PairingReloadRequested);
-            }
-            // S1i1 返工四：这一轮 `socket.read()` 是不是真的读超时了——只有这个分支能证明
-            // relay 这一刻确实没有新帧在路上。Ping/Pong/Binary 只说明这一轮读到的不是业务
-            // Text，不代表安静（对端仍活着，缓冲区里可能还有紧随其后的 Text），不能再被当
-            // 「安静」处理（返工三的 `!frame_delivered` 会把 Ping/Pong 那一轮也算安静，评审
-            // 判定「太急」）。
-            let mut read_timed_out_this_round = false;
-            let read_result = socket.read();
-            if read_result.is_ok() {
-                keepalive_idle.record_activity(Instant::now());
-            }
-            match read_result {
-                Ok(Message::Text(text)) => {
-                    if let Some(response) =
-                        handle_frame(inner, text.as_ref(), active_k_room.as_ref())
-                    {
-                        let activates_pairing =
-                            response.get("t").and_then(Value::as_str) == Some("pair.ready");
-                        socket
-                            .send(Message::Text(response.to_string().into()))
-                            .map_err(|error| format!("frame response write failed: {error}"))?;
-                        inner.state.frames_sent.fetch_add(1, Ordering::Relaxed);
-                        if activates_pairing {
-                            if active_k_room.is_none() {
-                                active_k_room = lock(&inner.registry).take_staged_pairing_k_room();
-                            } else {
-                                let _ = lock(&inner.registry).take_staged_pairing_k_room();
-                            }
-                            if active_k_room.is_some() {
-                                inner.state.enable_upstream_gate();
-                                request_session_index_snapshot(inner, connection_generation);
-                            }
-                        }
-                    }
-                }
-                Ok(Message::Close(_)) => {
-                    let _ = socket.close(None);
-                    drain_close(&mut socket);
-                    return Ok(ConnectionExit::ClosedByPeer);
-                }
-                Ok(Message::Ping(_)) => {
-                    // tungstenite 0.30 queues the matching Pong in read() and flushes it itself on
-                    // the next read/flush call; sending another Pong here would duplicate the reply.
-                }
-                Ok(Message::Pong(_) | Message::Binary(_) | Message::Frame(_)) => {}
-                Err(WebSocketError::ConnectionClosed) => return Ok(ConnectionExit::ClosedByPeer),
-                Err(WebSocketError::Io(error)) if is_read_timeout(&error) => {
-                    read_timed_out_this_round = true;
-                }
-                Err(error) => return Err(format!("read failed: {error}").into()),
+            if let Some(exit) = connection_request::take_loop_control(inner, &mut socket) {
+                return Ok(exit);
             }
 
-            // S1i1 返工三：`consume_token_ack` 在 `RefreshDropped` 分支置位 `resync_required`
-            // 闸门（沿用返工二的字段与 `take` 语义：读且清零，一次 rejected 至多兑现一次收敛
-            // 意图）。返工二在这里原地重发一次 `synchronize_registry` 并阻塞等它的
-            // `token.sync.ack`——但 `read_registry_sync_ack`（本文件上方）在等 ack 期间把任何
-            // 非 ack 帧都当协议违规直接报错断连；relay 侧在线 `input` 帧是直接投递、不入
-            // pending（`remote-relay/src/room-do.js:576-589` + 规范 §3 第 76-77 行），若插在
-            // 「重发 sync」与「ack 回来」之间会被 ack waiter 读走、报错断连——该帧从未进
-            // `handle_frame`、没有本地落账、没有回 ack，用户从手机发的这条指令永久静默丢失。
-            // 评审判定 BLOCKER。
-            //
-            // 改弦更张：不在这条存活连接里等第二次 ack，只记一个「该断了」的意图
-            // （`registry_resync_pending`），本轮循环仍然只用同一套 `match socket.read()` 分发
-            // 继续正常处理接下来的帧——`handle_frame` 从始至终只有这一套解释，没有第二套并行
-            // 的、把非预期帧当协议违规的状态机（这正是评审点名严禁的「等 ack 期间复刻一份主
-            // 循环分发逻辑」）。让既有的重连路径（`attempt_once` 重新调用
-            // `run_connection_request`）去做那次 sync——顶部（下方 `synchronize_registry` 首次
-            // 调用那行）就是连接建立时那条久经测试的老路，会把 DB 真相（新代号）交给 relay；
-            // `prepare_outbox_for_reconnect` 也由那条路径自己负责（紧跟在顶部
-            // `synchronize_registry` 之后），这里不需要重复调用。返回 `ConnectionFailure::Other`
-            // 而非 `Stopped`——这是可重试的断开，`attempt_once`/`connect_loop` 走既有的失败计数
-            // + 指数退避重连（`record_failure`/`backoff_delay`），天然兜住万一反复 rejected 的
-            // 热循环，不会无限制地贴着 relay 的 protocol violation 预算撞
-            // （`room-do.js:724-726`）。
-            //
-            // S1i1 返工四：返工三「只有这一轮恰好没收到新应用帧（`!frame_delivered`）才断开」
-            // 的判据本身有两个反向缺陷，评审判 BLOCKER：
-            // ① 太懒：`!frame_delivered` 只要求这一轮没读到 Text，而 `READ_TIMEOUT`
-            // （500ms）只约束阻塞读本身——只要 relay 持续以 < 500ms 的间隔投 Text，读永远不
-            // 超时、`frame_delivered` 恒真，断开永不触发，收敛没有上界；
-            // ② 太急：Ping/Pong/Binary 那一轮 `frame_delivered` 也是假，会被当成「安静」立刻
-            // 断开，可能把紧随其后、已经在缓冲区里的业务 Text 帧晾在原地。
-            // 改法：判据只认「这一轮 `socket.read()` 真的读超时了」
-            // （`read_timed_out_this_round`，只在 `is_read_timeout` 分支置位）——Ping/Pong/
-            // Binary 不算安静，说明对端仍活着、后面可能还有帧，继续用同一套 `match` 正常处理；
-            // 同时加一条硬截止 `REGISTRY_RESYNC_DRAIN_DEADLINE`（2 秒，从
-            // `registry_resync_pending` 第一次置位的 `registry_resync_pending_since` 起算），
-            // 帧完整到达时繁忙连接也必须在这个时限内无条件断开，不会被持续到达的完整 Text 帧
-            // 无限期拖住。帧完整时两头都收住：安静连接第一次读超时（≤ `READ_TIMEOUT` = 500ms）
-            // 就断；繁忙连接最多 2 秒内必定断，Ping/Pong 不再造成过早断开。
-            //
-            // 但这条硬截止本身也要「`socket.read()` 会返回」才谈得上被求值——`READ_TIMEOUT`
-            // （500ms）约束的是单次底层读，不是「一条完整消息到达」。relay 若持续投喂未拼完
-            // 的分片消息（字节不断到达、每次间隔都 < 500ms，但消息迟迟不完整），
-            // `socket.read()` 会一直卡在 tungstenite 内部不返回——本段之后的这条硬截止判断、
-            // 下方的 shutdown 检查、liveness 检查、`drain_upstream` 全都不会被求值，此时收敛
-            // 没有有限上界。这不是本判据独有的缺陷，而是主循环「只在 `socket.read()` 返回后才
-            // 跑一轮判据」这个既有结构的性质。触发它需要恶意或损坏的 relay；这样的 relay 本来
-            // 就能直接丢弃全部帧做拒绝服务，不因此获得新能力。彻底解决要在 socket 层加读截止/
-            // 看门狗，属另一件事（已记 BACKLOG）。
-            let was_registry_resync_pending = registry_resync_pending;
-            registry_resync_pending |= lock(&inner.registry).take_resync_required();
-            if registry_resync_pending && !was_registry_resync_pending {
-                registry_resync_pending_since = Some(Instant::now());
-            }
-            let registry_resync_deadline_elapsed = registry_resync_pending_since
-                .is_some_and(|since| since.elapsed() >= REGISTRY_RESYNC_DRAIN_DEADLINE);
-            if registry_resync_pending
-                && (read_timed_out_this_round || registry_resync_deadline_elapsed)
-            {
-                return Err(ConnectionFailure::Other(
-                    "refresh put rejected; reconnecting to resync registry".to_owned(),
-                ));
-            }
+            let read_timed_out_this_round = match connection_request::process_socket_read(
+                &mut socket,
+                inner,
+                &mut active_k_room,
+                connection_generation,
+                &mut keepalive_idle,
+            )? {
+                connection_request::SocketRead::Continue(read_timed_out_this_round) => {
+                    read_timed_out_this_round
+                }
+                connection_request::SocketRead::Exit(exit) => return Ok(exit),
+            };
+            connection_request::check_registry_resync(
+                inner,
+                read_timed_out_this_round,
+                &mut registry_resync_pending,
+                &mut registry_resync_pending_since,
+            )?;
 
-            if inner.shutdown.load(Ordering::Acquire) {
-                let _ = socket.close(None);
-                drain_close(&mut socket);
-                return Ok(ConnectionExit::ClosedByPeer);
+            if let Some(exit) = connection_request::take_shutdown(inner, &mut socket) {
+                return Ok(exit);
             }
 
             if let Err(error) = drain_upstream(
@@ -3212,43 +3058,24 @@ fn run_connection_request(
             }
             drain_registry_outbox(&mut socket, inner)?;
 
-            let frames_sent = inner.state.frames_sent.load(Ordering::Relaxed);
-            if frames_sent != last_observed_frames_sent {
-                keepalive_idle.record_activity(Instant::now());
-                last_observed_frames_sent = frames_sent;
-            }
-            if read_timed_out_this_round {
-                keepalive_idle
-                    .send_ping_if_due(Instant::now(), &inner.state, |message| socket.send(message))
-                    .map_err(|error| format!("keepalive ping write failed: {error}"))?;
-                last_observed_frames_sent = inner.state.frames_sent.load(Ordering::Relaxed);
-            }
+            connection_request::maintain_keepalive(
+                &mut socket,
+                &inner.state,
+                &mut keepalive_idle,
+                &mut last_observed_frames_sent,
+                read_timed_out_this_round,
+            )?;
 
-            if last_liveness_check.elapsed() >= inner.liveness_interval {
-                last_liveness_check = Instant::now();
-                let (enabled, fresh_config) = current_config(inner);
-                let fresh_token = (inner.token_provider)().map(SecretToken::new);
-                // 已持有 K_room 时不重读钥匙串，避免钥匙串 IPC 卡住 ws 读线程；无钥匙时保持轮询自愈，钥匙撤销检测不在这里做。
-                let pairing_k_room_is_staged = lock(&inner.registry).pairing_k_room_is_staged();
-                let fresh_k_room_available = active_k_room.is_some()
-                    || (!pairing_k_room_is_staged
-                        && (inner.k_room_provider)(&connected_config.room_id).is_some());
-                if evaluate_connection_liveness(
-                    enabled,
-                    fresh_config.as_ref(),
-                    connected_config,
-                    fresh_token.as_ref(),
-                    connected_token,
-                    active_k_room.is_some(),
-                    fresh_k_room_available,
-                ) == ConnectionDecision::Disconnect
-                {
-                    let _ = socket.close(None);
-                    drain_close(&mut socket);
-                    return Ok(ConnectionExit::ConfigStale {
-                        connected_for: connection_loop_started_at.elapsed(),
-                    });
-                }
+            if let Some(exit) = connection_request::check_liveness(
+                &mut socket,
+                inner,
+                connected_config,
+                connected_token,
+                active_k_room.as_ref(),
+                &mut last_liveness_check,
+                connection_loop_started_at,
+            ) {
+                return Ok(exit);
             }
         }
     })()
@@ -3295,7 +3122,7 @@ fn drain_upstream_with_budget(
     let connection_generation = state.connection_generation_snapshot();
     let mut drained_items = 0;
 
-    // msgfix1 T4：`reply` 排在 milestone/live 之前——`msg.fetch` 是远端主动按需拉取，理应比
+    // Drain replies before milestone/live traffic so explicit remote `msg.fetch` requests receive prompt responses.
     // 背景里程碑/live 广播更快送达；且 `reply_queue` 与另外两条队列完全独立（不同的
     // `Mutex<VecDeque<_>>`），排在前面不会让 milestone/live 挨饿（各自预算互不借用）。
     if drain_reply_queue(
@@ -3343,7 +3170,7 @@ fn drain_upstream_with_budget(
     Ok(())
 }
 
-/// msgfix1 T4（M0 §10.9「reply 独立有界队列」）+ 返修③（skeptic 补审）：排空
+/// Drain the bounded reply queue, rechecking connection generation and session ownership before sending.
 /// `state.reply_queue`，逐条 seal 成 `reply` kind 信封发出（见 `send_upstream_value`）。
 ///
 /// **出队时二次归属复核**（返修③）：`reply_queue` 是持久队列，一条分片从入队到真正出队之间
@@ -3441,7 +3268,7 @@ fn drain_reply_queue(
     Ok(false)
 }
 
-/// msgfix1 T4 返修②（skeptic 补审）：只在该 session 当前的单飞行占用仍是**这次
+/// Release a session single-flight slot only if its current generation matches this request, preventing delayed terminal frames from clearing a newer owner.
 /// generation**（全局单调递增，`handle_msg_fetch_at` 每接受一次请求就领一个新值，见
 /// `GatewayInnerState::msg_fetch_generation_counter`）时才清除——此前按 `command_id` 匹配，
 /// 一旦客户端复用同一个 command_id（旧请求已超时被新请求接管，二者 command_id 相同），旧
@@ -3459,7 +3286,7 @@ fn clear_msg_fetch_inflight_if_matches(state: &GatewayInnerState, session: &str,
     }
 }
 
-/// msgfix1 T4（M0 §10.9「reply 独立有界队列」满→回 busy 终态）：尝试把一条 reply 条目塞进
+/// Try to enqueue a single reply in the independent bounded queue; report saturation so callers can abort chunk transfer and attempt a terminal busy error.
 /// `state.reply_queue`——容量见 `REPLY_QUEUE_CAPACITY`。满时返回 `false`，调用方据此中止当前
 /// 分片序列并改发 `msg.fetch.error{busy}` 终态（`handle_msg_fetch_at` 的兜底路径），不静默
 /// 丢帧。用于**单帧**入队（`msg.fetch.error`、`busy` 兜底本身、以及各类正常单条 reply）——
@@ -3473,7 +3300,7 @@ fn try_enqueue_reply(state: &GatewayInnerState, item: ReplyQueueItem) -> bool {
     true
 }
 
-/// msgfix1 T4：多分片传输专用入队——比 `try_enqueue_reply` 严格预留 1 个坑位。一旦某片因为
+/// Reserve one reply queue slot when enqueueing chunks so a capacity failure can be followed by a terminal busy error.
 /// "满"而失败，调用方要紧接着回退发一条 `msg.fetch.error{busy}` 终态（M0 §10.9「满→回 busy
 /// 终态、不静默」），这条终态帧必须总有地方放——如果分片本身把队列写到刚好 100% 满才失败，
 /// 兜底 error 会紧接着在同一次饱和里也失败，退化成"满→连 busy 都发不出去"的双重饱和（这条
@@ -3491,7 +3318,7 @@ fn try_enqueue_reply_chunk(state: &GatewayInnerState, item: ReplyQueueItem) -> b
     true
 }
 
-/// msgfix1 T4 返修②（skeptic 补审）：单飞行槽位因超时被新请求接管时，把上一个 generation
+/// When a new fetch takes over an expired single-flight slot, purge queued fragments belonging to the superseded generation.
 /// 还没发出的残片从 `reply_queue` 里整体清掉——这些分片属于一次客户端早已放弃等待（超过
 /// `MSG_FETCH_INFLIGHT_TIMEOUT_MS` 未见任何回应）的旧 fetch，继续让它们被正常 drain 发出只会
 /// 把跟当前请求毫不相干的旧数据推给客户端（旧 command_id 因为 `msg_fetch_command_ledger_admit`
@@ -3551,7 +3378,7 @@ fn drain_milestone_queue(
                 && t == "session.index"
                 && payload.get("full").and_then(Value::as_bool) != Some(true)
             {
-                // M2-4c（B1）/M2-4d：session.index 的增量 diff 按 op 四路分治（详见
+                // Filter incremental session.index diffs by their four operations; full snapshots use a separate filtering path.
                 // `filter_session_index_incremental_for_active_repo` 文档）；全量快照
                 // （`full == true`，走 (a) 的 `filter_session_index_snapshot_for_active_repo`）
                 // 不会走到这条分支。
@@ -3812,7 +3639,7 @@ fn send_upstream_value(
     session: Option<String>,
     value: Value,
     client_msg_id: Option<&str>,
-    // msgfix1 T4：`reply`（M0 §10.1）是第一个真正需要非空 `command_id` 的出站 kind——
+    // Outbound `reply` frames require a nonempty `command_id` for request correlation; existing event and live frames continue to omit it.
     // 既有 event/live 调用点全部继续传 `None`，行为逐字节不变；`drain_reply_queue` 是
     // 唯一会传 `Some(..)` 的调用方。
     command_id: Option<&str>,
@@ -3913,7 +3740,7 @@ fn lookup_session_repo(
 /// M2-4c（b）/M2-4d：上行里程碑/live 归属过滤共用判定——单活跃房间模型下恒启用，先查连接
 /// 生命周期缓存，未命中才调用 `session_repo_provider`，避免发布热路径逐条开 DB 查询。
 ///
-/// F1（B3 返工，修竞态）：`sessions.repo_id` 并非真正不可变（见 `SESSION_REPO_EPOCH`
+/// `sessions.repo_id` can change concurrently; check `SESSION_REPO_EPOCH` before and after lookup to prevent stale ownership decisions.
 /// 文档）——上一版只在函数**开头** load 一次全局代号，若 `update_session_repo` 恰好在
 /// "load 完代号"与"缓存/查询完成"之间那段窗口里改绑，本次判定用的还是改绑前的旧归属
 /// （要等下一次调用才能自愈，审查判定这个窗口必须关死，不能靠"下次"补救）。这里改成三段：
@@ -3984,7 +3811,7 @@ fn filter_session_index_snapshot_for_active_repo(inner: &Inner, sessions: Value)
 /// `active_repo_id_for_gating` 为 `None`（理论不可达，见 `repo_id_is_active` 文档）时整个摘要
 /// fail-closed 回 `Value::Null`，不把"曾经见过的某个项目"当默认值泄漏出去。
 ///
-/// **已知边界（B3 backlog 跟进·纯记档，未修）**：项目改名（`rename_repo`）不发 session.index
+/// **Known limitation:** `rename_repo` emits no session.index increment, so connected clients retain stale names until a full snapshot refresh.
 /// 增量——在线手机端的顶部摘要与既有会话行会一直显示旧名，直到下一次断连重连拿到新的全量
 /// 快照才刷新；改名后若又有新会话在同一项目下创建，其 `created` 增量会带新名，此时同一屏可能
 /// 新旧名并存（老会话行仍是旧名，新会话行已是新名）。属低频可接受；如需消除，应在 rename 路径
@@ -4002,7 +3829,7 @@ fn active_repo_summary_for_snapshot(inner: &Inner, sessions: &Value) -> Value {
     serde_json::json!({ "id": active_repo_id, "name": name })
 }
 
-/// B2（backlog 跟进）：`list_session_index_snapshot_rows` 的 SQL 无 `LIMIT`——过滤后的
+/// `list_session_index_snapshot_rows` has no SQL `LIMIT`, so filtered snapshot rows can grow without bound and require a send-size budget.
 /// `sessions` 行数组理论上随会话数增长无上限。`msg.completed` 早已在 `enqueue_milestone_item`
 /// 有发送前尺寸兜底（`SNAPSHOT_SEND_BUDGET_BYTES`，见该处文档），session.index 全量快照此前
 /// 完全没有——超过 relay 的 64KiB 明文帧硬闸会被 `frame_too_large` 断连，断连后客户端重连会
@@ -4049,7 +3876,7 @@ fn truncate_session_index_snapshot_rows(sessions: Value, budget: usize) -> (Valu
     (Value::Array(kept), true)
 }
 
-/// B2：只在真的发生截断时插入 `truncated: true` 这一键；不截断时该键整个不存在（不是
+/// Insert `truncated: true` only when truncation occurs; otherwise omit the key entirely rather than emitting an explicit false value.
 /// `false`）——同 `repo`/`repo_name` 系列可选键"键缺失 vs 显式值"的一贯纪律，手机端
 /// `parseFrame` 对未知键本就无视（本任务不改手机端 UI），向后兼容零风险。
 fn mark_session_index_snapshot_truncated(mut payload: Value, truncated: bool) -> Value {
@@ -4061,7 +3888,7 @@ fn mark_session_index_snapshot_truncated(mut payload: Value, truncated: bool) ->
     payload
 }
 
-/// M2-4c（B1）：Active 模式下 session.index 的增量 diff（`full == false`，`session` 恒
+/// In Active mode, route incremental session.index diffs (`full == false`, `session` always `None`) by operation because each payload requires a different filtering source.
 /// `None`，走 `drain_milestone_queue` 而非快照过滤）按 `op` 四路分治，不能套用逐条里程碑那套
 /// "按 session 查一次"的通用判定——四种 op 的 payload 形状各不相同，各自要用不同的信息源：
 /// - `created`：payload 里的 `session.repo_id` 是现成字段（`build_session_index_created_
@@ -4177,7 +4004,7 @@ fn build_envelope_json(
     ts_ms: u64,
     client_msg_id: Option<&str>,
 ) -> serde_json::Value {
-    // msgfix1 T4：`command_id` 现在如实回显 `meta.command_id`——此前这里硬编码
+    // Echo `meta.command_id` exactly so the envelope matches the authenticated metadata; hardcoding a null value would break replies.
     // `Value::Null`，因为唯一的调用方 `send_upstream_value` 服务 event/live，两者的
     // `EnvelopeMeta.command_id` 恒为 `None`。`reply`（M0 §10.1）是第一个真正需要非空
     // `command_id` 的出站 kind——取值必须与 `crate::remote_crypto::seal` 用来算 AAD 的那份
@@ -4390,11 +4217,11 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> String {
     text[..end].to_owned()
 }
 
-/// msgfix1 T7 B2（opus 整盘审 P1-4 裁决=最小可见化）：工具输出被裁到 `OUTPUT_TRUNCATE_BYTES`
+/// When tool output exceeds `OUTPUT_TRUNCATE_BYTES`, mark truncation visibly so readers do not mistake incomplete output for the complete result.
 /// 时，纯粹砍掉尾部字节会让远端读者以为内容天然到此为止、完全看不出发生过截断——这是一种
 /// "不可见的信息损失"：用户可能依据不完整的工具输出做判断而自己毫无察觉。这里只做最小可见化：
 /// 真正发生截断时在文本尾追加固定标记 `TOOL_OUTPUT_TRUNCATION_MARKER`；能整份取回被截掉尾部的
-/// 完整 ref 化留作 BACKLOG（M0 条文/设计稿本任务不动，见 HANDOFF 交接单），这里只解决
+/// Full-content recovery through references is not implemented here; this helper only makes truncation visible.
 /// "看不看得出被截断"，不解决"截断之后怎么找回全文"。
 ///
 /// 标记必须**计入 `max_bytes` 预算之内**，不能先按 `max_bytes` 截完正文再往后拼标记——那样会把
@@ -4573,7 +4400,7 @@ fn extract_tool_milestones(
                     }
                 }
                 AgentEvent::NeedsDecision { .. } => {
-                    // msgfix2 U1 修单三（G2·独立审查 P1）+ msgfix2 U1b 尾单 B2：真路由——
+                    // Use explicit runtime routing for scope changes so aggregation eligibility and delta emission remain separate, observable decisions.
                     // scope_change 是否允许并入 L1 由 `event_joins_l1_aggregation` 在运行时
                     // 判定；与 ApprovalRequested 分支同构成 if/else 两支，路由决策（调用单点
                     // 函数）和"是否产生 delta"分离成显式两条路径——不让"跳过"靠 match arm 本身
@@ -5232,7 +5059,7 @@ fn enqueue_batch_payload_for_upstream(
 /// `control.history` 使用的预构建 live 入队口。与 delta 共用同一有界 FIFO、generation
 /// 标签和 drain 归属闸；只绕过 classify，因为 payload 已由 history 契约构造函数定型。
 ///
-/// msgfix1 T3（缺口①·M0 §10.9 同一姿势）：返回值 `true` = 已成功 try_send 进队列（尽力而为，
+/// Return `true` only after `try_send` successfully queues the item; this is best-effort admission, not a delivery guarantee.
 /// 不保证送达，但已在制品）；`false` = 未能入队（client_msg_id 非法 / upstream 门控关闭 /
 /// 队列满或断连）——调用方（`control.history` 命令臂）据此回真实失败 ack，不再无条件回 `Ok`。
 fn enqueue_prebuilt_live_for_upstream(
@@ -5276,7 +5103,7 @@ fn enqueue_milestone_item(
         if let Some(blocks) = item.payload.get_mut("blocks") {
             *blocks = truncate_history_tool_outputs(blocks.clone());
         }
-        // msgfix1 T3（设计稿 §A）：`build_msg_completed_payload` 把预算好的 content_ref
+        // `build_msg_completed_payload` carries a precomputed content_ref under a private key that must be removed before size measurement or wire serialization.
         // 挂在私有键下——无论是否超预算都必须先把它取出并从 payload 上剥离，绝不能让它
         // 混进下面的尺寸测量（否则会把整条原始内容的哈希/字节数误算进 payload 尺寸）或
         // 流到 wire（非超预算消息不该带 content_ref，§10.6「可选字段」）。
@@ -5454,9 +5281,9 @@ fn build_content_ref(message_id: i64, revision: i64, content_raw: &str) -> Value
     })
 }
 
-/// msgfix1 T4（M0 §10.5 `msg.fetch.error`）：六值 code 枚举的通用构造——`current_ref` 仅
+/// Construct `msg.fetch.error` payloads for the six error codes; include `current_ref` only for `stale_revision`, omitting it for other codes.
 /// `stale_revision` 必填，其余 code 整个省略该字段（不是 `null`，见样张
-/// `data-plane-v1.json` 的 `msg_fetch_error_not_found`——msgfix1 T7 B5：pending 版已合入
+/// `data-plane-v1.json` includes `msg_fetch_error_not_found`, which demonstrates that errors other than stale revision omit `current_ref` entirely.
 /// 正式文件并删除，改指正式文件）。
 fn msg_fetch_error_payload(code: &str, current_ref: Option<Value>) -> Value {
     let mut frame = serde_json::json!({"t": "msg.fetch.error", "code": code});
@@ -5466,7 +5293,7 @@ fn msg_fetch_error_payload(code: &str, current_ref: Option<Value>) -> Value {
     frame
 }
 
-/// msgfix1 T4（M0 §10.5 `msg.chunk`）+ §10.9（重组安全/offset 续传）：把消息原文按
+/// Split raw message bytes into ordered `msg.chunk` payloads from the resume offset while retaining whole-message length and hash for safe reassembly.
 /// `CHUNK_RAW_BYTES` 切成有序分片，逐片产 `msg.chunk` 密文体。`start_offset` 支持 `msg.fetch`
 /// 的 `offset` 续传语义——只从这个偏移开始切，不重复发送客户端已经拿到的前缀；越界（
 /// `start_offset >= content.len()`）时钳到末尾。`content_sha256`/`total_bytes` 恒对**全量**
@@ -5522,14 +5349,14 @@ fn build_msg_chunks(
     chunks
 }
 
-/// msgfix1 T4（M0 §10.9 单飞行 + 超时释放）：某 session 现有的在途 fetch 记录是否仍然"占着"
+/// Check whether a session fetch still owns its single-flight slot; expiry releases the slot while saturating subtraction handles clock rollback.
 /// 单飞行槽位——超时（`MSG_FETCH_INFLIGHT_TIMEOUT_MS`）后视为已释放。纯函数，供不依赖
 /// provider/socket 的单元测试直接钉超时边界（含时钟回拨的 `saturating_sub` 防御）。
 fn msg_fetch_inflight_is_active(accepted_at_ms: u64, now_ms: u64) -> bool {
     now_ms.saturating_sub(accepted_at_ms) < MSG_FETCH_INFLIGHT_TIMEOUT_MS
 }
 
-/// msgfix1 T4（M0 §10.9 per-source 60s 字节预算）：纯函数版本——先按
+/// Pure admission calculation for the source-wide 60-second byte budget: prune expired entries before checking and recording the requested bytes.
 /// `now_ms - MSG_FETCH_BYTE_BUDGET_WINDOW_MS` 剪掉窗口外的陈旧条目，再判断加上
 /// `requested_bytes` 是否仍在 `MSG_FETCH_BYTE_BUDGET_PER_WINDOW` 之内；放行时把这次请求记进
 /// 窗口。返回 `(是否放行, 剪枝并可能追加记账后的窗口)`——调用方在同一次加锁临界区内原地替换
@@ -5554,7 +5381,7 @@ fn msg_fetch_budget_admit(
     (admit, window)
 }
 
-/// msgfix1 T4 返修②（skeptic 补审）：check-and-insert——若 `(session, command_id)` 已经在
+/// Check and insert `(session, command_id)` in the ledger so a command already processed cannot be admitted again.
 /// 账本里（意味着这个 command_id 之前已经被 `handle_msg_fetch_at` 处理过一次，无论那次成功
 /// 还是失败），返回 `false`（拒绝复用）；否则记入账本（容量满时 FIFO 淘汰最老一条）并返回
 /// `true`（放行——本次是这个 `(session, command_id)` 第一次被处理）。见 `MsgFetchCommandLedger`
@@ -5582,7 +5409,7 @@ fn msg_fetch_command_ledger_admit(
 /// actionable 块型名单（设计稿 §A「权限请求/确认卡」）：`approval`（审批卡，对应用户需要放行/
 /// 拒绝的权限请求，见 `db::Block::Approval`）、`decision_card`（ask/dispatch_confirm 两种
 /// kind 共用同一块型，对应确认卡/决策卡，见 `db::Block::DecisionCard`）、`scope_change`
-/// （msgfix1 T3 返修 P0-1：来自 `AgentEvent::NeedsDecision`，UI 呈现「接受并继续」这类需要
+/// Scope changes from `AgentEvent::NeedsDecision` expose actions such as accepting and continuing; preserve these blocks because they require user authorization.
 /// 用户放行的动作，见 `db::Block::ScopeChange`/`agent_event::ScopeChange`——语义上与
 /// approval/decision_card 同级，都是"此刻等待用户处理"）。这三类块承载"需要用户立即行动"
 /// 的语义，preview 降级时必须原样保留，绝不能被截断/丢弃吞掉。其余块型
@@ -5647,7 +5474,7 @@ fn build_oversized_preview_blocks(blocks: &Value) -> Value {
 /// 本身超预算时（如 actionable 块本身就很大）进一步退化为"仅提示块 + content_ref"，ref 永不
 /// 丢（设计稿 §A 明文约束）。
 /// 二次退化的最终形态——仅一个提示文本块，不含任何原始内容（连 actionable 块也不留）。
-/// msgfix1 T3 返修 P0-1：`downgrade_to_preview_payload`（msg.completed 口）与 history
+/// `downgrade_to_preview_payload` for `msg.completed` and history row fallback share one notice-only representation to preserve content_ref consistently.
 /// 单行降级（`build_history_page_with_limit`）共用同一常量形态，保证两口"仅提示块 +
 /// content_ref"的最终表示逐字节一致——ref 永不丢是两口共同的硬不变量，不是各自各写一份。
 fn notice_only_preview_blocks() -> Value {
@@ -5672,7 +5499,7 @@ fn downgrade_to_preview_payload(payload: &Value, content_ref: Value, t: &str) ->
 /// optional `"agent"` 键，`None` 时整个键省略（不是 `null`），保持老消费方（无该键时按老形状
 /// 解析）向后兼容。user 消息 / 无 agent 归属的场景走 `None`。
 ///
-/// msgfix1 T3：`revision`/`content_raw` 用于预计算 content_ref（M0 §10.6），挂在私有键
+/// Use `revision` and `content_raw` to precompute content_ref and carry it under a private payload key until enqueue decides whether a preview is needed.
 /// `MSG_COMPLETED_REF_SOURCE_KEY` 下随 payload 一起传递给 `enqueue_milestone_item`——该函数
 /// 决定是否需要把消息降级为 preview，需要时才会真正把 content_ref 摆上顶层；不需要时会把这个
 /// 私有键整个剥掉，绝不流到 wire（非超预算消息不该带 content_ref，见该常量文档）。
@@ -5703,7 +5530,7 @@ pub(crate) fn build_msg_completed_payload(
     payload
 }
 
-/// msgfix1 T5（缺口④·M0 §10.7）：`revision` 参与派生——`revision==1` 与旧派生逐字节相同
+/// Include `revision` in identifier derivation while keeping `revision == 1` byte-for-byte compatible with the original derivation.
 /// （存量零扰动，client-msg-id-derivation-v1.json 首条既有向量钉死），`revision>1` 在 name
 /// 末尾追加 `|<revision>`（与合入的 revision KAT 向量互证）。每个 revision 天然是一个新
 /// client_msg_id，relay 幂等去重不会把"终态改写后的重发"当成旧事件吞掉。
@@ -5721,7 +5548,7 @@ pub(crate) fn derive_msg_completed_client_msg_id(
     }
 }
 
-/// idlefix-T1 缺口②：连接后补发批里的 `run.status` 现状帧专用——与首发（live，
+/// Derive deterministic identifiers for reconnect `run.status` replay frames so replaying the same run and state does not create a new event identity.
 /// `publish_run_status_milestone` 走 `try_random_client_msg_id`）区分开：补发是"重放当前已知
 /// 状态"，同一状态/run_id 组合确定性推导同一个 client_msg_id，避免每次重连补发都造出不同的
 /// client_msg_id（同 msg.completed/card.* 补发的确定性推导惯例）。
@@ -5808,7 +5635,7 @@ pub(crate) fn build_run_status_payload(
     })
 }
 
-/// idlefix-T1 补针 C（TOCTOU）：`publish_run_status_milestone`（真实运行时经全局 `GATEWAY` 调用
+/// Extract live `publish_run_status_milestone` enqueue logic into a helper taking `&Inner` so replay ordering and mutual exclusion can be tested without the global `GATEWAY`.
 /// 的实时入队路径）真正落地的入队逻辑拆到这里、显式接收 `&Inner`——单测里 `GATEWAY` 故意不装
 /// （见 `entropy_failure_does_not_panic_in_random_id_publish_facades` 头注），若把入队逻辑锁在
 /// `GATEWAY.get()` 后面，测试就没有任何办法绕开全局单例去验证锁的互斥语义。持有
@@ -6412,7 +6239,7 @@ fn truncate_history_tool_outputs(mut blocks: Value) -> Value {
             continue;
         };
         if let Some(text) = output.as_str() {
-            // msgfix1 T7 B2：msg.completed（4592 一带经 enqueue_milestone_item）与 history
+            // `msg.completed` via `enqueue_milestone_item` and history queries share this helper so both paths visibly mark truncated output.
             // 查询（5653 一带）共用本函数——两口都要在截断发生时带上可见化标记。
             *output = Value::String(truncate_utf8_with_marker(text, OUTPUT_TRUNCATE_BYTES));
         }
@@ -6507,7 +6334,7 @@ fn build_history_page_with_limit(
             .unwrap_or(usize::MAX)
             > HISTORY_SEND_BUDGET_BYTES
         {
-            // msgfix1 T3（设计稿 §A）：超预算不再整条丢弃——降级为块级 preview +
+            // Downgrade oversized messages to a block-level preview plus content_ref so they remain visible and their full content can still be fetched.
             // content_ref，让远端至少看得见这条消息、按需可拉全文。`oversized_dropped`
             // 计数器语义随之改为「本条降级为 preview 的次数」，继续保持指标可观测。
             let content_ref = build_content_ref(row.message_id, row.revision, &row.content_raw);
@@ -6525,7 +6352,7 @@ fn build_history_page_with_limit(
                 row_has_older.then_some(row.message_id),
             );
             oversized_dropped += 1;
-            // msgfix1 T3 返修 P0-1：块级 preview 本身仍超预算时（如 actionable 块本身巨大）
+            // If a block-level preview still exceeds the budget, including oversized actionable blocks, fall back to a notice plus content_ref instead of dropping the row.
             // 不再丢行——退化到与 `downgrade_to_preview_payload`（msg.completed 口）共用
             // 的同一"仅提示块 + content_ref"终态（`notice_only_preview_blocks`）。这一级在
             // 设计上必然装得下（content_ref 固定四字段 + 定长提示文案 + 有界 session/游标
@@ -6588,7 +6415,7 @@ fn build_history_page_with_limit(
     }
 }
 
-/// msgfix1 T4（M0 §10.4/§10.9）：`msg.fetch` 的完整校验链 + 分片入队——生产入口，`now_ms` 取
+/// Production entry point for the complete `msg.fetch` validation and chunk enqueue path; `now_ms` uses the real clock and replies are sent asynchronously.
 /// 真实时钟。**没有直接返回值**：`msg.fetch` 不像 `input.send`/`control.stop` 那样回一个
 /// `input.ack`——按 M0 §10.5，它唯一的应答形态是 `reply` kind 下的 `msg.chunk`/
 /// `msg.fetch.error`，全部经 `try_enqueue_reply` 送进 `state.reply_queue`，由
@@ -6629,41 +6456,15 @@ fn handle_msg_fetch_at(
     now_ms: u64,
 ) {
     let state = &inner.state;
-    // msgfix1 T4 返修③（skeptic 补审）：入队那一刻的连接 generation 一并存进每条
+    // Store the connection generation with every queued reply so draining can reject data left over from an earlier connection.
     // `ReplyQueueItem`——`drain_reply_queue` 出队时据此判断这条数据是不是跨连接残留（见该
     // 函数 doc）。
     let connection_generation = state.connection_generation_snapshot();
-
-    // 步骤⓪（返修②·skeptic 补审）：command_id 复用账本——这个 `(session, command_id)`
-    // 之前处理过，一律拒绝复用（回 busy，引导客户端换新 command_id）。必须放在最前面：一旦
-    // 放行，下面每一条早退路径都会把这次 `(session, command_id)` 记进 `msg_fetch_inflight`/
-    // `reply_queue`，而 `generation` 判定的正确性前提就是"同一 `(session, command_id)` 只会
-    // 被这个函数处理一次"。
-    if !msg_fetch_command_ledger_admit(state, session, command_id) {
-        // 这条 busy 回复本身也走一次全新 generation——它不会被写进 `msg_fetch_inflight`
-        // （压根没到步骤④），`generation` 字段只是满足 `ReplyQueueItem` 的结构要求，不参与
-        // 任何后续比对。
-        let generation = state
-            .msg_fetch_generation_counter
-            .fetch_add(1, Ordering::Relaxed);
-        if !try_enqueue_reply(
-            state,
-            ReplyQueueItem {
-                session: Some(session.to_owned()),
-                command_id: command_id.to_owned(),
-                payload: msg_fetch_error_payload("busy", None),
-                final_frame: true,
-                generation,
-                connection_generation,
-            },
-        ) {
-            state.reply_queue_dropped.fetch_add(1, Ordering::Relaxed);
-        }
+    let Some(generation) =
+        msg_fetch::admit_command_id(state, session, command_id, connection_generation)
+    else {
         return;
-    }
-    let generation = state
-        .msg_fetch_generation_counter
-        .fetch_add(1, Ordering::Relaxed);
+    };
 
     let reply_error = |code: &str, current_ref: Option<Value>| {
         if !try_enqueue_reply(
@@ -6685,152 +6486,40 @@ fn handle_msg_fetch_at(
         }
     };
 
-    // 步骤①：active repo 归属闸——先于任何消息级查询，越权请求连"这个 message_id 存不存在"
-    // 都探不出来（不泄露存在性差异，同 `command_session_allowed` 既有姿势）。
-    if !command_session_allowed(inner, session) {
-        reply_error("forbidden", None);
+    let Some((content_raw, revision)) =
+        msg_fetch::lookup_message(inner, session, message_id, &reply_error)
+    else {
         return;
-    }
-    let (content_raw, revision, session_deleted) =
-        match (inner.message_fetch_provider)(session, message_id) {
-            Ok(MessageForFetchResult::Found {
-                content_raw,
-                revision,
-                session_deleted,
-            }) => (content_raw, revision, session_deleted),
-            Ok(MessageForFetchResult::WrongSession) => {
-                reply_error("forbidden", None);
-                return;
-            }
-            Ok(MessageForFetchResult::NotFound) => {
-                reply_error("not_found", None);
-                return;
-            }
-            Err(error) => {
-                // 查询本身失败（DB 错误）——fail-closed，不当"未知即放行"；也不把内部错误细节
-                // 泄露给远端，`forbidden` 是六值枚举里最贴近"拒绝、不解释原因"的现成 code。
-                eprintln!("remote gateway: msg.fetch lookup failed — {error}");
-                reply_error("forbidden", None);
-                return;
-            }
-        };
-    if session_deleted {
-        reply_error("soft_deleted", None);
-        return;
-    }
-
-    // 步骤②：revision 校验——`offset` 续传按当前 revision 校验，不符即 stale。
-    if requested_revision != revision {
-        reply_error(
-            "stale_revision",
-            Some(build_content_ref(message_id, revision, &content_raw)),
-        );
-        return;
-    }
-
-    // 步骤③：total_bytes 上限。
-    if content_raw.len() > MSG_FETCH_TOTAL_BYTES_LIMIT {
-        reply_error("too_large", None);
-        return;
-    }
-
-    // 步骤③.5（返修④，M0 §10.4 新条文）：offset 越界——严格大于 total_bytes 是协议误用（不是
-    // "已经拿到全部内容"这种合法收尾态，那种情形是 `offset == total_bytes`，继续走步骤⑤产出
-    // 单片零长终态帧，见 `build_msg_chunks` doc）。回 `not_found` 而不是此前的静默钳位——更
-    // 诚实地告诉客户端这个请求本身不合法，而不是假装成功却什么都不做。
-    if offset > content_raw.len() {
-        reply_error("not_found", None);
-        return;
-    }
-
-    // 步骤④：单飞行闸（per-session）+ 60s 字节预算（msgfix1 T7 B1：gateway 全局聚合，不再
-    // per-session 分桶）——两把锁按固定顺序（inflight 先于 budget）依次拿、依次放，不嵌套持锁
-    // 跨越业务逻辑，避免与其它持锁路径产生锁序分歧。
-    let total_bytes = content_raw.len();
-    {
-        let mut inflight = lock(&state.msg_fetch_inflight);
-        if let Some(existing) = inflight.get(session) {
-            if msg_fetch_inflight_is_active(existing.accepted_at_ms, now_ms) {
-                drop(inflight);
-                reply_error("busy", None);
-                return;
-            }
-        }
-        // 返修②（skeptic 补审）：接管前记下被取代那次接受的 generation——释放锁之后立刻拿它去
-        // 清 `reply_queue` 里同 generation 的残片（见 `purge_stale_reply_queue_generation`
-        // doc），避免旧 fetch 的分片继续被正常 drain 发给已经不再关心它们的客户端。
-        let superseded_generation = inflight.get(session).map(|entry| entry.generation);
-        inflight.insert(
-            session.to_owned(),
-            MsgFetchInflightEntry {
-                command_id: command_id.to_owned(),
-                accepted_at_ms: now_ms,
-                generation,
-            },
-        );
-        drop(inflight);
-        if let Some(superseded_generation) = superseded_generation {
-            purge_stale_reply_queue_generation(state, session, superseded_generation);
-        }
-    }
-    let admitted = {
-        let mut budget_slot = lock(&state.msg_fetch_byte_budget);
-        let window = std::mem::take(&mut *budget_slot);
-        let (admit, window) = msg_fetch_budget_admit(window, now_ms, total_bytes);
-        *budget_slot = window;
-        admit
     };
-    if !admitted {
-        // 预算不放行——释放刚占的单飞行槽位（这次请求从未真正开始传输，不该占着槽位等
-        // 30 秒超时才被动释放），再回 busy。
-        clear_msg_fetch_inflight_if_matches(state, session, generation);
-        reply_error("busy", None);
+    if !msg_fetch::validate_message(
+        message_id,
+        requested_revision,
+        offset,
+        &content_raw,
+        revision,
+        &reply_error,
+    ) {
         return;
     }
-
-    // 步骤⑤：全过——切片入队。`build_msg_chunks` 恒返回非空序列（见其 doc），因此
-    // `last_index` 恒可算，`final_frame` 恒有归宿。
-    let chunks = build_msg_chunks(message_id, revision, content_raw.as_bytes(), offset);
-    let last_index = chunks.len() - 1;
-    let mut fully_enqueued = true;
-    for (index, chunk) in chunks.into_iter().enumerate() {
-        let enqueued = try_enqueue_reply_chunk(
-            state,
-            ReplyQueueItem {
-                session: Some(session.to_owned()),
-                command_id: command_id.to_owned(),
-                payload: chunk,
-                final_frame: index == last_index,
-                generation,
-                connection_generation,
-            },
-        );
-        if !enqueued {
-            fully_enqueued = false;
-            break;
-        }
+    if !msg_fetch::admit_inflight_and_budget(
+        state,
+        session,
+        command_id,
+        generation,
+        now_ms,
+        content_raw.len(),
+        &reply_error,
+    ) {
+        return;
     }
-    if !fully_enqueued {
-        // M0 §10.9：满→丢整个传输并回 busy 终态（可观测，不静默）。已经入队的前缀分片仍会
-        // 被正常发出——客户端按同一 command_id 收到"部分分片 + busy 终态"，§10.9 的整体
-        // SHA-256 校验天然通不过，会弃拉并可用同一/新 command_id 重试，不会展示半截内容。
-        if !try_enqueue_reply(
-            state,
-            ReplyQueueItem {
-                session: Some(session.to_owned()),
-                command_id: command_id.to_owned(),
-                payload: msg_fetch_error_payload("busy", None),
-                final_frame: true,
-                generation,
-                connection_generation,
-            },
-        ) {
-            // 双重饱和——连兜底 error 都塞不进去。释放单飞行槽位，不然会一直卡到超时；
-            // 如实计数，不假装已经通知到客户端。
-            state.reply_queue_dropped.fetch_add(1, Ordering::Relaxed);
-            clear_msg_fetch_inflight_if_matches(state, session, generation);
-        }
-    }
+    msg_fetch::enqueue_chunks(
+        state,
+        session,
+        command_id,
+        (message_id, revision, offset, &content_raw),
+        generation,
+        connection_generation,
+    );
 }
 
 fn handle_command_envelope(
@@ -6911,281 +6600,22 @@ fn handle_command_envelope(
 
     match (kind, payload.get("t").and_then(Value::as_str)) {
         ("input", Some("input.send")) => {
-            let Some(session) = payload.get("session").and_then(Value::as_str) else {
-                return failed();
-            };
-            // M2-4c：下行归属闸——不属于当前 active repo 的 session 一律 failed（fail-closed）。
-            if !command_session_allowed(inner, session) {
-                return failed();
-            }
-            let Some(text) = payload.get("text").and_then(Value::as_str) else {
-                return failed();
-            };
-            let Some(outcome) = (inner.input_send_handler)(InputSendFrame {
-                session: session.to_owned(),
-                command_id: command_id.clone(),
-                text: text.to_owned(),
-            }) else {
-                // receipt 无法持久化或终态暂不可知时不回 ack，让 relay 保留并重投；
-                // 这不是坏帧，不增加 bad_frames。
-                return None;
-            };
-            Some(input_ack_json(&command_id, outcome))
+            command_envelope::handle_input_send(inner, &payload, &command_id)
         }
         ("control", Some("control.stop")) => {
-            let Some(session) = payload.get("session").and_then(Value::as_str) else {
-                return failed();
-            };
-            // M2-4c：下行归属闸——同 input.send。
-            if !command_session_allowed(inner, session) {
-                return failed();
-            }
-            let Some(issued_at_ms) = payload
-                .get("issued_at_ms")
-                .and_then(Value::as_u64)
-                .filter(|value| *value > 0 && *value <= JSON_SAFE_INTEGER_MAX)
-            else {
-                return failed();
-            };
-            let Some(expires_at_ms) = payload
-                .get("expires_at_ms")
-                .and_then(Value::as_u64)
-                .filter(|value| *value > 0 && *value <= JSON_SAFE_INTEGER_MAX)
-            else {
-                return failed();
-            };
-            if issued_at_ms > expires_at_ms {
-                return failed();
-            }
-            if expires_at_ms - issued_at_ms > CONTROL_STOP_MAX_LIFETIME_MS {
-                return failed();
-            }
-            if is_control_stop_stale(issued_at_ms, expires_at_ms, now_unix_ms()) {
-                return failed();
-            }
-            if !(inner.control_replay_handler)(session, &command_id) {
-                return failed();
-            }
-            let outcome = (inner.control_stop_handler)(ControlStopFrame {
-                session: session.to_owned(),
-                command_id: command_id.clone(),
-            });
-            Some(input_ack_json(&command_id, outcome))
+            command_envelope::handle_control_stop(inner, &payload, &command_id)
         }
         ("input", Some("input.answer")) => {
-            let Some(session) = payload.get("session").and_then(Value::as_str) else {
-                return failed();
-            };
-            // M2-4c：下行归属闸——同 input.send。
-            if !command_session_allowed(inner, session) {
-                return failed();
-            }
-            let Some(decision_id) = payload.get("decision_id").and_then(Value::as_str) else {
-                return failed();
-            };
-            let Some(option) = payload.get("option").and_then(Value::as_str) else {
-                return failed();
-            };
-            let Some(outcome) = (inner.input_answer_handler)(InputAnswerFrame {
-                session: session.to_owned(),
-                command_id: command_id.clone(),
-                decision_id: decision_id.to_owned(),
-                option: option.to_owned(),
-            }) else {
-                return None;
-            };
-            Some(input_ack_json(&command_id, outcome))
+            command_envelope::handle_input_answer(inner, &payload, &command_id)
         }
         ("control", Some("control.history")) => {
-            let Some(session) = payload.get("session").and_then(Value::as_str) else {
-                return failed();
-            };
-            if session.len() > SESSION_ID_MAX_BYTES {
-                return failed();
-            }
-            if !command_session_allowed(inner, session) {
-                return failed();
-            }
-            let before_message_id = match payload.get("before_message_id") {
-                None | Some(Value::Null) => None,
-                Some(value) => {
-                    let Some(cursor) = value.as_i64().filter(|cursor| *cursor >= 0) else {
-                        return failed();
-                    };
-                    Some(cursor)
-                }
-            };
-            // 多取一行只为判断是否确有更早消息，wire 页仍至多 50 条。若整窗都因单条超预算
-            // 被有意丢弃，用最老已扫描 id 继续查下一窗；否则空页的 null 游标会让更早消息永远
-            // 不可达。响应里的 before_message_id 始终回显手机原始请求，而不是内部扫描游标。
-            let mut scan_before = before_message_id;
-            let mut oversized_dropped = 0_u64;
-            let page = loop {
-                let Ok(rows) = (inner.session_history_provider)(
-                    session,
-                    scan_before,
-                    (HISTORY_PAGE_MAX_ROWS + 1) as i64,
-                ) else {
-                    return failed();
-                };
-                let page = build_history_page(session, before_message_id, rows);
-                oversized_dropped = oversized_dropped.saturating_add(page.oversized_dropped);
-                let emitted = page
-                    .payload
-                    .get("messages")
-                    .and_then(Value::as_array)
-                    .map(|messages| !messages.is_empty())
-                    .unwrap_or(false);
-                let Some(next_scan_before) = page.next_scan_before else {
-                    break page;
-                };
-                if emitted {
-                    break page;
-                }
-                if scan_before.is_some_and(|cursor| next_scan_before >= cursor) {
-                    return failed();
-                }
-                scan_before = Some(next_scan_before);
-            };
-            state
-                .history_oversized_dropped
-                .fetch_add(oversized_dropped, Ordering::Relaxed);
-            let cursor_name = before_message_id
-                .map(|cursor| cursor.to_string())
-                .unwrap_or_else(|| "latest".to_owned());
-            let client_msg_id =
-                derive_client_msg_id(&format!("history|{session}|{command_id}|{cursor_name}"));
-            // msgfix1 T3（缺口①）：入队失败（门控关闭/队列满断连）必须回真实失败 ack——
-            // 此前无条件回 `Ok`，客户端会以为帧已在路上，实则从未入队、永不到达。
-            let enqueued = enqueue_prebuilt_live_for_upstream(
-                state,
-                &inner.upstream_tx,
-                MilestoneItem {
-                    session: Some(session.to_owned()),
-                    t: "history".to_owned(),
-                    payload: page.payload,
-                    client_msg_id,
-                },
-            );
-            Some(input_ack_json(
-                &command_id,
-                if enqueued {
-                    AckOutcome::Ok
-                } else {
-                    AckOutcome::Failed
-                },
-            ))
+            command_envelope::handle_control_history(inner, &payload, &command_id)
         }
         ("control", Some("control.snapshot")) => {
-            let Some(session) = payload.get("session").and_then(Value::as_str) else {
-                return failed();
-            };
-            // P0-b 微返工第 4 轮：session 长度纵深守卫——见 `SESSION_ID_MAX_BYTES` 定义处的
-            // 完整推导。放在归属闸之前：协议都不合规的 session 值不值得再去查归属。
-            if session.len() > SESSION_ID_MAX_BYTES {
-                return failed();
-            }
-            // P0-b：下行归属闸——同 input.send/control.stop/input.answer。
-            if !command_session_allowed(inner, session) {
-                return failed();
-            }
-            // P0-b：单次临界区原子取出该 session 的当前归约态——不存在即 idle。
-            let (run, blocks) = {
-                let snapshots = lock(&state.partial_snapshots);
-                match snapshots.get(session) {
-                    Some(entry) => (
-                        Some((entry.run_id.clone(), entry.last_seq)),
-                        entry.reducer.snapshot_blocks(),
-                    ),
-                    None => (None, Vec::new()),
-                }
-            };
-            let snapshot_payload = build_snapshot_payload(
-                session,
-                run.as_ref()
-                    .map(|(run_id, through_run_seq)| (run_id.as_str(), *through_run_seq)),
-                &blocks,
-            );
-            // P0-b 返工②(c)·微返工第 3 轮改写发送侧兜底：`build_snapshot_payload` 已经做过
-            // 收敛，这里只兜住"收敛后仍超预算"的边缘情形——绝不把超帧交给 relay 裁决（1009
-            // 踢断桌面 + 客户端重请求 = 断连环）。`SNAPSHOT_SEND_BUDGET_BYTES`（44KiB）是按
-            // 信封膨胀折算过的明文预算，不是拿裸 payload 直接比 relay 64KB 硬闸——见该常量
-            // 定义处的完整推导；`SNAPSHOT_PAYLOAD_BUDGET_BYTES` 收敛正确后本分支正常路径几乎
-            // 不可达，纯保险丝。只护 snapshot 这一条路径，不改其它里程碑的既有 enqueue 行为。
-            //
-            // P0-b 微返工第 4 轮：改用 `snapshot_frame_bytes` 计量——与 `shrink_snapshot_
-            // blocks_to_budget` 收敛判断同一把尺子（都含 `t`），不再是这里量未合并 `t` 的裸
-            // `snapshot_payload`。旧写法两处口径分裂：①收敛判断按含 `t` 的尺寸算已在预算内，
-            // ②这里却按裸尺寸算是否超 44KiB 兜底阈值，一个真实逼近阈值的边界帧可能被①放行、
-            // 又被②的偏小裸尺寸误判"未超"而照发。
-            //
-            // 窄窗如实记档：命中这个分支时函数已经回 `AckOutcome::Ok`（下面这行）而对应的
-            // snapshot 帧其实从未入队/发出——与 drain 阶段过滤丢弃属同一族"ack 已回但帧未达"
-            // 窄窗，不是本轮修复范围，只是不新增语义、如实标注既有取舍。
-            let snapshot_payload_bytes = snapshot_frame_bytes(&snapshot_payload);
-            if snapshot_payload_bytes > SNAPSHOT_SEND_BUDGET_BYTES {
-                state
-                    .snapshot_oversized_dropped
-                    .fetch_add(1, Ordering::Relaxed);
-                return Some(input_ack_json(&command_id, AckOutcome::Ok));
-            }
-            // v1.8.11：client_msg_id 由请求 command_id 确定性派生——重投同一请求天然幂等去重。
-            let client_msg_id = derive_client_msg_id(&format!("snapshot|{session}|{command_id}"));
-            // snapshot 应答走既有里程碑队列出口（同 drain 轮里程碑先于 live）。直接用本次调用
-            // 已持有的 inner.state/inner.milestone_tx 入队，而不是经全局单例 publish_milestone
-            // 重新查找——生产环境下两者指向同一个 Inner，直接用局部引用可测（单元测试不会注册
-            // 全局 GATEWAY 单例，经全局查找会在测试里静默无法验证已构造好的 payload）。
-            enqueue_milestone_for_upstream(
-                state,
-                &inner.milestone_tx,
-                MilestoneItem {
-                    session: Some(session.to_owned()),
-                    t: "snapshot".to_owned(),
-                    payload: snapshot_payload,
-                    client_msg_id,
-                },
-            );
-            Some(input_ack_json(&command_id, AckOutcome::Ok))
+            command_envelope::handle_control_snapshot(inner, &payload, &command_id)
         }
         ("control", Some("msg.fetch")) => {
-            // msgfix1 T4（M0 §10.4）：`{session, message_id, revision, offset}` 四字段——字段
-            // 缺失/类型不符是协议违例（走既有 `failed()`），与业务级拒绝（越权/软删/过大/
-            // stale/busy——那些走 `msg.fetch.error` reply，不是这里）是两层不同的失败。
-            let Some(session) = payload.get("session").and_then(Value::as_str) else {
-                return failed();
-            };
-            if session.len() > SESSION_ID_MAX_BYTES {
-                return failed();
-            }
-            let Some(message_id) = payload.get("message_id").and_then(Value::as_i64) else {
-                return failed();
-            };
-            let Some(requested_revision) = payload.get("revision").and_then(Value::as_i64) else {
-                return failed();
-            };
-            let Some(offset) = payload
-                .get("offset")
-                .and_then(Value::as_i64)
-                .filter(|value| *value >= 0)
-                .and_then(|value| usize::try_from(value).ok())
-            else {
-                return failed();
-            };
-            // msgfix1 T4：`msg.fetch` 不像 `input.send`/`control.stop`/`control.history`/
-            // `control.snapshot` 那样回一个 `input.ack`——按 M0 §10.5，它唯一的应答形态是
-            // `reply` kind 下的 `msg.chunk`/`msg.fetch.error`，全部由 `handle_msg_fetch`
-            // 经 `try_enqueue_reply` 送进独立的 `reply_queue`（M0 §10.9），由
-            // `drain_reply_queue` 异步发出。这里返回 `None`——不是"处理失败"，是"响应已经
-            // 走另一条通道，这条 `handle_frame` 调用没有直接要回写 socket 的 Value"。
-            handle_msg_fetch(
-                inner,
-                session,
-                &command_id,
-                message_id,
-                requested_revision,
-                offset,
-            );
-            None
+            command_envelope::handle_msg_fetch_kind(inner, &payload, &command_id)
         }
         _ => failed(),
     }

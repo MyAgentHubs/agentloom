@@ -19,7 +19,7 @@ type Props = {
   openTabs: RightPanelTab[];
   expanded: boolean;
   canMaximize?: boolean;
-  /** plan B3：Review tab 角标——变更文件数 > 0 时显数字。 */
+  /** Review tab badge shows a number only when there are changed files (> 0). */
   reviewBadge?: number;
   onTab: (tab: RightPanelTab | null) => void;
   onExpand: () => void;

@@ -103,7 +103,7 @@ type RenderSegment =
     }
   | { kind: "artifacts"; segment: Extract<Segment, { kind: "artifacts" }> };
 
-// 超过阈值的文本块整体走 markdown 同步解析会阻塞主线程数秒·折叠默认（T7）。
+// Huge text blocks default to collapsed: parsing the whole thing as markdown synchronously can block the main thread for seconds.
 // 阈值降到 5 万（D3 整盘审 P2①）：实测 remark 解析 99k≈205ms、50k≈25ms，
 // 流式场景每个 chunk 都会重解析一次，WKWebView 比桌面 Chrome 更慢，原 10 万阈值偏松。
 const HUGE_TEXT_BLOCK_CHARS = 50_000;
@@ -978,7 +978,7 @@ function MessageContentImpl({
       );
     if (block.type === "gate_card" || block.type === "draft_failed")
       return null; // gateView 不匹配（已清）→ 不渲
-    // plan B3：内联变更卡——「查看」透传 onViewRun（App 里开右面板 Review tab）。
+    // Inline change card: "View" forwards onViewRun to open the Review tab in the right panel.
     if (block.type === "run_card")
       return (
         <RunCard

@@ -4,7 +4,7 @@
 //! The app server is deliberately minimal: POST /mcp answers a single JSON-RPC
 //! message as plain `application/json`; a notification (no `id`) gets HTTP 202
 //! with no body; GET /mcp is 405 (no SSE); there is no `Mcp-Session-Id`
-//! (stateless); `initialize` pins protocolVersion `2025-06-18`; only
+//! (stateless); `initialize` pins the protocol version to the `PROTOCOL_VERSION` constant below; only
 //! `initialize` / `tools/list` / `tools/call` are understood.
 //!
 //! This test replicates that surface with wiremock and drives a real
@@ -120,7 +120,7 @@ async fn streamable_http_initialize_list_and_call_round_trip() {
     let url = format!("{}/mcp", server.uri());
     let cfg = http_cfg(url);
 
-    // initialize handshake succeeds against a server advertising 2025-06-18,
+    // initialize handshake succeeds against a server advertising the pinned protocol version,
     // and the `notifications/initialized` (202) path did not break it.
     let (conn, caps) = McpConnection::connect(&cfg, Duration::from_secs(5))
         .await

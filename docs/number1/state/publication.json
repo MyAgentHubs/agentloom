@@ -1,0 +1,22 @@
+{
+  "approved": true,
+  "branch": "myagenthubs/number1-debt-graph",
+  "public_main_observed": "16db362c93724d352272972c28d1a09dab470813",
+  "campaign_base_sha": null,
+  "export_scan": "initial exporter failed self-match; explicit package transforms applied; final scan 0 hits",
+  "full_snapshot_build": "PASS: public clone engine build/tests, macOS app compile/tests, frontend checks/tests/build; initial failures and corrected reruns retained in evidence/verification.json",
+  "pending_patches_applied": false,
+  "public_scope": "43 files in agentloom; 11 relay targets in existing public repo need baseline reconciliation; 6 remote-web targets lack published source",
+  "private_history_included": false,
+  "relay_main_observed": "cea5b8dbe807e0cb62c204238d87bbe5253297a4",
+  "secret_scan": "26 fixture findings reviewed against identical public main files; not an exit-0 scan",
+  "frontend_function_debt": {
+    "app_files": 35,
+    "app_functions": 42,
+    "remote_web_files": 4,
+    "remote_web_functions": 4
+  },
+  "approval_scope": "Publish public AgentLoom campaign only; relay/web integration or separate publication deferred",
+  "status": "preflight_passed_activation_pending",
+  "public_history_parent": "16db362c93724d352272972c28d1a09dab470813"
+}

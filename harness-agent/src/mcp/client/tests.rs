@@ -165,7 +165,7 @@ async fn mcp_client_initialize_sends_client_info_and_parses_capabilities() {
 // The rmcp client negotiates the protocol version instead of pinning one, so
 // a server that answers with an older (but valid) version now connects rather
 // than being rejected. This is the intentional behaviour that lets us talk to
-// the AgentLoom app server (which speaks 2025-06-18).
+// the AgentLoom app server (which speaks protocol revision 2025.06.18).
 #[tokio::test]
 async fn mcp_client_accepts_server_negotiated_protocol_version() {
     let (client_read, server_write) = tokio::io::duplex(4096);

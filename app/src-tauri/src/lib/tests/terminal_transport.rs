@@ -214,11 +214,9 @@ fn transport_terminal_barrier_observes_removed_slot_and_emits_terminal_last() {
     assert_eq!(events.last().unwrap().event, terminal);
 }
 
-/// M1-T1（remote control M0 §4c）+ M1 修复轮 P1-1（2026-08-11）：释放咽喉——槽释放后传入
-/// 的 db 必须落一条 idle 行。P1-1 修复后写口改走 `refresh_session_runtime`
-/// （`db::upsert_session_runtime_status`）——run_id 列不再被清空覆盖成 NULL，而是原样保留
-/// 表中现值（重算口本身拿不到 run_id，见该函数文档）：这是行为变化，旧版本这里断言
-/// run_id 必须清空，现在改断言 run_id 保留。
+/// Releasing the run slot must refresh the persisted runtime status to idle.
+/// The refresh cannot recover a run ID, so it must preserve the stored run_id rather
+/// than overwrite it with NULL and lose the association with the completed run.
 #[test]
 fn emit_terminal_after_releasing_run_slot_writes_session_runtime_idle() {
     let conn = crate::test_support::mem_db();
@@ -365,16 +363,19 @@ fn repeated_request_stop_missing_slot_stays_on_legacy_channel_without_transport_
 
 #[test]
 fn single_run_streaming_source_has_no_legacy_agent_event_emit() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/solo_stream.rs"
+    ));
     let single = source
-        .split("fn spawn_and_stream(")
+        .split("fn pump_stdout(")
         .nth(1)
-        .and_then(|tail| tail.split("\n#[tauri::command]").next())
+        .and_then(|tail| tail.split("\nfn wait_for_attempt(").next())
         .expect("spawn_and_stream source slice");
 
     assert!(single.contains("transport.push(&run_id, event)"));
     assert!(
-        !single.contains("emit_agent_event("),
+        !source.contains("emit_agent_event("),
         "solo streaming and terminal events must be exclusive to EventTransport"
     );
 }

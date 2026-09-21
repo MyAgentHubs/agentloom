@@ -1285,9 +1285,9 @@ fn swap_impl_with_marker_writer(
     }
 
     if fault == Some(Fault::PostSwapPreMarker) {
-        // 模拟“交换刚成功、marker 还没来得及落成 Swapped 就被杀掉”。这条路径
-        // 本身不可能在正常单测里断言（进程会被杀死），只在 T3c/T0 的集成/
-        // 真机验收里驱动到，这里仅提供确定性触发点。
+        // Simulates the process being killed right after the swap succeeds but before the
+        // marker is durably written as Swapped. This path cannot be asserted from a normal unit
+        // test (the process is killed), so it is exercised only via real-machine drills; this call gives it a deterministic trigger point.
         std::process::abort();
     }
 

@@ -4,10 +4,15 @@ use crate::agent_event::{
 };
 use rusqlite::Connection;
 use std::collections::{hash_map::Entry, HashMap, HashSet};
-use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use tauri::Manager;
+
+mod attempt_reader;
+mod reader_watchdog;
+mod single_worker;
+
+use single_worker::dispatch_single_worker_run;
 
 type MemberParser = fn(&str) -> Vec<AgentEvent>;
 type PreparedMember = (
@@ -38,10 +43,9 @@ fn finalize_team_run(
 ) -> rusqlite::Result<()> {
     crate::db::mark_team_run_done(conn, session_id, run_id)
 }
-
-/// worker 回传文本累积粒度（GLM dogfood 实证 bug 修复：token 粒度被逐 token 注入换行；
-/// 2026-07-24 二次 dogfood 回归修复：claude/borrow-claude 的子行 token 片段被 Line 粒度误插换行，
-/// 断词/断表格——详见 `for_parse_fn` 文档）。
+/// Worker output text-accumulation granularity, fixed after real dogfood testing:
+/// blindly inserting newlines per token split claude/borrow-claude sub-line token fragments,
+/// breaking words and tables; see the `for_parse_fn` docs.
 /// - `Line`：codex parser——`item.completed`/`agent_message` 每条 `TextDelta` ≈ 一整条完整消息，
 ///   累积多条时需补 `'\n'` 分隔，否则相邻消息会黏在一起。
 /// - `Token`：claude/borrow-claude parser（`stream_event`/`text_delta` 逐 API delta，子行片段）
@@ -57,9 +61,8 @@ pub enum TextGranularity {
     Line,
     Token,
 }
-
 impl TextGranularity {
-    /// 与 `parser_for_parse_fn` 同源、按各 parser 真实产出形态派生（2026-07-24 dogfood 回归修复）：
+    /// Derived from the same source as `parser_for_parse_fn`, matching each parser's actual emitted text shape:
     /// - Codex：`item.completed`/`agent_message` 每条 `TextDelta` 是一条**完整消息**（`agent_event.rs`
     ///   `parse_codex_item`），同批多条需要补 `'\n'` 分隔——`Line` 正确。
     /// - Claude（含 borrow-claude）：`stream_event`/`content_block_delta`/`text_delta` 每条
@@ -77,7 +80,6 @@ impl TextGranularity {
         }
     }
 }
-
 /// 一个队员的派单规格（真 run·由 start_team_run 从前端 member spec + agent profile 构造）。
 #[derive(Clone, Debug)]
 pub struct MemberSpec {
@@ -95,7 +97,6 @@ pub struct MemberSpec {
     /// 喂 worker 子进程的**全量** prompt（TaskPack 冷 brief·build_task_pack 产）；只给 build_member_command 用。
     pub prompt: String,
 }
-
 /// 队员唯一键（codex P1-5·复合·跨 run 不撞）。
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MemberKey {
@@ -133,10 +134,10 @@ pub struct DispatchIntentGuard {
     registry: Arc<Mutex<TeamRegistry>>,
     team_running: TeamRunning,
     session_id: String,
-    // M1 修复轮 P1-2（opus 深审·2026-08-11）：`None` = 测试/内部二次登记默认态（Drop 只做原有
-    // 的计数清理、不碰 db，零测试改动）；生产调用点（`run_lead_worker_with_dispatch_intent`）
-    // 用 `with_refresh` 挂上后，Drop（intent 计数真正清零/递减）时重算 session_runtime——
-    // 这是「team 从忙转闲」的真正时点之一（详见 P1-1 窗口注释）。
+    // `None` defaults for tests and internal re-registration: Drop only does original count cleanup,
+    // never touches the db, and needs no test changes. Production (`run_lead_worker_with_dispatch_intent`)
+    // attaches a handle via `with_refresh`; Drop recomputes session_runtime when the intent count truly
+    // reaches zero — one of the actual points where a team transitions from busy to idle.
     refresh: Option<(crate::Running, tauri::AppHandle)>,
 }
 
@@ -378,7 +379,7 @@ impl TeamRunning {
         }
     }
     /// reader 线程在 child.wait() 后调：锁内摘除 slot（pid 不再可被 stop 拿到）+ 返回是否曾被请求停。
-    #[allow(dead_code)] // T7 reader 改用 run-level 版本；保留旧 API 给既有语义/测试。
+    #[allow(dead_code)] // Superseded by the run-level variant; kept for existing callers and tests relying on the old per-member API.
     pub fn finish_member(&self, key: &MemberKey) -> bool {
         let Ok(mut registry) = self.0.lock() else {
             return false;
@@ -871,11 +872,11 @@ pub fn start_team_run(
     // A 子片（spec §3.1 run_id 贯通）：前端传 propose 的 run_id 则复用·不传则自生（M1b 兼容）。
     let run_id = run_id.unwrap_or_else(crate::new_run_id);
     let criteria = criteria.unwrap_or_default();
-    // M1-T1（remote control M0 §4c）：team 注册咽喉——`reserve_team_run_slot` 已在上面成功
-    // 占到槽（否则本函数已 `?` 提前返回），此处 run_id 已现场确定，一并写入。这是「reserve」
-    // 类写口（run_id 现场已知，直接 set_session_runtime；不是「release/摘槽」类，不走
-    // refresh_session_runtime——见该函数与 set_session_runtime 文档分工）。失败非致命但不再
-    // 全吞（P3-1），仿 set_goal_title 的写法。
+    // Team run slot reservation is the team registration choke point: `reserve_team_run_slot` above
+    // acquired the slot (otherwise `?` already returned); run_id is now determined and written alongside.
+    // This is a "reserve" write: run_id is known here, so call set_session_runtime directly, not
+    // refresh_session_runtime for "release/free slot" writes; see both functions' docs for responsibilities.
+    // Failure here is non-fatal but no longer silently swallowed, following set_goal_title's pattern.
     if let Ok(conn) = db.0.lock() {
         if let Err(e) = crate::db::set_session_runtime(
             &conn,
@@ -2027,182 +2028,21 @@ fn read_member_attempt(
     first_event: MemberFirstEventWatchdog,
     emit: &mut dyn FnMut(DispatchMeta, AgentEvent),
 ) -> MemberReadAttempt {
-    let mut saw_error = false;
-    let mut saw_blocked = false;
-    let mut saw_needs_decision = false;
-    let mut blocked_message: Option<String> = None;
-    let mut blocked_reason: Option<String> = None;
-    let mut failure_reason = None;
-    let mut buffered = None;
-    let mut terminal_events = Vec::new();
-    let mut tool_events = Vec::new();
-    let mut assistant_text = String::new();
-    let mut assistant_text_only = String::new();
-    let pid = child.id();
-    let (stderr_handle, stderr_live_tail) = match child.stderr.take() {
-        Some(stderr) => {
-            let (handle, tail) = crate::spawn_stderr_tail_thread_shared(
-                stderr,
-                crate::member_log_file(&key.session_id, &spec.assignment_id),
-            );
-            (Some(handle), tail)
-        }
-        None => (None, Arc::new(Mutex::new(Vec::new()))),
+    let context = attempt_reader::AttemptReadContext {
+        tr,
+        key,
+        run_id,
+        spec,
+        wt,
+        parser,
+        parse_fn,
+        locale,
+        granularity,
+        first_event_deadline: first_event.deadline,
     };
-    let (first_event_watchdog, first_event_watchdog_handle) = crate::spawn_first_event_watchdog(
-        tr.clone(),
-        key.clone(),
-        pid,
-        stderr_live_tail.clone(),
-        first_event
-            .deadline
-            .saturating_duration_since(std::time::Instant::now()),
-    );
-    if let Some(stdout) = child.stdout.take() {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            first_event_watchdog.first_line_seen();
-            let events = if locale == crate::Locale::Zh {
-                parser(&line)
-            } else {
-                crate::parse_agent_line_for_locale(
-                    parse_fn.expect("localized member parser requires ParseFn"),
-                    &line,
-                    locale,
-                )
-            };
-            for event in events {
-                let event = match event {
-                    AgentEvent::ToolStarted {
-                        id,
-                        tool,
-                        summary,
-                        card,
-                    } => AgentEvent::ToolStarted {
-                        id,
-                        tool,
-                        summary: crate::agent_event::relativize_summary(&summary, wt),
-                        card,
-                    },
-                    event => event,
-                };
-                match &event {
-                    AgentEvent::Completed { .. } => buffered = Some(event),
-                    AgentEvent::ToolStarted { .. } | AgentEvent::ToolCompleted { .. } => {
-                        tool_events.push(event.clone());
-                        emit(member_dispatch_meta(run_id, spec, None), event);
-                    }
-                    AgentEvent::Error { message } => {
-                        // P2-8（opus 对抗审）：`"error": ""` 这种空字符串会被 harness 解析层
-                        // 当成合法 message（不是 None，是 Some("")）——归一到 None，
-                        // 让下面「failure_reason.is_none() → 该合成一条」的判据不被空串绕过。
-                        //
-                        // 对抗审补丁（本刀）：`failure_reason` 必须「非空 wins」，不能像旧写法
-                        // 那样无条件覆盖——旧写法下，同一个 attempt 里先收到一条带真实文本的
-                        // Error、后面又收到一条空串/空白 Error（探针 F 实证的现实序列：budget
-                        // Blocked + 真实 Error + 空 Error），后到的空串会把已经记下的真实错误
-                        // 抹成 None，诊断信息彻底丢失。改成跟 blocked_reason（见下面
-                        // AgentEvent::Blocked 分支）同款「只在新事件确有非空内容时才覆盖」——
-                        // 多条非空 Error 仍是后者覆盖前者（原有语义不变），只是空串不再抹值。
-                        if !message.trim().is_empty() {
-                            failure_reason = Some(message.clone());
-                        }
-                        saw_error = true;
-                        terminal_events.push(event);
-                    }
-                    // P1（member 失败原因透出）：Blocked/NeedsDecision 是 myagent 引擎退出码
-                    // 3/4 契约的正常收工narrative（非崩溃）——记标志供终态收尾选诚实措辞，
-                    // 事件本身仍照常实时 emit 给前端（跟旧的 `_` 兜底分支一致，不改事件流）。
-                    AgentEvent::Blocked { message, reason } => {
-                        saw_blocked = true;
-                        // P2-6：harness_blocked_message / harness_interrupted_message 已经把
-                        // 真实缘由渲成人话了——留着给终态措辞拼接（run.interrupted 也走这条
-                        // 分支，真实文案会说「运行已中断」，借它跟泛化的「被阻塞」框架区分开）。
-                        if !message.trim().is_empty() {
-                            blocked_message = Some(message.clone());
-                        }
-                        // 对抗审补丁：blocked_reason 必须「非空 wins」，不能跟上面 message 共用
-                        // trim-guard 同步写——探针实证反例：同一 run 里 budget_exhausted 的
-                        // NeedsDecision（reason=Some）先到，随后若再收到 run.blocked/
-                        // run.interrupted（message 非空、但那两条协议路径恒 reason=None，见
-                        // agent_event.rs 对应构造点），旧写法会把已经拿到的结构化 reason 覆盖
-                        // 回 None，终态分类误降回 "stalled"。改成只在新事件确有结构化 reason
-                        // 时才覆盖——一旦拿到过某个 Some 值，后续 None 不再抹掉它。
-                        if reason.is_some() {
-                            blocked_reason = reason.clone();
-                        }
-                        emit(member_dispatch_meta(run_id, spec, None), event);
-                    }
-                    AgentEvent::NeedsDecision { .. } => {
-                        saw_needs_decision = true;
-                        emit(member_dispatch_meta(run_id, spec, None), event);
-                    }
-                    AgentEvent::TextDelta { text } => {
-                        assistant_text.push_str(text);
-                        assistant_text_only.push_str(text);
-                        if granularity == TextGranularity::Line {
-                            assistant_text.push('\n');
-                            assistant_text_only.push('\n');
-                        }
-                        emit(member_dispatch_meta(run_id, spec, None), event);
-                    }
-                    AgentEvent::ThinkingDelta { text } => {
-                        assistant_text.push_str(text);
-                        if granularity == TextGranularity::Line {
-                            assistant_text.push('\n');
-                        }
-                        emit(member_dispatch_meta(run_id, spec, None), event);
-                    }
-                    _ => emit(member_dispatch_meta(run_id, spec, None), event),
-                }
-            }
-        }
-    }
-    let first_line_seen = first_event_watchdog.stdout_closed();
-    let _ = first_event_watchdog_handle.join();
-    tr.begin_finalize_member(key);
-    let (exit_status, owner_timed_out) = if first_line_seen {
-        (child.wait().ok(), false)
-    } else {
-        match crate::wait_for_first_event_owner(
-            &mut child,
-            pid,
-            first_event.deadline,
-            Child::try_wait,
-            Child::wait,
-            crate::kill_process_group,
-            std::time::Instant::now,
-            std::thread::sleep,
-        ) {
-            crate::FirstEventOwnerWait::Exited(status) => (Some(status), false),
-            crate::FirstEventOwnerWait::TimedOut(status) => (status, true),
-            crate::FirstEventOwnerWait::WaitError => (None, false),
-        }
-    };
-    let owner_timeout_stderr =
-        owner_timed_out.then(|| crate::stderr_tail_last_lines(&stderr_live_tail));
-    let first_event_timeout_stderr = first_event_watchdog
-        .timeout_stderr()
-        .or(owner_timeout_stderr);
-    let stderr_tail = stderr_handle
-        .map(|handle| handle.join().unwrap_or_default())
-        .unwrap_or_default();
-
-    MemberReadAttempt {
-        saw_error,
-        saw_blocked,
-        saw_needs_decision,
-        blocked_message,
-        blocked_reason,
-        failure_reason,
-        buffered,
-        terminal_events,
-        tool_events,
-        assistant_text,
-        assistant_text_only,
-        exit_status,
-        stderr_tail,
-        first_event_timeout_stderr,
-    }
+    let mut reader = attempt_reader::start_attempt_reader(&mut child, &context);
+    attempt_reader::read_stdout_events(&mut child, &context, &mut reader, emit);
+    attempt_reader::finish_attempt(child, &context, reader)
 }
 
 impl MemberFirstEventWatchdog {
@@ -2315,9 +2155,10 @@ fn run_member_reader_for_locale(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::cognitive_complexity)]
 fn run_member_reader_for_locale_with_watchdog(
-    mut child: Child,
-    mut retry_command: Option<&mut Command>,
+    child: Child,
+    retry_command: Option<&mut Command>,
     retry_stdin_prompt: Option<&crate::agent::StdinPrompt>,
     hook_guard: Option<crate::checkpoint_hook::HookRunGuard>,
     tr: &TeamRunning,
@@ -2334,391 +2175,39 @@ fn run_member_reader_for_locale_with_watchdog(
     emit: &mut dyn FnMut(DispatchMeta, AgentEvent),
     stage1: Option<&Stage1Ctx>,
 ) -> bool {
-    let mut retry_count = 0;
-    let mut current_pid = child.id();
-    let mut attempt_watchdog = first_event;
-    let attempt = loop {
-        let mut attempt = read_member_attempt(
-            child,
-            tr,
-            key,
-            run_id,
-            spec,
-            wt,
-            parser,
-            parse_fn,
-            locale,
-            granularity,
-            attempt_watchdog.clone(),
-            emit,
-        );
-        let exit_success = attempt.exit_status.as_ref().is_some_and(|s| s.success());
-        let auth_failed = matches!(
-            terminal_status(
-                attempt.saw_error,
-                attempt.buffered.is_some(),
-                exit_success,
-                false,
-            ),
-            StatusTransition::Failed
-        ) && attempt
-            .failure_reason
-            .as_deref()
-            .is_some_and(crate::agent_event::is_auth_error);
-        if !auth_failed || retry_count >= crate::agent_event::AUTH_RETRY_MAX {
-            break attempt;
-        }
-        let Some(command) = retry_command.as_deref_mut() else {
-            break attempt;
-        };
-
-        retry_count += 1;
-        std::thread::sleep(std::time::Duration::from_millis(
-            350 * u64::from(retry_count),
-        ));
-        attempt_watchdog = MemberFirstEventWatchdog::for_command(parse_fn, command, spec);
-        match crate::agent::spawn_with_stdin_prompt(command, retry_stdin_prompt) {
-            Ok(mut retry_child) => {
-                let retry_pid = retry_child.id();
-                if tr.register_auth_retry(key, current_pid, retry_pid) {
-                    current_pid = retry_pid;
-                    child = retry_child;
-                    continue;
-                }
-                crate::kill_process_group(retry_pid);
-                let _ = retry_child.wait();
-                break attempt;
-            }
-            Err(error) => {
-                let message =
-                    crate::ui_msg::al_err("member.spawnFailed", &[("detail", error.to_string())]);
-                attempt.saw_error = true;
-                attempt.failure_reason = Some(message.clone());
-                attempt.terminal_events.push(AgentEvent::Error { message });
-                break attempt;
-            }
-        }
-    };
-    // Revoke the run-bound hook token before TeamRunning exposes this run as finished.
-    drop(hook_guard);
-    let MemberReadAttempt {
-        mut saw_error,
-        saw_blocked,
-        saw_needs_decision,
-        blocked_message,
-        blocked_reason,
-        mut failure_reason,
-        buffered,
-        mut terminal_events,
-        tool_events,
-        assistant_text,
-        assistant_text_only,
-        exit_status,
-        stderr_tail,
-        first_event_timeout_stderr,
-    } = attempt;
-    let exit_success = exit_status.as_ref().is_some_and(|s| s.success());
-    // 锁内摘 pid（防 pid 复用误杀）+ 取停标志 + 按 remaining 计数判 run_done（M2 T7）
-    let (stopped, run_done) = tr.finish_member_and_run_done(key);
-    if crate::should_inject_first_event_watchdog_error(
-        stopped,
-        buffered.is_some(),
-        first_event_timeout_stderr.as_deref(),
-    ) {
-        let stderr_summary = first_event_timeout_stderr
-            .expect("watchdog injection predicate requires timeout stderr");
-        let message = crate::first_event_watchdog_error_message(
-            locale,
-            "member.spawnFailed",
-            &attempt_watchdog.engine,
-            &attempt_watchdog.binary,
-            &stderr_summary,
-        );
-        terminal_events.push(AgentEvent::Error {
-            message: message.clone(),
-        });
-        saw_error = true;
-        failure_reason = Some(message);
-    }
-    for event in terminal_events {
-        emit(member_dispatch_meta(run_id, spec, None), event);
-    }
-    let mut status = terminal_status(saw_error, buffered.is_some(), exit_success, stopped);
-    // P1-2（opus 对抗审·判据结构化）：failure_kind 是发给前端的**可信硬判据**——
-    // "stalled" / "env" 只由后端在这里、按真实的 saw_blocked/saw_needs_decision 标志写下，
-    // 绝不从文案字符串里反推。前端别再用正则去嗅 failure_reason 里有没有某句暗号式短语
-    // （那句短语本身也在 failure_reason 里，agent 输出/stderr 完全可能顶格抄一遍把自己
-    // 伪装成「诚实停摆」——结构化字段没有这个反向可控的通道）。
-    //
-    // D6（delta 复审·实证反例）：这个赋值曾经嵌在下面「要不要合成兜底文案」那个
-    // `if failure_reason.is_none()` 分支里——但 agent 自己抢先报 Error（run.failed /
-    // claude 原生 error / auth 重试注入）是最常见的失败形态，failure_reason 一旦非空，
-    // 那个分支整块被跳过，"stalled" 判据也就没机会写。最典型的受害场景：harness 先发
-    // run.blocked（saw_blocked=true）再发 run.failed（saw_error=true，failure_reason
-    // 非空）——这明明是诚实停摆，却因为 agent 后发的 Error 抢跑而被前端落进「env 环境
-    // 故障」桶，跟本刀「诚实收工」的目标反着来。改成独立判定：只要真见过 Blocked/
-    // NeedsDecision 事件就标 stalled，跟消息合成是否运行解耦。不开新 spoof 洞——
-    // saw_blocked/saw_needs_decision 只可能由 harness 解析层产的真事件置位，agent 自己
-    // 抢发 Error 至多让这里从「该标 stalled」意外掉回「没标」（已被这条修复堵上），
-    // 没有反向路径能让它凭空把自己升格成 stalled。
-    // budget_exhausted / context_exhausted 结构化分流：只信 AgentEvent::Blocked.reason——
-    // agent_event.rs 只在①trigger=="harness" 且命中白名单（budget_exhausted_still_progressing
-    // 等），或②顶层 reason 字面等于 "context_budget_exhausted"（单轮上下文 token 预算溢出，
-    // 判据见 agent_event.rs::harness_context_budget_exhausted_reason 文档——不共用①的 emit
-    // 点，没有 blocked_reason/trigger 字段，agent 无输入通道可碰）时才填这个字段，agent 自己
-    // 文本学舌绕不过去。命中不了就照旧落 "stalled" 老路（no_progress / stuck_repeating /
-    // agent 主动 block_with_questions 都留在这条老路，别扩面——本刀只新增分流
-    // "context_budget_exhausted" 这一种第四类，不动既有 budget_exhausted_still_progressing）。
-    let is_budget_exhausted =
-        blocked_reason.as_deref() == Some("budget_exhausted_still_progressing");
-    let is_context_exhausted = blocked_reason.as_deref() == Some("context_budget_exhausted");
-    let mut failure_kind: Option<&'static str> = None;
-    if matches!(status, StatusTransition::Failed) && !stopped && (saw_blocked || saw_needs_decision)
-    {
-        failure_kind = Some(if is_budget_exhausted {
-            "budget_exhausted"
-        } else if is_context_exhausted {
-            "context_exhausted"
-        } else {
-            "stalled"
-        });
-    }
-    // P2（本刀·诚实正文不再被引擎报错原文抢占）：`failure_reason` 在上面 Error 分支
-    // （见本函数 saw_error 那段）是「无条件覆盖」写的——只要这个 attempt 里出现过任意一条
-    // 非空 Error 事件，`failure_reason.is_none()` 就恒假，下面这条「该不该合成诚实正文」的
-    // 闸门会被整段短路掉，budget_exhausted/context_exhausted 的诚实正文（带行动指引）永远
-    // 没机会写，用户只能看到引擎报错原文。这是「存在性」短路，跟到达顺序无关（Error 事件
-    // 先到后到都一样会短路）。
-    //
-    // 修法：只对 budget_exhausted / context_exhausted 这两种 kind 放开闸门——即便
-    // `failure_reason` 已经被 Error 原文占了，也照样走下面的诚实正文合成，合成完再把原先
-    // 占位的 Error 原文追加在诚实正文之后（不丢诊断信息，只是不再顶替）。`stalled` 分支不
-    // 在放开范围内——`run_member_reader_harness_blocked_then_agent_reported_error_still_stalled`
-    // 钉死了它必须保留「agent 抢先报的 Error 原文原样当 failure_reason，不被诚实正文覆盖」
-    // 这个既有行为，不许动。
-    let overridden_error_text = if is_budget_exhausted || is_context_exhausted {
-        failure_reason.clone()
-    } else {
-        None
-    };
-    let should_synthesize_message = matches!(status, StatusTransition::Failed)
-        && !stopped
-        && (failure_reason.is_none() || is_budget_exhausted || is_context_exhausted);
-    if should_synthesize_message {
-        // P1：见过 Blocked/NeedsDecision 事件（harness 契约退出码 3/4）→ 队员是正常收工在
-        // 停摆/等决策，不是环境挂了——诚实措辞，别再合成「检查 CLI 登录/额度/网络」误导用户。
-        // 只对 harness 解析器成员生效：saw_blocked/saw_needs_decision 只可能由 harness 的
-        // parse_harness_line_for_locale 产的事件置位，claude/codex 的退出码 3 不会误触发。
-        // P2-3（opus 对抗审）：这两个标志只影响这里「选哪句文案」，terminal_status 的状态
-        // 判定本身不看它们（干净退出+见过 Blocked 仍是 Done，接力照常跑，见上面函数注释）。
-        //
-        // is_budget_exhausted/is_context_exhausted 为真必然意味着 saw_blocked 为真（两者
-        // 都只能从 AgentEvent::Blocked 事件里的结构化 reason 置位，见 blocked_reason 的
-        // 「非空 wins」注释）——所以放开闸门后新增的 budget/context 分支必然落进这条
-        // `saw_blocked || saw_needs_decision` 为真的路径，不会误入下面「从零合成通用进程
-        // 失败文案」的 else 分支（那条分支仍只服务旧的「零信号」场景，行为不变）。
-        let message = if saw_blocked || saw_needs_decision {
-            let mut message = if is_budget_exhausted {
-                crate::member_budget_exhausted_failure_message(locale)
-            } else if is_context_exhausted {
-                crate::member_context_exhausted_failure_message(locale)
-            } else {
-                crate::member_stall_failure_message(
-                    locale,
-                    saw_blocked,
-                    saw_needs_decision,
-                    exit_status.as_ref(),
-                )
-                .expect("saw_blocked || saw_needs_decision guarantees Some")
-            };
-            // P2-6：harness 解析层在同一条协议路径上已经把「停摆/中断的真实缘由」渲成人话
-            // 了（harness_blocked_message / harness_interrupted_message，见
-            // read_member_attempt 的 Blocked 匹配分支）——拼进来，用户不用自己翻 trace；
-            // run.interrupted 走的也是 Blocked 事件，那条真实文案本身会说「运行已中断」，
-            // 借它把「有问题在等回答/被阻塞」这句泛化框架跟真中断区分开。
-            if let Some(detail) = blocked_message.as_deref().map(str::trim) {
-                if !detail.is_empty() {
-                    message.push('\n');
-                    message.push_str(detail);
-                }
-            }
-            // 本刀新增：只有 budget/context 两类才会把 `overridden_error_text` 填上（见上面
-            // `should_synthesize_message` 的放开条件）——这是原先被抢占、代表引擎报错原文的
-            // 那份 `failure_reason`。拼接顺序取「诚实正文 → blocked_message 详情 → Error 原
-            // 文」：诚实正文（带行动指引）最先看到最重要；blocked_message 是同一条 harness
-            // 协议路径给的「真实缘由」人话，语义上比 agent/引擎另外报的 Error 原文更贴题，排
-            // 第二；Error 原文只是「不丢诊断信息」的兜底追加，排最后——跟既有 blocked_message
-            // 追加写法（上面那段）同款风格，不发明新格式。
-            //
-            // opus 对抗审补丁（本刀）：这一段此前是裸拼接，用户容易把它读成诚实正文本身的
-            // 一部分（诚实正文说「可以再派一单」、尾巴却是条 auth 报错，误导）。加一句双语
-            // 引导词 `overridden_error_lead_in` 划清「这不是诚实正文，是另一条引擎报错」的
-            // 边界。**只加在这一段**——上面 blocked_message 那段保持裸拼不动，见
-            // `overridden_error_lead_in` 的文档：前端 `humanizeFailureDetail` 靠正则锚定
-            // blocked_message 里「分隔符后直接跟已知裸码」，垫字会破坏那个锚定。
-            if let Some(raw) = overridden_error_text.as_deref().map(str::trim) {
-                if !raw.is_empty() {
-                    message.push('\n');
-                    message.push_str(overridden_error_lead_in(locale));
-                    message.push_str(raw);
-                }
-            }
-            message
-        } else {
-            // 这个分支才是「从零合成一条通用进程失败文案」——没有更具体的信号（不是
-            // stalled，agent 也没在 Error 事件里给出可读文本），只有这里才配标 "env"：
-            // 别的 Failed 来源（saw_error 带真实 auth/quota 文本、blocking-write、stage1
-            // relay 失败）留给前端既有的正则分类链，别被这里一刀切的 "env" 盖掉。
-            failure_kind = Some("env");
-            crate::cli_exit_failure_message(
-                locale,
-                &spec.agent_name,
-                exit_status.as_ref(),
-                &stderr_tail,
-            )
-        };
-        emit(
-            member_dispatch_meta(run_id, spec, None),
-            AgentEvent::Error {
-                message: message.clone(),
-            },
-        );
-        failure_reason = Some(message);
-    }
-    let (changed_files, anchor) = crate::worktree::synthesize_hard_fields(wt, base_sha);
-    let command_evidence = derive_command_evidence(&tool_events, &spec.provider);
-    let git_wall = detect_git_wall_block(&tool_events);
-    // worker 回传文本：优先 Completed.final_text（parser 给了就用）·否则 provider 中立回退到累积的纯
-    // TextDelta 正文（如 codex final_text 恒 None·收尾走流式）→ 队长能看到 worker 文本输出·不必再派 reader。
-    let completed_final = match &buffered {
-        Some(AgentEvent::Completed { final_text, .. }) => {
-            final_text.as_deref().filter(|s| !s.trim().is_empty())
-        }
-        _ => None,
-    };
-    let final_text_ref: Option<&str> = completed_final.or_else(|| {
-        let t = assistant_text_only.trim();
-        if t.is_empty() {
-            None
-        } else {
-            Some(t)
-        }
-    });
-    let mut scan_text = assistant_text;
-    if let Some(final_text) = final_text_ref {
-        scan_text.push_str(final_text);
-    }
-    if matches!(status, StatusTransition::Done) && changed_files.is_empty() {
-        if let Some(marker) = detect_blocking_write_failure(&scan_text) {
-            status = StatusTransition::Failed;
-            if failure_reason.is_none() {
-                failure_reason = Some(blocking_write_failure_message(locale, &marker));
-            }
-        }
-    }
-    // 刀一 Stage①（终审修）：在 build_member_result 前算·这样接力失败能降进终态 status。
-    let changed = !changed_files.is_empty();
-    let session_head_sha = match stage1 {
-        Some(ctx) if matches!(status, StatusTransition::Done) => {
-            match run_stage1_for_locale(locale, ctx, run_id, base_sha, changed) {
-                Stage1Result::Relayed { session_head } => Some(session_head),
-                Stage1Result::NoChanges => None,
-                Stage1Result::Failed { reason } => {
-                    // worker 完成但改动没落进会话 → 降 Failed + reason·别向 lead 报成功 Done
-                    // （否则 lead 以为接力成功·下个 worker 看不到·破诚实/G1）。
-                    status = StatusTransition::Failed;
-                    if failure_reason.is_none() {
-                        failure_reason = Some(reason);
-                    }
-                    None
-                }
-            }
-        }
-        _ => None,
-    };
-    let transient_error = if matches!(status, StatusTransition::Done) && saw_error {
-        failure_reason.take().map(|message| Risk {
-            id: MEMBER_RESULT_TRANSIENT_ERROR_RISK_ID.into(),
-            text: transient_error_note(&message),
-            source_refs: vec![],
-            confidence: None,
-            source_kind: Some("member_runner".into()),
-        })
-    } else {
-        None
-    };
-    // D7：Done 但见过 Blocked/NeedsDecision——契约上有点奇怪的组合，落一条 risk 留痕迹
-    // （复用 transient_error 同款做法），别让它完全静默过去。
-    let stalled_on_done =
-        if matches!(status, StatusTransition::Done) && (saw_blocked || saw_needs_decision) {
-            Some(Risk {
-                id: STALLED_ON_DONE_RISK_ID.into(),
-                text: "队员进程干净退出（exit 0），但过程里见过 Blocked/NeedsDecision 叙事事件\
-（harness 契约退出码 3/4 语义）——终态仍按 Done 处理（维持既有基线行为），这里留痕供排查。"
-                    .into(),
-                source_refs: vec![],
-                confidence: None,
-                source_kind: Some("member_runner".into()),
-            })
-        } else {
-            None
-        };
-    let mut member_result = build_member_result(
-        spec,
-        status,
-        changed_files,
-        anchor,
-        command_evidence,
-        final_text_ref,
-    );
-    // P2-8：末端再兜底归一一次——万一某条上游路径（未来新增的失败源）也塞了个空串，
-    // 别让「Failed 终态 failure_reason 必非空」这条不变量被绕过。
-    member_result.failure_reason = failure_reason.filter(|r| !r.trim().is_empty());
-    // P1-2：failure_kind 只在「见过 Blocked/NeedsDecision 或走了通用进程失败合成」这条
-    // 分支里被写（见上面 `if matches!(status, StatusTransition::Failed) ...` 块）——blocking
-    // write / stage1 relay 失败等其他终态来源不写它，交给前端既有的文本启发式兜底分类，
-    // 不冒充成结构化判据没覆盖到的类别。
-    member_result.failure_kind = failure_kind.map(str::to_string);
-    // P2-7：exit_code/stderr_tail 只在真失败/被停时才落盘——干净 Done 的成功 run 没必要
-    // 把最多 4KB stderr（token/凭据的常见载体）无条件塞进 DB 里的 blocks JSON。
-    if matches!(status, StatusTransition::Failed | StatusTransition::Stopped) {
-        member_result.exit_code = exit_status
-            .as_ref()
-            .and_then(std::process::ExitStatus::code);
-        member_result.stderr_tail = {
-            let trimmed = stderr_tail.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        };
-    }
-    if let Some(risk) = transient_error {
-        member_result.risks.push(risk);
-    }
-    if let Some(risk) = stalled_on_done {
-        member_result.risks.push(risk);
-    }
-    if let Some(command) = git_wall {
-        let clipped = clip_member_result_field(&command, 120);
-        member_result.risks.push(Risk {
-            id: GIT_WALL_BLOCKED_RISK_ID.into(),
-            text: format!(
-                "agent 试图 git 写（{clipped}）但被沙箱挡下、未执行（.git 只读）。如需回滚请用替代法或手动处理。"
-            ),
-            source_refs: vec![],
-            confidence: None,
-            source_kind: Some("member_runner".into()),
-        });
-    }
-    crate::agent_event::maybe_mark_long_task(&mut member_result, status, final_text_ref);
-    let (meta, ev) = member_terminal_event(
+    let (attempt, attempt_watchdog) = reader_watchdog::read_settled_member_attempt(
+        child,
+        retry_command,
+        retry_stdin_prompt,
+        tr,
+        key,
         run_id,
         spec,
-        buffered,
-        status,
-        Some(member_result),
-        session_head_sha,
+        wt,
+        parser,
+        parse_fn,
+        locale,
+        granularity,
+        first_event,
+        emit,
     );
-    emit(meta, ev);
-    run_done
+    // Revoke the run-bound hook token before TeamRunning exposes this run as finished.
+    drop(hook_guard);
+    let mut state = reader_watchdog::begin_member_finalization(
+        attempt,
+        &attempt_watchdog,
+        tr,
+        key,
+        run_id,
+        spec,
+        locale,
+        emit,
+    );
+    reader_watchdog::classify_and_synthesize_failure(&mut state, run_id, spec, locale, emit);
+    let artifacts = reader_watchdog::apply_post_run_outcomes(
+        &mut state, wt, base_sha, run_id, spec, locale, stage1,
+    );
+    reader_watchdog::build_and_emit_member_result(state, artifacts, run_id, spec, emit)
 }
 
 #[cfg(test)]
@@ -3152,127 +2641,22 @@ pub fn run_single_worker(
     };
     let stage1 = stage1_ctx_from_snapshot(stage1_snapshot, session_id, &member.assignment_id, &wt);
 
-    let transport = crate::event_transport().clone();
-    // G3-A T2：队员消耗并入会话账——用户视角看的是「这个会话花了多少」，队员是这个会话
-    // 派出去干活的，其 token 消耗理应算进会话总账（而非只算 lead 自己那部分）。素材来源：
-    // `emit_fn` 里流过的每一条事件，其中终态 `Completed`（由 `member_terminal_event` 构造，
-    // 见该函数文档「透传暂存 Completed 的真 token」）带真实 input_tokens/output_tokens——
-    // 这是队员消耗唯一可得的落点，`MemberResult` 结构体本身不带 usage 字段。用 `Cell`
-    // 而非直接在这几个闭包外部变量上做可变借用，是因为 `emit_fn` 要同时被
-    // `run_single_worker_inner_for_locale` 和 `emit_terminal_failed_orchestrated` 两处
-    // `&mut` 借用，`Cell` 免去借用检查器对「同一个 emit_fn 里两次可变借用外部变量」的额外
-    // 周旋（`Cell<Option<(Option<u64>,Option<u64>)>>` 全是 Copy 类型，`get`/`set` 零成本）。
-    let member_usage: std::cell::Cell<Option<(Option<u64>, Option<u64>)>> =
-        std::cell::Cell::new(None);
-    let result = run_single_worker_lifecycle(
+    dispatch_single_worker_run(
+        app,
+        db,
         team_running,
         session_id,
         run_id,
-        &spec,
-        || {
-            if !emit_events {
-                return Ok(None);
-            }
-            register_member_transport(&transport, session_id, run_id, &spec, granularity, true)
-                .map(Some)
-        },
-        |transport_lane_id| {
-            let (open_meta, open_event) = member_open_event(run_id, &spec);
-            if let Some(lane_id) = transport_lane_id.as_deref() {
-                transport.push_with_dispatch(lane_id, stamp_orchestrated(open_meta), open_event);
-            }
-            let base_sha = crate::worktree::rev_parse_head(&wt).unwrap_or_default();
-            let mut pending_terminals = Vec::new();
-            let mut emit_fn = |d: DispatchMeta, e: AgentEvent| {
-                if let AgentEvent::Completed {
-                    input_tokens,
-                    output_tokens,
-                    ..
-                } = &e
-                {
-                    member_usage.set(Some((*input_tokens, *output_tokens)));
-                }
-                if let Some(lane_id) = transport_lane_id.as_deref() {
-                    emit_member_transport_event(
-                        &transport,
-                        lane_id,
-                        &mut pending_terminals,
-                        stamp_orchestrated(d),
-                        e,
-                    );
-                }
-            };
-            let result = run_single_worker_inner_for_locale(
-                team_running,
-                session_id,
-                run_id,
-                spec.clone(),
-                command,
-                stdin_prompt,
-                parser,
-                Some(parse_fn),
-                crate::current_locale(app),
-                granularity,
-                wt,
-                base_sha,
-                &mut emit_fn,
-                stage1.as_ref(),
-            );
-            if let Err(reason) = &result {
-                emit_terminal_failed_orchestrated(run_id, &spec, reason, &mut emit_fn);
-            }
-            result
-        },
-        |result| {
-            let conn = db.0.lock().map_err(|e| e.to_string())?;
-            persist_member_result_message(
-                &conn,
-                session_id,
-                run_id,
-                &spec.agent_id,
-                &spec.agent_name,
-                result,
-            )
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-        },
-        |reason| {
-            let conn = db.0.lock().map_err(|e| e.to_string())?;
-            persist_member_setup_failure_message(&conn, session_id, run_id, &spec, reason)
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        },
-        |reason| {
-            let conn = db.0.lock().map_err(|e| e.to_string())?;
-            persist_member_failure_message(&conn, session_id, run_id, &spec, reason)
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        },
-        || {
-            let conn = db.0.lock().map_err(|e| e.to_string())?;
-            finalize_team_run(&conn, session_id, run_id).map_err(|e| e.to_string())
-        },
-    );
-    // 落账放在 lifecycle 返回之后、唯一一次——不管队员终态是 Ok(Done/Failed) 都可能真的
-    // 跑过进程、烧过 token（一次失败的 worker 调用照样计费），所以不按 `result` 是否 Ok 门控，
-    // 只按「有没有捕到真实 usage」门控（防双记账：这里只在本函数体内调一次
-    // add_session_usage，没有第二条写入路径）。
-    if let Some((input_tokens, output_tokens)) = member_usage.get() {
-        if input_tokens.is_some() || output_tokens.is_some() {
-            let lock_result = db.0.lock();
-            match lock_result {
-                Ok(conn) => {
-                    if let Err(e) =
-                        crate::db::add_session_usage(&conn, session_id, input_tokens, output_tokens)
-                    {
-                        eprintln!("member usage persist failed (non-fatal): {e}");
-                    }
-                }
-                Err(_) => eprintln!("member usage persist skipped: db lock poisoned"),
-            }
-        }
-    }
-    result
+        spec,
+        command,
+        parser,
+        parse_fn,
+        granularity,
+        wt,
+        stage1,
+        emit_events,
+        stdin_prompt,
+    )
 }
 
 /// 真 spawn 薄壳：emit 开场（P1-4）→ spawn（进程组·stderr 落 member log）→ register →

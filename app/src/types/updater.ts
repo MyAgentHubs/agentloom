@@ -1,7 +1,7 @@
-// T4：`updater.rs`（`app/src-tauri/src/updater.rs`）状态机的前端镜像类型 +
-// 运行时类型守卫。与 Rust `UpdaterState`/`UpdaterSnapshot` 严格同构：字段名/
-// 可选性逐一对齐 serde 内部标签枚举（`#[serde(tag = "kind", rename_all =
-// "snake_case")]`）产出的 wire JSON —— 故意不做驼峰化，直接消费后端原样形状。
+// Frontend mirror types and runtime type guards for the updater.rs (app/src-tauri/src/updater.rs) state machine.
+// Strictly isomorphic with Rust UpdaterState/UpdaterSnapshot: field names and optionality exactly match
+// the wire JSON from serde's internally tagged enum (#[serde(tag = "kind", rename_all = "snake_case")]).
+// Names deliberately remain un-camelCased so the backend shape can be consumed as-is.
 // 真值来源见 `../../src-tauri/src/fixtures/updater-state.json`（Rust
 // `include_str!` 同一份 JSON，`updater.test.ts` 对拍：契约样张必须有真路径消费
 // 方，见内部笔记同名教训）。

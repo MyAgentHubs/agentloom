@@ -20,7 +20,7 @@ export function DecisionCard({
   const [questionOpen, setQuestionOpen] = useState(false);
   const disabled = block.status === "submitting" || !onChoose;
 
-  // 决策打扰收敛刀 T1·症状 B：chosen 态不再整条消失（原来 return null 让点击像石沉大海）——
+  // Keep the chosen state visible instead of vanishing the whole block (returning null made a click feel like it went nowhere) —
   // 渲一行紧凑回执，与 App.tsx onDecisionChoose 落地的 "submitting"→"chosen" 状态机对齐。
   if (block.status === "chosen") {
     return (

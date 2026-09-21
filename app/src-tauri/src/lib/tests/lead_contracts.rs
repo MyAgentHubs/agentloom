@@ -255,6 +255,7 @@ fn list_and_undo_reject_solo_and_team_sessions_while_running() {
 }
 
 #[test]
+#[allow(clippy::cognitive_complexity)]
 fn locale_whitelist_and_backend_messages_are_bilingual() {
     assert_eq!(Locale::parse("zh"), Some(Locale::Zh));
     assert_eq!(Locale::parse("en"), Some(Locale::En));

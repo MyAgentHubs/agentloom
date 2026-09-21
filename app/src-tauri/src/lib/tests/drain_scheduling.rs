@@ -87,13 +87,10 @@ fn drain_with_dirty_replay_stops_after_clean_round() {
     assert_eq!(rounds, 1, "无脏位时不应额外重放");
 }
 
-// T7：worker 报告落账（M1 台账 pending 行）与 lead run 槽释放各自触发同一 session 的
-// `drain_after_run_release`——两个触发谁先谁后都可能发生（worker settled 回调与 lead
-// 收尾释放槽是两条并发路径）。这两条测试用 `try_begin_draining` + `drain_with_dirty_replay`
-// 这套既有排空引擎（同 `drain_with_dirty_replay_replays_notification_merged_during_first_round`
-// 手法）分别模拟「谁先取得排空资格」的两种顺序，断言：无论哪一种，晚到的那次触发都只能
-// 合并为脏位、换来恰好一次原地重放（不是零次——不丢唤醒；也不是多次——不空转），而它携带的
-// 报告最终被消费恰好一次（`consumed == 1`），不丢也不重复起跑。
+// Worker report settlement and lead run-slot release can trigger draining concurrently.
+// Exercise both acquisition orders through `try_begin_draining` and `drain_with_dirty_replay`:
+// the later trigger must merge into a dirty flag and cause exactly one replay, so the
+// pending report is consumed exactly once without losing a wakeup or spinning.
 
 #[test]
 fn worker_settled_race_settled_trigger_wins_first_lead_release_merges_as_dirty() {
@@ -275,13 +272,13 @@ fn startup_remote_inbox_rescan_acquires_draining_guard_before_drain() {
     // 变异自证：去掉 try_begin_draining 包裹、恢复直接 drain_remote_inbox，这条测试会变红。
     // 启发式源码断言：只挡启动循环内缺少 guard 或两个调用文本整体调换的粗糙回归；不验证
     // guard 的运行时生命周期，也挡不住把调用藏进其他函数或更绕控制流的改法，仍需人工 review。
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib/app_setup.rs"));
     let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
     let loop_body = production
         .split("for session_id in pending_remote_sessions {")
         .nth(1)
         .unwrap()
-        .split("\n                }\n            });")
+        .split("\n        }\n    });")
         .next()
         .unwrap();
     let begin_idx = loop_body
@@ -298,11 +295,10 @@ fn startup_remote_inbox_rescan_acquires_draining_guard_before_drain() {
 
 #[test]
 fn drain_owned_runs_resume_pending_before_remote_inbox_and_inbox_not_gated() {
-    // T4 C2：旧「autofeed → 迟到答案挂账 → inbox」三段顺序已合并为「try_resume_pending →
-    // remote_inbox」两段；排空序仍固定，且 inbox 段不能被包进依赖 try_resume_pending 返回值
-    // 的条件分支——remote inbox 不受自动恢复的 not_before 门影响（F.6）。
-    // 启发式源码断言：只挡把 inbox 段整体挪到 try_resume_pending 之前、或把它塞进条件分支
-    // 这类粗糙回归；不验证调用是否藏在更绕的控制流里，也不证明运行时真的按此顺序执行。
+    // Pending resumes must precede remote inbox draining, and the inbox must remain
+    // independent of the resume result so a not_before delay cannot block remote delivery.
+    // These source checks catch reordered calls and simple conditional gating; they do
+    // not prove runtime ordering or detect calls hidden in more complex control flow.
     let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
     let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
     let body = production
@@ -384,13 +380,16 @@ fn drain_remote_inbox_next_pending_releases_db_lock_before_deliver_closure() {
 fn spawn_and_stream_solo_run_release_triggers_drain_after_run_release() {
     // 启发式源码断言：只挡「spawn_and_stream 里 emit 之后完全没有 drain」这类回归；挡不住
     // 把 drain 藏进某个被误认为安全、实际在锁内执行的子闭包等绕法，那仍需人工 review。
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/solo_stream.rs"
+    ));
     let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
     let body = production
-        .split("fn spawn_and_stream(")
+        .split("fn finish_solo_stream(")
         .nth(1)
         .unwrap()
-        .split("\n#[tauri::command]")
+        .split("\nfn ")
         .next()
         .unwrap();
     let emit_idx = body

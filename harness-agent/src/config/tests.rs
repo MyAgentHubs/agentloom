@@ -228,9 +228,9 @@ fn detect_protocol_ladder() {
 #[test]
 fn default_context_tokens_for_known_providers() {
     // DeepSeek V4 全系官方 1,048,576(1M) 窗口（api-docs.deepseek.com/news/news260424/
-    // + huggingface.co/deepseek-ai/DeepSeek-V4-Pro，2026-08-21 核）。没这个兜底就落
-    // 通用默认 16384，历史压缩可用预算塌到 ~4157（< 固定系统/任务/地形头），每轮
-    // 第 2 步即 context_budget_exhausted、模型一行代码没写就被掐（2026-06-23 dogfood
+    // DeepSeek V4 officially has a 1,048,576 (1M) token window; sources: api-docs.deepseek.com/news/news260424/ and huggingface.co/deepseek-ai/DeepSeek-V4-Pro.
+    // Without this seed, the generic 16384 default leaves ~4157 usable tokens after history-compaction overhead, below the fixed system/task/terrain headers.
+    // This regression test prevents `context_budget_exhausted` by turn 2, before the model can write any code.
     // 实证；旧值 65536 本身也只是 V3 时代残留，写小了 16 倍）。
     assert_eq!(
         default_context_tokens("deepseek", "deepseek-v4-flash"),
@@ -258,7 +258,7 @@ fn default_context_tokens_now_covers_non_deepseek() {
 #[test]
 fn zai_has_context_default_not_none() {
     // 200_000 对齐登记表 glm_spec 主线（default_model("zai")="glm-4.6" 正落这档）；
-    // 来源 docs.z.ai/guides/llm/glm-4.6，2026-08-21 核；原值 128_000 是旧登记值残留。
+    // Source: docs.z.ai/guides/llm/glm-4.6; the old value 128_000 was a stale registry leftover.
     assert_eq!(
         super::default_context_tokens("zai", "glm-4.6"),
         Some(200_000)
@@ -281,7 +281,7 @@ fn default_output_tokens_from_registry() {
 fn zai_has_output_default_not_none() {
     // "zai" 绕过 model_registry（provider_id 不含 glm/zhipu 子串），之前
     // default_output_tokens 落 None → AnthropicProvider 兜底到硬编码 4096。
-    // 131_072 对齐登记表 glm_spec 主线输出；来源同上，2026-08-21 核。
+    // 131_072 matches the glm_spec registry output-token entry; same source as above.
     assert_eq!(
         super::default_output_tokens("zai", "glm-4.6"),
         Some(131_072)
@@ -449,7 +449,7 @@ fn model_override_none_falls_back_to_default() {
 fn deepseek_resolves_real_context_window_when_unset() {
     // 隔离空配置（无 stored deepseek·context_tokens 未设）→ resolve 必须用 deepseek 的
     // 真实窗口兜底·而不是落 None（None 会让历史压缩退到 16384 默认、预算塌到 ~4157、
-    // turn 2 即 context_budget_exhausted——2026-06-23 dogfood 翻车点）。
+    // Without this fallback, the context budget is None; history compaction defaults to 16384, leaving ~4157 usable tokens and triggering `context_budget_exhausted` by turn 2.
     let dir = tempfile::tempdir().unwrap();
     let _home = EnvGuard::set("MYAGENT_HOME", dir.path().to_str().unwrap());
     let _api_key = EnvGuard::set("DEEPSEEK_API_KEY", "sk-test");

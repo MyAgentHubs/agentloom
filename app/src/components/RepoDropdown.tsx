@@ -14,7 +14,7 @@ type Props = {
 
 /**
  * cluster L Phase 2 plan B Task 7 · repo dropdown（v4 state 4 严格保真）。
- * Mount 在 TopBar.tsx 内 .topbar__main 下 · open state 由 TopBar 控（B1）。
+ * Mounts under TopBar.tsx's .topbar__main; open state is owned by TopBar, not this component.
  * 仅 N repos 时 TopBar 条件 render。
  *
  * v4 真实 DOM：.dropdown.repo / .dd-search placeholder="搜索 repo…" / N 行 .dd-row[.active]

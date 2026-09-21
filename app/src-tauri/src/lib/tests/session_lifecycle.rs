@@ -495,9 +495,9 @@ fn list_sessions_excludes_soft_deleted_and_restores() {
 
 #[test]
 fn purge_session_refuses_live_session() {
-    // 🔴 C-1(codex+opus T5 审):purge 只对软删(tombstoned)会话——live 会话调 purge 必拒
-    // (SESSION_NOT_TRASHED)·DB 行不动(防 db::delete_session 无条件级联硬删 live·不可逆)。
-    // 前置门在 resolve 之前·与 workspace 类型(Local/Repo/Err)无关·故测试 resolve-env 无关。
+    // Purging a live session must return SESSION_NOT_TRASHED and preserve its DB row,
+    // preventing irreversible cascading deletion of a session that is not tombstoned.
+    // This check precedes workspace resolution, so it must hold for every workspace type.
     use crate::test_support::mem_db;
     let c = mem_db();
     crate::db::create_session(&c, "s-live", "t", "local-default", "local").unwrap();

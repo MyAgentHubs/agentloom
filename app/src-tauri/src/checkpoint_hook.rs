@@ -25,7 +25,7 @@ const STOP_BLOCK_MAX_COUNT: u32 = 6;
 const STOP_BLOCK_MAX_WINDOW_SECS: u64 = 900;
 // Bounded worker pool for the checkpoint hook's tiny_http server.
 //
-// CORRECTED (2026-07-29 audit): going from 1 consumer thread to N is necessary but was NOT, by
+// Preventing head-of-line blocking requires multiple consumer threads, but that is not, by
 // itself, sufficient to fix head-of-line blocking — a first attempt at this fix only added worker
 // threads and shipped believing that alone was the cure. It measurably wasn't: the PreToolUse
 // commit path held `registrations`'s lock across the entire DB write (`Connection::open` +
@@ -38,7 +38,7 @@ const STOP_BLOCK_MAX_WINDOW_SECS: u64 = 900;
 // requests. Requests are small and low-QPS (localhost only), so this still doesn't need to be a
 // large pool — 4 is plenty of headroom for that purpose.
 const HOOK_SERVER_THREADS: usize = 4;
-// Bounded self-heal (2026-07-30 audit follow-up): if every worker thread dies — e.g. tiny_http's
+// Bound recovery attempts: if every worker thread dies — for example, when tiny_http's
 // own accept thread hit a transient error such as EMFILE and gave up, which pushes one `Err` into
 // the shared queue and then exits for good — the checkpoint hook goes fully unreachable with no
 // visible signal anywhere except an `eprintln!` per dying thread. Every PreToolUse/Stop curl call
@@ -53,7 +53,7 @@ const HOOK_SERVER_THREADS: usize = 4;
 // persistently-unbindable port can't spin retrying forever.
 const HOOK_SERVER_REBUILD_ATTEMPTS: u32 = 3;
 const HOOK_SERVER_REBUILD_BASE_DELAY: Duration = Duration::from_millis(150);
-// KNOWN LOW-RISK GAP (2026-07-30 audit item 4, not fixed here): during the backoff window between
+// Another local process can claim the port during recovery: between
 // bind attempts, the now-freed port is briefly "up for grabs" on localhost — some unrelated local
 // process could in principle bind it first, in which case `rebuild_once`'s subsequent attempts
 // keep failing with "address in use" (a *different* process's, not our own) until
@@ -294,7 +294,7 @@ pub fn install(
     }
     let db_path = database_path(conn)?;
     let allowed_root = fs::canonicalize(allowed_root).map_err(|error| error.to_string())?;
-    // KNOWN GAP, not fixed here (2026-07-30 audit item 4, deliberately out of scope — self-heal's
+    // Recovery leaves a registration-routing gap (self-healing's
     // job is keeping an *already-issued* port reachable, not steering new registrations away from
     // one that's still dead): if self-heal has exhausted `HOOK_SERVER_MAX_HEAL_CYCLES` /
     // `HOOK_SERVER_REBUILD_ATTEMPTS` and the service stays DEAD, `SERVER` still caches
@@ -381,8 +381,8 @@ fn random_token() -> Result<String, String> {
 /// happens (every mutation site here is a single, atomic-from-the-map's-perspective insert /
 /// remove / field write), so recovering via `into_inner()` and continuing to serve is memory-safe.
 ///
-/// It's also required for *availability* (2026-07-29 audit correction, further corrected
-/// 2026-07-29 delta review): a panic while this lock is held is a real, expected possibility —
+/// Recovering poisoned locks is also required for availability:
+/// a panic while this lock is held is an expected possibility —
 /// `start_server`'s worker loop wraps `handle_request` in `catch_unwind` specifically because of
 /// it, and `handle_request` has a `#[cfg(test)]` panic injection point that deliberately panics
 /// mid-critical-section to exercise this exact case (see its test). Poisoning is *sticky*: once a
@@ -500,7 +500,7 @@ fn spawn_workers(
                             "[checkpoint-hook] worker thread stopping: recv() failed ({error}); \
                              server was unblocked or its accept thread died"
                         );
-                        // P0 FIX (2026-07-30 audit, real-EMFILE probe): a *real* accept-thread
+                        // Wake every waiting worker after an accept-thread failure: a real accept-thread
                         // death pushes exactly ONE `Message::Error` into tiny_http's internal
                         // queue (see `MessagesQueue::push`/`pop` — a push is one `notify_one()`,
                         // same as `unblock()`), so only the ONE worker that happens to pop it ever
@@ -537,7 +537,7 @@ fn spawn_workers(
                 // unwinding handler cannot drop it and trigger tiny_http's body-less automatic
                 // 500; the catch branch below still owns it and can return a diagnostic body.
                 //
-                // Correction (2026-07-29 audit): an earlier version of this comment justified
+                // Availability requires poison recovery beyond the memory safety attributed to
                 // `AssertUnwindSafe` by saying `registrations_for_thread` "is a `Mutex`, which
                 // already poisons safely on an internal panic" — true, but that's a
                 // *memory-safety* property (no torn/half-written `HashMap`), not a
@@ -843,7 +843,7 @@ fn handle_request(
     let request_path = request.url().to_string();
     // Test-only fault injection, read from headers up front (before any auth/parsing, so neither
     // can change a real response's status or text) but *applied* at the specific points the
-    // 2026-07-29 audit needs them to be indistinguishable from a real slow DB / a real panic mid
+    // fault scenarios require, making them indistinguishable from a real slow database or a panic mid
     // critical-section:
     //   - `test_sleep_millis`: applied inside the DB-write closure below, simulating a slow/busy
     //     DB exactly where a real one would be slow. (An earlier version of this test slept at the
@@ -942,7 +942,7 @@ fn handle_request(
         respond(request, 204, "");
         return;
     }
-    // --- Narrow-lock commit path (2026-07-29 audit fix) ---------------------------------------
+    // Keep the registrations lock narrow while preserving revocation ordering across database writes.
     //
     // INVARIANT (unchanged from the original design, proved differently): once `HookRunGuard::drop`
     // (revocation) returns, no PreToolUse write for that (session_id, run_id) can still be in

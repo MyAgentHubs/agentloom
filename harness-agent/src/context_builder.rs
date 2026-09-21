@@ -6,47 +6,12 @@ use crate::provider::ChatMessage;
 use crate::run_progress::RunProgress;
 use crate::working_ledger::WorkingLedger;
 
-const MAX_RIPPLE_CANDIDATES_IN_FRAME: usize = 5;
-const MAX_RIPPLE_SITES_HARD_CAP: usize = 100;
-
-/// 据客观状态给一句方向建议——纯启发·引擎从不强制模型照做。
-/// `write_tools_offered`：与 `run_loop.rs` 喂给 `decide()` 的信号同源（run 全程恒定）。
-/// 无写工具的 run（如被禁写的 MCP 派单 lead）结构上做不到"去改一个文件"——`edited_files`
-/// 永远是空，硬让它 "make a concrete change" 只会诱它去撞不存在的工具（F1）。
-fn suggest_next_step(
-    goal: &GoalState,
-    progress: &RunProgress,
-    write_tools_offered: bool,
-) -> String {
-    if let Some(failed) = goal
-        .contract
-        .criteria
-        .iter()
-        .find(|c| c.status == CriterionStatus::Failed)
-    {
-        return format!(
-            "address failing criterion [{}] ({})",
-            failed.id,
-            crate::cockpit_render::render_criterion_for_model(failed)
-        );
-    }
-    if !progress.ripple_candidates.is_empty() {
-        return "address the ripple candidates above together (don't fix one at a time)"
-            .to_string();
-    }
-    if progress.edited_files.is_empty() {
-        if write_tools_offered {
-            return "make a concrete change toward the acceptance criteria (let the compiler enumerate the rest)".to_string();
-        }
-        return "dispatch the next step to a worker, verify what's already been done, or report your conclusion to the user and wrap up".to_string();
-    }
-    "run your acceptance check to confirm, or finish".to_string()
-}
+mod state_frame;
 
 /// Render the current harness-owned state into a provider-visible dashboard.
-/// `write_tools_offered`：同上，另驱动 Urge/Narrow 话术分档（F1）——无写工具时换派单/
-/// 验证/回答用户口径，Narrow 档也不再声称探索工具被收窄（对齐 T2：narrow_explore 在
-/// 无写工具时不摘 grep/ls/glob）。
+/// `write_tools_offered`: same source; also drives Urge/Narrow phrasing—no write tools means
+/// the copy switches to dispatch/verify/report framing, and Narrow no longer claims exploration
+/// tools are narrowed, since narrow_explore never strips grep/ls/glob without write tools.
 pub fn render_state_frame(
     goal: &GoalState,
     progress: &RunProgress,
@@ -68,164 +33,13 @@ pub fn render_state_frame(
             goal.contract.constraints.join("; ")
         ));
     }
-    frame.push_str(&format!("Budget: turn {turn}/{max_turns}\n"));
-    if turn.saturating_add(1) >= max_turns {
-        let remaining = max_turns.saturating_sub(turn);
-        frame.push_str(&format!(
-            "WRAP-UP: only {remaining} turn(s) left ({turn}/{max_turns}). If the objective is met: (1) delete any scratch/temp files YOU created that are not part of the task, (2) reply with your final summary as plain text and do NOT call any more tools. If not met, spend the remaining turn(s) on the single most critical action.\n"
-        ));
-    } else if progress.consecutive_stale_turns >= 3 {
-        frame.push_str(&format!(
-            "NOTICE: no file edits for {} consecutive turns. If the task is already complete, delete any scratch/temp files you created, then reply with your final summary as plain text instead of more verification.\n",
-            progress.consecutive_stale_turns
-        ));
-    }
-    frame.push_str(
-        "Acceptance criteria (FIXED - you cannot change these; to revise, escalate, do not negotiate):\n",
-    );
-    if goal.contract.criteria.is_empty() {
-        frame.push_str("  (none specified)\n");
-    } else {
-        for criterion in &goal.contract.criteria {
-            let status = match criterion.status {
-                CriterionStatus::Passed => "PASS",
-                CriterionStatus::Failed => "FAIL",
-                CriterionStatus::Pending => "pending",
-                CriterionStatus::Waived => "waived",
-                CriterionStatus::Uncertain => "uncertain",
-            };
-            frame.push_str(&format!(
-                "  [{status}] {} - {}\n",
-                criterion.id,
-                crate::cockpit_render::render_criterion_for_model(criterion)
-            ));
-        }
-    }
-    frame.push_str("Progress this run:\n");
-    if progress.edited_files.is_empty() {
-        frame.push_str("  files changed: (none yet)\n");
-    } else {
-        let files: Vec<&str> = progress
-            .edited_files
-            .iter()
-            .map(std::string::String::as_str)
-            .collect();
-        frame.push_str(&format!("  files changed: {}\n", files.join(", ")));
-    }
-    frame.push_str(&format!(
-        "  reads so far: {} unique - checks run: {} - stale turns: {} - turns since last edit: {}\n",
-        progress.read_keys.len(),
-        progress.checks_run,
-        progress.consecutive_stale_turns,
-        progress.turns_since_last_real_edit
-    ));
-    if !progress.ripple_candidates.is_empty() {
-        frame.push_str("Ripple candidates to address together (don't fix one at a time):\n");
-        for candidate in progress
-            .ripple_candidates
-            .iter()
-            .take(MAX_RIPPLE_CANDIDATES_IN_FRAME)
-        {
-            frame.push_str("  ");
-            frame.push_str(&candidate.symbol);
-            if let Some(field) = &candidate.missing_field {
-                frame.push_str(&format!(" [missing field: {field}]"));
-            }
-            let reported = candidate
-                .compiler_reported_sites
-                .iter()
-                .take(MAX_RIPPLE_SITES_HARD_CAP)
-                .cloned()
-                .collect::<Vec<_>>();
-            if reported.is_empty() {
-                frame.push_str(" - reported: (none)");
-            } else {
-                frame.push_str(&format!(" - reported: {}", reported.join(", ")));
-            }
-            let omitted_reported = candidate
-                .compiler_reported_sites
-                .len()
-                .saturating_sub(reported.len());
-            let extra = candidate
-                .extra_candidate_sites
-                .iter()
-                .take(MAX_RIPPLE_SITES_HARD_CAP)
-                .cloned()
-                .collect::<Vec<_>>();
-            if !extra.is_empty() {
-                frame.push_str(&format!(" - grep candidates: {}", extra.join(", ")));
-            }
-            let omitted_extra = candidate
-                .extra_candidate_sites
-                .len()
-                .saturating_sub(extra.len());
-            if omitted_reported > 0 {
-                frame.push_str(&format!(
-                    "  ({omitted_reported} more reported sites omitted by safety cap)"
-                ));
-            }
-            if omitted_extra > 0 {
-                frame.push_str(&format!(
-                    "  ({omitted_extra} more grep candidates omitted by safety cap)"
-                ));
-            }
-            if candidate.truncated {
-                frame.push_str("  (candidate search truncated)");
-            }
-            frame.push('\n');
-        }
-        let omitted = progress
-            .ripple_candidates
-            .len()
-            .saturating_sub(MAX_RIPPLE_CANDIDATES_IN_FRAME);
-        if omitted > 0 {
-            frame.push_str(&format!("  ... {omitted} more candidate groups omitted\n"));
-        }
-    }
-    if ledger.plan.is_some()
-        || !ledger.known.is_empty()
-        || !ledger.unknown.is_empty()
-        || ledger.next_intent.is_some()
-    {
-        frame.push_str("Your working notes (you maintain these):\n");
-        if let Some(plan) = &ledger.plan {
-            frame.push_str(&format!("  plan: {plan}\n"));
-        }
-        if !ledger.known.is_empty() {
-            frame.push_str(&format!("  known: {}\n", ledger.known.join("; ")));
-        }
-        if !ledger.unknown.is_empty() {
-            frame.push_str(&format!("  unknown: {}\n", ledger.unknown.join("; ")));
-        }
-        if let Some(next_intent) = &ledger.next_intent {
-            frame.push_str(&format!("  next: {next_intent}\n"));
-        }
-    }
-    use crate::adaptive_safety_net::SafetyLevel;
-    match (level, write_tools_offered) {
-        (SafetyLevel::Urge, true) => frame.push_str(
-            "Heads-up: you've gone several turns without a concrete edit. Consider making one now \
-             (you can ignore this if you're still gathering needed context).\n",
-        ),
-        (SafetyLevel::Narrow, true) => frame.push_str(
-            "Exploration tools (grep/ls/glob) are temporarily narrowed; fs_read on the file you'll \
-             change is still available. Make a concrete edit toward the goal.\n",
-        ),
-        // F1：无写工具的 run 换派单/验证/回答用户口径；Narrow 档不提"探索工具被收窄"
-        // （对齐 T2：narrow_explore 在无写工具时不摘 grep/ls/glob，话术得如实反映）。
-        (SafetyLevel::Urge, false) => frame.push_str(
-            "Heads-up: you've gone several turns without dispatching work, verifying a result, or \
-             reporting to the user. Consider doing one of those now (you can ignore this if you're \
-             still gathering needed context).\n",
-        ),
-        (SafetyLevel::Narrow, false) => frame.push_str(
-            "You've gone many turns without dispatching work, verifying a result, or reporting to \
-             the user. Do one of those now: delegate the next step to a worker, verify what's \
-             already been done, or tell the user your conclusion and wrap up.\n",
-        ),
-        (SafetyLevel::Halt, _) | (SafetyLevel::Free, _) => {}
-    }
-    let suggestion = suggest_next_step(goal, progress, write_tools_offered);
+    state_frame::append_budget_notice(&mut frame, turn, max_turns, progress);
+    state_frame::append_acceptance_criteria(&mut frame, goal);
+    state_frame::append_run_progress(&mut frame, progress);
+    state_frame::append_ripple_candidates(&mut frame, progress);
+    state_frame::append_working_notes(&mut frame, ledger);
+    state_frame::append_safety_notice(&mut frame, level, write_tools_offered);
+    let suggestion = state_frame::suggest_next_step(goal, progress, write_tools_offered);
     frame.push_str(&format!(
         "Suggested next step (a hint, not the only allowed action): {suggestion}\n"
     ));
@@ -542,7 +356,7 @@ mod tests {
             false,
         );
         let lc = frame.to_lowercase();
-        // T2 让 narrow_explore 在无写工具时不摘 grep/ls/glob——话术不能撒谎说工具被收窄了。
+        // narrow_explore never strips grep/ls/glob without write tools, so the copy must not falsely claim tools were narrowed.
         assert!(!lc.contains("narrowed"));
         assert!(!lc.contains("make a concrete edit"));
         assert!(lc.contains("dispatch"));

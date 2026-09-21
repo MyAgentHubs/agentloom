@@ -90,7 +90,7 @@ fn answer_lead_question_resumes_only_inside_appended_some_branch_after_emit() {
 
 #[test]
 fn try_resume_pending_with_gate_releases_db_lock_before_starting_lead_session() {
-    // M1-T1 死锁血案同款红线：std::sync::Mutex 不可重入，绝不能带着 db 锁进入
+    // Release the database lock before starting the lead session: std::sync::Mutex is not reentrant.
     // start_lead_session（它自己也会 db.0.lock()，同线程二次加锁直接死锁）。
     // 用源码缩进断言判门读锁的内层 block 在 start_lead_session( 调用之前就已经收口
     // （同仓先例：lead_step_spawn_closure_releases_db_lock_before_spawning_child）。
@@ -156,11 +156,11 @@ fn resume_pending_classify_attempt_outcome_busy_non_busy_and_success() {
 
 #[test]
 fn resume_pending_after_answer_records_failure_but_never_clears_on_bare_start_success() {
-    // T5-fix A 源码形状：非 busy 分支必须调 record_resume_failure（计入共享退避）；
+    // Non-busy failures must call record_resume_failure to participate in shared backoff.
     // 起跑成功（`resume_error` 为 None）绝不能在这里调 note_resume_success 清零——
     // 「runner 线程创建成功、run 移交」不等于真正交付 ack，过早清零会把仍在排队的连续
     // 失败在下一轮真失败前抹掉、退避永远卡在最短档（真正的清零只发生在
-    // `commit_lead_run_delivery` 的 Ok 分支，T5 M3/I5）。busy 两者都不该调，留给下一次
+    // Reset backoff only after commit_lead_run_delivery succeeds; busy attempts must preserve it for retry.
     // drain 的 try_resume_pending 自然重试（答案 id 已在起跑前登记，不会丢）。
     let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
     let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
@@ -181,7 +181,7 @@ fn resume_pending_after_answer_records_failure_but_never_clears_on_bare_start_su
 
 #[test]
 fn try_resume_pending_never_clears_backoff_on_bare_start_success() {
-    // T5-fix A 的镜像覆盖：`try_resume_pending`（C2 自动路径）同样不得在 `Ok(())` 分支
+    // try_resume_pending must preserve backoff on Ok(()) because starting a run does not acknowledge delivery.
     // 清零——同上，理由见 `resume_pending_after_answer_records_failure_but_never_clears_
     // on_bare_start_success`。
     let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
@@ -200,7 +200,7 @@ fn try_resume_pending_never_clears_backoff_on_bare_start_success() {
     assert!(body.contains("record_resume_failure(app, session_id, &e)"));
 }
 
-/// T8 P1-②：答案 ack 的真相源已改为组装阶段（`build_lead_context_prompt_for_session`）
+/// Use answer identifiers returned by build_lead_context_prompt_for_session as the acknowledgment source of truth.
 /// 直接返回的 `assembly.included_answer_ids`——在 `start_lead_session` 自己 spawn 出的
 /// runner 线程内、同一线程就地捕获进 `in_flight_answer_ids_t`，收尾 ack
 /// （`commit_lead_run_delivery`）直接消费这个变量。原「调用方登记 + EOF 处跨线程 take」
@@ -208,7 +208,7 @@ fn try_resume_pending_never_clears_backoff_on_bare_start_success() {
 /// `ResumeState.in_flight_answer_ids`）已整套删除——同线程 happens-before 天然消灭了
 /// 「登记晚于取用」的竞态窗口，不需要再靠跨线程状态传递。
 ///
-/// T8-fix（可杀变异加固）：原断言只验证「捕获行早于 ack 调用行」——两个 `find` 各自成立、
+/// Checking capture order alone cannot prove that acknowledgment consumes the captured answer identifiers.
 /// 顺序也成立，但如果把 EOF 处 ack 的真实实参悄悄换回全局 `take_in_flight_answer_ids(...)`
 /// （捕获行留在原地变成死代码），旧断言测不出来。补两条：① 直接抠出
 /// `commit_lead_run_delivery(` 调用的实参文本，断言答案位置的实参就是
@@ -258,7 +258,7 @@ fn resume_pending_start_lead_session_captures_assembly_answer_ids_before_ack() {
     }
 }
 
-/// T5-fix C 的调用方侧镜像：`try_resume_pending_with_gate` 把联合快照读到的 `answer_ids`
+/// Pass the atomic snapshot's answer_ids through try_resume_pending_with_gate into start_lead_session.
 /// 随 `start_lead_session(...)` 调用一起移交（`Some(answer_ids)`），由被调用方在自己的
 /// runner 线程内、组装阶段就地消费——不需要调用方自己另外登记任何跨线程状态。
 #[test]
@@ -280,7 +280,7 @@ fn resume_pending_with_gate_carries_answer_ids_into_start_lead_session_not_after
 }
 
 // ---------------------------------------------------------------------------------------
-// T4：统一自动恢复状态机 try_resume_pending —— F1-F7。
+// Verify that try_resume_pending preserves the shared automatic resume state machine's invariants.
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -450,7 +450,7 @@ fn resume_pending_timer_armed_when_missing_and_skips_when_already_armed() {
 
 #[test]
 fn resume_pending_answer_ids_register_and_ack_round_trip() {
-    // F4（T8 P1-②更新）：register 之后未 ack 前 id 一直可见（不在 spawn 前被消费）；ack
+    // Registered answer identifiers remain visible until acknowledgment, including before the runner spawns.
     // 精确摘除指定 id，未 ack 的留下。原「in_flight 快照 take」全局侧信道已删——答案 ack
     // 的真相源改为 lead runner 线程内组装阶段直接捕获的 `assembly.included_answer_ids`，
     // 不再需要跨线程登记/取用这一步。
@@ -518,7 +518,7 @@ fn try_resume_pending_busy_does_not_count_as_failure() {
 }
 
 // ---------------------------------------------------------------------------------------
-// T4-fix：skeptic 抓的两个 T4 真洞——A（DB 错误/timer 线程失败永等）、B（联合原子快照 +
+// Guard against indefinite waits after database or timer failures and loss of atomic answer snapshots.
 // in-flight 覆盖）。
 // ---------------------------------------------------------------------------------------
 
@@ -647,11 +647,11 @@ fn try_resume_pending_with_gate_answer_ids_snapshotted_while_conn_lock_held() {
 
 #[test]
 fn resume_pending_with_gate_answer_ids_carried_as_start_lead_session_call_argument() {
-    // B（in-flight 覆盖洞，T4-fix B 原始动机）：答案 id 快照必须随 `start_lead_session(...)`
+    // Transfer the answer identifier snapshot as part of the start_lead_session call to prevent overwrite races.
     // 这一次调用整体移交，由被调用方在自己的 runner 线程内、组装阶段就地消费——不能等
     // 调用返回之后、被 `result.is_ok()` 收窄才在这里另起炉灶处理（busy/prespawn 早退路径
     // 天然到不了那种「事后处理」代码，「busy 不覆盖既有集合」的语义靠这一点自然保留）。
-    // T8 P1-②：真相源已改为组装阶段直接返回的 `assembly.included_answer_ids`（同线程
+    // assembly.included_answer_ids is the source of truth captured within the runner thread.
     // 捕获），调用方这一侧不需要也不该再自己维护任何跨调用的答案 id 状态。
     let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
     let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
@@ -667,7 +667,7 @@ fn resume_pending_with_gate_answer_ids_carried_as_start_lead_session_call_argume
         .find("start_lead_session(")
         .expect("必须有 start_lead_session 调用");
     // 只在调用点之后找「实参」——`body` 里调用前的注释也会提到 `Some(answer_ids)`
-    // 字样（T8-fix 重写注释引入），若从整个 body 头部找会误配到注释而非真实调用参数。
+    // Search after the call site so comment mentions cannot be mistaken for actual call arguments.
     let carry_idx = body[start_idx..]
         .find("Some(answer_ids)")
         .map(|idx| idx + start_idx)

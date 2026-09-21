@@ -249,20 +249,12 @@ fn myagent_hook_server_keeps_first_preimage_and_undo_restores_original_bytes() {
     );
 }
 
-/// D1 (2026-07-29 delta review) — regression pin for the revocation barrier itself, exercised
-/// through the real production path (`install()` + `guard_for_command()` +
-/// `HookRunGuard::drop`, not an ephemeral test-only `HookServer`) against a genuinely slow
-/// (test-injected) DB write. Proves three things about dropping the run guard while that write
-/// is still in flight:
-///   1. the drop returns at all — watched with a timeout so a regression here fails this test
-///      instead of hanging the whole suite;
-///   2. it actually waited for the write, rather than returning immediately;
-///   3. after the drop returns, a new write against the same (now-revoked) token is rejected.
-///
-/// Kills the "delete `InFlightWriteGuard`'s decrement" mutation: under that mutation,
-/// `in_flight_writes` never returns to zero, so `HookRunGuard::drop`'s poll loop spins
-/// forever and assertion 1 times out — with no other test catching it, since nothing else
-/// exercises revocation racing a genuinely in-flight write.
+/// Exercise revocation through `install()`, `guard_for_command()`, and
+/// `HookRunGuard::drop` while a deliberately slow DB write is in flight.
+/// Dropping the run guard must wait for that write, finish within the timeout,
+/// and reject subsequent writes using the revoked token.
+/// The timeout also catches a missing `InFlightWriteGuard` decrement: if the
+/// in-flight count never reaches zero, guard cleanup would otherwise wait forever.
 #[test]
 fn hook_run_guard_drop_waits_for_in_flight_write_then_revokes() {
     let (_home_root, home) = crate::test_support::tmp_root();

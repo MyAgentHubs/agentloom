@@ -289,9 +289,9 @@ fn setup_wires_real_activity_summary_writer_through_test_db_not_a_mock() {
              `extract_tool_milestones` 判断'聚合器是否启用'的唯一依据"
     );
 
-    // B3（G3）时序锚：记录 delta 发出时刻，断言"真实落库时刻"严格早于节流窗口
-    // （ACTIVITY_SUMMARY_THROTTLE_MS=2000ms）到期——不是"反正等到 3s 兜底超时就算过"的
-    // 平凡实现（那样测不出写线程是不是绕了一圈节流才凑巧赶上宽松 deadline）。
+    // Record the delta send time so persistence must precede expiration of
+    // ACTIVITY_SUMMARY_THROTTLE_MS. A write that merely beats the fallback timeout
+    // would not prove that persistence bypasses summary throttling.
     let sent_at = Instant::now();
     inner
         .state

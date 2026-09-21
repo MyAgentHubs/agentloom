@@ -18,7 +18,7 @@ type Props = {
 
 /**
  * cluster L Phase 2 plan B Task 4 · namespace dropdown（v4 state 3 严格保真）。
- * Mount 在 TopBar.tsx 内 .topbar__main 下 · open state 由 TopBar 控（B1 ownership）。
+ * Mounts under TopBar.tsx's .topbar__main; open state is owned by TopBar, not this component.
  *
  * v4 真实 DOM：.dropdown / .dd-search / .dd-section-title 含 .builtin-tag /
  *   .dd-row[.active] 含 .dd-check + NamespaceAvatar + .dd-nm 含 <small> 副标题 + .dd-ct count /

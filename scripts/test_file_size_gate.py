@@ -149,6 +149,29 @@ class ClassificationTests(unittest.TestCase):
                         self.assertIn(f"  {name}:\n    needs: file-size-gate\n", source)
                     self.assertEqual(source.count("needs.file-size-gate.outputs.baseline"), 2)
 
+    def test_public_snapshot_gate_fetches_selected_commit_for_default_base(self):
+        path = SCRIPT.parent.parent / ".github/workflows/ci.yml"
+        self.assertTrue(path.is_file())
+        source = path.read_text()
+        pin = workflow_shell(path, "Fetch and pin file size baseline")
+        self.assertIn("SIZE_GATE_PR_BASE: ${{ github.event.pull_request.base.sha }}", source)
+        self.assertIn('baseline="$SIZE_GATE_PR_BASE"', pin)
+        self.assertIn('git fetch --no-tags origin "$baseline"', pin)
+        self.assertIn('git update-ref refs/remotes/origin/main "$baseline"', pin)
+        self.assertIn("python3 -I scripts/check_file_size.py\n", source)
+        self.assertNotIn("--base refs/remotes/public/main", source)
+
+    def test_public_snapshot_gate_pins_pre_push_or_approved_first_push_sha(self):
+        path = SCRIPT.parent.parent / ".github/workflows/ci.yml"
+        source = path.read_text()
+        pin = workflow_shell(path, "Fetch and pin file size baseline")
+        self.assertIn("SIZE_GATE_BEFORE: ${{ github.event.before }}", source)
+        self.assertIn('baseline="$SIZE_GATE_BEFORE"', pin)
+        self.assertIn('"$GITHUB_REF" == refs/heads/myagenthubs/number1-debt-graph', pin)
+        self.assertIn('baseline=16db362c93724d352272972c28d1a09dab470813', pin)
+        self.assertIn('git update-ref refs/remotes/origin/main "$baseline"', pin)
+        self.assertNotIn('HEAD^', pin)
+
 
 class RepositoryTests(unittest.TestCase):
     def setUp(self):
@@ -434,8 +457,9 @@ class RepositoryTests(unittest.TestCase):
         path.parent.rmdir()
         self.assertIn("拒绝放行", self.run_gate(2))
 
-    def run_ci_shell(self, workflow, event, before, expected):
+    def run_ci_shell(self, workflow, event, before, expected, *, pr_base="", ref="refs/heads/main"):
         env = dict(self.env, GITHUB_EVENT_NAME=event, SIZE_GATE_BEFORE=before,
+                   SIZE_GATE_PR_BASE=pr_base, GITHUB_REF=ref,
                    GITHUB_OUTPUT=str(self.root / "ci-output"))
         result = subprocess.run(
             ["bash", "-c", workflow_shell(workflow, "Fetch and pin file size baseline")],
@@ -459,7 +483,8 @@ class RepositoryTests(unittest.TestCase):
                 for ref in gate.BASELINE_REFS:
                     self.git("update-ref", "-d", ref)
                 self.assertIn("缺少基线", self.run_gate(2))
-                self.run_ci_shell(workflow, "pull_request", "", 0)
+                self.run_ci_shell(workflow, "pull_request", "", 0,
+                                  pr_base=strict, ref="refs/pull/1/merge")
                 self.assertEqual(self.git("rev-parse", f"refs/remotes/origin/{branch}"), strict)
                 self.assertIn(" / 900 / 500 / ", self.run_gate(1))
 
@@ -477,7 +502,8 @@ class RepositoryTests(unittest.TestCase):
                     self.git("update-ref", "-d", ref)
                 self.git("update-ref", f"refs/remotes/origin/{branch}", candidate)
                 self.run_gate(0)  # Reproduce checkout's false green before pinning.
-                self.run_ci_shell(workflow, "push", strict, 0)
+                self.run_ci_shell(workflow, "push", strict, 0,
+                                  ref=f"refs/heads/{branch}")
                 self.assertEqual(self.git("rev-parse", f"refs/remotes/origin/{branch}"), strict)
                 self.assertIn(" / 900 / 500 / ", self.run_gate(1))
                 if branch == "main":
@@ -499,11 +525,13 @@ class RepositoryTests(unittest.TestCase):
             self.git("update-ref", f"refs/heads/{branch}", commit)
             for before in ("0" * 40, "", "not-a-commit"):
                 with self.subTest(branch=branch, before=before):
-                    self.assertIn("first import requires a reviewed baseline",
-                                  self.run_ci_shell(workflow, "push", before, 1))
+                    output = self.run_ci_shell(workflow, "push", before, 1,
+                                               ref=f"refs/heads/{branch}")
+                    self.assertIn("ERROR:", output)
             # A syntactically valid but missing previous object must also fail.
             with self.subTest(branch=branch, before="missing object"):
-                self.run_ci_shell(workflow, "push", "a" * 40, 128)
+                self.run_ci_shell(workflow, "push", "a" * 40, 128,
+                                  ref=f"refs/heads/{branch}")
 
     def test_ci_real_shallow_push_fetches_previous_object(self):
         self.created.add(self.root / "scripts/check_file_size.py")
@@ -525,7 +553,8 @@ class RepositoryTests(unittest.TestCase):
                     self.root = checkout
                     self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "true")
                     self.run_gate(0)  # Shallow checkout points the baseline at HEAD.
-                    self.run_ci_shell(workflow, "push", strict, 0)
+                    self.run_ci_shell(workflow, "push", strict, 0,
+                                      ref=f"refs/heads/{branch}")
                     self.assertIn(" / 900 / 500 / ", self.run_gate(1))
                 finally:
                     self.root = original
@@ -566,10 +595,69 @@ class RepositoryTests(unittest.TestCase):
         self.write("app/src/a.ts", 500)
         current = self.baseline()
         self.write("app/src/a.ts", 900)
-        self.assertIn("不接受命令行参数", self.run_gate(2, "--baseline", "looser"))
+        self.assertIn("只接受无参数或", self.run_gate(2, "--baseline", "looser"))
+        self.assertIn("只接受无参数或", self.run_gate(2, "--foo"))
+        self.assertIn("只接受无参数或", self.run_gate(2, "--base"))
+        self.assertIn("只接受无参数或", self.run_gate(2, "--base", "a", "b"))
         env = dict(self.env, BASELINE_REF="looser", FILE_SIZE_BASELINE_REF="looser",
                    GIT_DIR=str(self.root / "missing"), GIT_WORK_TREE=str(self.root / "missing"))
         self.assertIn(current, self.run_gate(1, env=env))
+
+    def test_base_flag_overrides_baseline_ref(self):
+        self.write("app/src-tauri/src/big.rs", 1000)
+        snapshot = self.baseline()
+        self.git("branch", "public-snapshot", snapshot)
+        self.write("app/src-tauri/src/big.rs", 900)
+        self.baseline()
+        self.write("app/src-tauri/src/big.rs", 950)
+        self.assertIn("超标总量：50 行", self.run_gate(1))
+        output = self.run_gate(0, "--base", "refs/heads/public-snapshot")
+        self.assertTrue(output.startswith("基线：refs/heads/public-snapshot ("), output)
+        self.assertIn("超标总量：0 行", output)
+
+    def test_base_falls_back_to_internal_baseline_for_absent_snapshot_root(self):
+        self.write("app/src/a.ts", 10)
+        tag_commit = self.baseline()
+        self.git("branch", "public-tag", tag_commit)
+        self.write("remote-web/src/big.ts", 900)
+        self.baseline()  # origin/master now carries the file at 900 lines
+        output = self.run_gate(0, "--base", "refs/heads/public-tag")
+        self.assertIn("回退：remote-web/src（基线 refs/heads/public-tag 不含该根，改按", output)
+
+        # origin/master shrinks to 800; an uncommitted bump back to 900 is net
+        # growth and the fallback baseline must still catch it.
+        self.write("remote-web/src/big.ts", 800)
+        self.baseline()
+        self.write("remote-web/src/big.ts", 900)
+        self.assertIn(" / 900 / 800 / 基线历史额度", self.run_gate(1, "--base", "refs/heads/public-tag"))
+
+        # No internal baseline ref at all: fail closed, never fall through to
+        # the hard cap silently.
+        self.git("update-ref", "-d", "refs/remotes/origin/master")
+        self.assertIn("缺少可回退的内部基线", self.run_gate(2, "--base", "refs/heads/public-tag"))
+
+    def test_default_mode_ignores_skip_rule_for_same_scenario(self):
+        self.write("app/src/a.ts", 10)
+        self.baseline()
+        self.write("remote-web/src/big.ts", 900)
+        output = self.run_gate(1)
+        self.assertNotIn("跳过：", output)
+        self.assertIn(" / 900 / 500 / 硬上限（新文件）", output)
+
+    def test_base_judges_root_normally_when_baseline_tree_has_any_file(self):
+        self.write("app/src/a.ts", 10)
+        self.write("remote-web/src/other.ts", 5)
+        baseline_commit = self.baseline()
+        self.git("branch", "public-tag", baseline_commit)
+        self.write("remote-web/src/big.ts", 900)
+        output = self.run_gate(1, "--base", "refs/heads/public-tag")
+        self.assertNotIn("跳过：remote-web/src", output)
+        self.assertIn(" / 900 / 500 / 硬上限（新文件）", output)
+
+    def test_base_flag_missing_ref_fails_closed(self):
+        self.write("app/src-tauri/src/big.rs", 500)
+        self.baseline()
+        self.assertIn("基线 ref 不存在", self.run_gate(2, "--base", "refs/does/not/exist"))
 
     def test_git_replace_cannot_override_history(self):
         self.write("app/src/a.ts", 900)

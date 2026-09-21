@@ -377,7 +377,7 @@ fn scan_allows_normal_in_workspace_commands() {
 
 #[test]
 fn scan_is_honest_does_not_block_interpreters() {
-    // 诚实 gap（设计 §二·用户拍）：解释器/eval/xargs 不在防护内·不拦。别删这条。
+    // Deliberate gap, not an oversight: interpreters/eval/xargs are out of scope for this guard and are not blocked. Do not delete this test.
     let (cwd, w) = ws();
     assert!(
         dangerous_command_scan("python -c \"import os; os.remove('/etc/x')\"", &cwd, &w).is_none()

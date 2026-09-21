@@ -1,11 +1,11 @@
 #![cfg(test)]
 
 use super::*;
-/// msgfix1 T4（M0 §10.8）：`CHUNK_RAW_BYTES` 的生成式钉死测试——真实走
-/// `remote_crypto::seal`（真 AES-256-GCM，密文=明文+16B tag，不是估算）+
-/// `build_envelope_json`（真实 wire envelope 构造），用最坏转义样张 + 各字段边界值量出
-/// 最终 wire 帧字节数，断言 ≤ 64KiB 硬闸且余量 ≥10%。任何未来改动（envelope 加字段/
-/// `CHUNK_RAW_BYTES` 被调大）都会被这条测试如实钉住，不允许"拍脑袋改数字不重新量"。
+/// Measure the wire size for `CHUNK_RAW_BYTES` using actual `remote_crypto::seal`
+/// encryption and `build_envelope_json` serialization rather than a size estimate.
+/// Boundary field lengths and the binary fixture include encoding and authentication
+/// overhead. The resulting frame must fit the relay limit with at least ten percent
+/// headroom, constraining changes to the envelope or `CHUNK_RAW_BYTES`.
 fn worst_case_msg_chunk_wire_len(raw_len: usize) -> usize {
     // 最坏转义原始字节：高位不可打印字节（0xFF）与 ASCII 双引号（0x22）交替——排除"这段
     // 原始字节的 base64 编码恰好落在对 JSON/base64 都友好的巧合区间"的侥幸；反正
@@ -91,7 +91,7 @@ fn build_content_ref_matches_raw_bytes_sha256_and_length() {
     );
 }
 
-// ---- msgfix1 T4：build_msg_chunks（M0 §10.5/§10.9 重组安全 + offset 续传）----
+// ---- build_msg_chunks must support exact reassembly and offset-based resumption. ----
 
 #[test]
 fn build_msg_chunks_round_trips_exact_bytes_and_sha256_with_uneven_last_chunk() {
@@ -198,7 +198,7 @@ fn build_msg_chunks_offset_past_end_is_clamped_not_panicking() {
     assert_eq!(chunks[0]["chunk_len"], 0);
 }
 
-// ---- msgfix1 T4：msg_fetch_error_payload（M0 §10.5 六值 code 枚举）----
+// ---- msg_fetch_error_payload must preserve the six error codes and their field shapes. ----
 
 #[test]
 fn msg_fetch_error_payload_stale_revision_carries_current_ref_and_other_codes_omit_key() {
@@ -224,7 +224,7 @@ fn msg_fetch_error_payload_stale_revision_carries_current_ref_and_other_codes_om
     }
 }
 
-// ---- msgfix1 T4：单飞行超时 + 60s 字节预算（M0 §10.9 滥用闸）纯函数边界 ----
+// ---- Check single-flight timeout and rolling byte-budget boundaries. ----
 
 #[test]
 fn msg_fetch_inflight_is_active_boundary() {
@@ -284,7 +284,7 @@ fn msg_fetch_budget_admit_prunes_entries_older_than_the_sliding_window() {
     );
 }
 
-// ---- msgfix1 T4：build_envelope_json / send_upstream_value 的 command_id 直通 ----
+// ---- build_envelope_json and send_upstream_value must preserve command_id. ----
 
 #[test]
 fn build_envelope_json_reflects_meta_command_id_for_reply_kind() {

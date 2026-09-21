@@ -46,7 +46,6 @@ export function ReviewPanel({ review, onClose }: Props) {
   useEffect(() => {
     setOpen(defaultOpen());
     // 顺序变化不重置；文件身份或正文规模变化才应用新 review 的默认态。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fileIdentity]);
   if (!review.has_changes) return null;
   const toggle = (path: string) =>

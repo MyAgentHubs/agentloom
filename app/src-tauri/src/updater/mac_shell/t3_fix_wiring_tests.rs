@@ -6,6 +6,60 @@ use crate::updater_install::{Stage, TxnMarker};
 use std::cell::Cell;
 use std::fs;
 
+fn strip_comments_and_strings(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '/' && chars.peek() == Some(&'/') {
+            while let Some(&nc) = chars.peek() {
+                if nc == '\n' {
+                    break;
+                }
+                chars.next();
+            }
+            out.push_str("/*stripped-comment*/");
+        } else if c == '"' {
+            while let Some(nc) = chars.next() {
+                if nc == '\\' {
+                    chars.next();
+                    continue;
+                }
+                if nc == '"' {
+                    break;
+                }
+            }
+            out.push_str("\"stripped-string\"");
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn extract_fn_body<'a>(stripped_source: &'a str, fn_needle: &str, label: &str) -> &'a str {
+    let after_sig = stripped_source.split(fn_needle).nth(1).unwrap_or_else(|| {
+        panic!("{label}: 源码里没找到 {fn_needle:?}，测试的切片标记可能已经过期")
+    });
+    let open_rel = after_sig
+        .find('{')
+        .unwrap_or_else(|| panic!("{label}: {fn_needle:?} 后面没找到函数体开头的 `{{`"));
+    let from_open = &after_sig[open_rel..];
+    let mut depth: i32 = 0;
+    for (i, c) in from_open.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &from_open[..=i];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("{label}: {fn_needle:?} 的函数体没扫到匹配的收尾 `}}`，测试的切片标记可能已经过期");
+}
+
 fn make_bundle(parent: &Path, version: &str) -> PathBuf {
     let bundle = parent.join("AgentLoom.app");
     let contents = bundle.join("Contents");
@@ -346,6 +400,7 @@ fn dangling_symlink_marker_is_preserved_and_blocks_stage() {
 #[test]
 fn production_entrypoints_remain_wired_to_t3_fix_cores() {
     let source = include_str!("../../updater.rs");
+    let download_install_source = include_str!("../download_install.rs");
     let check_body = source
         .split("async fn perform_check(app:")
         .nth(1)
@@ -356,16 +411,37 @@ fn production_entrypoints_remain_wired_to_t3_fix_cores() {
     assert!(check_body.contains("perform_check_after_recovery_gate("));
     assert!(check_body.contains("installed_target_awaiting_reopen(app)"));
 
-    let download_body = source
-        .split("pub async fn download_and_install(")
-        .nth(1)
-        .unwrap()
-        .split("fn open_failure_detail(")
-        .next()
-        .unwrap();
-    assert!(download_body.contains("installed_target_awaiting_reopen(app)"));
-    assert!(download_body.contains("super::stage_after_old_marker_lookup("));
-    assert!(!download_body.contains("remove_dir_all"));
+    let stripped_source = strip_comments_and_strings(source);
+    let download_body = extract_fn_body(
+        &stripped_source,
+        "pub async fn download_and_install(",
+        "download_and_install",
+    );
+    let prepare_pos = download_body.find("prepare_download(").unwrap();
+    let stage_pos = download_body.find("download_and_stage(").unwrap();
+    let finalize_pos = download_body.find("finalize_staged(").unwrap();
+    assert!(prepare_pos < stage_pos && stage_pos < finalize_pos);
+
+    let stripped_download_install = strip_comments_and_strings(download_install_source);
+    let prepare_body = extract_fn_body(
+        &stripped_download_install,
+        "pub(super) fn prepare_download(",
+        "prepare_download",
+    );
+    let stage_body = extract_fn_body(
+        &stripped_download_install,
+        "pub(super) async fn download_and_stage(",
+        "download_and_stage",
+    );
+    let finalize_body = extract_fn_body(
+        &stripped_download_install,
+        "pub(super) fn finalize_staged(",
+        "finalize_staged",
+    );
+    assert!(prepare_body.contains("installed_target_awaiting_reopen(app)"));
+    assert!(stage_body.contains("super::stage_after_old_marker_lookup("));
+    let download_chain = format!("{download_body}\n{prepare_body}\n{stage_body}\n{finalize_body}");
+    assert!(!download_chain.contains("remove_dir_all"));
 
     let reopen_body = source
         .split("pub fn reopen(app:")

@@ -51,7 +51,7 @@ fn executor_system_prompt_teaches_persistent_ripple_work() {
     assert!(system.contains("shell_exec"));
     assert!(!system.contains("Use tools only when needed"));
 
-    // sharpened wide-ripple guidance (2026-06-21 slice)
+    // Strengthened wide-ripple guidance directs executors to inspect test-adjacent call sites beyond literal string matches.
     assert!(system.contains("the sites you miss are almost always in tests"));
     assert!(system.contains("grep -rn"));
     assert!(system.contains("whose path is under tests"));
@@ -241,7 +241,7 @@ async fn run_solo_task_real_time_gate_hard_denies_forbidden() {
 
 #[tokio::test]
 async fn run_solo_task_injects_task_contract_scope_and_constraints() {
-    // B1：任务契约的 scope/constraints 必须进 child（goal.created 看得见）
+    // The task contract's scope/constraints must reach the child run and be visible in goal.created.
     #[derive(Clone)]
     struct DoneProvider;
     #[async_trait::async_trait]
@@ -4737,10 +4737,10 @@ async fn pure_reader_hits_no_edit_backstop_before_budget() {
 /// `write_tools_offered` 若被错误算成 true（或没被接上 `decide()`），这条测试必红
 /// （已手工验证：见下方"变异验证"记录，改动只在开发过程中临时做，未进最终 diff）。
 ///
-/// 变异验证记录（2026-07-25 补测时手工做过，非自动化）：把 run_loop.rs 里
-/// `let write_tools_offered = [...]` 那一行临时改成 `let write_tools_offered = true;`，
-/// 跑本测试 → 在 no_edit_backstop(40) 附近被 halt，`calls` 远小于 max_turns，断言全部
-/// 失败（红）；改回真实表达式后重跑 → 绿。证明这条测试确实在盯 K2 的接线，不是摆设。
+/// Manual mutation check (not automated): in run_loop.rs, temporarily replace the real
+/// `let write_tools_offered = [...]` expression with `let write_tools_offered = true;`.
+/// This test halts near no_edit_backstop(40), with `calls` far below max_turns and all assertions failing (red).
+/// Restoring the real expression makes the rerun pass (green), confirming that this test guards that wiring.
 #[tokio::test]
 async fn pure_reader_with_write_tools_disallowed_never_hits_no_edit_backstop() {
     let dir = tempfile::tempdir().unwrap();
@@ -4828,12 +4828,12 @@ async fn pure_reader_with_write_tools_disallowed_never_hits_no_edit_backstop() {
         .iter()
         .find(|event| event["type"] == "run.needs_decision")
         .expect("budget exhaustion should emit needs_decision");
-    // P2（2026-07-26 更新此前 R1 断言）：这条 run 结构上不可能编辑（fs_write/fs_edit 被
-    // disallow），从没编辑过、从没重置过 turns_since_last_real_edit——但也正因为「结构上不可能
-    // 编辑」，不能拿「没编辑过」倒推 no_progress（P1 修完 MCP 型 lead 的安全网之后，这类
-    // 无写工具的 run 打满预算是常态，不是卡住）。`budget_exhausted_blocked_reason` 现在收
-    // `write_tools_offered` 入参，无写工具时恒落 `budget_exhausted_still_progressing`
-    // （不是 halt 触发的——是 loop 跑满后 emit_budget_exhausted_needs_decision 报的）。
+    // With fs_write/fs_edit disallowed, this run structurally cannot edit: it has never edited or reset
+    // turns_since_last_real_edit. That absence cannot imply no_progress: after fixing the MCP lead safety net,
+    // runs without write tools normally consume their full budget without being stuck.
+    // budget_exhausted_blocked_reason now also takes write_tools_offered; without write tools, it always returns
+    // budget_exhausted_still_progressing, reported by emit_budget_exhausted_needs_decision after the loop
+    // exhausts its budget, rather than triggered by a halt.
     assert_eq!(
         needs_decision["payload"]["blocked_reason"],
         "budget_exhausted_still_progressing"
@@ -4935,13 +4935,13 @@ async fn repeat_reader_with_no_new_info_gets_explore_truncated() {
     );
 }
 
-/// F1（opus 对抗审 Finding 1·T2）：镜像
-/// `repeat_reader_with_no_new_info_gets_explore_truncated`，唯一差别是 `disallowed_tools`
-/// 拿掉 fs_write/fs_edit（模拟被禁写工具的 lead——K2 的同一个场景）。对这类 run，
-/// narrow_explore 不该摘 grep/ls/glob：fs_read 之外，「新颖读」正是它清零 stale 计数、
-/// 避免 8 轮 halt 的仅剩自救手段之一，收窄探索工具是在它离 halt 只剩 2 轮时反而拿走
-/// 一半自救工具（误掐的放大器，不是刹车）。这条测试钉死"grep/ls/glob 在无写工具的 run
-/// 里、任何轮次都不该消失"——即便 stale 已经越过 narrow(6)/urge(4) 阈值。
+/// Mirrors `repeat_reader_with_no_new_info_gets_explore_truncated`; the only difference is that
+/// `disallowed_tools` removes fs_write/fs_edit, simulating a lead with write tools disabled.
+/// For this run, narrow_explore must retain grep/ls/glob: besides fs_read, novel reads are among its few
+/// remaining ways to reset the stale counter and avoid the 8-turn halt. Narrowing exploration only 2 turns
+/// before that halt removes half its recovery tools, amplifying false halts instead of providing a brake.
+/// This test ensures grep/ls/glob never disappear on any turn of a run without write tools,
+/// even when stale has crossed the narrow(6)/urge(4) thresholds.
 #[tokio::test]
 async fn repeat_reader_with_write_tools_disallowed_keeps_explore_tools_at_narrow() {
     let dir = tempfile::tempdir().unwrap();
@@ -4956,9 +4956,9 @@ async fn repeat_reader_with_write_tools_disallowed_keeps_explore_tools_at_narrow
     opts.permission = PermissionPolicy::Allow;
     opts.max_turns = 12;
     opts.run_id = Some(run_id.to_string());
-    // T2 的核心场景：结构上不可能写文件的 run（例如被 --disallow-tools 拿掉 fs_write/
-    // fs_edit 的 lead）——与 K2/`pure_reader_with_write_tools_disallowed_...` 同一个禁写
-    // 接线。
+    // Core scenario: a run structurally unable to write files, such as a lead whose fs_write/fs_edit
+    // tools were removed by --disallow-tools. This uses the same write-disabling wiring as
+    // the earlier `pure_reader_with_write_tools_disallowed_...` test.
     opts.disallowed_tools.insert("fs_write".to_string());
     opts.disallowed_tools.insert("fs_edit".to_string());
     let mut recorder = EventRecorder::new(
@@ -8329,17 +8329,17 @@ async fn preflight_reject_write_targets_bad_args_does_not_crash() {
 }
 
 // ---------------------------------------------------------------------------
-// P1/P2（2026-07-26）：`invalidates_verification` 与 `turn_had_edit` 概念分家的回归测试。
+// Regression tests separating `invalidates_verification` from `turn_had_edit`.
 //
-// 病灶回顾：MCP 工具（`McpToolProxy::execute` 用 `ToolOutcome::success_mutating`，
-// `invalidates_verification: true`）此前被 run_loop.rs 的 `if tool_result
-// .invalidates_verification { turn_had_edit = true; }` 硬焊成「本轮真编辑了工作区」，
-// 于是每次成功的 MCP 调用都会把 `note_safety_signals` 喂成「刚编辑过」，把
-// consecutive_stale_turns / turns_since_last_real_edit 全部清零——全靠
-// mcp__agentloom__* 干活、被 `--disallow-tools fs_edit,fs_write,shell_exec` 收走原生
-// 写工具的 lead，复读/同参重试环永远撞不上 adaptive_safety_net 的任何一档推力，能烧穿
-// 整个预算。下面几条测试分别钉住修复后三个概念（`turn_had_edit` 真编辑 /
-// `turn_had_mutating_call` 有副作用调用 / K1 的 novel-call 去重）各自接对了地方。
+// MCP tools (`McpToolProxy::execute` returning `ToolOutcome::success_mutating` with
+// `invalidates_verification: true`) were previously treated as actual workspace edits by run_loop.rs:
+// `if tool_result.invalidates_verification { turn_had_edit = true; }`.
+// Every successful MCP call thus fed `note_safety_signals` a just-edited signal, resetting both
+// consecutive_stale_turns and turns_since_last_real_edit. A lead relying entirely on mcp__agentloom__*
+// with native write tools removed by `--disallow-tools fs_edit,fs_write,shell_exec` could repeat reads
+// or retry identical arguments without triggering any adaptive_safety_net intervention, burning the full budget.
+// These tests guard the distinct wiring of `turn_had_edit` for actual edits,
+// `turn_had_mutating_call` for calls with side effects, and novel-call deduplication.
 // ---------------------------------------------------------------------------
 
 /// 永远成功、`invalidates_verification: true` 的假 MCP 工具（`is_mcp() == true`）——
@@ -8900,11 +8900,11 @@ impl ProviderClient for WorkspaceUnverifiableSafetyCounterProvider {
         };
         Ok(evidence_completion_response(tool_calls))
     }
-
     fn capabilities(&self) -> ProviderCapabilities {
         test_capabilities("workspace-unverifiable-safety-counters")
     }
 }
-
+mod blocked_events;
 mod scope_change;
 mod tail;
+mod tool_gates;

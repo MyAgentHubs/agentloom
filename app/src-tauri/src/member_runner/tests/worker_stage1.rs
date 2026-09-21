@@ -414,8 +414,8 @@ fn run_stage1_relays_worker_self_commit_into_session() {
 
 #[test]
 fn run_stage1_rejects_dirty_head_moved_to_avoid_silent_partial_relay() {
-    // codex T3 审：worker 自 commit 一部分 + 留未提交脏尾 → finalize 在看 git status 前就返 HeadMoved →
-    // Stage① 不得只 merge 已提交部分却报成功（会静默丢脏尾·破 G1·worker2 看不到全部）。脏尾时须返 None·不 relay。
+    // A worker may move HEAD while leaving uncommitted changes. Stage one must
+    // return None without relay so merging only the committed portion cannot report success.
     use crate::worktree;
     let _home_lock = worktree::test_home_lock();
     let home_tmp = tempfile::tempdir().unwrap();

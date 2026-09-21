@@ -724,7 +724,7 @@ body {
   font-weight: 600;
   box-shadow: 0 -1px 2px rgba(0, 0, 0, 0.04);
 }
-/* plan B3：Review tab 角标——变更文件数（暖橙 accent） */
+/* Review tab badge highlights the number of changed files with a warm orange accent. */
 .rptab__badge {
   flex: 0 0 auto;
   min-width: 16px;
@@ -2763,7 +2763,7 @@ body {
   white-space: nowrap;
   color: var(--ink-2);
 }
-/* T6 续接文档查看器：建议名 input · 按钮行 · markdown 文档体 · warnings 条 */
+/* Document viewer continuation: suggested-name input, button row, markdown body, and warnings strip. */
 .cc-field input {
   width: 100%;
   box-sizing: border-box;
@@ -4330,7 +4330,7 @@ button.overview__usagerow:hover .overview__usagerepo {
   white-space: pre-wrap;
 }
 
-/* ===== 巨型文本块折叠（T7·贴入超长文本默认不整体走 markdown） ===== */
+/* ===== Collapsible large text blocks avoid rendering long pasted text entirely as markdown by default. ===== */
 .huge-text {
   border: 1px dashed var(--line);
   border-radius: 8px;
@@ -4544,7 +4544,7 @@ button.overview__usagerow:hover .overview__usagerepo {
   display: none;
 }
 
-/* T5: 分组折叠带 */
+/* Collapsible group headers organize the sidebar into sections. */
 /* 视觉对齐批 V2 · group 头改「区段标签」形态、与会话行 pill 拉开两级区分：
    墨色降一档 + letter-spacing + 去 pill hover 背景（hover 改文字加深）+ 组间呼吸空间 */
 .sb-group {
@@ -5343,7 +5343,7 @@ button.overview__usagerow:hover .overview__usagerepo {
 }
 
 /* ============================================================
-   Shell 外壳重做（2026-06-04）· 新顶层骨架
+   Top-level shell layout provides a full-height sidebar and a window-filling content surface.
    = 全高左栏 .sidebar + 一张 surface（.surface 填窗·左角圆·收起 .full 接管）
    真相源：mockups/01-global-nav/shell-redesign.html
    注：旧三栏接缝规则已于阶段1 Task1.6a 删除
@@ -5586,8 +5586,6 @@ html[data-os="macos"] {
 .sf-ctx .dots:hover {
   color: var(--ink-2);
 }
-
-/* 导航 IA T5：FooterRepoSelector 退役·.foot-repo/.org-btn/.repo-btn/.repo-pop 死样式已清。 */
 
 .sf-tabs .topbar__panel {
   flex: 0 1 auto;
@@ -7151,7 +7149,7 @@ html[data-os="macos"] {
 .lead-summary__artiref:hover {
   border-color: var(--accent, #d97757);
 }
-/* ===== B2 GateCard（draft 审批卡·注意力分层·对齐 gate-card-draft.html 结构） ===== */
+/* ===== GateCard: draft approval card with visual hierarchy for attention. ===== */
 .gate-card {
   background: #f5f2ec;
   border: 1px solid var(--line);
@@ -7464,7 +7462,7 @@ html[data-os="macos"] {
     opacity: 1;
   }
 }
-/* 刀 R R3-T3：run_terminal 收尾卡块型——一行克制状态条（非大卡片），对齐 gate-proposing 的一行 dot + 文案惯例。 */
+/* Terminal completion uses a compact status strip, matching the proposing state with an inline dot and text. */
 .run-terminal {
   display: flex;
   align-items: center;
@@ -7793,12 +7791,12 @@ html[data-os="macos"] {
   border-bottom: 1px solid var(--line-soft);
 }
 
-/* ===== B2 AssignmentEditor（分工干预·对齐 team-assign-expand.html 结构·配色 app 中性） ===== */
+/* ===== AssignmentEditor: assignment controls using the application's neutral colors. ===== */
 .assign {
   margin-top: 8px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  /* GUI #2 二修：T6 只改了卡壳·真裁切祖先是这里——改派下拉 .assign__dd 出不了 .assign 边界 */
+  /* Allow the reassignment dropdown to extend beyond its assignment container without clipping. */
   overflow: visible;
   background: #fffefb;
 }
@@ -7985,7 +7983,7 @@ html[data-os="macos"] {
   color: #9e9788;
 }
 
-/* ===== B2 DraftFailedCard（队长拟失败三选项·§A5 回退） ===== */
+/* ===== DraftFailedCard: three recovery options when the team leader cannot create a draft. ===== */
 .draft-failed {
   margin: 8px 0 8px 28px;
   background: #fdf3f1;
@@ -8186,7 +8184,7 @@ html[data-os="macos"] {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 10px 12px;
-  /* 对齐居中内容列（与消息流 .turn 同宽·否则宽窗下横向铺满不对齐·opus T8 审 P1 layout） */
+  /* Match the centered message column width so this content stays aligned on wide windows. */
   max-width: var(--content-max);
   margin: 8px auto;
   width: 100%;
@@ -10577,8 +10575,8 @@ html[data-os="macos"] {
   gap: 8px;
 }
 
-/* V3b（2026-08-26·刀②「桌面 chat verbose 分级」）：ActivityFold——摘要/精简档过程块
-   折算成的一枚活动 chip，尺寸/线性 SVG 风格参照 ContextCompactedChip（无 emoji）。 */
+/* ActivityFold condenses process blocks into an activity chip in summary and compact modes.
+   Its size and line-based SVG styling match ContextCompactedChip, without emoji. */
 .activity-fold {
   margin: 5px 0;
 }

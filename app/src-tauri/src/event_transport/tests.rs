@@ -281,10 +281,9 @@ fn line_and_token_text_merging_have_exact_newline_boundaries() {
     }
 }
 
-/// 2026-07-24 dogfood 回归钉子：DeepSeek 借壳（走 claude 解析器，`ParseFn::Claude` →
-/// `TextGranularity::Token`）逐 token 快吐同批合并的 `TextDelta`，Token 粒度下必须原样零缝拼接
-/// ——修前误用 Line 粒度会在两段中间插 `'\n'`，把 "**DeepSeek**" 断成 "**DeepSe\nek**"，
-/// markdown 渲染成单换行→视觉上词中间出现空格（用户报「DeepSe ek」的根因）。
+/// Token deltas can split words and Markdown markers across event boundaries.
+/// Merging them must concatenate text without inserting characters, preserving
+/// the original word and bold formatting when the transport flushes.
 #[test]
 fn token_granularity_merges_split_word_and_bold_marker_without_inserting_chars() {
     let (_root, transport) = test_transport(8);

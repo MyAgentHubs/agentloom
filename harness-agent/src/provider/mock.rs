@@ -46,86 +46,16 @@ impl ProviderClient for MockProvider {
         _tools: &[serde_json::Value],
         events: &mut EventRecorder,
     ) -> Result<ProviderResponse> {
-        // 记录收到的图片附件供测试断言（mock 无内部可变状态·走事件通道）。
-        // `provider.mock.images_received` 不属 `harness.runtime.v1` 对外契约——它只在
-        // mock provider 下发、从不上真机 wire，因此不登记进 `vocabulary::VOCABULARY`，
-        // 并在 `tests/contract_coverage.rs` 的反向检查里被显式豁免。
-        let received_images: Vec<&crate::image::ImageBlock> =
-            messages.iter().flat_map(|m| m.images.iter()).collect();
-        if !received_images.is_empty() {
-            events.emit(
-                "provider.mock.images_received",
-                json!({
-                    "count": received_images.len(),
-                    "media_types": received_images
-                        .iter()
-                        .map(|img| img.media_type.clone())
-                        .collect::<Vec<_>>(),
-                }),
-            )?;
+        emit_images_received(messages, events)?;
+        if let Some(response) =
+            scripted_scenario_response(messages, events, self.finish_reason.clone())
+        {
+            return response;
         }
-        // Agentic loop scripted scenario (read->edit->verify >=3 turns). 由 tool 消息计数驱动，resume-safe。
-        let is_agentic = messages.iter().any(|m| {
-            m.content
-                .as_deref()
-                .is_some_and(|c| c.contains("agentic loop"))
-        });
-        if is_agentic {
-            let tool_msgs = messages.iter().filter(|m| m.role == "tool").count();
-            return scripted_step(tool_msgs, events, self.finish_reason.clone());
-        }
-
-        let is_dual_gate = messages.iter().any(|m| {
-            m.content
-                .as_deref()
-                .is_some_and(|c| c.contains("criterion then tool"))
-        });
-        if is_dual_gate {
-            let tool_msgs = messages.iter().filter(|m| m.role == "tool").count();
-            return dual_gate_step(tool_msgs, events, self.finish_reason.clone());
-        }
-
-        let is_two_step_egress = messages.iter().any(|m| {
-            m.content
-                .as_deref()
-                .is_some_and(|c| c.contains("two step egress"))
-        });
-        if is_two_step_egress {
-            let tool_msgs = messages.iter().filter(|m| m.role == "tool").count();
-            return two_step_egress_step(tool_msgs, events, self.finish_reason.clone());
-        }
-
-        let is_egress_curl = messages.iter().any(|m| {
-            m.content
-                .as_deref()
-                .is_some_and(|c| c.contains("egress curl"))
-        });
-        if is_egress_curl {
-            let tool_msgs = messages.iter().filter(|m| m.role == "tool").count();
-            return egress_curl_step(tool_msgs, events, self.finish_reason.clone());
-        }
-
-        let is_web_search_demo = messages.iter().any(|m| {
-            m.content
-                .as_deref()
-                .is_some_and(|c| c.contains("web_search demo"))
-        });
-        if is_web_search_demo {
-            let tool_msgs = messages.iter().filter(|m| m.role == "tool").count();
-            return web_search_step(tool_msgs, events, self.finish_reason.clone());
-        }
-
-        if messages.last().map(|message| message.role.as_str()) == Some("tool") {
-            let text = "Tool finished. I wrote the dispatch handoff report.";
-            for chunk in ["Tool finished. ", "I wrote the dispatch handoff report."] {
-                events.emit_text_delta(chunk)?;
-            }
-            return Ok(provider_response(
-                text,
-                String::new(),
-                Vec::new(),
-                self.finish_reason.clone(),
-            ));
+        if let Some(response) =
+            tool_completion_response(messages, events, self.finish_reason.clone())?
+        {
+            return Ok(response);
         }
 
         let prompt = messages
@@ -135,126 +65,8 @@ impl ProviderClient for MockProvider {
             .and_then(|message| message.content.as_deref())
             .unwrap_or_default();
 
-        if prompt.contains("show reasoning") {
-            for chunk in ["Thinking: ", "weigh options, ", "then answer."] {
-                events.emit_reasoning_delta(chunk)?;
-            }
-            let text = "Here is my reasoned answer.";
-            events.emit_text_delta(text)?;
-            return Ok(provider_response(
-                text,
-                "weigh options then answer",
-                Vec::new(),
-                self.finish_reason.clone(),
-            ));
-        }
-
-        if prompt.contains("propose scope") {
-            let text = "I need to widen the scope; proposing a scope change.";
-            events.emit_text_delta(text)?;
-            return Ok(provider_response(
-                text,
-                String::new(),
-                vec![ToolCall {
-                    id: "call_scope_1".to_string(),
-                    call_type: "function".to_string(),
-                    function: FunctionCall {
-                        name: "propose_scope_change".to_string(),
-                        arguments: json!({
-                            "kind": "scope",
-                            "detail": "refactor the whole module instead of the one bug"
-                        })
-                        .to_string(),
-                    },
-                }],
-                self.finish_reason.clone(),
-            ));
-        }
-
-        if prompt.contains("propose criterion") {
-            let text = "Proposing a verifiable acceptance criterion.";
-            events.emit_text_delta(text)?;
-            return Ok(provider_response(
-                text,
-                String::new(),
-                vec![ToolCall {
-                    id: "call_crit_1".to_string(),
-                    call_type: "function".to_string(),
-                    function: FunctionCall {
-                        name: "propose_criterion".to_string(),
-                        arguments: json!({
-                            "claim": "marker file exists",
-                            "check_cmd": "true",
-                            "success": "exit_zero"
-                        })
-                        .to_string(),
-                    },
-                }],
-                self.finish_reason.clone(),
-            ));
-        }
-
-        if prompt.contains("fail shell") {
-            let text = "I'll run a failing shell command and inspect the result.";
-            events.emit_text_delta(text)?;
-            return Ok(provider_response(
-                text,
-                "mock provider selected failing shell tool",
-                vec![ToolCall {
-                    id: "call_mock_shell_1".to_string(),
-                    call_type: "function".to_string(),
-                    function: FunctionCall {
-                        name: "shell_exec".to_string(),
-                        arguments: json!({
-                            "command": "printf 'failing\\n'; exit 7",
-                            "timeout_ms": 5000
-                        })
-                        .to_string(),
-                    },
-                }],
-                self.finish_reason.clone(),
-            ));
-        }
-
-        if prompt.contains("escape shell") {
-            let text = "I'll try to detach a background process.";
-            events.emit_text_delta(text)?;
-            return Ok(provider_response(
-                text,
-                "mock selected an escaping shell command",
-                vec![ToolCall {
-                    id: "call_mock_escape_1".to_string(),
-                    call_type: "function".to_string(),
-                    function: FunctionCall {
-                        name: "shell_exec".to_string(),
-                        arguments: json!({ "command": "setsid sleep 60", "timeout_ms": 5000 })
-                            .to_string(),
-                    },
-                }],
-                self.finish_reason.clone(),
-            ));
-        }
-
-        if prompt.contains("dispatch") || prompt.contains("shell") {
-            let text = "I'll call the shell dispatch command after approval.";
-            events.emit_text_delta(text)?;
-            return Ok(provider_response(
-                text,
-                "mock provider selected shell tool",
-                vec![ToolCall {
-                    id: "call_mock_shell_1".to_string(),
-                    call_type: "function".to_string(),
-                    function: FunctionCall {
-                        name: "shell_exec".to_string(),
-                        arguments: json!({
-                            "command": "printf 'dispatch accepted\\nreport saved: dispatch-handoff-report.md\\n'",
-                            "timeout_ms": 5000
-                        })
-                        .to_string(),
-                    },
-                }],
-                self.finish_reason.clone(),
-            ));
+        if let Some(response) = prompt_response(prompt, events, self.finish_reason.clone())? {
+            return Ok(response);
         }
 
         let text = format!("Mock response for: {prompt}");
@@ -284,6 +96,212 @@ impl ProviderClient for MockProvider {
             server_side_search: false,
         }
     }
+}
+
+fn emit_images_received(messages: &[ChatMessage], events: &mut EventRecorder) -> Result<()> {
+    // Record received image attachments through the event channel for test assertions.
+    // `provider.mock.images_received` is not part of the public `harness.runtime.v1`
+    // contract. It is emitted only by the mock provider and never appears on the real
+    // wire, so it is excluded from `vocabulary::VOCABULARY` and explicitly exempted
+    // from the reverse check in `tests/contract_coverage.rs`.
+    let received_images: Vec<&crate::image::ImageBlock> =
+        messages.iter().flat_map(|m| m.images.iter()).collect();
+    if !received_images.is_empty() {
+        events.emit(
+            "provider.mock.images_received",
+            json!({
+                "count": received_images.len(),
+                "media_types": received_images
+                    .iter()
+                    .map(|img| img.media_type.clone())
+                    .collect::<Vec<_>>(),
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn scripted_scenario_response(
+    messages: &[ChatMessage],
+    events: &mut EventRecorder,
+    finish_reason: Option<FinishReason>,
+) -> Option<Result<ProviderResponse>> {
+    let tool_msgs = || messages.iter().filter(|m| m.role == "tool").count();
+    let contains = |needle| {
+        messages.iter().any(|m| {
+            m.content
+                .as_deref()
+                .is_some_and(|content| content.contains(needle))
+        })
+    };
+
+    if contains("agentic loop") {
+        return Some(scripted_step(tool_msgs(), events, finish_reason));
+    }
+    if contains("criterion then tool") {
+        return Some(dual_gate_step(tool_msgs(), events, finish_reason));
+    }
+    if contains("two step egress") {
+        return Some(two_step_egress_step(tool_msgs(), events, finish_reason));
+    }
+    if contains("egress curl") {
+        return Some(egress_curl_step(tool_msgs(), events, finish_reason));
+    }
+    if contains("web_search demo") {
+        return Some(web_search_step(tool_msgs(), events, finish_reason));
+    }
+    None
+}
+
+fn tool_completion_response(
+    messages: &[ChatMessage],
+    events: &mut EventRecorder,
+    finish_reason: Option<FinishReason>,
+) -> Result<Option<ProviderResponse>> {
+    if messages.last().map(|message| message.role.as_str()) != Some("tool") {
+        return Ok(None);
+    }
+
+    let text = "Tool finished. I wrote the dispatch handoff report.";
+    for chunk in ["Tool finished. ", "I wrote the dispatch handoff report."] {
+        events.emit_text_delta(chunk)?;
+    }
+    Ok(Some(provider_response(
+        text,
+        String::new(),
+        Vec::new(),
+        finish_reason,
+    )))
+}
+
+fn prompt_response(
+    prompt: &str,
+    events: &mut EventRecorder,
+    finish_reason: Option<FinishReason>,
+) -> Result<Option<ProviderResponse>> {
+    if prompt.contains("show reasoning") {
+        for chunk in ["Thinking: ", "weigh options, ", "then answer."] {
+            events.emit_reasoning_delta(chunk)?;
+        }
+        let text = "Here is my reasoned answer.";
+        events.emit_text_delta(text)?;
+        return Ok(Some(provider_response(
+            text,
+            "weigh options then answer",
+            Vec::new(),
+            finish_reason,
+        )));
+    }
+
+    if prompt.contains("propose scope") {
+        let text = "I need to widen the scope; proposing a scope change.";
+        events.emit_text_delta(text)?;
+        return Ok(Some(provider_response(
+            text,
+            String::new(),
+            vec![ToolCall {
+                id: "call_scope_1".to_string(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "propose_scope_change".to_string(),
+                    arguments: json!({
+                        "kind": "scope",
+                        "detail": "refactor the whole module instead of the one bug"
+                    })
+                    .to_string(),
+                },
+            }],
+            finish_reason,
+        )));
+    }
+
+    if prompt.contains("propose criterion") {
+        let text = "Proposing a verifiable acceptance criterion.";
+        events.emit_text_delta(text)?;
+        return Ok(Some(provider_response(
+            text,
+            String::new(),
+            vec![ToolCall {
+                id: "call_crit_1".to_string(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "propose_criterion".to_string(),
+                    arguments: json!({
+                        "claim": "marker file exists",
+                        "check_cmd": "true",
+                        "success": "exit_zero"
+                    })
+                    .to_string(),
+                },
+            }],
+            finish_reason,
+        )));
+    }
+
+    if prompt.contains("fail shell") {
+        let text = "I'll run a failing shell command and inspect the result.";
+        events.emit_text_delta(text)?;
+        return Ok(Some(provider_response(
+            text,
+            "mock provider selected failing shell tool",
+            vec![ToolCall {
+                id: "call_mock_shell_1".to_string(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "shell_exec".to_string(),
+                    arguments: json!({
+                        "command": "printf 'failing\\n'; exit 7",
+                        "timeout_ms": 5000
+                    })
+                    .to_string(),
+                },
+            }],
+            finish_reason,
+        )));
+    }
+
+    if prompt.contains("escape shell") {
+        let text = "I'll try to detach a background process.";
+        events.emit_text_delta(text)?;
+        return Ok(Some(provider_response(
+            text,
+            "mock selected an escaping shell command",
+            vec![ToolCall {
+                id: "call_mock_escape_1".to_string(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "shell_exec".to_string(),
+                    arguments: json!({ "command": "setsid sleep 60", "timeout_ms": 5000 })
+                        .to_string(),
+                },
+            }],
+            finish_reason,
+        )));
+    }
+
+    if prompt.contains("dispatch") || prompt.contains("shell") {
+        let text = "I'll call the shell dispatch command after approval.";
+        events.emit_text_delta(text)?;
+        return Ok(Some(provider_response(
+            text,
+            "mock provider selected shell tool",
+            vec![ToolCall {
+                id: "call_mock_shell_1".to_string(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "shell_exec".to_string(),
+                    arguments: json!({
+                        "command": "printf 'dispatch accepted\\nreport saved: dispatch-handoff-report.md\\n'",
+                        "timeout_ms": 5000
+                    })
+                    .to_string(),
+                },
+            }],
+            finish_reason,
+        )));
+    }
+
+    Ok(None)
 }
 
 fn provider_response(

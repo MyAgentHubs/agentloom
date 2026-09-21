@@ -345,7 +345,7 @@ const styles = {
   },
 } satisfies Record<string, CSSProperties>;
 
-// P0-a1：数值全部钉死（spec `2026-08-12-remote-control-m2-c1-web-client.md` §0 决策 1 +
+// These values are pinned deliberately; do not re-derive them locally.
 // worker 任务书 M24DF §B），实现不许自创。
 const QR_MAX_URL_BYTES = 1024;
 const QR_ERROR_CORRECTION_LEVEL = "M";
@@ -473,8 +473,8 @@ export function SettingsRemoteControl({
   const [activeProjectError, setActiveProjectError] = useState<string | null>(
     null,
   );
-  // B2：切换伺服项目成功后常显的「需要重新扫码」提示——本地 state 天然满足「关闭或重新
-  // 进入该页面即消失」（组件卸载重挂载会重置回 false），不需要额外的定时器/持久化。
+  // The "re-scan needed" notice shown after switching the served project relies purely on local state.
+  // It disappears as soon as the page is re-entered (unmount/remount resets it to false), so no timer or persistence is needed.
   const [switchNotice, setSwitchNotice] = useState(false);
 
   const [pairingStatus, setPairingStatus] =
@@ -643,7 +643,7 @@ export function SettingsRemoteControl({
       });
       if (nextEnabled) {
         startPolling();
-        // B1：开启时若还没设过伺服哪个项目，直接默认带出 app 当前活跃项目——已设置过
+        // Enabling remote control with no served project set yet defaults it to the app's current active project.
         // （哪怕跟当前项目不一致）不动它，靠下方 A2 的不一致提示引导用户手动切换。
         if (activeRepoId === null && currentRepoId !== null) {
           await changeActiveProject(currentRepoId);
@@ -705,8 +705,8 @@ export function SettingsRemoteControl({
         "remote_control_get_settings",
       );
       setActiveRepoId(settings.active_repo_id ?? null);
-      // B2：只有「从一个已设置的项目切到另一个」才算真正的切换、需要提醒重新扫码——
-      // 从「未设置」首次带出项目（含 B1 开关自动默认）没有旧房间可断，不展示这条提示。
+      // Only a switch between two already-configured projects counts as a real change
+      // that warrants the re-scan reminder; a project carried over from "unset" (including the auto-default on enable) has no prior room to disconnect.
       if (previousActiveRepoId !== null) {
         setSwitchNotice(true);
       }
@@ -990,7 +990,7 @@ export function SettingsRemoteControl({
           ))}
         </select>
         {!activeRepoId || devices.length === 0 ? (
-          // B5（backlog 跟进）：切换项目会断连"已配对的手机"这件事，只在真的存在已配对
+          // Switching projects disconnects paired phones only when paired devices actually exist —
           // 设备时才成立——零设备时提示切换风险是"文案强于事实"（review 定性），复用
           // activeProjectHint 这条一直为真的背景说明（配对/设备归属当前活跃项目的房间），
           // 不展示只在有设备时才有意义的断连警告。

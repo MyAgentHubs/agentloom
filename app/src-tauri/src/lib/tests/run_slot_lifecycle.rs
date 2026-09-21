@@ -776,7 +776,7 @@ fn spawn_abort_production_cleanup_uses_bounded_helper_in_both_paths() {
     let solo = source
         .split("fn spawn_and_stream(")
         .nth(1)
-        .and_then(|tail| tail.split("\n#[tauri::command]").next())
+        .and_then(|tail| tail.split("\nfn claude_agent_argv(").next())
         .expect("spawn_and_stream source slice");
     let abort_cleanup = solo
         .split("if handoff == SpawnHandoffAction::Abort {")

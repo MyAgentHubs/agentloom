@@ -64,9 +64,8 @@ fn test_session_history_provider() -> SessionHistoryProvider {
     })
 }
 
-/// msgfix1 T4：默认对未预期的 `msg.fetch` provider 调用报错——同
-/// `test_session_history_provider` 既有姿势，测试没预期到会命中这里就该显式失败，而不是
-/// 悄悄返回一个看似合理的默认值掩盖误用。
+/// Fail unexpected message fetches explicitly, as the session history stub does,
+/// so a plausible default response cannot hide an unintended provider call.
 fn test_message_fetch_provider() -> MessageFetchProvider {
     Box::new(|session_id, message_id| {
         Err(format!(

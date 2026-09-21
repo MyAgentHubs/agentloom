@@ -1,0 +1,25 @@
+{
+  "source_ref": "d1fe4ad3",
+  "excluded_after_export": [
+    {
+      "path": "scripts/check_oss_residue.sh",
+      "sha256": "5e163f7112e7ec2d6526056194322b738f000441fff7fe273d4d21ab120cca8f",
+      "reason": "内部导出诊断工具；含自扫描模式或依赖未发布的导出工具，公共包不分发"
+    },
+    {
+      "path": "scripts/test_check_oss_residue.py",
+      "sha256": "d84dd977e1e71ce9f7bda091c6398163c49efeb87ebf8ae20cb8fc14f434491f",
+      "reason": "内部导出诊断工具；含自扫描模式或依赖未发布的导出工具，公共包不分发"
+    }
+  ],
+  "added_overlay": "docs/number1/**",
+  "private_git_history": false,
+  "approved_public_scope": "AgentLoom desktop and engine only; relay and Web remain deferred",
+  "public_bootstrap_adaptations": [
+    ".github/workflows/ci.yml: task branch triggers and trusted immutable baseline selection, graph and conventions gates",
+    "scripts/test_file_size_gate.py: exercise actual public CI rather than absent internal export workflow",
+    "scripts/check_conventions.py: scan public Issue templates, no exemption or numeric relaxation",
+    "scripts/test_check_conventions.py: public workflow and template regression coverage",
+    "AGENTS.md / CONTRIBUTING.md / README.md / README.zh-CN.md: accepted campaign entrypoints"
+  ]
+}

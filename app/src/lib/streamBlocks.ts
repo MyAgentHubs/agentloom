@@ -192,7 +192,7 @@ export function sealStreamTail(msgs: ChatMessage[]): ChatMessage[] {
   );
 }
 
-/** plan B3：把 run_card block 接到最后一条 assistant 消息 content 末尾（不可变 · 不改原数组）。 */
+/** Append a run_card block to the last assistant message's content array without mutating the original array. */
 export function appendRunCard(
   messages: ChatMessage[],
   card: Extract<Block, { type: "run_card" }>,

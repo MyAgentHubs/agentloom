@@ -209,3 +209,9 @@ The **AgentLoom** and **MyAgentHubs** names and logos are trademarks of MyAgentH
 - https://www.myagenthubs.com
 
 © 2026 MyAgentHubs
+
+## #1 debt-repayment campaign
+
+The dedicated campaign branch has an accepted, bounded task graph for contributors
+using ChatGPT or other tools. Start with [the contributor handoff](docs/number1/START.md).
+Submit campaign changes to `myagenthubs/number1-debt-graph`; this is not a release.

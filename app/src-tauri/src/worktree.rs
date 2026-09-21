@@ -13,7 +13,7 @@ pub struct Review {
     pub has_changes: bool,
     pub stat: String,
     pub patch: String,
-    /// plan B3：结构化变更文件数（角标用 · 前端不解析 stat 文本）。
+    /// Provide a structured file count for the badge so the frontend need not parse stat text.
     pub files_changed: u64,
     /// Review 中逐文件的能力边界：只有 checkpoint 账本记过 preimage 才可撤销。
     pub files: Vec<ReviewFile>,
@@ -278,7 +278,7 @@ pub(crate) fn git_read_output(dir: &Path, args: &[&str]) -> std::io::Result<std:
     git_read_command(dir, args).output()
 }
 
-#[allow(dead_code)] // Block ②-T2/T3 wires the resolved identity into mediated commits.
+#[allow(dead_code)] // Kept for the mediated-commit path that wires the resolved identity into commits.
 pub(crate) fn resolve_git_author_identity(worktree: &Path) -> Result<(String, String), String> {
     let read_value = |key: &str| -> Result<Option<String>, String> {
         let output = git_read_output(worktree, &[GIT_CONFIG_SUBCOMMAND, "--get", key])
@@ -478,7 +478,7 @@ fn head_tracked_entries_chunk(
     Ok((blobs, non_blobs))
 }
 
-#[allow(dead_code)] // Block ②-T2/T3 uses HEAD entries for pre-dirty comparison.
+#[allow(dead_code)] // Kept for the pre-dirty comparison that reads HEAD entries.
 pub(crate) fn read_head_entry(
     worktree: &Path,
     rel_path: &Path,
@@ -1282,7 +1282,7 @@ pub fn synthesize_hard_fields(
     (files, anchor)
 }
 
-/// plan B1 §1：一轮 diff 的结构化计数（binary 行计 0 但计入 files）。
+/// Count diff changes structurally; binary files contribute to the file count but not line counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NumstatCount {
     pub files: u64,
@@ -1320,7 +1320,7 @@ pub(crate) struct LandingStats {
     pub deletions: i64,
 }
 
-/// T7：per-file numstat（`<from>..<to>`）·返回 (path, insertions, deletions)。
+/// Return (path, insertions, deletions) per file in `<from>..<to>` for structured diff reporting.
 /// binary 行 `-\t-\t<path>` 计 0 行但保留文件项。rename `a => b` 整行算一项·path 取整段。
 /// 供 run_landing_info 给 Review 列改动文件（Local 读项目目录）。
 pub(crate) fn numstat_files_between(
@@ -1505,7 +1505,7 @@ pub(crate) fn worktree_is_dirty(wt: &Path) -> bool {
 /// 经 `git_checked_stdout` → `git_read_command` 的只读加固；git/status 失败直接返回 Err，
 /// 由交付门 fail-closed 拒绝远端操作。
 ///
-/// ★ 嵌套 git 仓盲区（R-B1 项 1）：agent 在全新空子目录里 `git init` 是常规动作（比如准备
+/// Nested repositories can hide checkpoint paths from the outer repository's status checks.
 /// clone 点什么进去）。一旦某个 checkpoint 路径落在这样一个嵌套仓内部，`git status` 对指向
 /// 嵌套仓内部的 pathspec 完全不下钻——恒吐空、无错误、退出码 0（已用最小复现坐实：
 /// `git status --porcelain -- sub/file` 在 `sub/` 是嵌套仓时，即使 `sub/file` 磁盘上确实
@@ -1564,7 +1564,7 @@ pub(crate) fn checkpoint_path_dirty_states(
                 ],
             )
             .is_ok();
-            // R-B3 项 4（Minor-4·悬空符号链接 fail-open）：`Path::exists` 跟随符号链接——
+            // `Path::exists` follows symlinks and can incorrectly treat a dangling link as absent.
             // 指向不存在目标的悬空 symlink 本身在磁盘上确实存在（`git status`
             // `--untracked-files=all` 也会把它列成未跟踪条目），但 `exists()` 解析目标失败会
             // 返回 false，让「没跟踪但磁盘上确实有文件」这条 fail-closed 判定对悬空 symlink
@@ -1579,7 +1579,7 @@ pub(crate) fn checkpoint_path_dirty_states(
 /// coding 闭环 刀1（spec §L1 行 56/69）：run_verifier 一次复验的结果。
 /// verdict = "passed" | "failed"；failed 时 fail_reason ∈ non_zero_exit / sandbox_denied /
 /// post_check_failed / head_moved / dirty_after_test / tree_modified。sandbox_denied 是
-/// non_zero_exit 的子类（2026-07-25 加·run_verifier_in_place 专用）：输出命中沙箱拒绝特征
+/// Classify non_zero_exit as sandbox_denied in run_verifier_in_place when output indicates a sandbox denial.
 /// （如 EPERM）时改用它，让 lead 正确归因「环境抽风」而非当代码红反复换 flag 重试——
 /// verdict 结论不变，只是 reason 更准。
 #[derive(Debug, Clone)]
@@ -1587,7 +1587,7 @@ pub(crate) fn checkpoint_path_dirty_states(
 pub struct VerifyResult {
     pub verdict: String,
     pub exit_code: Option<i64>,
-    /// S4（2026-07-25 存量语义变化记档）：这里存的是**头尾保留式截断后**的文本
+    /// Retain the head and tail of output within a bounded budget to avoid flooding the lead context.
     /// （见 `truncate_verifier_output_head_tail`），不再是命令的完整原始 stdout+stderr。
     /// 超预算（头 8 KiB + 尾 8 KiB）的中间段被丢弃、只留一条注明省略字节数的标记——
     /// 原始全文不可追回，这是接受的代价（防超大输出把 lead 的上下文灌爆）。
@@ -1920,7 +1920,7 @@ fn verifier_header_path(header: &str) -> String {
 /// 命中时 verdict 结论不变（仍 failed），只是把 fail_reason 从 non_zero_exit 改得更准确、
 /// 让 lead 正确归因「环境抽风」而不是反复瞎猜换命令重试。
 ///
-/// 2026-07-25 opus 对抗审揪出真误伤：`"eperm"` 若按裸子串匹配，会命中 `usePermission` /
+/// Match `"eperm"` at word boundaries to avoid misclassifying identifiers such as `usePermission` /
 /// `FilePermission` / `RolePermissions` / `writePermission` 这类前端极常见标识符（「以 e
 /// 结尾的词 + Permission」）——用户项目任何真代码红都可能被误标 sandbox_denied，lead 会
 /// 停下改代码去瞎折腾环境。`"eperm"` 改走独立词边界匹配（`contains_word`：命中处前后必须
@@ -1973,7 +1973,7 @@ fn contains_word(hay: &str, word: &str) -> bool {
     })
 }
 
-/// propose_verifier 就地化（方案 A·2026-07-24 用户拍板）：验证命令**直接在会话工作树
+/// Run verification directly in the session worktree so dependencies and uncommitted changes are available.
 /// （用户真实项目目录）里跑**，不再开临时 detached 空 worktree。旧 `run_verifier` 的临时树
 /// 范式在 in-place 下结构性必失败（① assert_app_domain_path 挡用户项目 ② 临时空树没
 /// node_modules / 未提交改动跑不了真验证）。本函数语义从「物理只读」改为「就地跑 + 事后核账 +
@@ -2029,7 +2029,7 @@ pub fn run_verifier_in_place(
         &workspace,
         crate::agent::augmented_path_for_spawn(),
     );
-    // 纵深防御（S3·2026-07-25 opus 对抗审顺手）：sandbox-exec 起独立进程组（pgid=自己的
+    // Isolate sandbox-exec in its own process group to keep group signals from reaching the host process.
     // pid），不把「同组误杀到宿主进程」全押在 Seatbelt profile 一个 `(allow signal ...)`
     // token 上——万一 profile 后续被改坏，独立进程组仍兜住信号作用域（同组内 kill(0,...)
     // 之类广播只打得到这棵子树，打不到发起 spawn 的宿主进程）。
@@ -2574,14 +2574,14 @@ pub fn finalize_session_before_cleanup(session_id: &str, repo: &Path) -> Result<
     Ok(())
 }
 
-/// plan B1 §3.4：reconcile 判定。
+/// Distinguish a consistent workspace from divergence requiring reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconcileVerdict {
     Clean,
     Diverged { reason: String },
 }
 
-/// plan B1 §3.4：旧 git ledger 的一致性只读检查。
+/// Check legacy git ledger consistency without mutating the repository.
 ///
 /// last active row 的 post_head 存在（rev-parse --verify）、是 HEAD 祖先
 /// （merge-base --is-ancestor）、worktree 干净（status --porcelain 空）；任一不满足 → Diverged。
@@ -3013,7 +3013,7 @@ fn release_or_trash_in(
             &[("trash", trash)],
         ));
     }
-    // 🔴 finalize-before-cleanup(G1):先固化未落地的活·失败 → Err·不删(T2 fail-closed)
+    // Finalize unlanded work before cleanup; propagate failure without deleting the workspace.
     finalize_session_before_cleanup(session_id, repo)?;
 
     let wt = session_wt_path(repo, &safe);
@@ -3232,7 +3232,7 @@ fn ensure_worktree_for_default_in(root: &Path, session_id: &str) -> Result<PathB
         crate::ui_msg::al_err("wt.scaffold.createDirFailed", &[("detail", e.to_string())])
     })?;
     assert_app_domain_path(&dir, "ensure_default_workspace")?;
-    // git init（gpg 关；这是 T5 前保留的 app 管理 session 脚手架，不是用户项目目录）
+    // Initialize the app-managed session scaffold with signing disabled.
     let out = crate::proc::command("git")
         .current_dir(&dir)
         .args(["-c", "commit.gpgsign=false", "init", "-q"])
@@ -3615,7 +3615,7 @@ pub fn ensure_member_workspace(
             .unwrap_or_else(|| "repo".into());
         // D12：确保会话分支 ref agentloom/<会话> 存在（real flow 在会话起手已建·此处幂等兜底·非破坏）。
         // 只建分支 ref（不建 session worktree·避免测试往真实 ~/.agentloom 留 session wt 残留）；
-        // session worktree 由会话起手 / T3 的 ensure_session_workspace 负责。不存在才建（在 repo HEAD·degraded
+        // ensure_session_workspace owns session worktree creation; create a missing branch at repository HEAD.
         // fallback·正常流程不触发）·存在则原样保留（绝不 reset·否则清空已落进会话分支的上个 worker 改动）。
         let session_branch = format!("agentloom/{s_safe}");
         let session_ref = format!("refs/heads/{session_branch}");

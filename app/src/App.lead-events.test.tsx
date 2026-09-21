@@ -572,10 +572,10 @@ describe("App", () => {
   });
 
   it("lead-message-appended 事件: 目标会话没有 messagesRef 缓存时忽略·不挡后续 get_messages 全量拉取", async () => {
-    // T3 顺手加固：会话「s2」从未被打开过（messagesRef 里没有它的 key），此时对它 emit
-    // lead-message-appended 若照旧用「只有这一条回显」种下缓存，之后真正打开 s2 会因为
-    // `!messagesRef.current.has(id)` 判假而跳过 get_messages 全量拉取——真实历史丢失，
-    // 只剩这一条回显。守卫后：事件被忽略，s2 打开时仍会真的发起全量拉取。
+    // Session "s2" has never been opened, so messagesRef has no key for it. Seeding its cache from a
+    // lead-message-appended event with only the echoed message would make !messagesRef.current.has(id)
+    // false on opening s2, skipping the full get_messages fetch and losing the real history.
+    // The guard ignores the event so opening s2 still triggers a full fetch instead of showing only the echo.
     mockBasicApp(
       [
         agentProfile({

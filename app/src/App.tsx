@@ -413,7 +413,7 @@ const CLONE_CONCURRENCY = 4;
 const CLONE_SETTLE_LINGER_MS = 1500;
 const HANDOFF_BUSY_RETRY_LIMIT = 20;
 const HANDOFF_BUSY_RETRY_DELAY_MS = 25;
-// T5「看一眼再派」：lead 选 dispatch_worker 时前端生成的本地确认卡（不持久化·不走后端
+// Local confirmation cards need unique source_run_id values to distinguish backend cards and prevent React key collisions.
 // choose_decision_card），用此前缀的 per-card 唯一 source_run_id（`local-dispatch-${uuid}`）
 // 标记，与后端 ask_user 衍生的 dispatch_confirm 卡区分；同时让同一会话内多张本地确认卡
 // （派单→取消→再派单）的 React turn key 不撞（MessageStream 据 source_run_id 取 key）。
@@ -480,8 +480,8 @@ function sendMessagePayload(
     : { sessionId, agentId, message, criteria: [] };
 }
 
-// 块 B（T5·P1-2·GUI 验收折轻）：run 级抑制——只消「真空壳」。
-// 用户定：完成态任务条 + verdict 都留（任务条=KISS 一行进右面板看过程·verdict=结论）·不再因 verdict 消任务条。
+// Suppress only empty run shells so meaningful run metadata remains visible.
+// Keep completed task rows alongside verdicts so both execution details and conclusions remain accessible.
 //   空 members 的 team_run → 消（空 turn）。
 //   非空 team_run 即使属于 coding run 也保留：它承载 lead / member metadata。
 //   RunLeadTurn 在有 coding_task 时会隐藏 worker task stack，避免同 run 双任务条。
@@ -1051,7 +1051,7 @@ function AppContent() {
       }
     }
 
-    // team_run 优先；无 team_run 但有冻结 gate 契约（B2·真 fan-out 前）→ 用冻结契约
+    // Fall back to the frozen contract before a team run exists so criteria retain their persisted identities.
     // （criteria 已是 freeze 后 DB 回读·id 一致·目标条带/验收清单可正确渲 + waive 命中 DB 行）
     const frozen = frozenGoalBySession.get(currentId ?? "");
     if (frozen) return { goal: frozen.goal, members: [], runId: frozen.runId };
@@ -1435,7 +1435,7 @@ function AppContent() {
     setQueuePausedSessions(next);
   }
 
-  /** F3 T2：无条件清掉某 sid 的 paused 门——用户主动发起新 run（无论直发还是递送）都
+  /** Clear stale queue pauses when a new run starts so an earlier stop cannot indefinitely block delivery.
    * 视为「停止意图结束」。补空队列停止那条漏洞：onStop 只在队列非空时才置 paused，
    * 但万一 paused 因别的路径残留，这里兜底清掉，不让它无限期挡住之后的自动递送。 */
   function clearQueuePauseForSid(sid: string) {
@@ -1446,7 +1446,7 @@ function AppContent() {
     setQueuePausedSessions(next);
   }
 
-  /** F3 T5：会话删除/归档时清掉排队 + paused 残留——不接的话切走的死会话队列永远挂着。 */
+  /** Clear queued messages and pause state when a session is deleted or archived to avoid orphaned queues. */
   function clearSessionQueueState(sid: string) {
     const nextQueue = clearQueued(queueBySessionRef.current, sid);
     if (nextQueue !== queueBySessionRef.current) {
@@ -1500,7 +1500,7 @@ function AppContent() {
     if (stillRunning) return;
     if (getSessionReadonlyReason(sid)) return;
     if (target.mode === "team" && teamConfigBlocked) return;
-    // F3 T4：solo 递送前复核 agent 是否仍可用——出队后再在 sendSoloForSession 内部
+    // Check agent availability before dequeueing so a silent send failure cannot discard the queued message.
     // 静默 return 会把已出队的消息凭空丢掉，复核必须在出队前做完。
     if (target.mode !== "team") {
       const agentStillAvailable =
@@ -1509,7 +1509,7 @@ function AppContent() {
       if (!agentStillAvailable) return;
     }
 
-    // F3 T1：await 复核期间用户可能已经在 chip 上把这条撤回/编辑走了（两条都直接改
+    // Abort delivery if the queue reference is unchanged after removal: the message was withdrawn or edited during the await.
     // queueBySessionRef，不等这个 await）。removeQueued 若没找到目标，原样返回传入的
     // 引用——引用相等即视为「条目已被用户拿走」，放弃递送，绝不能照发/双发。
     const before = queueBySessionRef.current;
@@ -1527,7 +1527,7 @@ function AppContent() {
       setQueuePausedSessions(nextPaused);
     }
 
-    // F3 T4：条目已出队，若发起本身被后端占槽竞争拒绝（SESSION_ALREADY_RUNNING /
+    // Requeue at the front on backend slot conflicts because dequeueing alone does not guarantee a successful start.
     // SESSION_BUSY），必须把它塞回队首——出队不等于发起成功，绝不能让消息凭空消失。
     const requeueOnConflict = () => {
       const current = queueBySessionRef.current;
@@ -1603,7 +1603,7 @@ function AppContent() {
     });
   }, [memberRunning, busy, currentId, clearStaleMemberCards]);
 
-  // F3 T3 触发沿①：全局 runningSessions（running）true→false 下降沿——按每个 sid
+  // Detect running-to-idle transitions for every session so background queues drain even when another session is selected.
   // 逐个判定，不再只认 currentId。旧实现只看当前视图的 busy：会话 A 排队后切到 B，
   // A 跑完时没人在看它（sid !== currentId），这个沿从未打过，切回 A 也补不上
   // （旧实现同 sid 才算沿，切走再切回中间那次跳变直接被吞）。
@@ -1652,7 +1652,7 @@ function AppContent() {
     // 措辞绝不能写「已落地」（此刻还没落地）。
     if (s.phase === "applying") return t("app.coding.awaitingDelivery");
     if (s.phase === "shelved") return null;
-    // T7：trust-land 下「无验证命令」不再阻断落地（T1/T4）。landing_blocked 现仅来自真实安全拦截
+    // A missing verification command does not block landing; this state reports actual safety failures.
     // （受保护路径 / ff 冲突·见 isLandingBlockedError）·故文案统一为「安全检查未通过」·不再提验证命令。
     if (s.phase === "landing_blocked")
       return errDetail
@@ -1808,7 +1808,7 @@ function AppContent() {
       }).catch((e) =>
         console.error("[coding-loop] 终态 coding_task append 失败", e),
       );
-      // 块 B（T3·P1-4）：applied/shelved 完成态补发 lead verdict（error 不补·诚实呈现 coding error 卡）。
+      // Emit a lead verdict after successful delivery or shelving; preserve the coding error card on failure.
       if (
         s.phase === "applied" ||
         s.phase === "shelved" ||
@@ -2178,11 +2178,11 @@ function AppContent() {
     sid: string,
     text: string,
     config?: ComposerRuntimeConfig,
-    // F3 T4：仅队列递送路径传入——发起撞后端占槽竞争（SESSION_ALREADY_RUNNING/
+    // Queue delivery uses this callback to restore a dequeued message when a backend slot conflict prevents starting.
     // SESSION_BUSY）时把条目塞回队首，别让已出队的消息凭空消失。
     onQueueConflict?: () => void,
   ) {
-    // F3 T2：用户主动发起新 run = 停止意图结束，清掉可能残留的 paused 门。
+    // Starting a new run ends the previous stop intent, so clear any stale queue pause.
     clearQueuePauseForSid(sid);
     const arr = messagesRef.current.get(sid) ?? [];
     if (arr.length === 0) {
@@ -2372,7 +2372,7 @@ function AppContent() {
     });
   }
 
-  // T5：lead 选 dispatch_worker → 不直接派·先出本地确认卡（澄清目标 + 子任务 + 派给谁）
+  // Require local confirmation before dispatch and expose the frozen goal before a team run exists.
   // + 把澄清目标 freeze 进 frozenGoalBySession（确认前即喂 topbar GoalBar·此刻还无 team_run 块）。
   function showDispatchConfirm(
     sid: string,
@@ -2455,7 +2455,7 @@ function AppContent() {
     ]);
   }
 
-  // T5：本地 dispatch_confirm 卡的确认/取消处理（不走后端·与 onDecisionChoose 的后端路分流）。
+  // Handle local dispatch confirmation separately because these cards do not use backend decision selection.
   function onLocalDispatchConfirm(
     sid: string,
     card: DecisionCardBlock,
@@ -2499,7 +2499,7 @@ function AppContent() {
     decisionCard: DecisionCardBlock | null,
     config?: ComposerRuntimeConfig,
   ) {
-    // 新一轮决策先清上一轮残留的待确认/收工卡（防陈旧卡残留·opus T8 审 NIT）·各分支按需重设
+    // Clear stale confirmation and closeout cards before each decision; each branch restores only the state it needs.
     setLeadView(sid, null);
     if (action.action === "reply") {
       // 决策5：reply = 转一次真 Normal 流式 send·用 team leadId（lead 既决策也答话）。
@@ -2553,7 +2553,7 @@ function AppContent() {
     }
     persistUserMsg(sid, userText); // 非 reply：补落用户消息
     if (action.action === "dispatch_worker") {
-      // 看一眼再派（T5）：lead 选 dispatch_worker 后不直接 start_team_run，
+      // Show a confirmation card before starting a team run so the goal, tasks, and assignees can be reviewed.
       // 先出一张 dispatch_confirm 确认卡（澄清目标 + 子任务 + 派给谁）+ 把澄清目标 freeze 进 topbar GoalBar；
       // 用户确认才真正派单（confirm 逻辑在 onDecisionChoose 里按 local 标记分流）。
       showDispatchConfirm(sid, action);
@@ -3017,7 +3017,7 @@ function AppContent() {
   }, []);
 
   const refetchAgents = useCallback(async () => {
-    // 表单内「重新检测」可能已发现新装的 CLI——agents 变化时同步刷新可用性，防 composer 用旧检测过滤（T6 F5）
+    // Refresh runtime availability with agent profiles so stale detection cannot hide newly installed agents from the composer.
     refreshRuntimeDetect();
     await invoke<AgentProfile[]>("list_agents")
       .then((xs) => {
@@ -3226,7 +3226,7 @@ function AppContent() {
         setToast(renderBackendError(String(e), t));
       });
     void refetchAgents();
-    // B1 NamespaceDropdown 需 allRepos 算 count · 启动同步拉一次
+    // Load repositories at startup so namespace counts are available to the dropdown.
     invoke<RepoMeta[]>("list_repos")
       .then((rs) => setAllRepos(rs ?? []))
       .catch(() => setAllRepos([]));
@@ -3444,7 +3444,7 @@ function AppContent() {
               .catch(() => {});
           }
           // worker 终态唤醒 lead 续跑已统一由后端 on_worker_settled 负责（报告落账之后才
-          // 触发，见 member_report_delivery 台账 + T7 设计），前端不再自行 invoke
+          // The backend resumes the lead only after the report is persisted; the frontend must not start an empty lead turn.
           // resume_lead_session——避免「报告可能还没落库就抢跑空轮」的双真相源。
           return;
         }
@@ -3732,7 +3732,7 @@ function AppContent() {
             ev.final_text ?? "",
           );
         }
-        // plan B3：非空轮（后端带 commit 字段）→ 末尾 append 持久 run_card block
+        // Persist a run card for nonempty runs so their results remain available in message history.
         if (ev.files_changed != null && ev.run_id) {
           finalMsgs = appendRunCard(
             ensureStreamTail(finalMsgs, leadStreamIdentity(sid), {
@@ -4047,7 +4047,7 @@ function AppContent() {
     };
   }, []);
 
-  // 决策打扰收敛刀 T1·症状 B 根修：后端 append_decision_echo 写库成功后 emit 这个事件——
+  // Consume persisted decision echoes immediately so they appear without reopening the session; deduplicate by database ID.
   // 原来点击 MCP ask_user 卡后的回显消息只在下次打开会话 `get_messages` 全量拉取时才出现，
   // 当场停留在同一进程里几乎永远看不到。payload.message 与 `get_messages` 单条消息形状一致
   // （含后端 DB 自增 id）；按 id 去重防未来重拉双份（e.g. reload 后 get_messages 又把它带回来）。
@@ -4057,7 +4057,7 @@ function AppContent() {
       message: ChatMessage & { id: number };
     }>("lead-message-appended", (e) => {
       const { session_id: sid, message } = e.payload;
-      // T3 顺手加固：该会话在 messagesRef 里还没有缓存条目（Map 没这个 key，不是「有 key
+      // Ignore uncached sessions so a lone echo cannot mark incomplete history as loaded and prevent a full fetch.
       // 但空数组」）时直接忽略——`?? []` 兜底会当场用「只有这一条回显」种下缓存，之后别处
       // 靠 `messagesBySession.has(sid)` 判「已加载」的地方会误判成「已加载」，挡掉后续
       // `get_messages` 全量拉取（真实历史就此丢失，只剩这一条回显）。真没缓存时让全量拉取
@@ -4192,7 +4192,7 @@ function AppContent() {
       if (!isLatestRequest()) return;
       reviewCacheRef.current.set(sid, r);
       setReview(r);
-      // plan B3：移除自动弹闸——右面板开合纯手动（不再 has → 自动 open/切 tab）。
+      // Refresh review data without opening or switching the panel so navigation stays under manual control.
       // review state 仍刷新（喂角标 + 面板内容），只是不主动 open。
     } catch (e) {
       if (!isLatestRequest()) return;
@@ -4241,7 +4241,7 @@ function AppContent() {
     /**
      * cluster L Phase 3 plan C2-B Task 1 · 打开 session
      * C2-B：refreshSessions 后立即 open 时 React state 尚未 commit，不能读闭包 sessions。
-     * B4：sess.namespace_id !== activeNamespaceId 时同步 activeNamespaceId + 刷新 reposInActiveNs（保 sidebar/crumb 同步）。
+     * Synchronize the active namespace and its repositories when opening a session so the sidebar and breadcrumb agree.
      */
     const source = list ?? sessions;
     const sess = source.find((s) => s.id === id);
@@ -4381,7 +4381,7 @@ function AppContent() {
     ) {
       refreshReview(id);
     }
-    // F3 T3：切回一个可能在后台错过下降沿的会话——若它此刻已经不忙且队列非空就补投一次；
+    // Retry queued delivery on session selection to recover an idle transition missed while the session was in the background.
     // deliverQueuedTarget 内部本就会先核 running/paused/agent 可用性，命中即投，未命中零副作用。
     void tryDeliverQueued(id);
   }
@@ -4408,7 +4408,7 @@ function AppContent() {
    * = applyNamespaceRepoSwitch 形状 + 补持久化 IPC（前者只 set 前端 state 不持久化）。
    */
   async function onSelectRepoInNamespace(nsId: string, repoId: string) {
-    // 持久化 + 刷新全包进同一 try（对齐既有 onSelectNamespace pattern·codex T3 审 BLOCK-1）：
+    // Catch persistence and refresh failures together, and update local state only after every awaited operation succeeds.
     // refresh IPC 若 throw 也走 catch return·不留未捕获 promise rejection。state set 仍只在全部 await 成功后一次性执行（原子）。
     // 注：set_active_namespace 成功后 set_last_active_repo 失败仍会留后端半切（ns last_used bump·repo 未写）——与既有
     // onSelectNamespace/onSelectRepo 同档的两调非原子性·真原子需后端单事务命令（超本 plan「不动后端」scope·deferred）。
@@ -4823,7 +4823,7 @@ function AppContent() {
 
   async function onNewSession() {
     if (activeRepoId === null) {
-      // B3：0 repo namespace 禁建 · Sidebar 已 disable 按钮兜底
+      // Reject session creation without a repository even if the disabled sidebar control is bypassed.
       return;
     }
     const activeRepo = allRepos.find((r) => r.id === activeRepoId);
@@ -4969,7 +4969,7 @@ function AppContent() {
     const i = activeScopedSorted(sessions).findIndex((s) => s.id === id);
     await invoke("delete_session", { id });
     setSessionDotStatus(id, null);
-    // F3 T5：会话删除是硬终点——排队条目 + paused 门跟着一起清，不留死会话的孤儿队列。
+    // Deleting a session must clear its queued messages and pause state to prevent orphaned delivery attempts.
     clearSessionQueueState(id);
     const list = await refreshSessions();
 
@@ -5070,7 +5070,7 @@ function AppContent() {
       navHistoryRef.current = pruned.history;
       navIndexRef.current = pruned.index;
       syncNavState();
-      // F3 T5：归档同删除一样退出活跃视图——排队条目 + paused 门一起清。
+      // Archived sessions leave the active view, so discard their queued messages and pause state.
       clearSessionQueueState(id);
     }
 
@@ -5092,7 +5092,7 @@ function AppContent() {
     // msgfix2 Q1 停止语义：显式停止 → 暂停该会话队列的自动递送（条目保留，
     // chip 转「待手动发送」态）；停止后 reserve_lead_start_after_globalstop 那条
     // 全局停止清除逻辑只认「用户手敲了新消息」，绝不能被队列自动递送顶掉。
-    // F3 T2：只在该会话此刻确有排队条目时才置 paused——队列空时置了也没有任何
+    // Pause only nonempty queues; an empty queue has no removal transition to clear the pause and could remain blocked.
     // 出队/移除动作能清掉它（maybeClearQueuePause 只在队列变空那一刻触发），会导致
     // 该会话的自动递送被永久锁死（下一条排队消息也永远等不到自动送出）。
     if (listQueue(queueBySessionRef.current, sid).length > 0) {
@@ -5163,7 +5163,7 @@ function AppContent() {
     text: string,
     agentIdCandidate: string | null,
     config?: ComposerRuntimeConfig,
-    // F3 T4：仅队列递送路径传入——发起撞后端占槽竞争（SESSION_ALREADY_RUNNING/
+    // Restore queued messages on backend slot conflicts so a failed start cannot silently lose a dequeued message.
     // SESSION_BUSY）时把条目塞回队首，别让已出队的消息凭空消失。
     onQueueConflict?: () => void,
   ) {
@@ -5174,7 +5174,7 @@ function AppContent() {
         ? agentIdCandidate
         : null;
     if (!selectedAgentId) return;
-    // F3 T2：用户主动发起新 run = 停止意图结束，清掉可能残留的 paused 门。
+    // Starting a new run ends the previous stop intent, so clear any stale queue pause.
     clearQueuePauseForSid(sid);
 
     const arr = messagesRef.current.get(sid) ?? [];
@@ -5255,7 +5255,7 @@ function AppContent() {
     ).catch((err) => {
       if (String(err).startsWith("SESSION_ALREADY_RUNNING:")) {
         if (onQueueConflict) {
-          // F3 T4：队列递送路径撞后端占槽竞争——撤回本次乐观占位（user msg + 空
+          // Roll back optimistic message placeholders and requeue on a slot conflict to avoid message loss and misleading errors.
           // assistant 占位），条目回队，不伪造「已在运行」提示、也不吞消息。
           setRun(sid, null);
           setSessionMessages(sid, arr);
@@ -5850,7 +5850,7 @@ function AppContent() {
   function setDecisionStatusInMemory(
     sid: string,
     decisionId: string,
-    // "pending"：决策打扰收敛刀 T1·症状 B 根修新增——MCP ask_user 卡点击后先乐观置
+    // Allow rollback to pending after a submission failure so the decision card remains retryable.
     // submitting，若 answer_lead_question 失败（非 NO_PENDING_QUESTION）须回滚回 pending
     // 让用户能重新点选，而不是卡死在灰态。
     status: "pending" | "submitting" | "chosen" | "failed",
@@ -5897,7 +5897,7 @@ function AppContent() {
     // submitting/chosen 不重入。
     if (!card || (card.status !== "pending" && card.status !== "failed"))
       return;
-    // T5：本地「看一眼再派」确认卡 → 前端直接派/取消·不走后端 choose_decision_card·不喂回 lead。
+    // Route uniquely prefixed local cards to frontend confirmation without submitting a backend decision or answering the lead.
     // 据 source_run_id 前缀判（每张本地卡都是 `local-dispatch-${uuid}`·唯一）；后端持久化卡
     // 带真 per-run source_run_id·不会命中此前缀。
     if (card.source_run_id.startsWith(`${LOCAL_DISPATCH_PREFIX}-`)) {
@@ -5908,21 +5908,21 @@ function AppContent() {
     // handler 阻塞在 channel 上·answer_lead_question 解阻塞。**MCP 卡绝不回退 legacy lead_step**。
     // （旧实现靠探测 NO_PENDING_QUESTION 当 legacy 判据·但「已取消/已消费的 MCP 卡」也返
     // NO_PENDING_QUESTION → 会在 stopped 会话上误触发 lead_step LLM 跑·整支终审 opus Important。）
-    // 决策打扰收敛刀 T1：后端 answer_lead_question 现在需要 sessionId 才能在「迟到答案」
+    // Include the session ID so late answers can be persisted and handled through the same success path as timely answers.
     // （ask_user 有界等待 240 秒超时后 handler 已体面退出）时落库——卡置 chosen + 转一条真实
     // 用户消息喂给 lead 下一轮，这条路径与「handler 还活着、当场应答」路径一样返回 Ok，
     // 下面 try 分支统一处理，不需要按「准点/迟到」分叉。
     if (card.source_run_id.startsWith(`${MCP_LEAD_PREFIX}-`)) {
       leadChoosingRef.current.add(sid);
-      // 决策打扰收敛刀 T1·症状 B 根修：await 前先乐观置 submitting——原来这里在 invoke
+      // Mark the card as submitting before awaiting IPC so the click is acknowledged immediately and repeat selection is disabled.
       // 落定前不改任何状态，点击后按钮不置灰、没有任何"已收到点击"的反馈。
       setDecisionStatusInMemory(sid, decisionId, "submitting");
       try {
-        // T3（remote control M0 §4a）：续跑权收归后端——commit_late_answer 落库成功后
+        // Let the backend resume after persisting an answer so local and remote submissions follow the same path.
         // answer_lead_question 已经自己 try_resume_after_answer 触发续跑（覆盖远程控制
         // 场景：手机答卡走同一条 IPC，背后没有前端替它自触发续跑）。这里
         // 只按后端回的 resumed 做乐观绘制，绝不再自己 invoke 任何续跑命令——否则本机
-        // 路径会双触发：后端先占槽、前端随后 resume 撞 busy，给用户弹假错误（T7 起前端
+        // A second frontend resume would race the backend for the session slot and produce a misleading busy error.
         // 已无任何自触发续跑的 IPC 入口）。
         const closeoutSeqBeforeAnswer = closeoutSeqRef.current.get(sid) ?? 0;
         const result = await invoke<{

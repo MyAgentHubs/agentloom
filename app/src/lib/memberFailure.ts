@@ -45,12 +45,12 @@ const AUTH_HINT = /\bauth/i;
 const API_OVERLOAD_HINT =
   /\b(503|529|overload(?:ed)?|temporarily unavailable|server busy|capacity)\b|繁忙|过载/i;
 
-// P1-2（opus 对抗审·裁定=判据结构化·2026-07-25 回炉）：这里曾经有一条 STALLED_HINT 正则，
-// 匹配 failure_reason 文本里「不是环境故障 / not an environment failure」这句字面短语。
-// 实证两条能绕过它的反例：① 后端把 stderr 原样拼进 failure_reason，agent 的 stderr 里
-// 恰好含这句英文字样 + 真 exit 1 → 被误判成 stalled（真故障标成停摆）；② 没有
-// result.failure_reason 时退回 blocks 正则扫描，agent 自己在输出里写「这不是环境故障」+
-// 一个 401 鉴权失败的工具输出 → 同样误判。字符串匹配天生可被产生这段文本的一方（agent 自
+// STALLED_HINT once matched the literal phrase "not an environment failure" in failure_reason.
+// Two real counterexamples exposed false stalled classifications: raw stderr spliced into failure_reason
+// could contain that phrase alongside a genuine exit 1; without result.failure_reason, the fallback regex
+// scanned blocks where an agent could write "this is not an environment failure" beside an unrelated 401 auth failure.
+// Matching agent-controlled stdout/stderr is inherently spoofable by its author and cannot classify failures safely.
+// Use the backend's structured MemberResult.failure_kind instead, keeping classification independent of agent-authored text.
 // 己的 stdout/stderr）伪造，不能作为分类判据。改用后端 MemberResult.failure_kind 结构化
 // 字段（"stalled" / "env"，只由 member_runner.rs 按真实的 saw_blocked/saw_needs_decision
 // 标志写）——这个字段不进 agent 可控的文本管道，没有反向伪造通道。

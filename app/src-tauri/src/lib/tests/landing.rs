@@ -2,7 +2,7 @@
 
 use super::*;
 
-// ===== T3：撤销自动落地（Local 就地 + repo + 守卫）=====
+// ===== Undo auto-landing (local in-place + repo + guards) =====
 
 /// 建 Local 就地会话 + 真 git 项目目录，落一笔改动 commit + 记 LandingCommit + merged artifact。
 /// 返回 (项目目录, pre_head, landed_head, artifact_id)。调用方须先 set HOME 并持 test_home_lock。
@@ -39,13 +39,13 @@ fn setup_local_landed(
     let landed = crate::worktree::rev_parse_head(project).unwrap();
 
     db::create_session(conn, "s1", "t", "local-default", "local").unwrap();
-    // R-B2 项 2d → R-B3 项 2（Minor-9 注释勘误）：故意保持 NULL scope——
+    // Intentionally retain NULL scope to distinguish project-root access from session-subdirectory access —
     // `member_artifact_diff_local_inplace_reads_project_dir` 靠这个 NULL scope 让
     // `inplace_session_workdir`（会指向 `project/s1/`）与 `inplace_project_path`（项目根）
     // 解析出两条不同的路径，从而真正验证 `member_artifact_diff_inner` 读的是**项目根**
     // 而不是 per-session 子目录；如果这里改置 'root'，两条路径会重合，测试就失去了区分
     // 「根锚定 vs 子目录」这两种实现的能力，等于名不副实。`setup_local_landed_multiline`
-    // 现在也保持 NULL scope（R-B3 项 2 已把它从误置的 'root' 改回来），两个夹具口径一致，
+    // also retains NULL scope instead of the incorrect 'root' scope, keeping both fixtures consistent,
     // 不再是「不同于」的关系——各自靠不同手段守住根锚定：这里靠子目录/根目录路径不重合，
     // 那边靠 `git config diff.relative true` 让 diff 输出对 cwd 敏感。
     conn.execute(
@@ -89,7 +89,7 @@ fn setup_local_landed(
     (pre, landed, "art-1".into())
 }
 
-/// R-B3 项 2（run_landing_info 根锚定守护）：这条测试走 `setup_local_landed_multiline` ——
+/// Verify that run_landing_info stays anchored to the project root using `setup_local_landed_multiline` —
 /// 该夹具现已配 `git config diff.relative true` + 恢复 NULL scope（见夹具内注释），
 /// `numstat_files_between` 走的正是 `run_landing_info_inner` 里靠 `inplace_project_path`
 /// 锚定项目根的那条路径（`lib.rs` 里 `run_landing_info_inner` 开头的注释已记录复现：子目录
@@ -118,7 +118,7 @@ fn run_landing_info_returns_landed_head_and_recomputes_local_line_counts() {
     assert_eq!(info.pre_head, pre, "应返回 pre_head sha");
     assert_eq!(info.files_changed, 2, "改了 2 个文件");
 
-    // 关键：行数从项目目录 pre..landed numstat **重算**·补 T2 缺口（存的是 0）。
+    // Verify line counts are recomputed from pre..landed numstat in the project directory despite stored zeros.
     // base.txt：+2/-1（l2→X2 改一行算删 1 增 1·加 l4 增 1）；added.txt：+3/-0。
     assert_eq!(info.insertions, 5, "重算 insertions（非存的 0）");
     assert_eq!(info.deletions, 1, "重算 deletions（非存的 0）");
@@ -142,7 +142,7 @@ fn run_landing_info_returns_landed_head_and_recomputes_local_line_counts() {
 
 #[test]
 fn member_artifact_diff_local_inplace_reads_project_dir() {
-    // T7 #5：Local 就地 artifact 的 commit 在**项目目录**·diff 必须读项目目录（非 sessions/base_repo）。
+    // Local in-place artifact commits live in the project directory, so diff must read it rather than sessions/base_repo.
     let _home = crate::worktree::test_home_lock();
     let tmp = tempfile::tempdir().unwrap();
     let old = std::env::var_os("HOME");

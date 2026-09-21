@@ -26,7 +26,7 @@ type Props = {
 
 export const PROJECT_EMOJIS = ["📕", "📝", "📊", "🎨", "🐍", "🚀", "📁", "💡"];
 
-/** 路径过长时省略中段，保留首尾可辨认片段（T22：编辑项目「位置」行展示用）。 */
+/** Elides the middle of an overlong path, keeping recognizable head and tail fragments (used by the project "location" display row). */
 export function elidePathMiddle(path: string, max = 56): string {
   if (path.length <= max) return path;
   const headLen = Math.ceil((max - 1) / 2);

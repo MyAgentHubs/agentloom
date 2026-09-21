@@ -38,6 +38,7 @@ pub fn production_sources(root: &Path) -> Vec<Source> {
 
 // Offsets always refer to the original UTF-8 source. Comments are skipped and
 // literals are opaque tokens, so fake declarations/braces cannot create a hole.
+#[allow(clippy::cognitive_complexity)]
 fn tokens(source: &str) -> Vec<Range<usize>> {
     let bytes = source.as_bytes();
     let mut result = Vec::new();

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 mod image_args;
+mod interactive;
 
 use crate::config::{self, config_images, StoredProvider};
 use crate::error::{HarnessError, Result};
@@ -1028,12 +1029,11 @@ async fn resume_with_provider(
         }
     }
 }
-
-async fn interactive_command(args: InteractiveArgs) -> Result<()> {
+async fn interactive_command(mut args: InteractiveArgs) -> Result<()> {
     crate::exec::sandbox::validate_write_fence(args.fs_write_fence)?;
     let extra_read_roots = crate::fs_scope::resolve_read_roots(&args.read_root)
         .map_err(HarnessError::InvalidConfig)?;
-    let workspace = args.workspace.unwrap_or(std::env::current_dir()?);
+    let workspace = args.workspace.take().unwrap_or(std::env::current_dir()?);
     let jsonl = args.jsonl;
     let journal_root = resolve_journal_root(args.journal_dir.clone(), &workspace);
     let learn = args.learn;
@@ -1047,17 +1047,19 @@ async fn interactive_command(args: InteractiveArgs) -> Result<()> {
     let mut permission = args.permission;
     let mut active_run_id: Option<String> = None;
     let criteria = crate::goal::parse_criteria(&args.criteria)?;
-    let mut context_files = args.context_files;
+    let mut context_files = std::mem::take(&mut args.context_files);
     let mut pending_images = crate::image::load_images(&args.image_args.image)?; // 只随首次 fresh run 带出去
 
-    if !jsonl {
-        println!("myagent interactive");
-        println!(
-            "provider: {provider} · workspace: {}",
-            workspace.to_string_lossy()
-        );
-        println!("type /help for commands, /exit to quit");
-    }
+    interactive::print_interactive_banner(jsonl, &provider, &workspace);
+
+    let ctx = interactive::InteractiveTurnContext {
+        args: &args,
+        workspace: &workspace,
+        journal_root: &journal_root,
+        output_mode,
+        extra_read_roots: &extra_read_roots,
+        criteria: &criteria,
+    };
 
     loop {
         if !jsonl {
@@ -1092,79 +1094,16 @@ async fn interactive_command(args: InteractiveArgs) -> Result<()> {
             continue;
         }
 
-        let (result, learn_provider) = if let Some(run_id) = active_run_id.clone() {
-            let saved_provider = read_saved_provider(&journal_root, &run_id)?;
-            let result = resume_with_provider(
-                &saved_provider,
-                workspace.clone(),
-                journal_root.clone(),
-                run_id.clone(),
-                Some(input.to_string()),
-                output_mode,
-                permission,
-                args.network,
-                args.fs_read_scope,
-                extra_read_roots.clone(),
-                args.fs_write_fence,
-                args.max_turns,
-                ControlInputKind::Sentinel,
-                args.native_search.enabled(),
-                !args.no_memory,
-                config::search_choice(),
-                Default::default(),
-                args.verify_every,
-                args.watchdog_repeat,
-                None,
-                config::load_config()
-                    .map(|c| c.mcp_servers())
-                    .unwrap_or_default(),
-                std::mem::take(&mut pending_images),
-            )
-            .await;
-            (result, saved_provider)
-        } else {
-            let learn_provider = provider.clone();
-            let result = run_with_provider(
-                &provider,
-                None,
-                None,
-                RunOptions {
-                    prompt: input.to_string(),
-                    workspace: workspace.clone(),
-                    provider_id: String::new(),
-                    model: String::new(),
-                    client_session_id: None,
-                    output_mode,
-                    control_input: ControlInputKind::Sentinel,
-                    permission,
-                    network: args.network,
-                    fs_read_scope: args.fs_read_scope,
-                    extra_read_roots: extra_read_roots.clone(),
-                    fs_write_fence: args.fs_write_fence,
-                    evidence_gate: args.evidence_gate,
-                    native_search_enabled: args.native_search.enabled(),
-                    disallowed_tools: Default::default(),
-                    memory_enabled: !args.no_memory,
-                    search: config::search_choice(),
-                    max_turns: args.max_turns,
-                    run_id: None,
-                    context_files: context_files.clone(),
-                    criteria: criteria.clone(),
-                    contract_policy: args.contract_policy,
-                    max_eval_attempts: args.max_eval_attempts,
-                    verify_reflex_debt: args.verify_every,
-                    watchdog_repeat_threshold: args.watchdog_repeat,
-                    journal_root: journal_root.clone(),
-                    mcp_servers: config::load_config()
-                        .map(|c| c.mcp_servers())
-                        .unwrap_or_default(),
-                    append_system_prompt: None,
-                    images: std::mem::take(&mut pending_images),
-                },
-            )
-            .await;
-            (result, learn_provider)
-        };
+        let (result, learn_provider) = interactive::run_interactive_turn(
+            &ctx,
+            &provider,
+            permission,
+            &active_run_id,
+            &context_files,
+            &mut pending_images,
+            input,
+        )
+        .await;
 
         match result {
             Ok(result) => {
@@ -1182,7 +1121,8 @@ async fn interactive_command(args: InteractiveArgs) -> Result<()> {
                 active_run_id = Some(result.run_id);
                 permission = elevate_permission(permission, always_used);
             }
-            Err(err) => eprintln!("error: {err}"),
+            Err(interactive::TurnError::Turn(err)) => eprintln!("error: {err}"),
+            Err(interactive::TurnError::Fatal(err)) => return Err(err),
         }
     }
 }

@@ -15,9 +15,9 @@ fn parse_goal_title_arg_trims_empty_absent() {
     assert_eq!(parse_goal_title_arg(&serde_json::json!({})), None);
 }
 
-/// 新项 A（2026-07-09）：dispatch_worker 工具 description 在注册处动态拼上花名册——
-/// lead 不必派错一次（agent_hint 不匹配）才看见谁在池子里。这里直接核 lib.rs 注册处
-/// 实际会用的 lead_tools::dispatch_worker_description 输出（同一份函数·非另造断言）。
+/// The registered dispatch tool description must list enabled pool members so the lead
+/// can choose a valid agent_hint without first making a failed dispatch. Check the same
+/// description builder used during registration to protect the actual advertised roster.
 #[test]
 fn dispatch_worker_registration_description_lists_enabled_members() {
     let pool = vec![

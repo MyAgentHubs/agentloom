@@ -1,4 +1,4 @@
-//! 完成判定模型无关：完成权威 helper（+ T2 的可收尾状态机）。
+//! Completion judgment is model-agnostic: the completion-authority helper (plus the finalize-ready state machine).
 //! 完成权威 = 完整 evaluate_criteria + decide_outcome，绝不复用中途验证缓存。
 
 use std::path::Path;

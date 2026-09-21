@@ -1,0 +1,137 @@
+{
+  "observed": "2026-09-21",
+  "graph_contract": "PASS: 110 nodes, no cycles; 60 file-size targets + 39 frontend-function target files; all fields/state/patch digests checked",
+  "patch_application_check": {
+    "L2B6": "git apply --check exit 0 on exported source",
+    "C1": "git apply --check exit 0 on exported source",
+    "applied_to_snapshot": false
+  },
+  "shell_syntax": "bash -n verify.sh exit 0",
+  "source_ci": {
+    "sha": "463b2bd957f40e62333b75a760baba0b6387f716",
+    "jobs": 9,
+    "conclusion": "all completed/success"
+  },
+  "snapshot_build": "PASS on public publication clone; source patches remain unapplied; no release packaging, signing or notarization",
+  "residue_scan": {
+    "initial": "failed self-match in internal diagnostic source",
+    "transformation": "package-transforms.json",
+    "final_hits": 0
+  },
+  "gitleaks": {
+    "exit_code": 1,
+    "findings": 26,
+    "triage": "fixed protocol/token-hash/known-answer-test values in 4 files; all four byte-identical to observed public main; no new-file findings",
+    "files": [
+      "app/src-tauri/src/remote_gateway/tests/registry_outbox.rs",
+      "remote-relay/fixtures/crypto-kat-v1.json",
+      "remote-relay/fixtures/connect-kdf-v1.json",
+      "remote-relay/fixtures/wire-v1.json"
+    ],
+    "final_candidate_rescan": "26 findings; same four files remain byte-identical to approved public main"
+  },
+  "public_main_diff_before_final_doc_overlay": {
+    "added": 83,
+    "changed": 207,
+    "removed": 0,
+    "meaning": "raw tree differences include completed debt work and handoff; not a behavioral-equivalence proof"
+  },
+  "remaining_before_push": [
+    "record immutable campaign base and push approved branch"
+  ],
+  "frontend_function_audit": {
+    "app": {
+      "files": 35,
+      "functions": 42,
+      "exit_code": 1
+    },
+    "remote_web": {
+      "files": 4,
+      "functions": 4,
+      "exit_code": 1
+    },
+    "other_diagnostics": 0,
+    "configuration_modified": false
+  },
+  "public_preflight": {
+    "platform": "macOS ARM64",
+    "engine": {
+      "fmt": 0,
+      "clippy": 0,
+      "build": 0,
+      "full_test_exit": 0,
+      "full_test_binaries": 46,
+      "lib_passed": 1316,
+      "lib_ignored": 1
+    },
+    "app": {
+      "fmt": 0,
+      "clippy": 0,
+      "compile_all_tests": 0,
+      "lib_passed": 2946,
+      "lib_ignored": 18,
+      "lib_exit": 0,
+      "integration_binaries": "all passed, including bridge_eval 10 and run_replay_eval 10"
+    },
+    "frontend": {
+      "typecheck": 0,
+      "lint": 0,
+      "format_check": 0,
+      "vitest_files": 194,
+      "vitest_passed": 2613,
+      "build": 0,
+      "script_tests": 0
+    },
+    "root": {
+      "file_size_gate": 0,
+      "excess_lines": 0,
+      "public_debt_lines": 74821,
+      "conventions_gate": 0,
+      "dated": 0,
+      "ledger": 0,
+      "file_size_regression_tests": 47,
+      "conventions_regression_tests": 49,
+      "ci_baseline_tests": 4,
+      "graph_nodes": 110,
+      "graph_regression_tests": 2
+    },
+    "initial_failures": [
+      {
+        "test": "engine edit_turn_injects_new_compile_error_next_turn / pre_existing_error_not_repeated",
+        "initial_exit": 101,
+        "action": "Removed inherited CARGO_TARGET_DIR; used command-local --target-dir. Both targeted tests and all 46 binaries passed. Cache interference is the working explanation; no production/test logic changed."
+      },
+      {
+        "test": "app foreground_insert_stays_fast_and_never_locked_during_backfill",
+        "initial_exit": 101,
+        "action": "Initial concurrent run took 877.9ms; targeted rerun passed and full serial lib rerun passed all 2946. Initial integration suites passed. Timing sensitivity remains; failure not erased."
+      },
+      {
+        "test": "public root script gates",
+        "action": "Public Issue templates were missing scan scope and regression tests referenced absent internal workflows. Adapted actual public gate coverage, retained fail-closed checks; final 47/49/4 suites passed."
+      }
+    ],
+    "limits": [
+      "Linux engine and Windows backend depend on public CI; not locally validated on macOS.",
+      "Existing warnings remain; this is a debt-repayment baseline, not a warning-free release.",
+      "No GUI change was introduced by the publication adaptations; imported snapshot is covered by component tests, not newly performed desktop click-through."
+    ]
+  },
+  "publication_ci": "not_started_before_push",
+  "local_log_digests": {
+    "publish-engine-clean.log": "6586a9c2aa8ab4ba0644335f9bf097401faba9bfb2b934c63a24da42f3a86418",
+    "publish-engine.log": "3de225c6a3e6a9368816a6a30545a476e4cbe0dab407885e6633f9e31b398cec",
+    "publish-engine-retest.log": "661aba97c48a91c2b34b6e5d29d8895e4ab51a1975ce85fc436e1887e6f8b093",
+    "publish-app.log": "39d6838357087fbfebb689ccbf038bd902600c629805612fcc7fa47473aaa6e1",
+    "publish-app-lib-clean.log": "6ce9c48e6b7bac6ed858a8a428b2ea462d93676561481712bd0af3cf59a8d582",
+    "publish-app-retest.log": "b30bf113091885cc642eb3107a54db28ba700e3c4cf83364ea9080180d54b88f",
+    "publish-frontend.log": "6b4a698c8b1ded7c6b14407f0af0960bb3f1b6e43334c47ae996953a98d58d59",
+    "publish-frontend-build.log": "6af83a0c1b0cfb9ae84e44a9b5040fab3b4fa57918af93168f659f94b25328a0",
+    "publish-script-tests-final.log": "5be8165b71d2918f74181c60f300468e409f60423d7b29efb5567605f2d200e8"
+  },
+  "local_log_note": "Digests identify maintainer-held raw logs; logs are not published because they include local environment paths. Public CI provides contributor-accessible fresh logs.",
+  "independent_review": {
+    "ci_and_conventions": "PASS: immutable first-push baseline, PR base, push before, and fail-closed regression coverage",
+    "graph_harness": "PASS: optimization bypass fixed using explicit checks; synthetic normal/optimized duplicate-node and oversized-file regression verified independently"
+  }
+}

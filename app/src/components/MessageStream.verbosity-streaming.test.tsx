@@ -84,7 +84,7 @@ const dc = (
 });
 
 // ─────────────────────────────────────────────────────────────────────────
-// V3b（2026-08-26·刀②「桌面 chat verbose 分级」渲染接线）：MessageStream 传档位 +
+// Desktop chat verbosity tiers wire through MessageStream's rendering path +
 // 新 streaming 判据 + scope_change 顺修断线。设计稿
 // desktop-verbose-design §2B
 // ─────────────────────────────────────────────────────────────────────────

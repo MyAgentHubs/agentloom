@@ -341,7 +341,7 @@ impl EventTransport {
     /// acquires an external/slot lock. The emit lock remains held from draining
     /// the lane until all sink callbacks have run sequentially and returned.
     ///
-    /// M1 修复轮 P0-1（2026-08-11·opus 深审）：callers must NOT hold the `db::Db` mutex
+    /// Deadlock-prevention invariant: callers must NOT hold the `db::Db` mutex
     /// (session_runtime table) across this call either. `TimedMutex`/`std::sync::Mutex` are
     /// non-reentrant; the release throats (`emit_terminal_after_releasing_run_slot` /
     /// `emit_lead_error_and_release` / `refresh_session_runtime`, all in lib.rs) take and drop
