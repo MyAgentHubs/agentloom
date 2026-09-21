@@ -1,0 +1,10 @@
+{
+  "id": "P1",
+  "status": "done",
+  "base_sha": "16db362c93724d352272972c28d1a09dab470813",
+  "result_sha": "e1ecf5265fac48412ac888b7750968996bbfcb0f",
+  "evidence": "evidence/verification.json",
+  "review": "PASS after optimization-mode regression fixed",
+  "tokens_used": null,
+  "next": "Contributors run BOOT in independent clone; integrate no pending patches automatically"
+}

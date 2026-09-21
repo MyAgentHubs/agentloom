@@ -37,7 +37,7 @@
     "meaning": "raw tree differences include completed debt work and handoff; not a behavioral-equivalence proof"
   },
   "remaining_before_push": [
-    "record immutable campaign base and push approved branch"
+    "push approved branch"
   ],
   "frontend_function_audit": {
     "app": {
@@ -117,7 +117,7 @@
       "No GUI change was introduced by the publication adaptations; imported snapshot is covered by component tests, not newly performed desktop click-through."
     ]
   },
-  "publication_ci": "not_started_before_push",
+  "publication_ci": "awaiting_first_push",
   "local_log_digests": {
     "publish-engine-clean.log": "6586a9c2aa8ab4ba0644335f9bf097401faba9bfb2b934c63a24da42f3a86418",
     "publish-engine.log": "3de225c6a3e6a9368816a6a30545a476e4cbe0dab407885e6633f9e31b398cec",
@@ -133,5 +133,7 @@
   "independent_review": {
     "ci_and_conventions": "PASS: immutable first-push baseline, PR base, push before, and fail-closed regression coverage",
     "graph_harness": "PASS: optimization bypass fixed using explicit checks; synthetic normal/optimized duplicate-node and oversized-file regression verified independently"
-  }
+  },
+  "campaign_base_sha": "e1ecf5265fac48412ac888b7750968996bbfcb0f",
+  "diff_check": "Source/docs pass git diff --check excluding two literal .patch payloads. Their unified-diff blank context lines contain required single-space prefixes; patch hashes and git apply --check pass, bytes intentionally preserved."
 }

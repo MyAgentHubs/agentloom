@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "publication": "approved_preflight_running",
+  "publication": "approved_ready",
   "active_claims": [],
   "nodes": {
     "P0": {
@@ -10,7 +10,12 @@
       ]
     },
     "P1": {
-      "status": "pending_publication_verification"
+      "status": "done",
+      "evidence": [
+        "evidence/verification.json",
+        "state/publication.json"
+      ],
+      "result_sha": "e1ecf5265fac48412ac888b7750968996bbfcb0f"
     },
     "BOOT": {
       "status": "planned"
@@ -337,5 +342,6 @@
       "status": "deferred_by_maintainer"
     }
   },
-  "resume_rule": "只读 index、当前节点、直接依赖证据和对应文件；不用重读整个会话"
+  "resume_rule": "只读 index、当前节点、直接依赖证据和对应文件；不用重读整个会话",
+  "campaign_base_sha": "e1ecf5265fac48412ac888b7750968996bbfcb0f"
 }

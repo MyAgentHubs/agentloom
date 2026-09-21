@@ -82,7 +82,7 @@
         "专用分支 CI 的 push/PR base 要接入该分支；新基线需维护者批准",
         "完整快照复验、残留和 secret 扫描后填写公开基线 SHA，更新 state/publication.json"
       ],
-      "status": "pending_publication_verification"
+      "status": "done"
     },
     {
       "id": "BOOT",
