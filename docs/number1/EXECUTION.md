@@ -23,6 +23,10 @@ cp harness-agent/target/release/myagent "app/src-tauri/binaries/myagent-${triple
 
 不要把自己的私有 API key、生产数据库、真实用户消息用作测试夹具。测试应使用临时目录，不包含机器专属 home 路径。
 
+## 模型与预算
+
+执行前读取 [MODEL-POLICY.md](MODEL-POLICY.md)。节点状态追加实际 model、reasoning_effort、角色、轮数、用量可观测性和升级/替代批准引用；实现与独立审查共用节点预算。
+
 ## 一轮 loop
 
 1. `observe`：核工作区和父 SHA；读当前节点、直接依赖和真实代码；确认测试基线，写入 claim。不同人不共享可写工作区。

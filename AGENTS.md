@@ -14,6 +14,9 @@ review and verification gates and target this campaign branch, not `main`.
 Changes outside a node, policy changes, dependencies, security/protocol changes,
 or extending the campaign to other repositories still require maintainer approval.
 The one-PR-per-contributor rule and human responsibility for PR prose still apply.
+Follow the [model and effort policy](docs/number1/MODEL-POLICY.md) for every
+worker and reviewer. Model upgrades require the approvals defined there;
+implementation, review and rework share one node budget.
 
 ## Before you write any code
 

@@ -2,6 +2,8 @@
 
 前提：P0/P1 已完成，BOOT 的真实平台与基线检查成功。以下只分配一个子单给一个 worker；涉及共同 crate/ratchet 的合入串行。维护者先将这些子单写入 state/<id>.json 并绑定 parent，不直接把父 epic 交给 worker 一次改完。
 
+所有子单遵循 [MODEL-POLICY.md](MODEL-POLICY.md)：以下预算已包含实现、独立审查和返工，不为每个角色重复分配。
+
 ## 恢复已完成工作
 
 ### REC-L2B6：先审查，不重新实现

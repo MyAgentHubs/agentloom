@@ -15,7 +15,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -25,7 +26,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -55,7 +56,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -65,7 +67,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -102,7 +104,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -112,7 +115,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -152,7 +155,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -162,7 +166,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -199,9 +203,10 @@
       ],
       "state": "state/REC-C1.json",
       "worker": {
-        "model": "gpt-5.6-sol",
+        "model": "gpt-5.6-terra",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -211,7 +216,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -246,7 +251,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -256,7 +262,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -289,7 +295,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -300,7 +307,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -341,7 +348,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -352,7 +360,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -393,7 +401,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -404,7 +413,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -445,7 +454,8 @@
       "worker": {
         "model": "gpt-5.6-terra",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -456,7 +466,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -497,7 +507,8 @@
       "worker": {
         "model": "gpt-5.6-terra",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -508,7 +519,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -549,7 +560,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -560,7 +572,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -604,7 +616,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -615,7 +628,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -656,7 +669,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -667,7 +681,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -708,7 +722,8 @@
       "worker": {
         "model": "gpt-5.6-terra",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -719,7 +734,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -761,7 +776,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -772,7 +788,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -813,7 +829,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -824,7 +841,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -865,7 +882,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -876,7 +894,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -924,7 +942,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -935,7 +954,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -977,7 +996,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -988,7 +1008,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1032,7 +1052,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1043,7 +1064,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1084,7 +1105,8 @@
       "worker": {
         "model": "gpt-5.6-terra",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1095,7 +1117,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1137,7 +1159,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1148,7 +1171,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1190,7 +1213,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1201,7 +1225,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1242,7 +1266,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1253,7 +1278,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1298,7 +1323,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1309,7 +1335,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1354,7 +1380,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1365,7 +1392,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1406,7 +1433,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1417,7 +1445,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1459,7 +1487,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1470,7 +1499,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1512,7 +1541,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1523,7 +1553,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1564,7 +1594,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1575,7 +1606,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1616,7 +1647,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1627,7 +1659,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1667,7 +1699,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1678,7 +1711,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1719,7 +1752,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1730,7 +1764,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1772,7 +1806,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1783,7 +1818,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1825,7 +1860,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1836,7 +1872,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1876,7 +1912,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1887,7 +1924,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1928,7 +1965,8 @@
       "worker": {
         "model": "gpt-5.6-terra",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1939,7 +1977,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -1982,7 +2020,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -1993,7 +2032,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2034,7 +2073,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -2045,7 +2085,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2087,7 +2127,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -2098,7 +2139,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2139,7 +2180,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -2150,7 +2192,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2191,7 +2233,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -2202,7 +2245,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2243,7 +2286,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -2254,7 +2298,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2297,7 +2341,8 @@
       "worker": {
         "model": "gpt-5.6-terra",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -2308,7 +2353,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2350,7 +2395,8 @@
       "worker": {
         "model": "gpt-5.6-terra",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -2361,7 +2407,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2403,7 +2449,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -2414,7 +2461,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2456,7 +2503,8 @@
       "worker": {
         "model": "gpt-5.6-terra",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -2467,7 +2515,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2509,7 +2557,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -2520,7 +2569,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2561,7 +2610,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "在 relay 独立克隆运行 npm test",
@@ -2571,7 +2621,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2615,7 +2665,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "在 relay 独立克隆运行 npm test",
@@ -2625,7 +2676,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2668,7 +2719,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "在 relay 独立克隆运行 npm test",
@@ -2678,7 +2730,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2721,7 +2773,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "在 relay 独立克隆运行 npm test",
@@ -2731,7 +2784,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2774,7 +2827,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "在 relay 独立克隆运行 npm test",
@@ -2784,7 +2838,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2827,7 +2881,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "在 relay 独立克隆运行 npm test",
@@ -2837,7 +2892,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2880,7 +2935,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "在 relay 独立克隆运行 npm test",
@@ -2890,7 +2946,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2933,7 +2989,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "在 relay 独立克隆运行 npm test",
@@ -2943,7 +3000,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -2986,7 +3043,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "在 relay 独立克隆运行 npm test",
@@ -2996,7 +3054,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -3039,7 +3097,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "在 relay 独立克隆运行 npm test",
@@ -3049,7 +3108,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -3092,7 +3151,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "在 relay 独立克隆运行 npm test",
@@ -3102,7 +3162,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -3145,7 +3205,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -3156,7 +3217,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -3197,7 +3258,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -3208,7 +3270,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -3249,7 +3311,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -3260,7 +3323,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -3301,7 +3364,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -3312,7 +3376,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -3353,7 +3417,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -3364,7 +3429,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -3405,7 +3470,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -3416,7 +3482,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -3456,7 +3522,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -3466,7 +3533,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -3498,7 +3565,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -3508,7 +3576,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -3542,7 +3610,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -3552,7 +3621,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -3662,7 +3731,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -3673,7 +3743,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -3727,7 +3797,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "模型不可用时使用可用同级模型并记录；不得自动升级到更昂贵模型"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -3737,7 +3808,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -3771,7 +3842,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -3782,7 +3854,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -3873,7 +3945,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -3884,7 +3957,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -3935,7 +4008,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -3946,7 +4020,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -3997,7 +4071,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -4008,7 +4083,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -4059,7 +4134,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -4070,7 +4146,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -4121,7 +4197,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -4132,7 +4209,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -4183,7 +4260,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -4194,7 +4272,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -4245,7 +4323,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -4256,7 +4335,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -4307,7 +4386,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -4318,7 +4398,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -4369,7 +4449,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -4380,7 +4461,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -4431,7 +4512,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -4442,7 +4524,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -4493,7 +4575,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -4504,7 +4587,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -4555,7 +4638,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -4566,7 +4650,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -4617,7 +4701,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -4628,7 +4713,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -4695,7 +4780,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -4706,7 +4792,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -4757,7 +4843,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -4768,7 +4855,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -4819,7 +4906,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -4830,7 +4918,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -4881,7 +4969,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -4892,7 +4981,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -4943,7 +5032,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -4954,7 +5044,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -5005,7 +5095,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -5016,7 +5107,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -5067,7 +5158,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -5078,7 +5170,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -5129,7 +5221,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -5140,7 +5233,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -5191,7 +5284,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -5202,7 +5296,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -5253,7 +5347,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -5264,7 +5359,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -5315,7 +5410,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -5326,7 +5422,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -5377,7 +5473,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -5388,7 +5485,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -5439,7 +5536,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -5450,7 +5548,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -5501,7 +5599,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -5512,7 +5611,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -5563,7 +5662,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -5574,7 +5674,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -5625,7 +5725,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -5636,7 +5737,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -5687,7 +5788,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -5698,7 +5800,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -5749,7 +5851,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -5760,7 +5863,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -5811,7 +5914,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -5822,7 +5926,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -5873,7 +5977,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -5884,7 +5989,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -5935,7 +6040,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -5946,7 +6052,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -5997,7 +6103,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -6008,7 +6115,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -6059,7 +6166,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -6070,7 +6178,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -6121,7 +6229,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -6132,7 +6241,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -6183,7 +6292,8 @@
       "worker": {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "medium",
-        "fallback": "不可用时记录替代模型；不得默默升级"
+        "fallback": "模型/档位不可用时先由维护者批准替代映射；在批准范围复用，禁止自动升级",
+        "policy": "docs/number1/MODEL-POLICY.md"
       },
       "verify": [
         "python3 docs/number1/tools/check_graph.py",
@@ -6194,7 +6304,7 @@
         "max_rounds": 3,
         "max_minutes": 60,
         "max_tokens": 24000,
-        "applies_to": "单个可执行子节点；时间包括测试，父节点不可一次执行"
+        "applies_to": "单个可执行子节点的规划、实现、审查和返工总和；时间包括测试，换模型/续跑不重置；父节点须拆分"
       },
       "stop": {
         "success": "范围内完成且确定性验收通过，独立审查已通过并合入任务分支",
@@ -6229,5 +6339,12 @@
         }
       ]
     }
-  ]
+  ],
+  "model_policy": "docs/number1/MODEL-POLICY.md",
+  "reviewer_default": {
+    "model": "gpt-5.6-sol",
+    "reasoning_effort": "medium",
+    "independent_context": true,
+    "policy": "docs/number1/MODEL-POLICY.md"
+  }
 }
