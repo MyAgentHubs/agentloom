@@ -46,10 +46,7 @@ const WHITELIST: &[(&str, usize)] = &[
     // 额度 2580 内。
     ("cli.rs", 1984),
     ("evaluator.rs", 1905),
-    ("plan/contract.rs", 1138),
     ("guardrails.rs", 1055),
-    ("plan/replan.rs", 1023),
-    ("plan/write_audit.rs", 1031),
     // 棘轮收口：超时语义改空闲(read_timeout)+连接超时,附约束注释(+4)
     // 棘轮收口：ProviderResponse 加 interruption 字段——collect() 中断分支把断流事实
     // 上车 + 本文件内 5 处构造点机械补 None(+8)
@@ -87,6 +84,12 @@ const WHITELIST: &[(&str, usize)] = &[
     // test cases. All of mod tests moved to the external file
     // safety/dangerous_paths/tests.rs to pass the check_file_size.py gate, bringing the main file
     // below 800 lines and removing its whitelist entry (former limit: 919).
+    //
+    // plan/contract.rs, plan/replan.rs, and plan/write_audit.rs each had their inline mod tests
+    // moved to external files (plan/contract/tests.rs, plan/replan/tests.rs, and
+    // plan/write_audit/tests.rs respectively) to pass the check_file_size.py gate, bringing each
+    // main file below 800 lines and removing all three whitelist entries (former limits:
+    // contract.rs 1138 / replan.rs 1023 / write_audit.rs 1031).
 ];
 
 const HARD_LIMIT: usize = 800;
