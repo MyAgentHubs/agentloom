@@ -1,0 +1,37 @@
+{
+  "id": "BOOT",
+  "status": "done",
+  "base_sha": "d635f9306f32d3d67b27c066c4c8d59d0a22b6e2",
+  "result_sha": "d635f9306f32d3d67b27c066c4c8d59d0a22b6e2",
+  "platform": "macOS ARM64 (Darwin 24.6.0)",
+  "toolchain": {
+    "rustc": "1.95.0-aarch64-apple-darwin",
+    "cargo": "1.95.0-aarch64-apple-darwin",
+    "environment": "PATH prepended with /Users/lshl124/.cargo/bin; HTTP(S)/ALL/NO proxy variables unset for engine verification"
+  },
+  "verify": [
+    {
+      "command": "python3 docs/number1/tools/check_graph.py && bash docs/number1/tools/verify.sh docs",
+      "exit_code": 0,
+      "result": "110 DAG nodes, 60 targets, 2 graph regression tests passed"
+    },
+    {
+      "command": "bash docs/number1/tools/verify.sh engine",
+      "exit_code": 101,
+      "result": "initial inherited-proxy run: four network_off tests reached the configured local proxy; 1314 lib tests passed, 2 failed, 1 ignored; cli_acceptance_matrix 28 passed, 2 failed"
+    },
+    {
+      "command": "cargo test -p myagent --locked network_off -- --nocapture (proxy variables unset)",
+      "exit_code": 0,
+      "result": "7 passed, 1 ignored; both affected cli_acceptance_matrix tests also passed"
+    },
+    {
+      "command": "bash docs/number1/tools/verify.sh engine (proxy variables unset)",
+      "exit_code": 0,
+      "result": "complete engine profile passed; existing Clippy warnings: lib 16, lib test 21"
+    }
+  ],
+  "tokens_used": null,
+  "usage_observable": false,
+  "next": "REC-C1 and REC-L2B6 are eligible for their node-specific recovery flow"
+}

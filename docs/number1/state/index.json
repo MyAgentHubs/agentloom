@@ -18,13 +18,21 @@
       "result_sha": "e1ecf5265fac48412ac888b7750968996bbfcb0f"
     },
     "BOOT": {
-      "status": "planned"
+      "status": "done",
+      "evidence": [
+        "state/BOOT.json"
+      ],
+      "result_sha": "d635f9306f32d3d67b27c066c4c8d59d0a22b6e2"
     },
     "REC-L2B6": {
       "status": "ready_after_publication"
     },
     "REC-C1": {
-      "status": "ready_after_publication"
+      "status": "done",
+      "evidence": [
+        "state/REC-C1.json"
+      ],
+      "result_sha": "d6165154ade7aa890db318df747ce9eaa6217c25"
     },
     "W2-CLOSE": {
       "status": "planned"
@@ -144,16 +152,28 @@
       "status": "planned"
     },
     "F39": {
-      "status": "planned"
+      "status": "done",
+      "evidence": [
+        "state/REC-C1.json"
+      ],
+      "result_sha": "d6165154ade7aa890db318df747ce9eaa6217c25"
     },
     "F40": {
-      "status": "planned"
+      "status": "done",
+      "evidence": [
+        "state/REC-C1.json"
+      ],
+      "result_sha": "d6165154ade7aa890db318df747ce9eaa6217c25"
     },
     "F41": {
       "status": "planned"
     },
     "F42": {
-      "status": "planned"
+      "status": "done",
+      "evidence": [
+        "state/REC-C1.json"
+      ],
+      "result_sha": "d6165154ade7aa890db318df747ce9eaa6217c25"
     },
     "F43": {
       "status": "planned"
