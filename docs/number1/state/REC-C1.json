@@ -73,5 +73,10 @@
   "upgrade_requests": [],
   "approved_model_mapping": [],
   "remaining_issues": [],
-  "next": "Open one pull request from myagenthubs/number1-rec-c1 to myagenthubs/number1-debt-graph; REC-L2B6 remains unapplied"
+  "public_pr": "https://github.com/MyAgentHubs/agentloom/pull/6",
+  "integration_pending": [
+    "Maintainer approval is required before the fork pull_request workflow will run; GitHub Actions run 35624563937 is action_required with no jobs started",
+    "The contributor must write the pull request template and AI-assistance disclosure in their own words before marking the draft ready"
+  ],
+  "next": "Approve and run CI for PR 6, add the human-authored PR description, then mark the PR ready; REC-L2B6 remains unapplied"
 }
