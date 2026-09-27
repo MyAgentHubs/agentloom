@@ -10,6 +10,7 @@ exercises the daily gate against disposable temporary git repositories.
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parent.parent
 SNAPSHOT_SCRIPT = ROOT / "scripts/build-oss-snapshot.sh"
 RESIDUE_SCRIPT = ROOT / "scripts/check_oss_residue.sh"
+_INTERNAL_TREE = (ROOT / "/".join(("docs", "superpowers"))).is_dir()
 
 # Concatenated so this file's own source never spells these strings out
 # contiguously (mirrors the same rule check_oss_residue.sh follows, and
@@ -106,6 +108,7 @@ INSTALL_DOC_CALL_RE = re.compile(r'^install_doc\s+(\S+)\s+(\S+)$', re.MULTILINE)
 EXTRA_LOOP_RE = re.compile(r'for extra in ([^;]+); do')
 
 
+@unittest.skipUnless(_INTERNAL_TREE, "public tree: scripts/build-oss-snapshot.sh only exists in the internal repo")
 class DriftGuardTests(unittest.TestCase):
     def test_six_patterns_match_snapshot_script(self):
         expected = extract_scan_patterns(SNAPSHOT_SCRIPT)
@@ -142,6 +145,7 @@ def normalize_private_path(entry):
     return entry[:-2] if entry.endswith("/*") else entry
 
 
+@unittest.skipUnless(_INTERNAL_TREE, "public tree: scripts/build-oss-snapshot.sh only exists in the internal repo")
 class PrivatePathsDriftGuardTests(unittest.TestCase):
     """PRIVATE_PATHS (scripts/check_oss_residue.sh, --public-tree mode) is
     the single definition of "paths that move to the private repo". Every
@@ -170,6 +174,7 @@ class PrivatePathsDriftGuardTests(unittest.TestCase):
             self.assertTrue(keep_covers(private_paths, base), f"{entry} not nested under PRIVATE_PATHS")
 
 
+@unittest.skipUnless(_INTERNAL_TREE, "public tree: scripts/build-oss-snapshot.sh only exists in the internal repo")
 class StructuralGuardTests(unittest.TestCase):
     """Parse build-oss-snapshot.sh itself: if it grows a new
     strip-then-copy-back step, KEEP must grow with it or these go red."""
@@ -434,6 +439,62 @@ class RepositoryTests(unittest.TestCase):
             "internal abs paths", "personal identifiers", "tracked file under a private path",
         ):
             self.assertTrue(f"ok    {label}" in output or f"FAIL  {label}" in output, (label, output))
+
+
+@unittest.skipUnless(_INTERNAL_TREE, "public tree: scripts/build-oss-snapshot.sh only exists in the internal repo")
+class SnapshotScanSelfExemptionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix=".oss-snapshot-scan-test-", dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.write("scripts/check_oss_residue.sh", RESIDUE_SCRIPT.read_text())
+
+    def write(self, relative, content):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+    def extract_snapshot_scan(self):
+        matches = re.findall(
+            r'^scan\(\) \{\n(.*?)^\}', SNAPSHOT_SCRIPT.read_text(),
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertEqual(len(matches), 1, "expected one top-level snapshot scan function")
+        return matches[0]
+
+    def run_snapshot_scan(self, out_dir, label, pattern):
+        script = (
+            "set -euo pipefail\n"
+            f"OUT={shlex.quote(str(out_dir))}\n"
+            "fail=0\n"
+            "scan() {\n" + self.extract_snapshot_scan() + "}\n"
+            f"scan {shlex.quote(label)} {shlex.quote(pattern)}\n"
+            'echo "FAIL=$fail"\n'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        return result.stdout
+
+    def test_snapshot_scan_ignores_copied_gate_itself(self):
+        self.assertIn(PRIVATE_REPO_LEAK, RESIDUE_SCRIPT.read_text())
+        output = self.run_snapshot_scan(self.root, "private repo names", PRIVATE_REPO_LEAK)
+        self.assertIn("FAIL=0", output)
+        self.assertIn("ok    private repo names", output)
+
+    def test_snapshot_scan_reports_other_file(self):
+        self.write("scripts/other.sh", f"# {HOME_LEAK}\n")
+        output = self.run_snapshot_scan(self.root, "internal abs paths", HOME_LEAK)
+        self.assertIn("FAIL=1", output)
+        self.assertIn("scripts/other.sh", output)
+
+    def test_snapshot_scan_reports_same_basename_at_other_path(self):
+        self.write("app/scripts/check_oss_residue.sh", f"# {HOME_LEAK}\n")
+        output = self.run_snapshot_scan(self.root, "internal abs paths", HOME_LEAK)
+        self.assertIn("FAIL=1", output)
+        self.assertIn("app/scripts/check_oss_residue.sh", output)
 
 
 if __name__ == "__main__":

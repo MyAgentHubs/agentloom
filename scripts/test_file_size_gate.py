@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 SCRIPT = Path(__file__).resolve().with_name("check_file_size.py")
+_INTERNAL_TREE = (SCRIPT.parent.parent / "/".join(("docs", "superpowers"))).is_dir()
 spec = importlib.util.spec_from_file_location("file_size_gate", SCRIPT)
 gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
@@ -158,6 +159,7 @@ class ClassificationTests(unittest.TestCase):
                         self.assertIn(f"  {name}:\n    needs: file-size-gate\n", source)
                     self.assertEqual(source.count("needs.file-size-gate.outputs.baseline"), 2)
 
+    @unittest.skipUnless(_INTERNAL_TREE, "public tree: .github/workflows/public-snapshot-size-gate.yml only exists in the internal repo")
     def test_public_snapshot_gate_fetches_public_main_with_base_flag(self):
         path = SCRIPT.parent.parent / ".github/workflows/public-snapshot-size-gate.yml"
         self.assertTrue(path.is_file())
@@ -166,6 +168,7 @@ class ClassificationTests(unittest.TestCase):
                       "+refs/heads/main:refs/remotes/public/main", source)
         self.assertIn("python3 -I scripts/check_file_size.py --base refs/remotes/public/main", source)
 
+    @unittest.skipUnless(_INTERNAL_TREE, "public tree: .github/workflows/public-snapshot-size-gate.yml only exists in the internal repo")
     def test_public_snapshot_gate_pins_fallback_baseline_to_pre_push_sha(self):
         path = SCRIPT.parent.parent / ".github/workflows/public-snapshot-size-gate.yml"
         source = path.read_text()

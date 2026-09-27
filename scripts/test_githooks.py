@@ -24,12 +24,14 @@ ZERO_SHA = "0" * 40
 # literal joined path) does not flag these fixture paths as leftover
 # indexing code.
 DOCS_TREE = "/".join(("docs", "superpowers"))
+_INTERNAL_TREE = (REPO_ROOT / DOCS_TREE).is_dir()
 
 
 def _has_cargo():
     return shutil.which("cargo") is not None
 
 
+@unittest.skipUnless(_INTERNAL_TREE, "public tree: .githooks/ fixtures only exist in the internal repo")
 class HooksFixtureTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix=".githooks-test-", dir=REPO_ROOT)
@@ -349,6 +351,7 @@ class HooksFixtureTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+@unittest.skipUnless(_INTERNAL_TREE, "public tree: .githooks/ fixtures only exist in the internal repo")
 class InstallHooksScriptTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix=".install-hooks-test-", dir=REPO_ROOT)
