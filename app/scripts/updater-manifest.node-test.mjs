@@ -313,6 +313,40 @@ test("check-version: public remote tag content disagreeing with working tree fai
   );
 });
 
+test("check-version: fetches the public tag into refs/public-tags/ namespace, never touching refs/tags/", async () => {
+  const repoRoot = await mkdtemp(
+    path.join(os.tmpdir(), "updater-manifest-test-"),
+  );
+  await writeVersionFixture(repoRoot);
+  const args = await baseCheckVersionArgs(repoRoot);
+  const calls = [];
+  const mockExec = args.exec;
+  args.exec = async (command, commandArgs, options) => {
+    calls.push({ command, args: commandArgs });
+    return mockExec(command, commandArgs, options);
+  };
+
+  await checkVersion(args);
+  const fetchCall = calls.find(
+    ({ command, args }) => command === "git" && args[0] === "fetch",
+  );
+  assert.ok(fetchCall);
+  assert.deepEqual(fetchCall.args, [
+    "fetch",
+    "--no-tags",
+    "public",
+    "+refs/tags/v0.2.8:refs/public-tags/v0.2.8",
+  ]);
+  assert.ok(
+    calls.some(({ command, args }) => command === "git" && args[0] === "show"),
+  );
+  for (const { command, args } of calls) {
+    if (command === "git" && args[0] === "show") {
+      assert.ok(args[1].startsWith("refs/public-tags/v0.2.8:"));
+    }
+  }
+});
+
 test("check-version: --public-remote pointing at the right github.com/MyAgentHubs/agentloom passes (default fixture)", async () => {
   const repoRoot = await mkdtemp(
     path.join(os.tmpdir(), "updater-manifest-test-"),

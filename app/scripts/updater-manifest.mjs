@@ -225,12 +225,23 @@ async function assertPublicTagMatchesWorkingTree({
   tag,
   localValues,
 }) {
-  await exec("git", ["fetch", publicRemote, "tag", tag], { cwd: repoRoot });
+  await exec(
+    "git",
+    [
+      "fetch",
+      "--no-tags",
+      publicRemote,
+      `+refs/tags/${tag}:refs/public-tags/${tag}`,
+    ],
+    { cwd: repoRoot },
+  );
   const remoteContents = {};
   for (const filePath of VERSION_FILE_PATHS) {
-    const { stdout } = await exec("git", ["show", `${tag}:${filePath}`], {
-      cwd: repoRoot,
-    });
+    const { stdout } = await exec(
+      "git",
+      ["show", `refs/public-tags/${tag}:${filePath}`],
+      { cwd: repoRoot },
+    );
     remoteContents[filePath] = stdout;
   }
   const remote = extractVersionValues(remoteContents);

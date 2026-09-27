@@ -235,8 +235,8 @@ if not latest:
     sys.exit("no isLatest release found on the public repo")
 print(latest[0])
 ' "${PREV_RELEASES_JSON}")"
-git -C "${REPO_ROOT}" fetch "${PUBLIC_REMOTE}" tag "${PREV_TAG}"
-RESOLVED_PREVIOUS_STORE_VERSION="$(git -C "${REPO_ROOT}" show "${PREV_TAG}:app/src-tauri/store/msix-identity.json" \
+git -C "${REPO_ROOT}" fetch --no-tags "${PUBLIC_REMOTE}" "+refs/tags/${PREV_TAG}:refs/public-tags/${PREV_TAG}"
+RESOLVED_PREVIOUS_STORE_VERSION="$(git -C "${REPO_ROOT}" show "refs/public-tags/${PREV_TAG}:app/src-tauri/store/msix-identity.json" \
   | python3 -c 'import json, sys; print(json.load(sys.stdin)["storeVersion"])')"
 
 if [ -z "${PREVIOUS_STORE_VERSION}" ]; then
