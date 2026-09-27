@@ -21,15 +21,15 @@
       "consumer_tests": [
         "data_plane_v1_msg_completed_matches_fixture_and_drives_builder"
       ],
-      "gap": "P0-c（本刀）已补：msg.completed 现覆盖 assistant 与 user 两种角色的落库咽喉（send_message / start_lead_session / commit_late_answer / 续会话种子四源统一走 dedup 落库 + command_id 穿线补发）；build_msg_completed_payload(message_id, role, blocks) 本就 role 无关，样张沿用既有 assistant 样张即可覆盖两路——不再需要专属 user 样张。显示当前 agent（MA1，本刀）已补：build_msg_completed_payload 加 optional agent 参数，Some 时插入样张的 \"agent\" 键（本样张即覆盖 Some 分支）；None（无 agent 归属）分支不单出样张，由 Rust 侧单元测试 builds_msg_completed_payload_agent_field_optional 覆盖『agent 键整个省略、不是 null』。已知子 gap：重连补发路径（publish_milestone_replay_batch_on_connect，消费 db::MilestoneReplayRow）暂不带 agent——MilestoneReplayRow 尚未携带 agent_name_snapshot，另立单跟进，不在本刀 scope。剩余 gap：本机旁路 IPC `append_message`（前端三处非 reply 动作）仍走非 dedup 版落库，无 dedup_key/里程碑，留后续刀。msgfix2 U1（M0 §10.10）已补：本样张与 msg_completed_with_content_ref 均加顶层 revision 字段。"
+      "gap": "msg.completed 现覆盖 assistant 与 user 两种角色的落库咽喉（send_message / start_lead_session / commit_late_answer / 续会话种子四源统一走 dedup 落库 + command_id 穿线补发）；build_msg_completed_payload(message_id, role, blocks) 本就 role 无关，样张沿用既有 assistant 样张即可覆盖两路——不再需要专属 user 样张。显示当前 agent：build_msg_completed_payload 加 optional agent 参数，Some 时插入样张的 \"agent\" 键（本样张即覆盖 Some 分支）；None（无 agent 归属）分支不单出样张，由 Rust 侧单元测试 builds_msg_completed_payload_agent_field_optional 覆盖『agent 键整个省略、不是 null』。已知子 gap：重连补发路径（publish_milestone_replay_batch_on_connect，消费 db::MilestoneReplayRow）暂不带 agent——MilestoneReplayRow 尚未携带 agent_name_snapshot。剩余 gap：本机旁路 IPC `append_message`（前端三处非 reply 动作）仍走非 dedup 版落库，无 dedup_key/里程碑。本样张与 msg_completed_with_content_ref 均加顶层 revision 字段。"
     },
     {
-      "category": "L1 活动摘要 activity_summary（M0 §10.11·msgfix2 U1）",
+      "category": "L1 活动摘要 activity_summary",
       "sample_count": 2,
       "consumer_tests": [
         "data_plane_v1_activity_summary_matches_fixture_and_drives_upsert（首发 revision=1 + 改写重发 revision=2 两态）"
       ],
-      "gap": "聚合器内存计数→节流→串行写线程→db::upsert_activity_summary_and_publish 的完整链路在 remote_gateway.rs/db.rs 内自包含并有单元测试覆盖；lib.rs 侧两处接线均已落地（U1b 已接线，不再是待办）：① 生产 DB 写 provider 在启动序列里通过 remote_gateway::install_activity_summary_writer(remote_gateway_activity_summary_writer(...)) 接进写线程；② 重启恢复扫描 db::reconcile_stale_running_activity_summaries 在启动序列里调用，且（msgfix2 整盘审 R4）调用点已挪到 remote_gateway::setup()+install_activity_summary_writer() 之后——挪之前 GATEWAY 单例尚未建立，被封口消息的 republish 会因为 GATEWAY.get()==None 静默 no-op（DB 状态改了但没广播出去）；挪之后 publish 真正生效。剩余 gap：reconcile 传入的 active_run_ids 目前恒为空集（供给真实运行态集合留后续刀，属另一件事，不影响本条『已接线』的结论）。"
+      "gap": "聚合器内存计数→节流→串行写线程→db::upsert_activity_summary_and_publish 的完整链路在 remote_gateway.rs/db.rs 内自包含并有单元测试覆盖；lib.rs 侧两处接线均已落地：① 生产 DB 写 provider 在启动序列里通过 remote_gateway::install_activity_summary_writer(remote_gateway_activity_summary_writer(...)) 接进写线程；② 重启恢复扫描 db::reconcile_stale_running_activity_summaries 在启动序列里调用，调用点位于 remote_gateway::setup()+install_activity_summary_writer() 之后——挪之前 GATEWAY 单例尚未建立，被封口消息的 republish 会因为 GATEWAY.get()==None 静默 no-op（DB 状态改了但没广播出去）；挪之后 publish 真正生效。剩余 gap：reconcile 传入的 active_run_ids 目前恒为空集（供给真实运行态集合留后续刀）。"
     },
     {
       "category": "event 其余里程碑：card.created / card.resolved / run.status / tool.completed",
@@ -74,10 +74,11 @@
     },
     {
       "category": "input.ack",
-      "sample_count": 2,
+      "sample_count": 3,
       "consumer_tests": [
         "relay input.ack 合法确认经 webSocketMessage 删除 pending_input 行并广播回执",
-        "relay input.ack 缺 command_id 经 webSocketMessage 不删除 pending_input 行且不崩溃"
+        "relay input.ack 缺 command_id 经 webSocketMessage 不删除 pending_input 行且不崩溃",
+        "desktop input_ack_json 带 reason 的输出与样张深比对（data_plane_v1_input_ack_failed_no_agent_matches_fixture）"
       ],
       "gap": "『未知 status』反样张未出：实勘 room-do.js handlePlainFrame 的 input.ack 分支对 outcome 字段零校验——只要 `typeof payload.command_id === \"string\"` 就无条件 removePendingInput，outcome 取值不影响是否删行。按字面造『未知 status → 不删行』反样张会与生产行为不符（现状是仍会删），故遵铁律 4 不出；今天唯一真实存在的拒绝差异是『command_id 缺失/非字符串』。"
     },
@@ -107,7 +108,7 @@
       "gap": null
     },
     {
-      "category": "消息完整性面（v1.9·msgfix1 T6 合入）：msg.fetch 请求 / msg.chunk 应答 / msg.fetch.error 两 code 分支 / 带 content_ref 的 msg.completed",
+      "category": "消息完整性面：msg.fetch 请求 / msg.chunk 应答 / msg.fetch.error 两 code 分支 / 带 content_ref 的 msg.completed",
       "sample_count": 5,
       "consumer_tests": [
         "remote-web parseFrame() accepts every valid: true data-plane-v1 case and reproduces it field-for-field（msg_fetch_request/msg_chunk/msg_fetch_error_stale_revision/msg_fetch_error_not_found/msg_completed_with_content_ref）",
@@ -288,7 +289,7 @@
     },
     {
       "name": "msg_completed",
-      "desc": "msg.completed——build_msg_completed_payload(message_id, role, blocks, agent, revision)；blocks 逐字段抄自 db::Block 的真实 Serialize 输出（Text + Tool 两类块，tag=\"type\"/snake_case）。显示当前 agent（MA1）：agent = 落库时的 agent_name_snapshot，Some 时插入本样张的 \"agent\" 键；user 消息 / 无 agent 归属时该键整个省略（不是 null）——另有消费测试单独覆盖 None 分支，未各出一张样张。msgfix2 U1（M0 §10.10）：顶层 revision 字段——桌面三处 msg.completed 产出点（live 首发/重连补发批/history 分页）恒带该消息当前 messages.revision。",
+      "desc": "msg.completed——build_msg_completed_payload(message_id, role, blocks, agent, revision)；blocks 逐字段抄自 db::Block 的真实 Serialize 输出（Text + Tool 两类块，tag=\"type\"/snake_case）。显示当前 agent：agent = 落库时的 agent_name_snapshot，Some 时插入本样张的 \"agent\" 键；user 消息 / 无 agent 归属时该键整个省略（不是 null）——另有消费测试单独覆盖 None 分支，未各出一张样张。顶层 revision 字段——桌面三处 msg.completed 产出点（live 首发/重连补发批/history 分页）恒带该消息当前 messages.revision。",
       "frame": {
         "t": "msg.completed",
         "message_id": 101,
@@ -662,7 +663,7 @@
     },
     {
       "name": "msg_chunk",
-      "desc": "msg.chunk——桌面经 reply 通道回的正常分片（M0 §10.5）。content_sha256/total_bytes 描述整条消息；offset/chunk_len 描述本分片在整体中的位置；bytes_b64 是本分片裸内容的 base64（样张用短占位串，真实分片大小上限由 T4 生成式测量钉死，见 M0 §10.8）。",
+      "desc": "msg.chunk——桌面经 reply 通道回的正常分片（M0 §10.5）。content_sha256/total_bytes 描述整条消息；offset/chunk_len 描述本分片在整体中的位置；bytes_b64 是本分片裸内容的 base64（样张用短占位串，真实分片大小上限由生成式测量钉死，见 M0 §10.8）。",
       "frame": {
         "t": "msg.chunk",
         "message_id": 4821,
@@ -711,7 +712,7 @@
     },
     {
       "name": "msg_completed_with_content_ref",
-      "desc": "msg.completed 挂可选 content_ref（M0 §10.6）——超预算消息降级为预览 blocks，content_ref 指向可按需拉取的全文；旧客户端不识别 content_ref 键时必须照常渲染 message_id/role/blocks 其余字段（前向兼容硬约束）。total_bytes 口径 = 该消息 DB content JSON 的 UTF-8 字节数，与预览后 blocks 的字节数无关（预览小、全文大是常态）。msgfix2 U1（M0 §10.10）：顶层 revision 与 content_ref.revision 并存、同值——客户端读取优先顶层。",
+      "desc": "msg.completed 挂可选 content_ref（M0 §10.6）——超预算消息降级为预览 blocks，content_ref 指向可按需拉取的全文；旧客户端不识别 content_ref 键时必须照常渲染 message_id/role/blocks 其余字段（前向兼容硬约束）。total_bytes 口径 = 该消息 DB content JSON 的 UTF-8 字节数，与预览后 blocks 的字节数无关（预览小、全文大是常态）。顶层 revision 与 content_ref.revision 并存、同值——客户端读取优先顶层。",
       "frame": {
         "t": "msg.completed",
         "message_id": 4821,
@@ -787,6 +788,21 @@
         "remote-web parseFrame() accepts every valid: true data-plane-v1 case（activity_summary_revision_update）",
         "remote-web milestoneProjection.ts::applyMsgCompleted revision 高者胜（消费 activity_summary_revision_update 的顶层 revision）",
         "db::upsert_activity_summary_and_publish 命中已存在 dedup_key 的 UPDATE 分支（revision+1）"
+      ]
+    },
+    {
+      "name": "input_ack_failed_no_agent",
+      "desc": "input.ack·异步终态失败：remote_inbox 投递时会话从未选过 agent，桌面立即判终态并补发带 reason 的失败回执；reason 为可选字段，旧手机忽略它、显示通用「发送失败」。",
+      "frame": {
+        "t": "input.ack",
+        "command_id": "cmd-dp1-ack-no-agent",
+        "outcome": "failed",
+        "reason": "no_agent"
+      },
+      "valid": true,
+      "consumers": [
+        "desktop input_ack_json 带 reason 的输出与样张深比对",
+        "remote-web parseFrame→handleAck→Composer 显示没选 agent 的专用文案（T2）"
       ]
     }
   ]

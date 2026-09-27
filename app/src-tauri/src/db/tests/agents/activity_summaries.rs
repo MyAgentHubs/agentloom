@@ -238,9 +238,9 @@ fn upsert_activity_summary_and_publish_second_call_updates_in_place_bumps_revisi
 
 #[test]
 fn upsert_activity_summary_and_publish_retry_with_unchanged_content_does_not_bump_revision() {
-    // msgfix2 U1b（第三轮审查 B1/G1-b）：模拟写线程重试——同一份内容（同计数/同状态）被
-    // 第二次调用（`flush_activity_summary` 失败重试语义，见该函数文档），必须原地不动
-    // revision，不能把"内容相同的重放"误判成一次真正的内容推进。
+    // Simulate a write-thread retry following the failure-retry semantics documented by flush_activity_summary:
+    // a second upsert with identical content (the same count and status) must leave the revision untouched,
+    // so replaying unchanged content is never mistaken for a real content advance.
     let c = crate::test_support::mem_db();
     create_session(
         &c,

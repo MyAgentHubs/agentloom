@@ -10,7 +10,7 @@ use crate::goal::{Criterion, GoalState, NetworkPolicy};
 use crate::guardrails::ContractPolicy;
 use crate::journal::RunPaths;
 use crate::orchestrator::{
-    run_solo_task, ControlInputKind, RunOptions, RunOutcome, RunResult, DEFAULT_VERIFY_EVERY,
+    ControlInputKind, RunOptions, RunOutcome, RunResult, DEFAULT_VERIFY_EVERY,
     DEFAULT_WATCHDOG_REPEAT, MIN_TASK_TURN_BUDGET,
 };
 use crate::plan::contract::{
@@ -18,25 +18,24 @@ use crate::plan::contract::{
     ChildRunOutcome, CommandEvidence, CommandRole, PlanTask, RemediationMeta, TaskDecision,
     TaskNarrative, TaskReport, TaskReportStatus, TaskStatus,
 };
-use crate::plan::executor_bridge::{task_report_from_child, task_to_goal_contract};
+use crate::plan::executor_bridge::task_to_goal_contract;
 use crate::plan::false_red::criterion_command_result_with_fence;
 use crate::plan::planning::{fold_plan_attempt, PlanStep};
 use crate::plan::preflight::{
     classify_preflight, decide_preflight, PreflightStep, RefineKind, DEFAULT_MAX_PREFLIGHT_REFINE,
 };
-use crate::plan::probe::{detect_invariants, stale_scope_paths};
+use crate::plan::probe::detect_invariants;
 use crate::plan::replan::{
     decide_replan, failure_fingerprint, fingerprint_hard_dedup_safe, gen_remediation_id,
     is_duplicate_task, validate_remediation_append, ReplanStep,
 };
 use crate::plan::state::{PlanTerminal, RunState, Trigger, UnmetSnapshot};
-use crate::plan::write_audit::{
-    capture_baseline, changed_paths_since, classify_violations, partition_formatting_violations,
-    TaskScope, WriteBaseline,
-};
+use crate::plan::write_audit::{capture_baseline, changed_paths_since, WriteBaseline};
 use crate::provider::{ChatMessage, ProviderClient};
 use crate::shell::PermissionPolicy;
+mod completion;
 mod images;
+mod loop_steps;
 
 /// Planner system 提示：含 "WORKLIST" 标记（mock 测试据此辨 planner 调用 vs child 调用）。
 const PLANNER_SYSTEM: &str = "You are the harness PLANNER. Decompose the goal into a WORKLIST of \
@@ -185,7 +184,7 @@ pub async fn run_plan<P: ProviderClient + Clone>(
 
     run_plan_loop(provider, &opts, state, &state_path, &mut recorder).await
 }
-/// 崩溃重启：载落盘 RunState（含 steps_used）·把「进行中」任务重跑 acceptance 当真相·再接着跑（spec §4.7·B5）。
+/// Restore persisted progress and budget usage after a crash; rerun acceptance for in-progress tasks before trusting their status.
 /// 没落盘 → 当全新 run_plan（含 Planner）。1b 单次重跑·1c 加假红防护。
 pub async fn resume_plan<P: ProviderClient + Clone>(
     provider: P,
@@ -511,7 +510,7 @@ async fn plan_preflight_refine<P: ProviderClient>(
         let resp = provider.next_turn(&messages, &[], recorder).await?;
         match fold_plan_attempt(&resp.text, attempt, k) {
             PlanStep::Accept { tasks } => {
-                // 必须恰好一个替代任务（R2-B2）：评审闸跑在 stamp 前的原始 scope 上，stamp 后多任务会被
+                // Exactly one replacement task keeps the stamped scope consistent with the original scope checked by the review gate.
                 // 统一覆写成原任务 scope → 互相重叠、绕过评审闸的「无依赖任务不得写重叠路径」检查。限定一个即无此问题。
                 if tasks.len() != 1 {
                     recorder.emit(
@@ -599,9 +598,8 @@ fn replan_memory(state: &RunState) -> Option<String> {
         )
     })
 }
-
 /// 主循环：取下一个可跑 pending → 跑 → 审计 → 判完成 → 折账 → 三支出口（spec §4.1 第 4–7 步）。
-/// 抽成独立函数·T8 的 resume_plan 复用。预算计数走 state.steps_used（持久化·B5）。
+/// Share execution with resume_plan so both paths enforce the budget using persisted state.steps_used.
 async fn run_plan_loop<P: ProviderClient + Clone>(
     provider: P,
     opts: &PlanRunOptions,
@@ -624,27 +622,17 @@ async fn run_plan_loop<P: ProviderClient + Clone>(
         match state.terminal() {
             // 全 done → 总验收【桩】（1b 信 per-task done·1c 接真总验收 + 整盘重验 + per-language）
             PlanTerminal::AllTasksDone => {
-                let outcome = finalize_completion_outcome(&state, opts, recorder).await?;
-                match outcome {
-                    FinalizeOutcome::NeedsReplan {
-                        code_red, snapshot, ..
-                    } => {
-                        match handle_overall_replan(
-                            provider.clone(),
-                            opts,
-                            &mut state,
-                            state_path,
-                            recorder,
-                            snapshot,
-                            code_red,
-                        )
-                        .await?
-                        {
-                            ReplanLoopAction::Continue => continue,
-                            ReplanLoopAction::Return(result) => return Ok(result),
-                        }
-                    }
-                    other => return finish_finalize_outcome(other, &state, opts, recorder),
+                match loop_steps::handle_all_tasks_done(
+                    provider.clone(),
+                    opts,
+                    &mut state,
+                    state_path,
+                    recorder,
+                )
+                .await?
+                {
+                    ReplanLoopAction::Continue => continue,
+                    ReplanLoopAction::Return(result) => return Ok(result),
                 }
             }
             // 没可跑 pending、又没全 done → 全卡住（F7）→ 干净 exit4（F6·不临时半建再规划）
@@ -665,7 +653,7 @@ async fn run_plan_loop<P: ProviderClient + Clone>(
             PlanTerminal::Running => {}
         }
 
-        // 计划级总预算（B5·走持久化的 steps_used·resume 后不归零）
+        // Persisted steps_used keeps the plan-wide budget from resetting when execution resumes.
         if state.steps_used >= opts.max_plan_steps {
             recorder.emit(
                 "run.needs_decision",
@@ -678,156 +666,48 @@ async fn run_plan_loop<P: ProviderClient + Clone>(
             return Ok(needs_decision_result(opts));
         }
 
-        let task = state
-            .runnable_next()
-            .expect("PlanTerminal::Running → runnable_next is Some")
-            .clone();
-        let child_id = format!("{}__{}", opts.plan_run_id, task.id);
-
-        // 开跑前 scope 复核（§4.1·提到 mark InProgress/计步之前·过期则 Blocked·不耗 step）
-        let stale = stale_scope_paths(&opts.workspace, &task.files_scope);
-        if !stale.is_empty() {
-            let reason = format!(
-                "files_scope 落空（计划过期·所在目录已不存在）：{}",
-                stale.join(", ")
-            );
-            recorder.emit(
-                "plan.task.blocked",
-                json!({ "task": task.id, "reason": "scope_stale", "stale_paths": stale }),
-            )?;
-            state.mark_status(&task.id, TaskStatus::Blocked { reason });
-            save_state(state_path, &state)?;
+        let Some(task) = loop_steps::pick_next_task(opts, &mut state, state_path, recorder)? else {
             continue;
-        }
+        };
 
-        // 拍 baseline（开工前闸 + 执行后审计复用同一份·BLOCK 1）
-        let baseline = capture_baseline(&opts.workspace)?;
-
-        // 开工前验收闸（§4·gate 开 且 change_required 才跑；invariant 走全局 health-check·不进闸）
-        if state.preflight_gate && task.acceptance_kind == AcceptanceKind::ChangeRequired {
-            match run_preflight_gate(
-                provider.clone(),
-                opts,
-                &mut state,
-                state_path,
-                recorder,
-                &task,
-                &baseline,
-            )
-            .await?
-            {
-                PreflightAction::Proceed => {}
-                PreflightAction::Continue => continue,
-                PreflightAction::Return(result) => return Ok(result),
-            }
-        }
+        let baseline = match loop_steps::prepare_task(
+            provider.clone(),
+            opts,
+            &mut state,
+            state_path,
+            recorder,
+            &task,
+        )
+        .await?
+        {
+            TaskPreflightAction::Proceed(baseline) => baseline,
+            TaskPreflightAction::Continue => continue,
+            TaskPreflightAction::Return(result) => return Ok(result),
+        };
 
         // 只有放行（ProceedCodeRed）或闸关/invariant 才到这：现在才 mark InProgress + 计步
         state.mark_status(&task.id, TaskStatus::InProgress);
         state.steps_used += 1;
         save_state(state_path, &state)?;
 
-        let scope = TaskScope::from_task(&task).with_crate_roots(crate_roots.clone());
-        let task_contract = task_to_goal_contract(&task);
-        let child_opts = child_run_options(opts, &caps, &task, &child_id);
-
-        let child = run_solo_task(
+        let report = loop_steps::run_child_task_and_report(
             provider.clone(),
-            Box::new(crate::judge::NoopJudge),
-            child_opts,
-            Some(task_contract),
-            Some(scope.clone()),
-        )
-        .await?;
-
-        let changed_files = changed_paths_since(&opts.workspace, &baseline)?;
-        let raw_violations = classify_violations(&changed_files, &scope);
-        // fmt-scope：把「名单外纯排版」从违规里分出来降级 advisory（红线/真内容/拿不准维持违规）。
-        let (violations, fmt_advisories) =
-            partition_formatting_violations(&opts.workspace, &baseline, &scope, raw_violations)
-                .await;
-        if !fmt_advisories.is_empty() {
-            recorder.emit(
-                "plan.task.scope_formatting_advisory",
-                json!({
-                    "task": task.id,
-                    "files": fmt_advisories.iter().map(|v| v.path.clone()).collect::<Vec<_>>(),
-                    "note": "顺手排版了名单外文件·已放行·纯排版（formatter 副作用）",
-                }),
-            )?;
-        }
-        let child_events = RunPaths::new(&opts.journal_root, &child_id).events_path;
-        let report =
-            task_report_from_child(&task, &child, &child_events, changed_files, violations)?;
-
-        recorder.emit("plan.task.report", serde_json::to_value(&report)?)?;
-
-        // 权威验收必走（两道）：child outcome / journal verdict 只进 report，不再当「是否跑验收」的闸。
-        let decision = run_task_acceptance(
+            opts,
+            &caps,
+            &crate_roots,
             &task,
-            &report,
-            &opts.workspace,
-            opts.network,
-            opts.fs_write_fence,
+            &baseline,
+            recorder,
         )
         .await?;
-        recorder.emit(
-            "plan.task.decision",
-            json!({ "task": task.id, "decision": &decision, "reason": decision_reason(&decision) }),
-        )?;
 
-        match decision {
-            TaskDecision::PassedByAcceptance { ref advisory, .. } => {
-                recorder.emit("plan.task.done", json!({ "task": task.id }))?;
-                emit_advisory_if_any(recorder, &task.id, advisory.as_ref())?;
-                state.mark_status(&task.id, TaskStatus::Done);
-                save_state(state_path, &state)?;
-            }
-            TaskDecision::FailedByAcceptance { .. } => {
-                let reason = decision_reason(&decision);
-                recorder.emit(
-                    "plan.task.blocked",
-                    json!({ "task": task.id, "reason": reason }),
-                )?;
-                state.mark_status(&task.id, TaskStatus::Blocked { reason });
-                save_state(state_path, &state)?;
-            }
-            TaskDecision::FailedByPolicy { .. } => {
-                let reason = decision_reason(&decision);
-                recorder.emit(
-                    "run.needs_decision",
-                    json!({ "reason": "failed_by_policy", "task": task.id, "detail": reason }),
-                )?;
-                state.mark_status(&task.id, TaskStatus::Blocked { reason });
-                save_state(state_path, &state)?;
-                return Ok(needs_decision_result(opts));
-            }
-            TaskDecision::UnvalidatedInfraError { signature, .. } => {
-                recorder.emit(
-                    "run.needs_decision",
-                    json!({
-                        "reason": "infra_red",
-                        "task": task.id,
-                        "signature": signature,
-                        "next_step": "环境抽风(网络/超时/锁)·非代码红·修环境后 resume·别当失败再规划",
-                    }),
-                )?;
-                save_state(state_path, &state)?; // 保持 InProgress，resume 先补验收
-                return Ok(needs_decision_result(opts));
-            }
-            TaskDecision::StoppedUnvalidated { reason } => {
-                recorder.emit(
-                    "run.needs_decision",
-                    json!({
-                        "reason": "stopped_unvalidated",
-                        "task": task.id,
-                        "detail": reason,
-                        "next_step": "验收未跑成·先修验收环境/命令后 resume",
-                    }),
-                )?;
-                save_state(state_path, &state)?;
-                return Ok(needs_decision_result(opts));
-            }
+        match loop_steps::settle_task_decision(
+            opts, &mut state, state_path, recorder, &task, &report,
+        )
+        .await?
+        {
+            ReplanLoopAction::Continue => continue,
+            ReplanLoopAction::Return(result) => return Ok(result),
         }
     }
 }
@@ -839,6 +719,12 @@ enum ReplanLoopAction {
 
 enum PreflightAction {
     Proceed,
+    Continue,
+    Return(RunResult),
+}
+
+enum TaskPreflightAction {
+    Proceed(WriteBaseline),
     Continue,
     Return(RunResult),
 }
@@ -1633,7 +1519,7 @@ enum FinalizeOutcome {
 }
 
 /// 全任务 done 后的真总验收（spec §3.2/§3.4·替 1b 桩）：跑总验收细项 ∪ per-language 不变量（state.checks）
-/// + 整盘重验所有 done 任务 acceptance（B2/B3），全走假红防护。infra/停止/策略先分桶，不喂再规划。
+/// Recheck acceptance for every done task with false-failure guards; infrastructure, stop, and policy outcomes must not trigger replanning.
 #[cfg(test)]
 async fn finalize_completion(
     state: &RunState,
@@ -1643,174 +1529,26 @@ async fn finalize_completion(
     let outcome = finalize_completion_outcome(state, opts, recorder).await?;
     finish_finalize_outcome(outcome, state, opts, recorder)
 }
-
 async fn finalize_completion_outcome(
     state: &RunState,
     opts: &PlanRunOptions,
     recorder: &mut EventRecorder,
 ) -> Result<FinalizeOutcome> {
-    let mut code_red: Vec<CommandEvidence> = Vec::new();
-    let mut code_unmet: Vec<Value> = Vec::new();
-    let mut infra: Vec<Value> = Vec::new();
-    let mut stopped: Vec<Value> = Vec::new();
-    let mut policy_unmet: Vec<Value> = Vec::new();
-    let mut checked_ids = Vec::new();
-    let mut passed_ids = Vec::new();
-    let mut failed_ids = Vec::new();
+    let mut results = completion::CompletionResults::default();
+    completion::run_overall_checks(state, opts, &mut results).await?;
+    completion::run_done_task_acceptance(state, opts, recorder, &mut results).await?;
+    let advisory_pending = completion::run_artifact_advisories(state, opts, &mut results).await?;
 
-    for c in &state.checks {
-        checked_ids.push(c.id.clone());
-        match criterion_command_result_readonly_checked(
-            c,
-            CommandRole::OverallCheck,
-            &opts.workspace,
-            opts.network,
-            opts.fs_write_fence,
-        )
-        .await?
-        {
-            AcceptanceResult::Pass { .. } => passed_ids.push(c.id.clone()),
-            AcceptanceResult::CodeRed { acceptance } => {
-                failed_ids.push(c.id.clone());
-                code_red.push(acceptance.clone());
-                code_unmet.push(
-                    json!({ "kind": "overall_check", "criterion": c.id, "evidence": acceptance }),
-                );
-            }
-            AcceptanceResult::InfraRed {
-                signature,
-                acceptance,
-            } => {
-                infra.push(json!({ "kind": "overall_check", "criterion": c.id, "signature": signature, "evidence": acceptance }));
-            }
-            AcceptanceResult::NotRun { reason } => {
-                stopped.push(json!({ "kind": "overall_check", "criterion": c.id, "stopped_unvalidated": reason }));
-            }
-            AcceptanceResult::PolicyFailure {
-                reason,
-                changed_files,
-                acceptance,
-            } => {
-                policy_unmet.push(json!({
-                    "kind": "overall_policy",
-                    "criterion": c.id,
-                    "reason": reason,
-                    "changed_files": changed_files,
-                    "evidence": acceptance,
-                }));
-            }
-        }
-    }
-    for t in &state.worklist {
-        if matches!(t.status, TaskStatus::Done) {
-            checked_ids.push(t.acceptance.id.clone());
-            let report = synthetic_report_for_task(t, TaskReportStatus::DoneCandidate);
-            let acceptance = criterion_command_result_readonly_checked(
-                &t.acceptance,
-                CommandRole::AuthoritativeAcceptance,
-                &opts.workspace,
-                opts.network,
-                opts.fs_write_fence,
-            )
-            .await?;
-            let decision = settle_report_decision(&report, acceptance);
-            let reason = decision_reason(&decision);
-            recorder.emit(
-                "plan.task.decision",
-                json!({ "task": t.id, "decision": &decision, "reason": reason, "phase": "finalize" }),
-            )?;
-            match &decision {
-                TaskDecision::PassedByAcceptance { .. } => passed_ids.push(t.acceptance.id.clone()),
-                TaskDecision::FailedByAcceptance { acceptance, .. } => {
-                    failed_ids.push(t.acceptance.id.clone());
-                    code_red.push(acceptance.clone());
-                    code_unmet.push(json!({ "kind": "task_acceptance", "task": t.id, "label": format!("task {} acceptance", t.id), "decision": &decision, "reason": decision_reason(&decision) }));
-                }
-                TaskDecision::UnvalidatedInfraError { signature, .. } => {
-                    infra.push(json!({ "kind": "task_acceptance", "task": t.id, "signature": signature, "decision": &decision }));
-                }
-                TaskDecision::StoppedUnvalidated { reason } => {
-                    stopped.push(json!({ "kind": "task_acceptance", "task": t.id, "stopped_unvalidated": reason }));
-                }
-                TaskDecision::FailedByPolicy { .. } => {
-                    policy_unmet.push(json!({
-                        "kind": "task_policy",
-                        "task": t.id,
-                        "decision": &decision,
-                        "reason": decision_reason(&decision),
-                    }));
-                }
-            }
-        }
-    }
-
-    let mut advisory_pending: Vec<Value> = Vec::new();
-    for t in &state.worklist {
-        if !matches!(t.status, TaskStatus::Done) {
-            continue;
-        }
-        if t.acceptance_kind != AcceptanceKind::ChangeRequired {
-            continue;
-        }
-        let Some(artifact) = &t.artifact_check else {
-            continue;
-        };
-        match criterion_command_result_readonly_checked(
-            artifact,
-            CommandRole::AuthoritativeAcceptance,
-            &opts.workspace,
-            opts.network,
-            opts.fs_write_fence,
-        )
-        .await?
-        {
-            AcceptanceResult::Pass { .. } => {}
-            AcceptanceResult::PolicyFailure {
-                reason,
-                changed_files,
-                acceptance,
-            } => {
-                policy_unmet.push(json!({
-                    "kind": "finalize_artifact_policy",
-                    "task": t.id,
-                    "reason": reason,
-                    "changed_files": changed_files,
-                    "evidence": acceptance,
-                }));
-            }
-            AcceptanceResult::CodeRed { acceptance } => {
-                advisory_pending.push(json!({
-                    "kind": "finalize_artifact_advisory",
-                    "task": t.id,
-                    "artifact": artifact.id,
-                    "result": "code_red",
-                    "evidence": acceptance,
-                }));
-            }
-            AcceptanceResult::NotRun { reason } => {
-                advisory_pending.push(json!({
-                    "kind": "finalize_artifact_advisory",
-                    "task": t.id,
-                    "artifact": artifact.id,
-                    "result": "not_run",
-                    "detail": reason,
-                }));
-            }
-            AcceptanceResult::InfraRed {
-                signature,
-                acceptance,
-            } => {
-                advisory_pending.push(json!({
-                    "kind": "finalize_artifact_advisory",
-                    "task": t.id,
-                    "artifact": artifact.id,
-                    "result": "infra_red",
-                    "detail": signature,
-                    "evidence": acceptance,
-                }));
-            }
-        }
-    }
+    let completion::CompletionResults {
+        code_red,
+        code_unmet,
+        infra,
+        stopped,
+        policy_unmet,
+        checked_ids,
+        passed_ids,
+        failed_ids,
+    } = results;
 
     if !policy_unmet.is_empty() {
         return Ok(FinalizeOutcome::Policy {
@@ -4043,7 +3781,7 @@ mod tests {
         assert_eq!(res.outcome, crate::orchestrator::RunOutcome::NeedsDecision);
     }
 
-    // 任务级：acceptance 命中 infra 签名 → 挂起 infra_red（不当代码红·B1/B2）
+    // Infrastructure signatures suspend the task as infra_red so infrastructure failures are not treated as code failures.
     #[tokio::test]
     async fn task_acceptance_infra_red_suspends() {
         let ws = tempfile::tempdir().unwrap();

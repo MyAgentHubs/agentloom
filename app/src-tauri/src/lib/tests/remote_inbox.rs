@@ -62,6 +62,7 @@ impl RemoteInputSendTestHarness {
                     |id, _command_id, error| {
                         db::mark_remote_input_failed(&self.conn.borrow(), id, error).is_ok()
                     },
+                    |_command_id, _reason| {},
                 );
             },
             || {
@@ -267,6 +268,7 @@ fn drain_remote_inbox_loop_stops_without_marking_delivered_on_busy() {
         },
         |_id, _command_id, _error| panic!("busy 不得记录失败次数"),
         |_id, _command_id, _error| panic!("busy 不得标失败终态"),
+        |_command_id, _reason| panic!("busy 不得补发失败回执"),
     );
     assert_eq!(delivery_calls, 1, "撞忙应在第一条投递后立即停");
     assert!(delivered_ids.is_empty(), "撞忙即停：零条 mark_delivered");
@@ -318,6 +320,7 @@ fn drain_remote_inbox_loop_drains_fifo_and_skips_non_busy_failures_without_block
             failed_ids.push(id);
             true
         },
+        |_command_id, _reason| {},
     );
     assert_eq!(
         delivered_ids,
@@ -386,6 +389,7 @@ fn drain_remote_inbox_loop_retries_delivery_failure_then_marks_third_failure_ter
                 terminal.set(true);
                 true
             },
+            |_command_id, _reason| {},
         );
         assert_eq!(attempts.get(), expected_attempts);
         assert_eq!(
@@ -425,6 +429,7 @@ fn drain_remote_inbox_loop_stops_when_record_failure_write_fails() {
         |_id, _command_id| panic!("投递失败不得 mark_delivered"),
         |_id, _command_id, _error| None,
         |_id, _command_id, _error| panic!("计数写失败不得继续标终态"),
+        |_command_id, _reason| panic!("计数写失败不得补发失败回执"),
     );
     assert_eq!(delivery_calls, 1, "计数写失败安全阀应立即停");
     assert_eq!(next_calls, 1, "计数写失败后不得再取下一条");
@@ -457,6 +462,7 @@ fn drain_remote_inbox_loop_stops_after_mark_delivered_failure() {
         |_id, _command_id| false,
         |_id, _command_id, _error| panic!("成功分支不得 record_failure"),
         |_id, _command_id, _error| panic!("成功分支不得 mark_failed"),
+        |_command_id, _reason| panic!("成功分支不得补发失败回执"),
     );
     assert_eq!(delivery_calls, 1, "mark 失败后不得继续投递第二条");
 }
@@ -482,6 +488,7 @@ fn drain_remote_inbox_loop_stops_before_redelivering_same_id() {
         |_id, _command_id| true,
         |_id, _command_id, _error| panic!("成功分支不得 record_failure"),
         |_id, _command_id, _error| panic!("成功分支不得 mark_failed"),
+        |_command_id, _reason| panic!("成功分支不得补发失败回执"),
     );
     assert!(
         next_pending_calls <= 2,
@@ -492,15 +499,14 @@ fn drain_remote_inbox_loop_stops_before_redelivering_same_id() {
 
 #[test]
 fn remote_inbox_emit_loads_new_solo_user_message_even_when_delivery_fails() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let delivery_body = production
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/remote_inbox.rs"
+    ));
+    let delivery_body = source
         .split("fn deliver_remote_inbox_entry(")
         .nth(1)
-        .unwrap()
-        .split("\nconst RESUME_WITHOUT_MESSAGE_FALLBACK_PROMPT")
-        .next()
-        .unwrap();
+        .expect("missing deliver_remote_inbox_entry start anchor");
     let emit_call =
         "emit_remote_inbox_message_if_new(app, session_id, &dedup_key, existed_before);";
     assert_eq!(
@@ -669,6 +675,7 @@ fn remote_inbox_redelivery_before_mark_delivered_dedupes_via_command_id_key() {
         |_id, _command_id| false, // 模拟 mark_delivered 落库失败
         |_id, _command_id, _error| panic!("成功分支不得 record_failure"),
         |_id, _command_id, _error| panic!("成功分支不得 mark_failed"),
+        |_command_id, _reason| panic!("成功分支不得补发失败回执"),
     );
 
     // 第二轮：同一条仍 pending 的行被再次取到、再次投递（真实 at-least-once 重投）；这次
@@ -698,6 +705,7 @@ fn remote_inbox_redelivery_before_mark_delivered_dedupes_via_command_id_key() {
         |id, _command_id| db::mark_remote_input_delivered(&conn, id).is_ok(),
         |_id, _command_id, _error| panic!("成功分支不得 record_failure"),
         |_id, _command_id, _error| panic!("成功分支不得 mark_failed"),
+        |_command_id, _reason| panic!("成功分支不得补发失败回执"),
     );
 
     assert_eq!(

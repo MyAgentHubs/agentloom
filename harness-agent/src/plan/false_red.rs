@@ -19,9 +19,9 @@ pub enum CheckVerdict {
     InfraRed { signature: String },
 }
 
-/// best-effort 识别「环境抽风」签名（spec §3.3·B5 收窄）：只认**具体短语**，
+/// Match only specific infrastructure failure phrases to avoid misclassifying code failures.
 /// 不用裸 "timeout"/"proxy"/"another process"（会把代码红如 "cannot find function `timeout`" 误判 infra）。
-/// 真超时由 T2 的结构化 `timed_out` 字段单独处理。完整失败分类法是 P2。
+/// Actual process timeouts are handled separately via the structured `timed_out` field.
 pub fn infra_signature(stderr: &str, stdout: &str) -> Option<String> {
     let hay = format!("{stderr}\n{stdout}").to_ascii_lowercase();
     const SIGNS: &[&str] = &[
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn does_not_misclassify_code_failures() {
-        // 裸词不再命中（B5）：这些是代码红·不能当 infra
+        // Bare words must not turn code failures into infrastructure failures.
         assert!(infra_signature("error[E0425]: cannot find function `timeout`", "").is_none());
         assert!(infra_signature("proxy module: assertion failed", "").is_none());
         assert!(infra_signature("another process spawned successfully", "").is_none());

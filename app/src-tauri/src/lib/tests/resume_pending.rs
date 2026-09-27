@@ -36,15 +36,16 @@ fn answer_lead_question_resumes_only_inside_appended_some_branch_after_emit() {
     // 反向 + 时序：appended=None（Delivered / CAS 没赢的双击）绝不触发续跑；appended=Some
     // 时续跑触发点必须在 emit 之后（先让前端看到答案消息、再看到 run 启动事件）。
     // 变异自证：把 try_resume_after_answer( 调用挪到 if let 外面/emit 之前，这条测试会变红。
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_answers.rs"
+    ));
     let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let body = production
-        .split("fn answer_lead_question(")
-        .nth(1)
-        .unwrap()
-        .split("\nfn try_resume_after_answer(")
-        .next()
-        .unwrap();
+    let body = source_window(
+        production,
+        "fn answer_lead_question(",
+        "\nfn try_resume_after_answer(",
+    );
 
     assert_eq!(
         body.matches("try_resume_after_answer(").count(),
@@ -90,20 +91,22 @@ fn answer_lead_question_resumes_only_inside_appended_some_branch_after_emit() {
 
 #[test]
 fn try_resume_pending_with_gate_releases_db_lock_before_starting_lead_session() {
-    // M1-T1 死锁血案同款红线：std::sync::Mutex 不可重入，绝不能带着 db 锁进入
+    // Release the database lock before starting the lead session: std::sync::Mutex is not reentrant.
     // start_lead_session（它自己也会 db.0.lock()，同线程二次加锁直接死锁）。
     // 用源码缩进断言判门读锁的内层 block 在 start_lead_session( 调用之前就已经收口
     // （同仓先例：lead_step_spawn_closure_releases_db_lock_before_spawning_child）。
     // 变异自证：把判门块的花括号去掉、让 conn 活到 start_lead_session 调用处，这条测试会变红。
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let body = production
-        .split("fn try_resume_pending_with_gate(")
-        .nth(1)
-        .unwrap()
-        .split("\nfn try_resume_pending(")
-        .next()
-        .unwrap();
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/delivery_drain.rs"
+    ));
+    let body = source
+        .split_once("pub(super) fn try_resume_pending_with_gate(")
+        .expect("missing try_resume_pending_with_gate start anchor in lib/delivery_drain.rs")
+        .1
+        .split_once("\npub(super) fn try_resume_pending(")
+        .expect("missing try_resume_pending end anchor in lib/delivery_drain.rs")
+        .0;
 
     let lock_idx = body
         .find("db_state.0.lock()")
@@ -156,21 +159,24 @@ fn resume_pending_classify_attempt_outcome_busy_non_busy_and_success() {
 
 #[test]
 fn resume_pending_after_answer_records_failure_but_never_clears_on_bare_start_success() {
-    // T5-fix A 源码形状：非 busy 分支必须调 record_resume_failure（计入共享退避）；
+    // Non-busy failures must call record_resume_failure to participate in shared backoff.
     // 起跑成功（`resume_error` 为 None）绝不能在这里调 note_resume_success 清零——
     // 「runner 线程创建成功、run 移交」不等于真正交付 ack，过早清零会把仍在排队的连续
     // 失败在下一轮真失败前抹掉、退避永远卡在最短档（真正的清零只发生在
-    // `commit_lead_run_delivery` 的 Ok 分支，T5 M3/I5）。busy 两者都不该调，留给下一次
+    // Reset backoff only after commit_lead_run_delivery succeeds; busy attempts must preserve it for retry.
     // drain 的 try_resume_pending 自然重试（答案 id 已在起跑前登记，不会丢）。
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_answers.rs"
+    ));
     let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
     let body = production
         .split("\nfn try_resume_after_answer(")
         .nth(1)
         .unwrap()
-        .split("\n/// `try_resume_pending_with_gate` 的判门可测纯内核")
-        .next()
-        .unwrap();
+        .split_once("\npub(super) fn resume_after_answer_candidate(")
+        .expect("end anchor `resume_after_answer_candidate` must exist in lib/lead_answers.rs")
+        .0;
     assert!(body.contains("record_resume_failure(app, session_id, error)"));
     assert!(
         !body.contains("note_resume_success(session_id)"),
@@ -181,18 +187,20 @@ fn resume_pending_after_answer_records_failure_but_never_clears_on_bare_start_su
 
 #[test]
 fn try_resume_pending_never_clears_backoff_on_bare_start_success() {
-    // T5-fix A 的镜像覆盖：`try_resume_pending`（C2 自动路径）同样不得在 `Ok(())` 分支
+    // try_resume_pending must preserve backoff on Ok(()) because starting a run does not acknowledge delivery.
     // 清零——同上，理由见 `resume_pending_after_answer_records_failure_but_never_clears_
     // on_bare_start_success`。
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let body = production
-        .split("\nfn try_resume_pending(app: &AppHandle, session_id: &str) {")
-        .nth(1)
-        .unwrap()
-        .split("\n/// T4：run 槽释放后的统一排空咽喉")
-        .next()
-        .unwrap();
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/delivery_drain.rs"
+    ));
+    let body = source
+        .split_once("\npub(super) fn try_resume_pending(app: &AppHandle, session_id: &str) {")
+        .expect("missing try_resume_pending start anchor in lib/delivery_drain.rs")
+        .1
+        .split_once("\npub(super) fn drain_after_run_release(")
+        .expect("missing drain_after_run_release end anchor in lib/delivery_drain.rs")
+        .0;
     assert!(
         !body.contains("note_resume_success"),
         "try_resume_pending 的 Ok(()) 分支不得清零退避——真 ack 才能清零"
@@ -200,7 +208,7 @@ fn try_resume_pending_never_clears_backoff_on_bare_start_success() {
     assert!(body.contains("record_resume_failure(app, session_id, &e)"));
 }
 
-/// T8 P1-②：答案 ack 的真相源已改为组装阶段（`build_lead_context_prompt_for_session`）
+/// Use answer identifiers returned by build_lead_context_prompt_for_session as the acknowledgment source of truth.
 /// 直接返回的 `assembly.included_answer_ids`——在 `start_lead_session` 自己 spawn 出的
 /// runner 线程内、同一线程就地捕获进 `in_flight_answer_ids_t`，收尾 ack
 /// （`commit_lead_run_delivery`）直接消费这个变量。原「调用方登记 + EOF 处跨线程 take」
@@ -208,7 +216,7 @@ fn try_resume_pending_never_clears_backoff_on_bare_start_success() {
 /// `ResumeState.in_flight_answer_ids`）已整套删除——同线程 happens-before 天然消灭了
 /// 「登记晚于取用」的竞态窗口，不需要再靠跨线程状态传递。
 ///
-/// T8-fix（可杀变异加固）：原断言只验证「捕获行早于 ack 调用行」——两个 `find` 各自成立、
+/// Checking capture order alone cannot prove that acknowledgment consumes the captured answer identifiers.
 /// 顺序也成立，但如果把 EOF 处 ack 的真实实参悄悄换回全局 `take_in_flight_answer_ids(...)`
 /// （捕获行留在原地变成死代码），旧断言测不出来。补两条：① 直接抠出
 /// `commit_lead_run_delivery(` 调用的实参文本，断言答案位置的实参就是
@@ -216,21 +224,40 @@ fn try_resume_pending_never_clears_backoff_on_bare_start_success() {
 /// 全局侧信道符号一个都不许再出现——真要开历史倒车也得先让这条测试失败。
 #[test]
 fn resume_pending_start_lead_session_captures_assembly_answer_ids_before_ack() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let stripped = strip_comments_and_strings(production);
-    let label = "start_lead_session";
-    let body = extract_fn_body(&stripped, "\nfn start_lead_session(", label);
-    let capture_idx = body
-        .find("in_flight_answer_ids_t = assembly.included_answer_ids;")
-        .expect("组装阶段必须把 assembly.included_answer_ids 捕获进 in_flight_answer_ids_t");
+    let runner = strip_comments_and_strings(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_session/runner_thread.rs"
+    )));
+    let stream = strip_comments_and_strings(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_session/stream_closeout.rs"
+    )));
+    let assembly = extract_fn_body(&runner, "fn assemble_lead_prompt(", "assemble_lead_prompt");
+    assert!(assembly.contains("in_flight_answer_ids_t = assembly.included_answer_ids;"));
+    assert!(assembly.contains("included_answer_ids: in_flight_answer_ids_t,"));
+    let spawn = extract_fn_body(&runner, "fn spawn_lead_runner(", "spawn_lead_runner");
+    assert!(spawn.contains("let in_flight_answer_ids_t = assembly.included_answer_ids;"));
+    let delivery = source_window(spawn, "delivery: LeadDelivery {", "}");
+    assert!(delivery.contains("in_flight_answer_ids_t,"));
+    let run = extract_fn_body(&runner, "fn run_lead_runner(", "run_lead_runner");
+    assert!(run.contains("delivery,"));
+    assert!(run.contains("persist_lead_closeout(ctx, closeout, delivery, mcp_srv)"));
+    let body = extract_fn_body(
+        &stream,
+        "fn persist_lead_closeout(",
+        "persist_lead_closeout",
+    );
+    let delivery = body
+        .split("let LeadDelivery {")
+        .nth(1)
+        .expect("delivery consumption")
+        .split_once("} = delivery;")
+        .expect("delivery destructuring boundary")
+        .0;
+    assert!(delivery.contains("in_flight_answer_ids_t,"));
     let ack_idx = body
         .find("commit_lead_run_delivery(")
         .expect("收尾必须调用 commit_lead_run_delivery");
-    assert!(
-        capture_idx < ack_idx,
-        "assembly.included_answer_ids 的捕获必须先于收尾 ack 调用"
-    );
 
     // ①：答案实参必须是 assembly 派生变量本身，不能悄悄换回全局 take_*() 侧信道调用。
     let call_end = body[ack_idx..]
@@ -245,33 +272,41 @@ fn resume_pending_start_lead_session_captures_assembly_answer_ids_before_ack() {
     );
 
     // ②：三个旧全局侧信道符号在全部生产代码（非注释/非测试）里必须零出现。
+    // Recursively scans every .rs under src (including modules split out of lib.rs before
+    // this change) instead of a hand-picked file list.
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let sources = source_scanner::production_sources(&src_dir);
     for banned in [
         "record_in_flight_answer_ids",
         "take_in_flight_answer_ids",
         "in_flight_answer_ids:",
     ] {
         assert!(
-            !stripped.contains(banned),
+            !sources
+                .iter()
+                .any(|source| strip_comments_and_strings(&source.production).contains(banned)),
             "生产代码不得再出现全局侧信道符号 `{banned}`——真相源已改为 \
                  assembly.included_answer_ids 同线程直接捕获，别开历史倒车"
         );
     }
 }
 
-/// T5-fix C 的调用方侧镜像：`try_resume_pending_with_gate` 把联合快照读到的 `answer_ids`
+/// Pass the atomic snapshot's answer_ids through try_resume_pending_with_gate into start_lead_session.
 /// 随 `start_lead_session(...)` 调用一起移交（`Some(answer_ids)`），由被调用方在自己的
 /// runner 线程内、组装阶段就地消费——不需要调用方自己另外登记任何跨线程状态。
 #[test]
 fn resume_pending_with_gate_carries_answer_ids_into_start_lead_session_not_after() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let body = production
-        .split("fn try_resume_pending_with_gate(")
-        .nth(1)
-        .unwrap()
-        .split("\nfn try_resume_pending(")
-        .next()
-        .unwrap();
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/delivery_drain.rs"
+    ));
+    let body = source
+        .split_once("pub(super) fn try_resume_pending_with_gate(")
+        .expect("missing try_resume_pending_with_gate start anchor in lib/delivery_drain.rs")
+        .1
+        .split_once("\npub(super) fn try_resume_pending(")
+        .expect("missing try_resume_pending end anchor in lib/delivery_drain.rs")
+        .0;
     assert!(
         body.contains("Some(answer_ids)"),
         "answer_ids 必须作为参数随 start_lead_session 调用一起传入，供被调用方在组装阶段\
@@ -280,7 +315,7 @@ fn resume_pending_with_gate_carries_answer_ids_into_start_lead_session_not_after
 }
 
 // ---------------------------------------------------------------------------------------
-// T4：统一自动恢复状态机 try_resume_pending —— F1-F7。
+// Verify that try_resume_pending preserves the shared automatic resume state machine's invariants.
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -315,15 +350,17 @@ fn resume_pending_origin_for_neither_reason_is_none() {
 #[test]
 fn try_resume_pending_with_gate_starts_lead_session_at_most_once() {
     // F1：两原因并存时源码上只有一处 start_lead_session 调用——不可能分叉成两轮。
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let body = production
-        .split("fn try_resume_pending_with_gate(")
-        .nth(1)
-        .unwrap()
-        .split("\nfn try_resume_pending(")
-        .next()
-        .unwrap();
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/delivery_drain.rs"
+    ));
+    let body = source
+        .split_once("pub(super) fn try_resume_pending_with_gate(")
+        .expect("missing try_resume_pending_with_gate start anchor in lib/delivery_drain.rs")
+        .1
+        .split_once("\npub(super) fn try_resume_pending(")
+        .expect("missing try_resume_pending end anchor in lib/delivery_drain.rs")
+        .0;
     assert_eq!(
         body.matches("start_lead_session(").count(),
         1,
@@ -450,7 +487,7 @@ fn resume_pending_timer_armed_when_missing_and_skips_when_already_armed() {
 
 #[test]
 fn resume_pending_answer_ids_register_and_ack_round_trip() {
-    // F4（T8 P1-②更新）：register 之后未 ack 前 id 一直可见（不在 spawn 前被消费）；ack
+    // Registered answer identifiers remain visible until acknowledgment, including before the runner spawns.
     // 精确摘除指定 id，未 ack 的留下。原「in_flight 快照 take」全局侧信道已删——答案 ack
     // 的真相源改为 lead runner 线程内组装阶段直接捕获的 `assembly.included_answer_ids`，
     // 不再需要跨线程登记/取用这一步。
@@ -475,15 +512,17 @@ fn try_resume_pending_with_gate_bypass_ignores_not_before_but_normal_gates() {
     // 只测门本身的纯判定：Normal 在 not_before 未到期时必须被挡（同
     // `note_resume_failure_gates_not_before_until_elapsed`），Bypass 不查 not_before——
     // 源码断言其判门只在 `gate == ResumeGate::Normal` 分支里出现。
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let body = production
-        .split("fn try_resume_pending_with_gate(")
-        .nth(1)
-        .unwrap()
-        .split("\nfn try_resume_pending(")
-        .next()
-        .unwrap();
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/delivery_drain.rs"
+    ));
+    let body = source
+        .split_once("pub(super) fn try_resume_pending_with_gate(")
+        .expect("missing try_resume_pending_with_gate start anchor in lib/delivery_drain.rs")
+        .1
+        .split_once("\npub(super) fn try_resume_pending(")
+        .expect("missing try_resume_pending end anchor in lib/delivery_drain.rs")
+        .0;
     assert!(
         body.contains("if gate == ResumeGate::Normal && !resume_not_before_allows(session_id) {"),
         "not_before 门必须只在 gate==Normal 时生效，Bypass 必须绕过"
@@ -494,15 +533,17 @@ fn try_resume_pending_with_gate_bypass_ignores_not_before_but_normal_gates() {
 fn try_resume_pending_busy_does_not_count_as_failure() {
     // F7：busy 不计入失败——源码断言 try_resume_pending/try_resume_after_answer 的 busy 分支
     // 都不调 record_resume_failure/note_resume_failure。
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let body = production
-        .split("fn try_resume_pending(app: &AppHandle, session_id: &str) {")
-        .nth(1)
-        .unwrap()
-        .split("\n/// T4：run 槽释放后的统一排空咽喉")
-        .next()
-        .unwrap();
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/delivery_drain.rs"
+    ));
+    let body = source
+        .split_once("pub(super) fn try_resume_pending(app: &AppHandle, session_id: &str) {")
+        .expect("missing try_resume_pending start anchor in lib/delivery_drain.rs")
+        .1
+        .split_once("\npub(super) fn drain_after_run_release(")
+        .expect("missing drain_after_run_release end anchor in lib/delivery_drain.rs")
+        .0;
     let busy_branch = body
         .split("Some((_, Err(e))) if autofeed_busy_error(&e) => {}")
         .nth(1)
@@ -518,7 +559,7 @@ fn try_resume_pending_busy_does_not_count_as_failure() {
 }
 
 // ---------------------------------------------------------------------------------------
-// T4-fix：skeptic 抓的两个 T4 真洞——A（DB 错误/timer 线程失败永等）、B（联合原子快照 +
+// Guard against indefinite waits after database or timer failures and loss of atomic answer snapshots.
 // in-flight 覆盖）。
 // ---------------------------------------------------------------------------------------
 
@@ -533,15 +574,17 @@ fn try_resume_pending_with_gate_snapshot_db_error_records_no_failure_recheck_sti
     // 边沿，pending 报告/答案就会永远悬空。
     // 用 `let candidate = candidate?;` 把函数体切成「快照段」与「其余段（含 recheck）」两半，
     // 分别断言：快照段里一次 record_resume_failure 都不能有；其余段里必须恰好一次。
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let body = production
-        .split("fn try_resume_pending_with_gate(")
-        .nth(1)
-        .unwrap()
-        .split("\nfn try_resume_pending(")
-        .next()
-        .unwrap();
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/delivery_drain.rs"
+    ));
+    let body = source
+        .split_once("pub(super) fn try_resume_pending_with_gate(")
+        .expect("missing try_resume_pending_with_gate start anchor in lib/delivery_drain.rs")
+        .1
+        .split_once("\npub(super) fn try_resume_pending(")
+        .expect("missing try_resume_pending end anchor in lib/delivery_drain.rs")
+        .0;
     let (snapshot_segment, rest) = body
         .split_once("let candidate = candidate?;")
         .expect("必须能找到快照段与 recheck 段的分界点");
@@ -584,15 +627,17 @@ fn try_resume_pending_with_gate_snapshot_db_error_records_no_failure_recheck_sti
 fn try_resume_pending_with_gate_arms_timer_when_not_before_gate_blocks() {
     // C：命中 not_before 门时必须确认/补武装 timer——防唤醒丢失。删掉 gate 内那次
     // `ensure_resume_timer_armed` 调用要能让本测试变红（skeptic 点名的可杀变异测试）。
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let body = production
-        .split("fn try_resume_pending_with_gate(")
-        .nth(1)
-        .unwrap()
-        .split("\nfn try_resume_pending(")
-        .next()
-        .unwrap();
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/delivery_drain.rs"
+    ));
+    let body = source
+        .split_once("pub(super) fn try_resume_pending_with_gate(")
+        .expect("missing try_resume_pending_with_gate start anchor in lib/delivery_drain.rs")
+        .1
+        .split_once("\npub(super) fn try_resume_pending(")
+        .expect("missing try_resume_pending end anchor in lib/delivery_drain.rs")
+        .0;
     let gate_idx = body
         .find("if gate == ResumeGate::Normal && !resume_not_before_allows(session_id) {")
         .expect("必须能找到 not_before 门判断");
@@ -614,15 +659,17 @@ fn try_resume_pending_with_gate_answer_ids_snapshotted_while_conn_lock_held() {
     // 内部完成，而不是等 conn 锁释放之后（`let (candidate, answer_ids) = match snapshot`
     // 之后）再单独另取一次全局 map——否则两次读取之间会给答案点击/report ack 留出穿插
     // 空当，「两原因原子快照」就只是名义上的。
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let body = production
-        .split("fn try_resume_pending_with_gate(")
-        .nth(1)
-        .unwrap()
-        .split("\nfn try_resume_pending(")
-        .next()
-        .unwrap();
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/delivery_drain.rs"
+    ));
+    let body = source
+        .split_once("pub(super) fn try_resume_pending_with_gate(")
+        .expect("missing try_resume_pending_with_gate start anchor in lib/delivery_drain.rs")
+        .1
+        .split_once("\npub(super) fn try_resume_pending(")
+        .expect("missing try_resume_pending end anchor in lib/delivery_drain.rs")
+        .0;
 
     let conn_arm_idx = body
         .find("Ok(conn) => match snapshot_resume_candidate(&conn, session_id) {")
@@ -647,27 +694,29 @@ fn try_resume_pending_with_gate_answer_ids_snapshotted_while_conn_lock_held() {
 
 #[test]
 fn resume_pending_with_gate_answer_ids_carried_as_start_lead_session_call_argument() {
-    // B（in-flight 覆盖洞，T4-fix B 原始动机）：答案 id 快照必须随 `start_lead_session(...)`
+    // Transfer the answer identifier snapshot as part of the start_lead_session call to prevent overwrite races.
     // 这一次调用整体移交，由被调用方在自己的 runner 线程内、组装阶段就地消费——不能等
     // 调用返回之后、被 `result.is_ok()` 收窄才在这里另起炉灶处理（busy/prespawn 早退路径
     // 天然到不了那种「事后处理」代码，「busy 不覆盖既有集合」的语义靠这一点自然保留）。
-    // T8 P1-②：真相源已改为组装阶段直接返回的 `assembly.included_answer_ids`（同线程
+    // assembly.included_answer_ids is the source of truth captured within the runner thread.
     // 捕获），调用方这一侧不需要也不该再自己维护任何跨调用的答案 id 状态。
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let body = production
-        .split("fn try_resume_pending_with_gate(")
-        .nth(1)
-        .unwrap()
-        .split("\nfn try_resume_pending(")
-        .next()
-        .unwrap();
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/delivery_drain.rs"
+    ));
+    let body = source
+        .split_once("pub(super) fn try_resume_pending_with_gate(")
+        .expect("missing try_resume_pending_with_gate start anchor in lib/delivery_drain.rs")
+        .1
+        .split_once("\npub(super) fn try_resume_pending(")
+        .expect("missing try_resume_pending end anchor in lib/delivery_drain.rs")
+        .0;
 
     let start_idx = body
         .find("start_lead_session(")
         .expect("必须有 start_lead_session 调用");
     // 只在调用点之后找「实参」——`body` 里调用前的注释也会提到 `Some(answer_ids)`
-    // 字样（T8-fix 重写注释引入），若从整个 body 头部找会误配到注释而非真实调用参数。
+    // Search after the call site so comment mentions cannot be mistaken for actual call arguments.
     let carry_idx = body[start_idx..]
         .find("Some(answer_ids)")
         .map(|idx| idx + start_idx)
@@ -728,15 +777,17 @@ fn resume_pending_timer_spawn_failure_leaves_superseded_generation_alone() {
 fn arm_resume_timer_with_spawn_failure_calls_reset_helper() {
     // 生产调用点断言：线程创建失败分支必须调用 note_resume_timer_spawn_failed 兜底复原，
     // 光有上面两条纯状态测试挡不住「生产代码压根没接这个 helper」的回归。
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let body = production
-        .split("fn arm_resume_timer_with<F>(")
-        .nth(1)
-        .unwrap()
-        .split("\nfn arm_resume_timer(")
-        .next()
-        .unwrap();
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/autofeed_resume.rs"
+    ));
+    let body = source
+        .split_once("pub(super) fn arm_resume_timer_with<F>(")
+        .expect("missing arm_resume_timer_with start anchor in lib/autofeed_resume.rs")
+        .1
+        .split_once("\nfn arm_resume_timer(")
+        .expect("missing arm_resume_timer end anchor in lib/autofeed_resume.rs")
+        .0;
     assert!(
         body.contains("note_resume_timer_spawn_failed("),
         "线程创建失败分支必须调用兜底复原 helper"

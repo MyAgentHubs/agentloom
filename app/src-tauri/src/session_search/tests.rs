@@ -358,8 +358,8 @@ fn search_sessions_gated_proceeds_for_newer_seq() {
 
 /// 命中词落在一条超大文本（约 3MB，模拟用户库实测最大单条
 /// 消息）末尾时，查询不应把全文拉进 Rust 处理——SQL 侧先用 `instr`/`substr`
-/// 切出命中窗口，摘要仍正确定位命中词，且整体查询耗时应远低于旧实现在同
-/// 量级文本上报告的 600~900ms（这里用宽松阈值防抖动，不苛求绝对下限）。
+/// 切出命中窗口，摘要仍正确定位命中词。守的是这条结构性质本身（SQL -> Rust
+/// 边界上跨过来的文本字符数），不靠墙钟毫秒数断言（曾在高负载下偶发假红）。
 #[test]
 fn large_text_match_near_end_is_fast_and_snippet_is_correct() {
     let c = crate::test_support::mem_db();
@@ -373,9 +373,9 @@ fn large_text_match_near_end_is_fast_and_snippet_is_correct() {
     )
     .unwrap();
 
-    let start = std::time::Instant::now();
+    let _ = take_via_fts_row_text_chars_high_watermark(); // reset before the call under test
     let results = search_sessions_inner(&c, "定罪关键词", 20).unwrap();
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let row_text_chars = take_via_fts_row_text_chars_high_watermark();
 
     assert_eq!(results.len(), 1);
     assert!(
@@ -389,8 +389,12 @@ fn large_text_match_near_end_is_fast_and_snippet_is_correct() {
         results[0].snippet.chars().count()
     );
     assert!(
-        elapsed_ms < 50.0,
-        "命中超大文本不应把全文拉进 Rust 处理，实测 {elapsed_ms:.1}ms"
+        row_text_chars > 0,
+        "the FTS path must have been exercised; a fallback path would leave the watermark at 0 and pass vacuously"
+    );
+    assert!(
+        row_text_chars < 400,
+        "SQL 应先用 substr 窗口化再交给 Rust，不应把 ~1.4M 字符整段正文读进 Rust：实测 {row_text_chars} 字符"
     );
 }
 

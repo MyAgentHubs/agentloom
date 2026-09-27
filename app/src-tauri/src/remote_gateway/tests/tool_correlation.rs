@@ -63,6 +63,8 @@ fn tool_started_name_survives_generation_change_and_completed_removes_it() {
                 session_id: "sess-1".to_owned(),
                 run_id: "run-1".to_owned(),
                 dispatch: None,
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![
                     crate::event_transport::SequencedEvent {
                         seq: 2,
@@ -188,6 +190,8 @@ fn completed_and_run_closeout_purge_only_their_run_correlations() {
                     session_id: "sess-1".to_owned(),
                     run_id: "run-completed".to_owned(),
                     dispatch: None,
+                    agent_id: None,
+                    agent_name_snapshot: None,
                     events: vec![crate::event_transport::SequencedEvent {
                         seq: 1,
                         event: AgentEvent::Completed {
@@ -209,6 +213,8 @@ fn completed_and_run_closeout_purge_only_their_run_correlations() {
                     session_id: "sess-1".to_owned(),
                     run_id: "run-closeout".to_owned(),
                     dispatch: None,
+                    agent_id: None,
+                    agent_name_snapshot: None,
                     events: vec![crate::event_transport::SequencedEvent {
                         seq: 2,
                         event: AgentEvent::RunCloseout {

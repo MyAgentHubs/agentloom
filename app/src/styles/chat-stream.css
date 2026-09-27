@@ -1,0 +1,479 @@
+/* Claude Code style: chat content centered at a 760px reading width (neither squeezed nor overflowing) + scrollbar flush to main's right edge
+   Strategy: .stream-wrap takes over the session flex slot, .stream fills main with vertical-only padding; max-width 760 is centered inside .turn (horizontal padding belongs to .turn itself),
+   so the scrollbar is attached to .stream's right edge while .stream fills main = visually, "the scrollbar is at main's right side" (matching Claude) */
+.stream-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.stream {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  /* Task 6: 24px at the bottom gives the composer natural spacing · 8px at the top prevents overlap with .session__head */
+  padding: 8px 0 24px;
+  /* Attempted fix · asymmetric left/right whitespace: .stream is the only ancestor with a scrollbar (.composer is its scrollbar-free sibling),
+     so in classic scrollbar mode the scrollbar consumes width only on the right → the centering axis of .turn's margin:auto shifts left relative to .composer,
+     visually, "right margin > left margin." stable both-edges reserves slots on both sides to preserve symmetry; in overlay scrollbar mode the slots are 0, with no side effect.
+     GUI testing has not been performed; the specific result depends on the system scrollbar mode + WebKit scrollbar-gutter support. */
+  scrollbar-gutter: stable both-edges;
+}
+.turn {
+  margin: 0 auto 16px;
+  max-width: var(--content-max);
+  padding: 0 var(--content-padding);
+  /* perf: WKWebView skips rendering/rasterization of messages outside the viewport, decoupling blank-screen duration from total message count.
+     contain-intrinsic-size gives off-viewport elements an estimated placeholder height (keeping scrollHeight calculable).
+     ⚠ Interaction with useAutoScroll's scrollHeight/automatic scroll-to-bottom needs GUI verification. */
+  content-visibility: auto;
+  contain-intrinsic-size: 0 200px;
+}
+.turn__author {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 4px;
+}
+.turn__role {
+  display: inline-flex;
+  align-items: center;
+  height: 16px;
+  padding: 0 6px;
+  border: 1px solid rgba(217, 119, 87, 0.28);
+  border-radius: 4px;
+  background: rgba(217, 119, 87, 0.08);
+  color: var(--ink-2);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  letter-spacing: 0.01em;
+}
+.turn__working {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  height: 18px;
+  padding: 0 7px;
+  border: 1px solid rgba(106, 155, 92, 0.24);
+  border-radius: 999px;
+  background: rgba(106, 155, 92, 0.1);
+  color: var(--green);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+}
+.turn__working-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: turn-working-pulse 0.9s ease-in-out infinite;
+}
+@keyframes turn-working-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.82);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.18);
+  }
+}
+.agent-avatar {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9.5px;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+}
+.agent-avatar svg {
+  width: 60%;
+  height: 60%;
+}
+.agent-avatar--user {
+  background: #8a8580;
+}
+.agent-avatar--claude {
+  background: linear-gradient(135deg, #e08562, #c5634a);
+}
+.agent-avatar--codex {
+  background: #1a1a1a;
+}
+.agent-avatar--deepseek {
+  background: #4d6bfe;
+}
+.agent-avatar--unknown {
+  background: var(--bg-sunken);
+  color: var(--ink-3);
+}
+/* `AgentAvatar`'s assistant glyph (`kind="assistant"` →
+ * `.agent-avatar--assistant`) has no matching background rule—its white glyph is invisible against a transparent background. Desktop currently does not pass the literal
+ * "assistant" (see the AgentAvatar.tsx comment); adding this is a fallback for a future desktop that does pass assistant, consistent with --unknown. */
+.agent-avatar--assistant {
+  background: var(--bg-sunken);
+  color: var(--ink-3);
+}
+.composer__agent .agent-avatar,
+.dd__item .agent-avatar {
+  width: 15px;
+  height: 15px;
+}
+.turn__name {
+  font-size: 11px;
+  color: var(--ink-3);
+}
+/* A horizontal row of small icons below each message (copy / export markdown), modeled on Claude's message action bar.
+   Hidden by default and fades in only when the message is hovered—but WKWebView's CSS :hover pseudo-class can remain "stuck" instead of clearing,
+   so visibility is driven by JS (MessageStream's onMouseEnter/Leave toggles .turn--hovered),
+   while :focus-within is retained (keyboard accessible + remains visible briefly after clicking a button). */
+.turn__actions {
+  margin-top: 6px;
+  display: inline-flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.turn--hovered .turn__actions,
+.turn:focus-within .turn__actions {
+  opacity: 1;
+}
+.turn__act {
+  display: inline-flex;
+  padding: 4px;
+  border-radius: 6px;
+  background: none;
+  border: none;
+  color: var(--ink-3);
+  cursor: pointer;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
+}
+.turn__act:hover {
+  background: var(--bg-sunken);
+  color: var(--ink-2);
+}
+.turn__act svg {
+  width: 16px;
+  height: 16px;
+}
+.scrollbtns {
+  position: absolute;
+  right: 18px;
+  bottom: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 5;
+}
+.scrollbtn {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: rgba(255, 254, 251, 0.92);
+  border: 1px solid var(--line);
+  box-shadow: 0 2px 8px rgba(28, 26, 23, 0.12);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink-2);
+  cursor: pointer;
+}
+.scrollbtn:hover {
+  background: var(--panel);
+}
+.scrollbtn svg {
+  width: 15px;
+  height: 15px;
+}
+.turn__text {
+  color: var(--ink);
+  font-size: 13.5px;
+  line-height: 1.7;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.turn__text p,
+.turn__text li {
+  color: var(--ink-2);
+}
+.turn__text blockquote p,
+.turn__text blockquote li {
+  color: inherit;
+}
+.turn__text strong,
+.turn__text b {
+  color: var(--ink);
+  font-weight: 600;
+}
+.turn__text p {
+  margin: 0 0 10px;
+}
+.turn__text h1,
+.turn__text h2,
+.turn__text h3,
+.turn__text h4,
+.turn__text h5,
+.turn__text h6 {
+  color: var(--ink);
+  font-weight: 600;
+}
+.turn__text h1 {
+  font-size: 17px;
+  line-height: 1.35;
+  margin: 16px 0 6px;
+}
+.turn__text h2 {
+  font-size: 15px;
+  margin: 15px 0 6px;
+}
+.turn__text h3 {
+  font-size: 14px;
+  margin: 14px 0 6px;
+}
+.turn__text h4,
+.turn__text h5,
+.turn__text h6 {
+  font-size: 13px;
+  margin: 12px 0 5px;
+}
+.turn__text > :is(h1, h2, h3, h4, h5, h6):first-child {
+  margin-top: 0;
+}
+.turn__text ul,
+.turn__text ol {
+  margin: 6px 0 10px;
+  padding-left: 20px;
+}
+.turn__text li {
+  margin: 2px 0;
+}
+.turn__text a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid var(--accent-soft);
+}
+.turn__text blockquote {
+  border-left: 3px solid var(--line);
+  padding: 4px 0 4px 12px;
+  margin: 8px 0;
+  color: var(--ink-3);
+}
+.turn__text hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 16px 0;
+}
+.turn__text code.inline {
+  border-radius: 3px;
+  padding: 1px 5px;
+  background: var(--bg-sunken);
+  color: var(--ink);
+  font-family: "SF Mono", monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.turn__text > pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.inline-path {
+  cursor: pointer;
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+}
+.inline-path:hover {
+  text-decoration-style: solid;
+}
+/* user messages = left-aligned light-beige rounded bubbles (option A); agent retains same-column-width prose.
+   The avatar + "You" row is already rendered by .turn__author and remains symmetrical with agent (option X).
+   Bubbles fit their content (fit-content); long sentences can fill the same message column. */
+.turn--user .turn__text {
+  background: var(--bg-sunken);
+  border-radius: 12px;
+  padding: 9px 13px;
+  width: fit-content;
+  max-width: 100%;
+}
+.turn--user .turn__text > :last-child {
+  margin-bottom: 0;
+}
+/* The bubble background and the default inline-code background both use --bg-sunken and clash → change inline code inside bubbles to white-background chips */
+.turn--user .turn__text code.inline {
+  background: var(--panel);
+}
+/* The hover background of the huge-text collapse toggle also uses --bg-sunken; hovering inside a bubble clashes with the bubble background
+   and makes feedback invisible → use the same white background inside bubbles (following the inline-code precedent above). */
+.turn--user .turn__text .huge-text__toggle:hover {
+  background: var(--panel);
+}
+.turn__streaming {
+  margin: 0;
+  color: var(--ink-2);
+  font-family: inherit;
+  font-size: 13.5px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.mm-table-wrap {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow-x: auto;
+  max-width: 100%;
+  margin: 8px 0;
+}
+.mm-table-wrap table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  table-layout: auto;
+}
+.mm-table-wrap th {
+  border-bottom: 1px solid var(--line);
+  padding: 8px 12px;
+  background: var(--bg-sunken);
+  color: var(--ink-2);
+  font-size: 11.5px;
+  font-weight: 600;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.mm-table-wrap td {
+  border-bottom: 1px solid var(--line-soft, var(--line));
+  padding: 8px 12px;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.mm-table-wrap tr:last-child td {
+  border-bottom: none;
+}
+.mm-table-wrap tr:hover td {
+  background: var(--bg);
+}
+.mermaid-block {
+  display: flex;
+  justify-content: center;
+  overflow-x: auto;
+  padding: 10px 0;
+}
+.mermaid-block svg {
+  max-width: 100%;
+  height: auto;
+}
+.mermaid-block__pre {
+  margin: 6px 0;
+  padding: 10px 12px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow-x: auto;
+  font-family: "SF Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--ink-2);
+  white-space: pre;
+}
+/* cluster 05 plan A · code block (matches multimodal .mm-code · light warm background #efe7d6 · softened from warm dark brown #28201a) */
+.mm-code {
+  background: #efe7d6;
+  border-radius: 8px;
+  overflow: hidden;
+  margin: 8px 0;
+  box-shadow: inset 0 0 0 1px rgba(53, 45, 37, 0.08);
+}
+.mm-code-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: rgba(53, 45, 37, 0.04);
+  border-bottom: 1px solid rgba(53, 45, 37, 0.08);
+}
+.mm-code-head .lang {
+  font-family: "SF Mono", monospace;
+  font-size: 10px;
+  color: #7a715f;
+}
+.mm-code-head .sp {
+  flex: 1;
+}
+.mm-code-head .btn {
+  border: 0;
+  border-radius: 4px;
+  padding: 2px 7px;
+  background: transparent;
+  color: #7a715f;
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+}
+.mm-code-head .btn:hover {
+  background: rgba(53, 45, 37, 0.07);
+}
+.mm-code pre {
+  margin: 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  color: #352d25;
+  font-family: "SF Mono", monospace;
+  font-size: 11.5px;
+  line-height: 1.6;
+  white-space: pre;
+}
+.mm-code-line {
+  display: block;
+  white-space: pre;
+}
+.mm-code .ln {
+  display: inline-block;
+  width: 30px;
+  color: #a89e84;
+  user-select: none;
+}
+.mm-code .tx {
+  color: #352d25;
+}
+.mm-code-expand {
+  width: 100%;
+  border: 0;
+  border-top: 1px solid rgba(53, 45, 37, 0.08);
+  padding: 7px 12px;
+  background: rgba(53, 45, 37, 0.025);
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+}
+.mm-code-expand:hover {
+  background: rgba(53, 45, 37, 0.05);
+}
+/* Claude Code style: the input area has no top divider (padding creates a natural transition from chat content · no visual separation)
+   its inner max-width 760 is centered to align with chat content (the same reading guide) */
+.composer {
+  max-width: calc(var(--content-max) + var(--content-padding) * 2);
+  margin: 0 auto;
+  width: 100%;
+  padding: 0 var(--content-padding) 14px;
+  box-sizing: border-box;
+}

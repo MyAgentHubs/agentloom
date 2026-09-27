@@ -162,9 +162,9 @@ describe("App", () => {
 
     const defaultInvoke = invokeMock.getMockImplementation();
     invokeMock.mockImplementation((cmd: string, args?: any) => {
-      // T3：solo 会话没有持久化 lead 配置——后端 try_resume_after_answer 的门天然关闭，
-      // 回 resumed:false；迟到答案已由 commit_late_answer 落成真实 user 消息，留给下一轮
-      // 普通 run 自然消费。
+      // A solo session has no persisted lead config, so the backend try_resume_after_answer gate is closed
+      // and returns resumed:false. commit_late_answer has already committed the late answer as a real user
+      // message for the next ordinary run to consume naturally.
       if (cmd === "answer_lead_question")
         return Promise.resolve({
           resumed: false,
@@ -285,8 +285,8 @@ describe("App", () => {
 
     const defaultInvoke = invokeMock.getMockImplementation();
     invokeMock.mockImplementation((cmd: string, args?: any) => {
-      // T3：team 会话（有持久化 lead 配置）——后端 try_resume_after_answer 门开，落库成功
-      // 后自己触发续跑，answer_lead_question 直接回 resumed:true。
+      // A team session has persisted lead config, so the backend try_resume_after_answer gate is open;
+      // committing the answer triggers its own resume, and answer_lead_question directly reports resumed:true.
       if (cmd === "answer_lead_question")
         return Promise.resolve({
           resumed: true,

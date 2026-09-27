@@ -52,11 +52,11 @@ fn broker_t1_resolve_identity_falls_back_when_unset() {
     );
 }
 
-/// R-B1 项 1（Major-1·交付闸门 fail-open 修复）：agent 在全新空子目录里 `git init` 是
-/// 常规动作（准备 clone 点什么进去）。一旦某个 checkpoint 路径落在这样一个嵌套仓内部，
-/// `git status` 对指向嵌套仓内部的 pathspec 恒吐空、退出码 0——不是「无变化」，是外层
-/// 仓库的 status 压根不下钻进这条边界。修复前，空输出被直接当「干净」放行；修复后必须
-/// 用 `git ls-files --error-unmatch` 核实索引真跟踪与否，未跟踪 + 磁盘上有文件 → 判脏。
+/// Git status can return empty output for paths inside a nested repository because
+/// the outer repository does not inspect that boundary. Empty output must not let
+/// uncommitted checkpoint content pass the delivery gate as clean.
+/// Check index membership with `git ls-files --error-unmatch`; an untracked path
+/// that exists on disk must be classified as dirty.
 #[test]
 fn checkpoint_path_dirty_states_treats_nested_git_repo_blind_spot_as_dirty() {
     let _env_lock = super::super::test_home_lock();
@@ -85,10 +85,10 @@ fn checkpoint_path_dirty_states_treats_nested_git_repo_blind_spot_as_dirty() {
     );
 }
 
-/// R-B3 项 4（Minor-4·悬空符号链接 fail-open）：与上一条同款嵌套仓盲区，但账本路径是一个
-/// 指向不存在目标的悬空 symlink——`Path::exists()` 跟随链接、解析目标失败会返回 false，
-/// 让「没跟踪但磁盘上确实有文件」这条 fail-closed 兜底对悬空 symlink 失效、误判成干净。
-/// 改用 `symlink_metadata`（不跟随链接，只问「这个路径本身是否有 inode」）后必须判脏。
+/// A dangling symlink inside a nested repository must still count as dirty
+/// checkpoint content even when git status returns no output for that path.
+/// `Path::exists()` follows the missing target and hides the link, so the fallback
+/// must use `symlink_metadata` to detect the link itself without following it.
 #[test]
 fn checkpoint_path_dirty_states_treats_dangling_symlink_in_blind_spot_as_dirty() {
     let _env_lock = super::super::test_home_lock();
@@ -250,6 +250,61 @@ fn local_git_filter_drivers_tolerates_unavailable_worktree_scope() {
     let _ = std::fs::remove_dir(&empty_home);
 
     assert!(drivers.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn hardened_git_write_prefix_matches_literal_expected_values() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Deliberate double bookkeeping: this literal must be updated by hand whenever
+    // HARDENED_GIT_WRITE_PREFIX (worktree/git_write.rs) changes, so that an accidental deletion
+    // of a hardening flag turns this test red instead of silently passing. Do not rewrite this to
+    // compare the constant against itself, which is the bug this test guards against.
+    let expected: [&str; 8] = [
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "gc.auto=false",
+    ];
+    assert_eq!(HARDENED_GIT_WRITE_PREFIX, expected);
+
+    // Route local_git_filter_drivers (real production code that applies
+    // HARDENED_GIT_WRITE_PREFIX to a live Command) through a recording shim standing in for
+    // `git`, so we assert on the literal argv a real invocation receives rather than re-deriving
+    // it from the constant under test.
+    let tmp = tempfile::tempdir().unwrap();
+    let worktree = tmp.path().join("worktree");
+    std::fs::create_dir(&worktree).unwrap();
+    let record = tmp.path().join("recorded-args");
+    let shim = tmp.path().join("git-shim.sh");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nexit 1\n",
+            record.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&shim, permissions).unwrap();
+    let empty_home = empty_git_home().unwrap();
+
+    let _ = local_git_filter_drivers(&shim, &worktree, &empty_home);
+    let _ = std::fs::remove_dir(&empty_home);
+
+    let recorded = std::fs::read_to_string(&record).unwrap();
+    let args = recorded.lines().map(str::to_owned).collect::<Vec<_>>();
+    assert!(
+        args.windows(expected.len())
+            .any(|window| window == expected),
+        "local_git_filter_drivers did not apply the hardened write prefix in order: {args:?}"
+    );
 }
 
 #[test]

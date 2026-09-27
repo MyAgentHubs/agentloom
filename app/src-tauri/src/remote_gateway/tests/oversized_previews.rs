@@ -121,12 +121,12 @@ fn downgrade_to_preview_payload_falls_back_to_notice_only_when_actionable_blocks
     assert_eq!(blocks[0]["text"], OVERSIZED_PREVIEW_TRUNCATION_NOTICE);
 }
 
-/// msgfix1 T3 返修 P1-1：history 口的同一变异（巨型 actionable 块本身就超预算）此前不
-/// 转红——`build_history_page_with_limit` 的二次退化在返修前直接丢行（P0-1），只有
-/// msg.completed 口的 `downgrade_to_preview_payload_falls_back_to_notice_only_when_
-/// actionable_blocks_still_overflow` 能抓到这个变异。这里走真实 history 分页函数端到端
-/// 验证：巨型 decision_card 单独就超 `HISTORY_SEND_BUDGET_BYTES`，preview（原样保留
-/// actionable 块）仍超预算，必须退化到"仅提示块 + content_ref"而不是从页面里消失。
+/// Exercise `build_history_page_with_limit` when an actionable block alone exceeds
+/// `HISTORY_SEND_BUDGET_BYTES`. Preserving that block in a preview still exceeds budget,
+/// so the row must fall back to a notice with content_ref instead of disappearing.
+/// This checks the history pagination path in addition to the completed-message case
+/// `downgrade_to_preview_payload_falls_back_to_notice_only_when_
+/// actionable_blocks_still_overflow`, using an oversized decision_card.
 #[test]
 fn history_page_downgrades_oversized_actionable_only_message_to_notice_only_with_ref() {
     let huge_question = "q".repeat(HISTORY_SEND_BUDGET_BYTES + 1024);

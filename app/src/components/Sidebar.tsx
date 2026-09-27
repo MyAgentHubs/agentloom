@@ -12,6 +12,10 @@ import { ProjectSwitcherFooter } from "./ProjectSwitcherFooter";
 import { SessionGroupSection } from "./SessionGroupSection";
 import { SessionRow, type SessionDotStatus } from "./SessionRow";
 import { UpdateButton } from "./UpdateButton";
+import {
+  arrangeContinuationThreads,
+  continuationChildrenByParent,
+} from "./sidebarContinuationThreads";
 
 type Props = {
   sessions: Session[];
@@ -30,7 +34,7 @@ type Props = {
   activeRepoId: string | null;
   reposInActiveNs: RepoMeta[];
   repoGroupExpanded: Record<string, boolean>;
-  /** B3：0 repo namespace 时 disable「+ 新会话」+ hover tip */
+  /** Disable "+ New session" (with a hover tip) when the namespace has zero repos. */
   newDisabled: boolean;
   onSelect: (id: string) => void;
   onNew: () => void;
@@ -86,51 +90,6 @@ const introIcon = (
     <path d="M14 2v6h6" />
   </svg>
 );
-
-function arrangeContinuationThreads(list: Session[]): Session[] {
-  const byId = new Map(list.map((s) => [s.id, s]));
-  const childrenByParent = continuationChildrenByParent(list);
-  const emitted = new Set<string>();
-  const arranged: Session[] = [];
-
-  function emitThread(root: Session) {
-    let current: Session | undefined = root;
-    while (current && !emitted.has(current.id)) {
-      arranged.push(current);
-      emitted.add(current.id);
-      const pointedChild: Session | undefined = current.continued_to_session_id
-        ? byId.get(current.continued_to_session_id)
-        : undefined;
-      const fallbackChildren: Session[] =
-        childrenByParent.get(current.id) ?? [];
-      current =
-        pointedChild ??
-        (fallbackChildren.length === 1 ? fallbackChildren[0] : undefined);
-    }
-  }
-
-  for (const session of list) {
-    if (emitted.has(session.id)) continue;
-    if (session.parent_session_id && byId.has(session.parent_session_id))
-      continue;
-    emitThread(session);
-  }
-  for (const session of list) {
-    if (!emitted.has(session.id)) emitThread(session);
-  }
-  return arranged;
-}
-
-function continuationChildrenByParent(list: Session[]): Map<string, Session[]> {
-  const childrenByParent = new Map<string, Session[]>();
-  for (const session of list) {
-    if (!session.parent_session_id) continue;
-    const children = childrenByParent.get(session.parent_session_id) ?? [];
-    children.push(session);
-    childrenByParent.set(session.parent_session_id, children);
-  }
-  return childrenByParent;
-}
 
 export const Sidebar = React.memo(function Sidebar({
   sessions,

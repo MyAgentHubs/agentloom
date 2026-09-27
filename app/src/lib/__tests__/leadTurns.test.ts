@@ -298,7 +298,7 @@ describe("buildLeadTurns", () => {
   });
 
   it("chosen decision_card 被消费·仍进组不生成空 turn（DecisionCard 渲紧凑「已选」回执）", () => {
-    // 决策打扰收敛刀 T1·症状 B 根修：chosen 卡不再从 leadTurns 分组里过滤——
+    // Keep the chosen card in its group so DecisionCard can render its compact selected receipt instead of returning null.
     // DecisionCard 组件对 chosen 态渲一行紧凑回执（不再 return null），组内必须留着
     // 这张卡才有东西可渲；旧行为（chosen 被扔、turn 判空）等于点击后连回执都没有。
     const { turns, consumedMessageIds } = buildLeadTurns(

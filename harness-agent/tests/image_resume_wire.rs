@@ -42,7 +42,7 @@ fn provider(base: &str) -> OpenAiCompatibleProvider {
         provider_id: "glm".into(),
         api_key: "sk".into(),
         base_url: format!("{base}/v1"),
-        // T19：GLM 现在按型号判 supports_images，"glm-5.2" 是纯文本型号（判 false）——
+        // GLM determines supports_images per model name: "glm-5.2" is text-only (false), so this suite uses a real vision-capable model to exercise the image-supporting provider resume-reread path.
         // 这批测试的意图是练"provider 支持图片"的 resume 重读路径，换成真实视觉型号。
         model: "glm-4.5v".into(),
         timeout_secs: 5,
@@ -557,15 +557,20 @@ async fn resume_detects_same_length_content_swap_via_sha256() {
 
 #[tokio::test]
 async fn resume_rejects_oversize_source_quickly_without_reading_full_file() {
-    // P2-3：`reload_one_image` 此前直接整读——600 MiB 稀疏文件 + 记录的 `bytes` 必然
-    // 不匹配也要等整读完才拒。修后必须先 `metadata()` 判 `MAX_IMAGE_BYTES` 再决定要不要
-    // 读，拒绝耗时应远小于整读同一文件一次的耗时。
+    // `reload_one_image` used to read the whole file unconditionally --
+    // a 600 MiB sparse file plus a mismatched recorded `bytes` would still be
+    // read in full before being rejected. The fix must call `metadata()` and
+    // reject on `MAX_IMAGE_BYTES` before ever opening/reading the file.
     //
-    // t12-img 第四轮返工（P2-B）：绝对阈值（曾用 500ms）在这个断言上没有牙——本机测过
-    // 修复前整读 600 MiB 稀疏文件只要 ~212ms，早就落在任何「宽松到防 CI 抖动」的绝对
-    // 阈值以内，删掉 `metadata()` 预检这条回归照样测不出来。改成自校准：先在本测试里把
-    // 同一个文件整读一遍量出 `full`，再断言重读耗时 `< full / 10`——本机实测两者相差
-    // 两个数量级（fix 前 212ms vs fix 后 ~2ms），负载高低同时影响分子分母，比值稳定。
+    // This is checked structurally instead of via wall-clock timing (a prior
+    // version asserted `elapsed < full_read_time / 10`, which flaked under CI
+    // load because `elapsed` also includes the whole resume round trip). The
+    // file is made unreadable (mode 0) after being created; `metadata()`
+    // (stat) does not need read permission and still succeeds, but any
+    // `read`/`open` call on the file would fail with EACCES. So if a future
+    // regression reads the file before checking its size, the failure reason
+    // recorded in the journal flips from `source_changed` to `source_missing`
+    // (read failure), which the assertion below catches.
     let ws = tempfile::tempdir().unwrap();
     let cap = Arc::new(Mutex::new(Vec::new()));
     let server = MockServer::start().await;
@@ -576,7 +581,7 @@ async fn resume_rejects_oversize_source_quickly_without_reading_full_file() {
 
     let huge = ws.path().join("huge.png");
     let f = std::fs::File::create(&huge).unwrap();
-    f.set_len(629_145_600).unwrap(); // 600 MiB，稀疏（不占实际磁盘块）
+    f.set_len(629_145_600).unwrap(); // 600 MiB, sparse (no real disk blocks used)
     drop(f);
     {
         use std::io::Write;
@@ -584,16 +589,28 @@ async fn resume_rejects_oversize_source_quickly_without_reading_full_file() {
         f.write_all(&PNG_MAGIC).unwrap();
     }
 
-    // 自校准基线：整读同一个文件一次，量出这台机器 / 这次负载下「读 600 MiB」的真实耗时。
-    let full_started = std::time::Instant::now();
-    let full_bytes = std::fs::read(&huge).unwrap();
-    let full = full_started.elapsed();
-    assert_eq!(
-        full_bytes.len(),
-        629_145_600,
-        "sanity：整读应读到全部 600 MiB"
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&huge).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&huge, perms).unwrap();
+    }
+    // Sanity: confirm the permission bit actually blocks reads in this
+    // environment. Running with privileges that bypass file permissions
+    // (e.g. as root), or a non-unix target where the mode bits above were
+    // never applied, would make the rest of this test meaningless.
+    if std::fs::read(&huge).is_ok() {
+        eprintln!(
+            "skipping resume_rejects_oversize_source_quickly_without_reading_full_file: \
+             file permissions did not block reads in this environment (likely running as root)"
+        );
+        return;
+    }
+    assert!(
+        std::fs::metadata(&huge).is_ok(),
+        "sanity: stat should still succeed without read permission"
     );
-    drop(full_bytes);
 
     let run_id = "resume_oversize_source";
     let paths = RunPaths::new(ws.path(), run_id);
@@ -622,7 +639,6 @@ async fn resume_rejects_oversize_source_quickly_without_reading_full_file() {
     )
     .unwrap();
 
-    let start = std::time::Instant::now();
     resume_solo_with_judge_and_fs_scope(
         provider(&server.uri()),
         Box::new(myagent::judge::NoopJudge),
@@ -650,18 +666,17 @@ async fn resume_rejects_oversize_source_quickly_without_reading_full_file() {
     )
     .await
     .unwrap();
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed < full / 10,
-        "先 stat 判大小应远快于整读同一文件一次：整读 {full:?} vs 重读拒绝 {elapsed:?}\
-         （应 < 整读 / 10，自校准防 CI 机器负载假红）"
-    );
 
     let msg = historical_image_bearing_message(&cap).await;
     assert!(msg["content"].is_string(), "超限图片必须被剥掉：{msg}");
     assert!(!msg.to_string().contains("base64"));
     let journal = std::fs::read_to_string(&paths.events_path).unwrap();
     assert!(journal.contains("attachment.dropped"));
+    assert!(
+        journal.contains("\"reason\":\"source_changed\""),
+        "拒绝原因应是 source_changed（先 stat 判大小），不该因为退化成先读文件而在这个\
+         不可读文件上变成 source_missing（读失败）：{journal}"
+    );
 }
 
 #[tokio::test]

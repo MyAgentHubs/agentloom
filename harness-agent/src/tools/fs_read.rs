@@ -285,7 +285,7 @@ pub(crate) fn canonicalize_lenient(path: &Path) -> std::path::PathBuf {
 }
 
 /// 纯词法规范化（解析 . 和 ..，不触盘），用于越界判断对不存在路径也成立。
-/// `pub(crate)`：B4 Guardrails::ensure_in_workspace 与 B6 fs_write/fs_edit 复用。
+/// `pub(crate)`: reused by `Guardrails::ensure_in_workspace` and by `fs_write`/`fs_edit`.
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {

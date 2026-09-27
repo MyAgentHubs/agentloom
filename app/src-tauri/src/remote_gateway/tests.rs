@@ -64,9 +64,8 @@ fn test_session_history_provider() -> SessionHistoryProvider {
     })
 }
 
-/// msgfix1 T4：默认对未预期的 `msg.fetch` provider 调用报错——同
-/// `test_session_history_provider` 既有姿势，测试没预期到会命中这里就该显式失败，而不是
-/// 悄悄返回一个看似合理的默认值掩盖误用。
+/// Fail unexpected message fetches explicitly, as the session history stub does,
+/// so a plausible default response cannot hide an unintended provider call.
 fn test_message_fetch_provider() -> MessageFetchProvider {
     Box::new(|session_id, message_id| {
         Err(format!(
@@ -146,6 +145,8 @@ fn text_delta_payload(session_id: &str) -> crate::event_transport::BatchPayload 
             session_id: session_id.to_owned(),
             run_id: "run-1".to_owned(),
             dispatch: None,
+            agent_id: None,
+            agent_name_snapshot: None,
             events: vec![crate::event_transport::SequencedEvent {
                 seq: 1,
                 event: crate::agent_event::AgentEvent::TextDelta {
@@ -166,6 +167,8 @@ fn single_event_payload(
             session_id: session_id.to_owned(),
             run_id: run_id.to_owned(),
             dispatch: None,
+            agent_id: None,
+            agent_name_snapshot: None,
             events: vec![crate::event_transport::SequencedEvent { seq: 1, event }],
         }],
     }
@@ -913,6 +916,7 @@ mod data_plane_contract;
 mod diagnostics;
 mod handshake_claim;
 mod history;
+mod input_ack_outbox;
 mod live_classification;
 mod live_connection;
 mod message_chunks;

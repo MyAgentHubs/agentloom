@@ -507,7 +507,7 @@ fn lead_sys_v2_instructs_nested_sandbox_bypass_guidance_for_worker_briefs() {
 
 #[test]
 fn lead_sys_v2_limits_ask_user_to_three_cases_and_pushes_operational_decisions_to_autonomy() {
-    // 决策打扰收敛刀 T3：ask_user 只留三类硬理由，运营决策（重派/重试/排序）改自决简报。
+    // Reserve questions for irreversible actions, scope changes, and genuine preferences so routine operational decisions remain autonomous.
     for needle in [
         "irreversible actions",
         "scope changes",

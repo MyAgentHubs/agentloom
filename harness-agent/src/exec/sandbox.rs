@@ -8,7 +8,7 @@
 //! daemon（Docker/其它 setuid 服务）的**间接**代写。因为 check_cmd 需要连本地服务，
 //! loopback 与 Unix socket 仍然放行；上层不应将本围栏表述为“绝对”不可绕过。
 //!
-//! 2026-07-25 定罪 + 同日 opus 对抗审更正病因表述（见 `ad019030` 与本 commit 的更正）：
+//! Root cause of an earlier signal-delivery failure, confirmed and later corrected once misdescribed:
 //! SBPL 里 `signal` 是与 `process*` 平级的独立顶层操作类，`(allow process*)` 不覆盖它，
 //! 会落进 `(deny default)`。**病因不是** `controlled.rs::wrap_self_reaping` 的自扫尾
 //! `kill -TERM -- -$$`——那层包裹 shell 是在拿到 `write_fence_invocation`（`sandbox-exec -p
@@ -496,9 +496,9 @@ mod tests {
         // 命令本身跑在 fence 沙箱**内**，自己给自己 fork 出的子进程发 SIGTERM——这才是
         // (allow signal (target same-sandbox)) 实际要放行的场景（对照 app 侧
         // run_verifier_in_place 撞见的 vitest/tinypool 自杀 worker 池那类问题）。
-        // wrap_self_reaping 的外层自扫尾包裹跑在沙箱外、不受这条 profile 管，与此无关
-        // （2026-07-25 opus 对抗审更正：本测试曾误标"验证自扫尾"，实际验证的是 fence
-        // 内命令自杀子进程）。
+        // wrap_self_reaping's outer self-reap wrapper runs outside the sandbox and is unrelated
+        // to this rule (corrected after this test was once mislabeled "verifies self-reaping";
+        // it actually verifies a command killing its own children from inside the fence).
         require_seatbelt("write_fence_allows_command_to_signal_its_own_children_under_sandbox");
         let workspace = tempfile::tempdir().unwrap();
         let (output, _) = run_fenced(

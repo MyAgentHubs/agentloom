@@ -1,7 +1,7 @@
-//! T1 图片附件：OpenAI 兼容 wire 格式 + capabilities 回归测试。
-//! 从 `openai_compatible.rs` 的 `mod tests` 拆出（避免该文件继续超出文件大小门禁的
-//! 基线历史额度），经 `#[path]` 挂在其 `mod tests` 下，`use super::*` 沿用父模块
-//! 私有测试夹具（`provider_for` 等）。
+//! Regression tests for the OpenAI-compatible wire format and image capabilities. Split out of
+//! `openai_compatible.rs`'s `mod tests` to keep that file under the file-size ratchet; mounted via
+//! `#[path]` under its own `mod tests`, so `use super::*` reuses the parent module's private test
+//! fixtures (`provider_for` and friends).
 use super::*;
 
 fn test_image() -> crate::image::ImageBlock {
@@ -149,8 +149,8 @@ fn images_on_non_user_role_are_ignored_not_serialized() {
 
 #[test]
 fn capabilities_supports_images_by_family_default() {
-    // T19：GLM 现在按型号判，不再是整个家族一刀切 true——glm-5.2 是纯文本型号，撞真实
-    // 厂商 400 的正是这个 provider/model 组合（见 supports_images_seed.rs）。
+    // GLM capability now depends on the specific model, not a blanket family default: glm-5.2 is a
+    // text-only model, and this exact provider/model pair is what a real 400 from the vendor hit (see supports_images_seed.rs).
     assert!(
         provider_for("glm", "glm-4.5v")
             .capabilities()

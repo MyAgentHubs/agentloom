@@ -148,8 +148,8 @@ fn history_tool_output_uses_existing_truncation_limit_without_rewriting_other_bl
         .as_str()
         .unwrap();
     assert_eq!(truncated_output.len(), OUTPUT_TRUNCATE_BYTES);
-    // msgfix1 T7 B2：history 口截断同样必须带可见化标记（与 msg.completed 口共用
-    // truncate_history_tool_outputs/truncate_utf8_with_marker，两口同一份行为）。
+    // History truncation must include the same visible marker as msg.completed;
+    // truncate_history_tool_outputs and truncate_utf8_with_marker share this contract.
     assert!(
         truncated_output.ends_with(TOOL_OUTPUT_TRUNCATION_MARKER),
         "截断的工具输出必须带 {TOOL_OUTPUT_TRUNCATION_MARKER:?} 标记"
@@ -158,7 +158,7 @@ fn history_tool_output_uses_existing_truncation_limit_without_rewriting_other_bl
 
 #[test]
 fn truncate_history_tool_outputs_leaves_short_output_untouched_without_marker() {
-    // msgfix1 T7 B2：未真正发生截断时不该附加标记——短输出原样透传。
+    // Short output must pass through unchanged without a truncation marker.
     let content_json = serde_json::json!([{
         "type": "tool",
         "id": "tool-1",
@@ -218,8 +218,8 @@ fn history_oversized_single_message_is_downgraded_to_preview_and_acknowledged() 
         }),
     );
 
-    // msgfix1 T3（设计稿 §A）：超预算的单条 history 消息不再让页面变空——降级为
-    // preview + content_ref，`history_oversized_dropped` 计数语义改为"降级次数"。
+    // An oversized history row must remain in the page as a preview with content_ref;
+    // `history_oversized_dropped` counts these downgrades rather than omitted rows.
     assert_eq!(
         handle_command_envelope(&inner, &envelope, Some(&k_room)),
         Some(input_ack_json("cmd-history-oversized", AckOutcome::Ok))
@@ -267,9 +267,9 @@ fn history_oversized_single_message_is_downgraded_to_preview_and_acknowledged() 
     );
 }
 
-/// msgfix1 T3（设计稿 §A）：一整窗全部由超限消息组成——旧行为是整页变空、逼着命令臂
-/// 循环推进游标去够更老的一条可读消息（该机制的旧版本见本文件历史）；新行为是每一条都
-/// 降级为 preview + content_ref，一页足以同时带回全部，不再需要多次查询。
+/// A window containing only oversized messages must return every row as a preview
+/// with content_ref in one page. Downgrading must not empty the page or require
+/// repeated queries to advance past oversized rows to find a readable message.
 #[test]
 fn history_full_oversized_window_downgrades_every_row_to_preview_in_one_page() {
     const OVERSIZED_ROW_COUNT: i64 = 5;
@@ -347,9 +347,9 @@ fn history_full_oversized_window_downgrades_every_row_to_preview_in_one_page() {
     assert_eq!(item.payload["next_before"], Value::Null);
 }
 
-/// msgfix1 T3（缺口①·M0 §10.9 同一姿势）：`control.history` 入队目标队列满时，此前会
-/// 无条件回 `AckOutcome::Ok`（客户端以为帧已在路上，实际从未入队、永不会到达）。现在必须
-/// 如实回 `Failed`，让客户端知道要重试。
+/// When the destination queue is full, `control.history` must return `Failed`.
+/// Returning `AckOutcome::Ok` would falsely promise delivery of a frame that was never
+/// enqueued; a failure acknowledgement lets the client retry.
 #[test]
 fn history_upstream_queue_full_returns_failed_ack_instead_of_fake_ok() {
     let (inner, _upstream_rx) = test_inner_for_history(

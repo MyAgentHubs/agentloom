@@ -1,0 +1,467 @@
+/* ===== session-hover-menu: row actions + ⋯ menu + rename + delete confirmation + unread/pin + archived section ===== */
+.sess__pin {
+  display: inline-flex;
+  align-items: center;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.sess__pin svg {
+  width: 12px;
+  height: 12px;
+}
+.sess__nm--unread {
+  font-weight: 700;
+  color: var(--ink);
+}
+.sess__unread {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+}
+.sess__acts {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 4px;
+  flex-shrink: 0;
+}
+.sess__iconbtn {
+  width: 21px;
+  height: 21px;
+  border-radius: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink-3);
+  cursor: pointer;
+  background: none;
+  border: 0;
+  padding: 0;
+}
+.sess__iconbtn svg {
+  width: 13px;
+  height: 13px;
+}
+.sess__iconbtn:hover,
+.sess__iconbtn.on {
+  background: rgba(122, 117, 104, 0.14);
+  color: var(--ink);
+}
+
+/* inline rename */
+.sess__rename {
+  flex: 1;
+  display: flex;
+  align-items: center;
+}
+.sess__rename input {
+  flex: 1;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1.5px solid var(--accent);
+  border-radius: 5px;
+  padding: 2px 6px;
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(217, 119, 87, 0.14);
+}
+.sess__keyhint {
+  font-size: 8.5px;
+  color: var(--ink-4);
+  margin-left: 6px;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.sess-kbd {
+  font-family: "SF Mono", monospace;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 3px;
+  font-size: 8.5px;
+  color: var(--ink-3);
+}
+
+/* ⋯ menu */
+.dd {
+  position: relative;
+}
+.sess-menu {
+  position: fixed;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  box-shadow: 0 12px 30px rgba(28, 26, 23, 0.18);
+  padding: 4px;
+  width: 206px;
+  z-index: 1000;
+}
+.sess-mi {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  color: var(--ink-2);
+  cursor: pointer;
+  background: none;
+  border: 0;
+  text-align: left;
+}
+.sess-mi__lbl {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sess-mi__arrow {
+  margin-left: auto;
+  color: var(--ink-4);
+  font-size: 9px;
+}
+.sess-mi .sess-kbd {
+  margin-left: auto;
+}
+.sess-mi:hover:not(:disabled) {
+  background: var(--bg-sunken);
+  color: var(--ink);
+}
+.sess-mi:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.sess-mi--danger {
+  color: var(--red);
+}
+.sess-mi--danger:hover:not(:disabled) {
+  background: rgba(184, 80, 72, 0.08);
+}
+.sess-mdiv {
+  height: 1px;
+  background: var(--line-soft, var(--line));
+  margin: 4px 6px;
+}
+
+/* Archived collapsible section */
+/* session-hover-menu: divider between pinned and unpinned groups in the active list */
+.sb-pin-div {
+  height: 1px;
+  background: var(--line);
+  margin: 6px 12px;
+}
+.sb-arch {
+  margin-top: 4px;
+}
+.sb-arch__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+.sb-arch__chev {
+  font-size: 9px;
+  transition: transform 0.12s;
+}
+.sb-arch.collapsed .sb-arch__chev {
+  transform: rotate(-90deg);
+}
+.sb-arch.collapsed .sb-arch__body {
+  display: none;
+}
+
+/* Collapsible group headers organize the sidebar into sections. */
+/* Visual alignment pass V2 · change group headers to the “section label” form, distinguishing them from session-row pills at two levels:
+   reduce the ink tone by one level + letter-spacing + remove the pill hover background (hover instead darkens text) + breathing space between groups */
+.sb-group {
+  margin-top: 2px;
+}
+.sb-group + .sb-group {
+  margin-top: 12px;
+}
+.sb-group__head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  color: var(--ink-3);
+  cursor: pointer;
+  position: relative;
+}
+.sb-group__head:hover {
+  color: var(--ink-2);
+}
+.sb-group__chev {
+  font-size: 9px;
+  flex-shrink: 0;
+  color: var(--ink-3);
+}
+.sb-group__name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sb-group__count {
+  font-size: 10px;
+  color: var(--ink-3);
+  background: var(--bg-sunken, rgba(0, 0, 0, 0.05));
+  border-radius: 8px;
+  padding: 0 5px;
+  flex-shrink: 0;
+}
+.sb-group__more-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+.sb-group__more {
+  background: none;
+  border: 0;
+  cursor: pointer;
+  color: var(--ink-3);
+  font-size: 13px;
+  padding: 0 2px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+}
+.sb-group__menu {
+  position: absolute;
+  right: 0;
+  top: 100%;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  z-index: 100;
+  min-width: 100px;
+  overflow: hidden;
+}
+.sb-group__mi {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 7px 12px;
+  font-size: 12px;
+  color: var(--ink-2);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.sb-group__mi:hover {
+  background: var(--bg-sunken, rgba(0, 0, 0, 0.04));
+}
+.sb-group__mi--danger {
+  color: var(--red, #c0392b);
+}
+.sb-group__body {
+  /* Body displays normally; indent it one additional level relative to the group header, creating a hierarchical distinction from session-row pills */
+  padding-left: 8px;
+}
+.sb-group.collapsed .sb-group__body {
+  display: none;
+}
+.sb-group__rename-input {
+  flex: 1;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid var(--accent, #d97757);
+  border-radius: 6px;
+  padding: 1px 4px;
+  outline: none;
+  background: var(--panel);
+  color: var(--ink);
+}
+.sb-new-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  margin-top: 10px;
+  padding: 7px 12px;
+  border-radius: 8px;
+  font-size: 11px;
+  color: var(--ink-4);
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+}
+.sb-new-group:hover {
+  color: var(--ink-3);
+  background: var(--bg-sunken);
+}
+.sb-new-group-input {
+  padding: 4px 12px;
+}
+.sb-new-group-input input {
+  width: 100%;
+  font-size: 11px;
+  border: 1px solid var(--accent, #d97757);
+  border-radius: 6px;
+  padding: 3px 6px;
+  outline: none;
+  background: var(--panel);
+  color: var(--ink);
+  box-sizing: border-box;
+}
+
+/* parallel clone progress (one row per repo) */
+.ob-prog {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 12px 16px;
+  max-width: 480px;
+}
+.ob-prog .dest {
+  font-family: "SF Mono", monospace;
+  font-size: 10px;
+  color: var(--ink-4);
+  margin-bottom: 9px;
+}
+.ob-prow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+.ob-prow:last-of-type {
+  border-bottom: none;
+}
+.ob-prow .st {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.ob-prow .st.done {
+  background: #e0ebd9;
+}
+.ob-prow .st.done svg {
+  width: 11px;
+  height: 11px;
+  stroke: var(--green);
+  fill: none;
+}
+.ob-prow .st.fail {
+  background: #f0ddd9;
+}
+.ob-prow .st.fail svg {
+  width: 11px;
+  height: 11px;
+  stroke: var(--red);
+  fill: none;
+}
+.ob-prow .st.spin {
+  border: 2px solid var(--accent-soft);
+  border-top-color: var(--accent);
+}
+.ob-prow .nm {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  flex-shrink: 0;
+}
+.ob-prow.done-row .nm,
+.ob-prow.fail-row .nm {
+  font-weight: 500;
+}
+.ob-prow .mid {
+  flex: 1;
+  min-width: 0;
+}
+.ob-prow .mid .ob-bar {
+  height: 5px;
+}
+.ob-prow .tail {
+  font-size: 10.5px;
+  color: var(--ink-3);
+  margin-left: auto;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.ob-prow .tail .pct {
+  font-family: "SF Mono", monospace;
+  color: var(--accent);
+  font-weight: 600;
+}
+.ob-prow .tail .open {
+  color: var(--ink-3);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.ob-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-sunken);
+  overflow: hidden;
+}
+.ob-bar .fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+}
+.ob-retry {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--red);
+  background: #f0ddd9;
+  border-radius: 8px;
+  padding: 2px 9px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.ob-retry svg {
+  width: 10px;
+  height: 10px;
+  stroke: var(--red);
+  fill: none;
+}
+.ob-prog .nonblock {
+  font-size: 10.5px;
+  color: var(--ink-3);
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  line-height: 1.45;
+}
+.ob-prog .nonblock svg {
+  width: 12px;
+  height: 12px;
+  stroke: var(--green);
+  fill: none;
+  flex-shrink: 0;
+}
+
+@keyframes ob-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.ob-prow .st.spin {
+  animation: ob-spin 0.8s linear infinite;
+}

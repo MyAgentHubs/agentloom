@@ -133,6 +133,52 @@ fn stage_bytes_rejects_symlink_escaping_app_root() {
     );
 }
 
+/// P3-1: once a symlink target climbs past the staging root, if its first
+/// remaining segment happens to equal the app name (e.g. it lands on
+/// `<staging root's parent>/AgentLoom.app/...`, i.e. the real already-installed
+/// app outside the staging layer), the later "does the first segment equal
+/// app_root" check alone would wave it through. This must be caught by the
+/// dedicated "climbed past staging root" branch in `resolve_symlink_target`,
+/// not merely by the `escapes bundle` branch it happens to also trip.
+/// Asserting the exact error text pins down which branch actually fired.
+#[test]
+fn stage_bytes_rejects_symlink_that_escapes_staging_root_even_when_first_segment_matches_app_name()
+{
+    let tmp = tempfile::tempdir().unwrap();
+    let bundle = make_installed_bundle(tmp.path(), "0.2.9");
+    let plist_bytes = minimal_plist("0.3.0");
+    let archive = build_archive(vec![
+        RawEntry {
+            header: raw_header(
+                tar::EntryType::Regular,
+                "AgentLoom.app/Contents/Info.plist",
+                plist_bytes.len() as u64,
+            ),
+            data: plist_bytes,
+            link_name: None,
+        },
+        RawEntry {
+            header: raw_header(tar::EntryType::Symlink, "AgentLoom.app/Contents/evil", 0),
+            data: vec![],
+            // Three ".." climb out of AgentLoom.app/Contents past the staging
+            // root, then re-descend into "AgentLoom.app/Contents/MacOS/AgentLoom"
+            // — the first segment matches app_root, so if the "climbed past
+            // staging root" check is removed, the later "escapes bundle" check
+            // would wrongly let this through.
+            link_name: Some("../../../AgentLoom.app/Contents/MacOS/AgentLoom".to_string()),
+        },
+    ]);
+
+    let err = stage_bytes(&bundle, &archive, "0.3.0", &always_ok).unwrap_err();
+    match err {
+        InstallError::PathEscape(msg) => assert!(
+            msg.contains("escapes staging root"),
+            "必须命中「越过暂存根」分支，got {msg:?}"
+        ),
+        other => panic!("expected PathEscape, got {other:?}"),
+    }
+}
+
 #[test]
 fn stage_bytes_allows_symlink_within_app_root() {
     let tmp = tempfile::tempdir().unwrap();

@@ -1,7 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, test, vi } from "vitest";
-// @ts-expect-error - Vitest runs in Node, but this frontend tsconfig has no Node type declarations.
-import { readFileSync } from "fs";
+import { readGlobalCss } from "../styles/readGlobalCss";
 import type { Block, MemberUnit } from "../types/agent";
 
 vi.mock("./CodeBlock", () => ({
@@ -82,6 +81,32 @@ const member = (o: Partial<MemberUnit>): MemberUnit => ({
 });
 
 describe("MessageContent", () => {
+  it("raw block 循环中的 decision_card 不渲染正文兜底内容", () => {
+    const { container } = render(
+      <MessageContent
+        blocks={[
+          {
+            type: "decision_card",
+            decision_id: "decision-1",
+            kind: "ask",
+            question: "选择方案",
+            options: ["方案 A", "方案 B"],
+            recommended: "方案 A",
+            rationale: null,
+            payload: null,
+            source_run_id: "run-1",
+            status: "pending",
+            chosen_option: null,
+            created_at: 1,
+          },
+        ]}
+      />,
+    );
+
+    expect(container.querySelector(".turn__unknown-block")).toBeNull();
+    expect(container.querySelector(".turn__text")).toBeEmptyDOMElement();
+  });
+
   it("gate_card 块 + gateView=draft → 渲 GateCard 草案", () => {
     render(
       <MessageContent
@@ -97,6 +122,45 @@ describe("MessageContent", () => {
 
     expect(screen.getByText("草案")).toBeInTheDocument();
     expect(screen.getByText("能登录")).toBeInTheDocument();
+  });
+
+  it("gate_card 块 + gateView=proposing → 渲染提案中提示", () => {
+    const { container } = render(
+      <MessageContent
+        blocks={[{ type: "gate_card", session_id: "s1" }]}
+        gateView={{ kind: "proposing" }}
+      />,
+    );
+
+    expect(container.querySelector(".gate-proposing")).not.toBeNull();
+    expect(container.querySelector(".gate-proposing__dot")).not.toBeNull();
+  });
+
+  it("draft_failed 块 + gateView=failed → 渲 DraftFailedCard", () => {
+    const { container } = render(
+      <MessageContent
+        blocks={[{ type: "draft_failed", session_id: "s1" }]}
+        gateView={{
+          kind: "failed",
+          failure: { kind: "invokeFailed", reason: "网络错误" },
+          runId: "r1",
+          contractId: "c1",
+        }}
+        onGateRetry={() => {}}
+        onGateManual={() => {}}
+        onGateBackToNormal={() => {}}
+      />,
+    );
+
+    expect(container.querySelector(".draft-failed")).not.toBeNull();
+  });
+
+  it("gate_card 块 + gateView 不匹配 → 渲染为空", () => {
+    const { container } = render(
+      <MessageContent blocks={[{ type: "gate_card", session_id: "s1" }]} />,
+    );
+
+    expect(container.querySelector(".turn__text")).toBeEmptyDOMElement();
   });
 
   it("streaming=true → 仍走 markdown 渲染，避免处理中闪成原始 Markdown", () => {
@@ -274,7 +338,7 @@ describe("MessageContent", () => {
   });
 
   it("表格迭代：常态 100% 自适应换行，横滚只作兜底", () => {
-    const css = readFileSync("src/styles/global.css", "utf-8");
+    const css = readGlobalCss();
 
     expect(css).toMatch(/\.mm-table-wrap\s*\{[^}]*overflow-x:\s*auto/);
     expect(css).toMatch(/\.mm-table-wrap table\s*\{[^}]*width:\s*100%/);
@@ -328,7 +392,7 @@ describe("MessageContent", () => {
   });
 
   describe("prose 排版契约（2026-05-31 · 拉回设计系统）", () => {
-    const css = readFileSync("src/styles/global.css", "utf-8");
+    const css = readGlobalCss();
 
     it("正文收窄到 p,li = --ink-2（容器基色不变）", () => {
       // 分组 selector 断最后一个 .turn__text li {（首 selector 后是逗号、断不到）

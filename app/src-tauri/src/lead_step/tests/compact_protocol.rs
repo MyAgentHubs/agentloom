@@ -150,10 +150,12 @@ fn lead_context_prompt_compact_renders_summary_before_messages_and_filters_water
     assert!(prompt.contains("fresh message"));
 }
 
-/// T8 P2-③：forced 答案（`included_answer_ids` 对应条目）必须豁免 compact 过滤——它们是被
-/// 强制纳入的，本就该无视摘要窗口。没被强制纳入时，压实过滤后的旧消息既不渲染也不计入
-/// `included_answer_ids`（回归钉死上一个测试的「covered old message 被过滤」语义，同时确认
-/// 「ack 集合 = 实际入 prompt 集合」这条不变量）。
+/// Forced answers (entries in `included_answer_ids`) must be exempt from compact filtering --
+/// once forced in, they should ignore the summary window entirely. When not forced in, an
+/// old message filtered out by compaction is neither rendered nor counted in
+/// `included_answer_ids` (pinning down the previous test's "covered old message gets
+/// filtered" behavior, and confirming the invariant that the ack set equals the set that
+/// actually made it into the prompt).
 #[test]
 fn lead_context_prompt_pending_section_forced_answer_survives_compact_filter_and_is_counted() {
     let conn = Connection::open_in_memory().unwrap();

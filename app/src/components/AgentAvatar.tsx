@@ -24,6 +24,11 @@ const GLYPHS: Record<string, ReactNode> = {
       <path d="M3 13c3 0 4-2 7-2s4 3 8 1c0 0-1 5-7 5-5 0-8-4-8-4z" />
     </svg>
   ),
+  gemini: (
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M12 2c.6 4.4 2 6.8 6 8-4 1.2-5.4 3.6-6 8-.6-4.4-2-6.8-6-8 4-1.2 5.4-3.6 6-8z" />
+    </svg>
+  ),
   user: (
     <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
       <circle cx="12" cy="8" r="4" />
@@ -43,11 +48,13 @@ const GLYPHS: Record<string, ReactNode> = {
 };
 
 const STYLES: Record<string, CSSProperties> = {
+  gemini: { background: "#1a73e8" },
   glm: { background: "#7c3aed" },
   kimi: { background: "#8b5cf6" },
 };
 
 const TEXT: Record<string, string> = {
+  gemini: "G",
   glm: "G",
   kimi: "K",
 };
@@ -65,6 +72,7 @@ function resolveKind(kind: string): string | null {
     normalized.includes("z.ai")
   )
     return "glm";
+  if (normalized.includes("gemini")) return "gemini";
   if (normalized.includes("kimi")) return "kimi";
   return null;
 }

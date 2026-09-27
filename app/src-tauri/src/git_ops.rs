@@ -1,4 +1,4 @@
-//! b2b「把活发出去」后端基础（plan 2026-06-21-tc3-b2b-changebar-push-pr · Slice A Task A1）。
+//! Backend foundation for handing work off to collaborators ("send it out").
 //!
 //! 提供：
 //! - gh 多账户身份解析（session → gh 账户登录名 / token）

@@ -107,11 +107,11 @@ fn enclosing_fn_name(text: &str, idx: usize) -> Option<String> {
 ///
 /// 白名单——已逐条核实身份、不是 agent CLI 子进程，允许留在统一口之外：
 /// - `agent.rs::spawn_with_stdin_prompt_ack` —— 本身就是统一口的实现，不能自己调自己。
-/// - `agent.rs::path_from_login_shell` —— 探测用户 login shell 的真实 PATH，不是 agent 进程。
+/// - `agent/harness_runtime.rs::path_from_login_shell` —— 探测用户 login shell 的真实 PATH，不是 agent 进程。
 /// - `detect.rs::query_registry_value` —— Windows `reg query` 注册表探针。
 /// - `github.rs::command_output_with_timeout` —— git/gh 命令的通用超时执行器。
-/// - `lib.rs::windows_taskkill_tree` —— Windows `taskkill` 树杀探针。
-/// - `worktree.rs::reject_ignored_exact_paths` —— `git check-ignore` 校验。
+/// - `lib/win_taskkill.rs::windows_taskkill_tree` —— Windows `taskkill` 树杀探针。
+/// - `worktree/git_write.rs::reject_ignored_exact_paths` —— `git check-ignore` 校验。
 ///
 /// 若未来新增一处裸 spawn 且确认不是 agent CLI 子进程，往这张表加一行并写清身份；
 /// 若是 agent CLI 子进程，改走 `spawn_with_stdin_prompt`，不要加白名单。
@@ -119,21 +119,58 @@ fn enclosing_fn_name(text: &str, idx: usize) -> Option<String> {
 fn agent_backend_commands_spawn_via_stdin_prompt_helper() {
     const ALLOWLIST: &[(&str, &str)] = &[
         ("agent.rs", "spawn_with_stdin_prompt_ack"),
-        ("agent.rs", "path_from_login_shell"),
+        ("agent/harness_runtime.rs", "path_from_login_shell"),
         ("detect.rs", "query_registry_value"),
         ("github.rs", "command_output_with_timeout"),
-        ("lib.rs", "windows_taskkill_tree"),
-        ("worktree.rs", "reject_ignored_exact_paths"),
+        ("lib/win_taskkill.rs", "windows_taskkill_tree"),
+        ("worktree/git_write.rs", "reject_ignored_exact_paths"),
     ];
+
+    // Recursively collect every `.rs` file under `src/`: the old single-level
+    // `read_dir` only saw `src/*.rs`, so a bare spawn in a subdirectory like
+    // `lead_step/*.rs` or `checkpoint/*.rs` slipped past this guard.
+    fn collect_rust_sources(dir: &Path, files: &mut Vec<PathBuf>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read src dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                collect_rust_sources(&path, files);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    // Two ways a whole file counts as test-only code. The first-token check —
+    // the first non-blank, non-comment line is `#![cfg(test)]` — matches
+    // `lib/tests/source_scanner.rs`'s `production_text`, which only ever
+    // recognizes that same leading token sequence. It covers arbitrarily
+    // named, self-gated files under a `tests/` directory such as
+    // `agent/tests/claude.rs` or `member_runner/tests/registry.rs`. The file
+    // name check — exactly `tests.rs` or ending in `_tests.rs` — is an
+    // allowance specific to this guard, not shared with `production_text`: it
+    // covers files like `sandbox/tests.rs` / `sandbox/tests/profile_tests.rs`,
+    // which carry no `#![cfg(test)]` header of their own and are instead
+    // mounted by a parent's `#[cfg(test)] mod tests;` (or otherwise live
+    // inside a `#[cfg(test)]` test module).
+    fn is_whole_file_test_source(file_name: &str, source: &str) -> bool {
+        if file_name == "tests.rs" || file_name.ends_with("_tests.rs") {
+            return true;
+        }
+        source
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with("//"))
+            == Some("#![cfg(test)]")
+    }
 
     let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut violations = Vec::new();
-    let mut entries: Vec<_> = std::fs::read_dir(&src_dir)
-        .expect("read src dir")
-        .map(|entry| entry.expect("dir entry").path())
-        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("rs"))
-        .collect();
-    entries.sort();
+    let mut entries = Vec::new();
+    collect_rust_sources(&src_dir, &mut entries);
 
     for path in entries {
         let file_name = path
@@ -141,7 +178,20 @@ fn agent_backend_commands_spawn_via_stdin_prompt_helper() {
             .and_then(|n| n.to_str())
             .expect("utf8 file name")
             .to_string();
+        // Match the allowlist on the path relative to `src/`, not the bare file
+        // name: after recursion, two different subdirectories could each hold a
+        // file with the same basename (e.g. a future `foo/lib.rs`), and matching
+        // by basename alone would let a violation in one silently piggyback on
+        // an allowlist entry meant for the other.
+        let rel_path = path
+            .strip_prefix(&src_dir)
+            .expect("path under src_dir")
+            .to_string_lossy()
+            .replace('\\', "/");
         let source = std::fs::read_to_string(&path).expect("read source file");
+        if is_whole_file_test_source(&file_name, &source) {
+            continue;
+        }
         // 内联 `mod tests {` 之后是测试模块（含 fixture 用的裸 spawn），不受本规则约束。
         // 外提后 src/*.rs 只留下 `mod tests;` 声明，测试 fixture 位于子目录；
         // 未匹配到内联测试模块时，仍完整扫描当前文件。
@@ -156,7 +206,7 @@ fn agent_backend_commands_spawn_via_stdin_prompt_helper() {
             search_from = idx + ".spawn()".len();
             let enclosing_fn = enclosing_fn_name(production, idx);
             let allowed = ALLOWLIST.iter().any(|(allowed_file, allowed_fn)| {
-                *allowed_file == file_name.as_str() && enclosing_fn.as_deref() == Some(*allowed_fn)
+                *allowed_file == rel_path.as_str() && enclosing_fn.as_deref() == Some(*allowed_fn)
             });
             if allowed {
                 continue;

@@ -8,12 +8,9 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import QRCode from "qrcode";
-import {
-  SettingsRemoteControl,
-  base64UrlEncode,
-  buildPairingQrUrl,
-  type RemotePairingPayload,
-} from "./SettingsRemoteControl";
+import { SettingsRemoteControl } from "./SettingsRemoteControl";
+import { base64UrlEncode, buildPairingQrUrl } from "./remoteControlRelayQr";
+import type { RemotePairingPayload } from "./remoteControlTypes";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -869,6 +866,34 @@ describe("SettingsRemoteControl", () => {
     ).toBeInTheDocument();
   });
 
+  it("卸载后停止网关状态轮询", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let gatewayStatusCalls = 0;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_control_get_settings") {
+        return {
+          enabled: true,
+          relay_url: "wss://relay.example.com",
+          active_repo_id: "repo-1",
+        };
+      }
+      if (cmd === "list_repos") return [repoOne, repoTwo];
+      if (cmd === "remote_devices_list") return [activeDevice];
+      if (cmd === "remote_gateway_status") {
+        gatewayStatusCalls += 1;
+        return gatewayStatus;
+      }
+      return undefined;
+    });
+
+    const { unmount } = render(<SettingsRemoteControl />);
+    await waitFor(() => expect(gatewayStatusCalls).toBe(1));
+
+    unmount();
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    expect(gatewayStatusCalls).toBe(1);
+  });
+
   it("Done 继续轮询到 Idle 且设备列表只在进入 Done 时刷新一次", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const statuses = [
@@ -932,6 +957,50 @@ describe("SettingsRemoteControl", () => {
 
     await act(async () => vi.advanceTimersByTimeAsync(3000));
     expect(pairingStatusCalls).toBe(3);
+  });
+
+  it("关闭轮询后迟到的网关响应不写回状态", async () => {
+    let resolveGateway!: (status: typeof gatewayStatus) => void;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_control_get_settings") {
+        return {
+          enabled: true,
+          relay_url: "wss://relay.example.com",
+          default_relay_url: "wss://agentloom.myagenthubs.com",
+          active_repo_id: "repo-1",
+        };
+      }
+      if (cmd === "list_repos") return [repoOne, repoTwo];
+      if (cmd === "remote_devices_list") return [activeDevice];
+      if (cmd === "remote_gateway_status") {
+        return new Promise<typeof gatewayStatus>((resolve) => {
+          resolveGateway = resolve;
+        });
+      }
+      return undefined;
+    });
+
+    render(<SettingsRemoteControl />);
+    const toggle = await screen.findByRole("switch", {
+      name: "允许手机远程控制",
+    });
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("remote_gateway_status"),
+    );
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(toggle).toHaveAttribute("aria-checked", "false"),
+    );
+
+    await act(async () => {
+      resolveGateway({
+        running: false,
+        stopped_reason: "room_claim_conflict",
+        last_error: "late gateway error",
+      });
+    });
+    expect(screen.queryByText("late gateway error")).not.toBeInTheDocument();
+    expect(screen.queryByText(/房间被另一台桌面占用/)).not.toBeInTheDocument();
   });
 
   it("配对状态查询错误后停止配对轮询", async () => {
@@ -1118,7 +1187,7 @@ describe("SettingsRemoteControl", () => {
         repoId: "repo-2",
       }),
     );
-    // B2 的反例：从「未设置」首次带出项目没有旧房间可断，不该弹出重新扫码提示。
+    // Counter-case: the first project carried over from "unset" has no prior room to disconnect, so the re-scan prompt should not appear.
     expect(
       screen.queryByText(
         "伺服项目已切换，房间也随之变了——手机端需要重新扫码才能连接。",

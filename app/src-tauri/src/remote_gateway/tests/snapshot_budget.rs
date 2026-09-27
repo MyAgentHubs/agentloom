@@ -53,7 +53,7 @@ fn build_snapshot_payload_evicts_tool_blocks_before_older_text_blocks_and_keeps_
     let folded_count: usize = notice_text
         .rsplit('(')
         .next()
-        .and_then(|tail| tail.split(' ').next())
+        .and_then(|tail| tail.split_once(' ').map(|(before, _after)| before))
         .and_then(|digits| digits.parse().ok())
         .expect("提示文案必须以 (N 块折叠) 收尾，且 N 可解析");
     assert!(

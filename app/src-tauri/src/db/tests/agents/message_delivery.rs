@@ -339,10 +339,10 @@ fn member_report_delivery_atomic_helper_rolls_back_without_ghost_publish() {
 
 #[test]
 fn persist_member_report_atomic_republishes_dispatch_card_terminal_rewrite_with_new_revision() {
-    // msgfix1 T5（缺口④）：running dispatch_card 终态改写提交后，必须重读该消息、以新
-    // revision 重发 msg.completed——revision 从 1（running）bump 到 2（done），
-    // derive_msg_completed_client_msg_id 随 revision 变化，relay 才会把这次改写当"新事件"
-    // 广播，不会被幂等去重吞掉。
+    // After committing a running dispatch_card terminal rewrite, reread the message and republish
+    // msg.completed with the new revision: 1 (running) becomes 2 (done). Since
+    // derive_msg_completed_client_msg_id changes with revision, the relay broadcasts the rewrite
+    // as a new event instead of swallowing it through idempotent deduplication.
     let c = crate::test_support::mem_db();
     create_session(&c, "s-dispatch-republish", "x", "local-default", "local").unwrap();
 

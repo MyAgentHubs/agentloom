@@ -114,6 +114,9 @@ describe("AgentForm", () => {
       within(providers).getByRole("button", { name: "Kimi" }),
     ).toBeInTheDocument();
     expect(
+      within(providers).getByRole("button", { name: "Gemini" }),
+    ).toBeInTheDocument();
+    expect(
       within(providers).queryByRole("button", { name: /Claude CLI/ }),
     ).toBeNull();
     expect(
@@ -241,6 +244,18 @@ describe("AgentForm", () => {
         authMode: null,
         apiKey: "sk-glm",
       }),
+    );
+  });
+
+  it("harness 选 Gemini 联动 endpoint/name（单接入点）", () => {
+    render(<AgentForm agent={null} onCancel={vi.fn()} onSaved={vi.fn()} />);
+
+    clickHarnessPreset("Gemini");
+    expect(screen.getByLabelText("名称")).toHaveValue("Gemini（myagent）");
+    openMoreOptions();
+
+    expect(screen.getByLabelText("Endpoint")).toHaveValue(
+      "https://generativelanguage.googleapis.com/v1beta/openai/",
     );
   });
 

@@ -3,6 +3,7 @@ import type { ComponentProps } from "react";
 // @ts-expect-error - Vitest runs in Node, but this frontend tsconfig has no Node type declarations.
 import { existsSync, readFileSync } from "fs";
 import { describe, it, expect, vi } from "vitest";
+import { readGlobalCss } from "./styles/readGlobalCss";
 import { makeSession } from "./test/factories";
 import App from "./App";
 import { setupAppTests } from "./__tests__/helpers/appTestSetup";
@@ -66,7 +67,7 @@ describe("App", () => {
   });
 
   it("阶段1 · 左栏 .sidebar 宽 230 + .surface 左角圆", () => {
-    const css = readFileSync("src/styles/global.css", "utf-8");
+    const css = readGlobalCss();
     expect(css).toMatch(/\.sidebar\s*\{[^}]*flex:\s*0 0 230px/);
     expect(css).toMatch(/\.surface\s*\{[^}]*border-radius:\s*15px 0 0 15px/);
     expect(css).toMatch(
@@ -75,7 +76,7 @@ describe("App", () => {
   });
 
   it("阶段1 收尾 · 旧三栏接缝 CSS 已删（.app--rpexpand / .body 容器 / .app__main / .topbar 容器）", () => {
-    const css = readFileSync("src/styles/global.css", "utf-8");
+    const css = readGlobalCss();
     expect(css).not.toMatch(/\.app--rpexpand/);
     expect(css).not.toMatch(/\.app__main\s*\{/);
     expect(css).not.toMatch(/^\.body\s*\{/m);
@@ -83,18 +84,18 @@ describe("App", () => {
   });
 
   it("阶段1 收尾 · tabs 行横滚、sf-tabs 允许右侧语言菜单溢出", () => {
-    const css = readFileSync("src/styles/global.css", "utf-8");
+    const css = readGlobalCss();
     expect(css).toMatch(/\.sf-tabs\s*\{[^}]*overflow:\s*visible/);
     expect(css).toMatch(/\.rptabs__tabrow\s*\{[^}]*overflow-x:\s*auto/);
   });
 
   it("阶段1 收尾 · .sf-tabs.expanded 最大化吃满 header（§2.D 右最大盖 main）", () => {
-    const css = readFileSync("src/styles/global.css", "utf-8");
+    const css = readGlobalCss();
     expect(css).toMatch(/\.sf-tabs\.expanded\s*\{[^}]*flex:\s*1/);
   });
 
   it("设置 sheet 放大到业界尺寸 + sheet-scope 控件放大 + 全局 .st-* 基线未动", () => {
-    const css = readFileSync("src/styles/global.css", "utf-8");
+    const css = readGlobalCss();
     // 外框放大
     expect(css).toMatch(/\.settings-sheet\s*\{[^}]*max-width:\s*1080px/);
     expect(css).toMatch(/\.settings-sheet\s*\{[^}]*max-height:\s*760px/);
@@ -118,7 +119,7 @@ describe("App", () => {
   });
 
   it("composer/content 阅读宽度布局回归（与 shell 翻转无关·勿随骨架迁移误删）", () => {
-    const css = readFileSync("src/styles/global.css", "utf-8");
+    const css = readGlobalCss();
     expect(css).toMatch(/--content-max:\s*760px/);
     expect(css).toMatch(/--content-padding:\s*24px/);
     expect(css).toMatch(/\.turn\s*\{[^}]*max-width:\s*var\(--content-max\)/);
@@ -181,7 +182,7 @@ describe("App", () => {
       }),
     );
 
-    const css = readFileSync("src/styles/global.css", "utf-8");
+    const css = readGlobalCss();
     expect(css).toMatch(/\.sidebar\s*\{[^}]*background:\s*var\(--bg\)/);
     expect(css).toMatch(/\.surface\s*\{[^}]*background:\s*var\(--panel\)/);
     expect(container.querySelector(".app-shell")).not.toBeNull();
@@ -193,7 +194,7 @@ describe("App", () => {
   });
 
   describe("shell-redesign 阶段0 · 新顶层 surface CSS 基座", () => {
-    const shellCss = readFileSync("src/styles/global.css", "utf-8");
+    const shellCss = readGlobalCss();
     it("定义 .app-shell 横向 flex 容器", () => {
       expect(shellCss).toMatch(/\.app-shell\s*\{[^}]*display:\s*flex/);
     });

@@ -1,0 +1,666 @@
+/* Per-run undo mode in the existing Review tab. DOM follows undo-panel-v1. */
+.undo-review .review-head {
+  flex: 0 0 auto;
+  padding: 12px 13px 11px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.undo-review .review-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.undo-review .back {
+  display: grid;
+  place-items: center;
+  width: 23px;
+  height: 23px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+.undo-review .back:hover {
+  color: var(--ink);
+  background: var(--bg-sunken);
+}
+.undo-review .back svg {
+  width: 14px;
+  height: 14px;
+}
+.undo-review .review-title {
+  flex: 1;
+  min-width: 0;
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 680;
+}
+.undo-review .mode-pill {
+  border-radius: 999px;
+  padding: 3px 7px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  font-size: 9.5px;
+  font-weight: 700;
+}
+.undo-review .review-sub {
+  margin: 4px 0 0 31px;
+  color: var(--ink-3);
+  font-size: 10.5px;
+}
+.undo-review .file-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.undo-review .file {
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--panel);
+}
+.undo-review .file-head {
+  display: flex;
+  align-items: flex-start;
+  min-height: 46px;
+  padding: 0 11px;
+}
+.undo-review .file-head:hover {
+  background: var(--bg);
+}
+.undo-review .check-wrap {
+  position: relative;
+  display: grid;
+  place-items: center;
+  align-self: stretch;
+  width: 25px;
+  flex: 0 0 25px;
+  cursor: pointer;
+}
+.undo-review .undo-check {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.undo-review .undo-check:focus-visible {
+  outline: 2px solid var(--accent-soft);
+  outline-offset: 1px;
+}
+.undo-review .undo-check:disabled {
+  opacity: 0.6;
+}
+.undo-review .undo-check:disabled,
+.undo-review .check-wrap.disabled {
+  cursor: not-allowed;
+}
+.undo-review .file-toggle {
+  display: grid;
+  grid-template-columns: 13px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-height: 46px;
+  padding: 7px 0;
+  border: none;
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  cursor: default;
+}
+.undo-review .file-toggle--interactive {
+  cursor: pointer;
+}
+.undo-review .file-toggle:disabled {
+  color: inherit;
+  cursor: default;
+}
+.undo-review .chev {
+  width: 12px;
+  height: 12px;
+  color: var(--ink-4);
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2.2;
+  transition: transform 0.15s;
+}
+.undo-review .chev-placeholder {
+  width: 12px;
+  height: 12px;
+}
+.undo-review .file.open .chev {
+  transform: rotate(90deg);
+}
+.undo-review .unpreviewable .chev {
+  opacity: 0.35;
+}
+.undo-review .file-name-wrap {
+  min-width: 0;
+}
+.undo-review .file-name {
+  display: block;
+  overflow: hidden;
+  color: var(--ink);
+  font-family: "SF Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.undo-review .file-kind {
+  display: block;
+  margin-top: 3px;
+  color: var(--ink-3);
+  font-size: 9.5px;
+  line-height: 1.35;
+}
+.undo-review .file-kind.danger {
+  color: var(--red);
+}
+.undo-review .file-kind.restore {
+  color: #4f7544;
+}
+.undo-review .file-kind.warn {
+  color: #8b5a25;
+}
+.undo-review .already-undone {
+  background: #f8f6f1;
+}
+.undo-review .already-undone .file-name {
+  color: var(--ink-4);
+  text-decoration: line-through;
+}
+.undo-review .already-undone .file-kind,
+.undo-review .already-undone .stats {
+  color: var(--ink-4);
+}
+.undo-review .stats {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink-3);
+  font-family: "SF Mono", ui-monospace, monospace;
+  font-size: 10px;
+  white-space: nowrap;
+}
+.undo-review .stats .add {
+  color: var(--green);
+}
+.undo-review .stats .del {
+  color: var(--red);
+}
+.undo-review .kind-badge {
+  margin-left: 3px;
+  border-radius: 999px;
+  padding: 2px 6px;
+  color: var(--ink-3);
+  background: var(--bg-sunken);
+  font-family: inherit;
+  font-size: 8.5px;
+  font-weight: 700;
+}
+.undo-review .kind-badge.created {
+  color: #8c5825;
+  background: #fbf0d8;
+}
+.undo-review .kind-badge.deleted,
+.undo-review .kind-badge.failed {
+  color: #8b3a33;
+  background: #f8e5e1;
+}
+.undo-review .kind-badge.skipped {
+  color: #8c5825;
+  background: #fbf0d8;
+}
+.undo-review .file-body {
+  border-top: 1px solid var(--line-soft);
+  background: #fffdfa;
+}
+.undo-review .diff-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 13px 6px 49px;
+  color: var(--ink-3);
+  background: #faf7f1;
+  font-size: 9.5px;
+}
+.undo-review .diff-label svg {
+  width: 11px;
+  height: 11px;
+}
+.undo-review .diff-code {
+  padding: 5px 0;
+  overflow-x: auto;
+  font-family: "SF Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  line-height: 1.72;
+}
+.undo-review .diff-line {
+  display: flex;
+  min-width: max-content;
+  padding: 0;
+}
+.undo-review .gutter {
+  width: 40px;
+  flex: 0 0 40px;
+  padding-right: 9px;
+  color: var(--ink-4);
+  text-align: right;
+  user-select: none;
+}
+.undo-review .code-line {
+  min-width: 310px;
+  flex: 1;
+  padding-right: 12px;
+  white-space: pre;
+}
+.undo-review .diff-line.ctx {
+  color: var(--ink-3);
+}
+.undo-review .diff-line.add {
+  color: #3f6135;
+  background: rgba(106, 155, 92, 0.13);
+}
+.undo-review .diff-line.del {
+  color: #8b3a33;
+  background: rgba(184, 80, 72, 0.11);
+}
+.undo-review .result-banner {
+  margin: 10px 11px 0;
+  padding: 10px 11px;
+  border: 1px solid #d8e5d1;
+  border-radius: 9px;
+  background: #f3f7f0;
+}
+.undo-review .result-main {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #4f7544;
+  font-size: 11.5px;
+  font-weight: 700;
+}
+.undo-review .result-main svg {
+  width: 15px;
+  height: 15px;
+}
+.undo-review .result-skip,
+.undo-review .result-failed {
+  margin-top: 6px;
+  color: #8b5a25;
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+.undo-review .result-failed {
+  color: var(--red);
+}
+.undo-review .result-file {
+  background: #f8f6f1;
+}
+.undo-review .result-file .file-name,
+.undo-review .result-file .file-kind,
+.undo-review .result-file .stats {
+  color: var(--ink-3);
+}
+.undo-review .skipped-file {
+  background: #fffdf7;
+  box-shadow: inset 3px 0 0 #d7a45d;
+}
+.undo-review .failed-file {
+  background: #fff9f8;
+  box-shadow: inset 3px 0 0 var(--red);
+}
+.undo-review .review-foot {
+  display: block;
+  flex: 0 0 auto;
+  padding: 0;
+  border-top: 1px solid var(--line-soft);
+  color: inherit;
+  background: var(--panel);
+}
+.undo-review .boundary {
+  display: flex;
+  gap: 8px;
+  margin: 9px 11px 8px;
+  padding: 9px 10px;
+  border: 1px solid #e8dfcc;
+  border-radius: 9px;
+  background: #faf7ef;
+}
+.undo-review .boundary svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+  margin-top: 1px;
+  color: var(--amber);
+}
+.undo-review .boundary p {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 9.7px;
+  line-height: 1.52;
+}
+.undo-review .boundary strong {
+  color: var(--ink);
+}
+.undo-review .undo-primary {
+  width: calc(100% - 22px);
+  min-height: 38px;
+  margin: 0 11px 11px;
+  border: none;
+  border-radius: 9px;
+  color: #fff;
+  background: var(--accent);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(122, 67, 45, 0.18);
+}
+.undo-review .undo-primary:hover {
+  background: #c96c4d;
+}
+.undo-review .undo-primary:disabled {
+  color: var(--ink-4);
+  background: var(--bg-sunken);
+  cursor: not-allowed;
+  box-shadow: none;
+}
+.undo-panel-state,
+.undo-action-error {
+  padding: 16px;
+  color: var(--ink-3);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.undo-panel-state--error,
+.undo-action-error {
+  color: var(--red);
+}
+.undo-action-error {
+  padding: 9px 11px 0;
+}
+
+/* Agent Team M1b live runs / inline diff / noise collapsing. */
+.livestream {
+  margin: 10px 0 0 0;
+  border: 1px solid rgba(217, 119, 87, 0.4);
+  border-radius: 10px;
+  background: linear-gradient(0deg, #fffdfa, #fff6ef);
+  overflow: hidden;
+}
+.ls-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 11px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.ls-spin svg {
+  width: 14px;
+  height: 14px;
+  color: var(--accent);
+  animation: spin 1.2s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.ls-lab {
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.ls-name {
+  font-size: 12px;
+  font-weight: 600;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ls-who {
+  font-size: 10px;
+  color: var(--ink-3);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.ls-who-av {
+  width: 15px;
+  height: 15px;
+  font-size: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+}
+.iso {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 9.5px;
+  font-weight: 600;
+  color: var(--purple);
+  background: rgba(91, 63, 165, 0.08);
+  border: 1px solid rgba(91, 63, 165, 0.2);
+  padding: 2px 8px;
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+.iso svg {
+  width: 10px;
+  height: 10px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+}
+.ls-feed {
+  padding: 6px 0 2px;
+  max-height: 268px;
+  overflow-y: auto;
+}
+.ls-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 11px;
+  border-top: 1px solid var(--line-soft);
+  background: var(--panel);
+  font-family: "SF Mono", ui-monospace, monospace;
+  font-size: 10px;
+  color: var(--ink-3);
+}
+.ls-foot-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: 0 0 7px;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+.ls-foot-verb {
+  color: var(--ink-2);
+  font-weight: 600;
+}
+.ls-foot-sep {
+  color: var(--line);
+}
+.ls-foot-tok {
+  margin-left: auto;
+  color: var(--ink-4);
+}
+
+/* F2: Collapse consecutive tool cards as a group (replacing old .noise* noise collapsing; semantics are unified into grouping). */
+.toolfold {
+  margin: 7px 0 0 0;
+  display: block;
+  font-size: 10.5px;
+  color: var(--ink-2);
+  padding: 0;
+  font-family: "SF Mono", ui-monospace, monospace;
+  cursor: pointer;
+}
+.toolfold__sum {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  list-style: none;
+  cursor: pointer;
+}
+.toolfold__sum::-webkit-details-marker {
+  display: none;
+}
+.toolfold__chevron {
+  width: 11px;
+  height: 11px;
+  stroke: var(--ink-4);
+  fill: none;
+  stroke-width: 2;
+  transition: transform 0.15s ease;
+}
+.toolfold[open] .toolfold__chevron {
+  transform: rotate(90deg);
+}
+.toolfold__label {
+  color: var(--ink-2);
+}
+.toolfold__list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+.toolfold__list .toolcard {
+  margin: 0;
+}
+
+.diffcard {
+  margin: 8px 0 0 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  overflow: hidden;
+}
+.diff-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 11px;
+  cursor: pointer;
+  width: 100%;
+  background: none;
+  border: none;
+  text-align: left;
+}
+.diff-head:hover {
+  background: var(--bg);
+}
+.diff-verb {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+.diff-file {
+  font-family: "SF Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  color: var(--ink);
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.diff-stat {
+  font-family: "SF Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  flex-shrink: 0;
+}
+.diff-add {
+  color: var(--green);
+}
+.diff-del {
+  color: var(--red);
+}
+.diff-chev {
+  width: 11px;
+  height: 11px;
+  color: var(--ink-4);
+  flex-shrink: 0;
+}
+.diff-chev svg {
+  width: 11px;
+  height: 11px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2.4;
+  transition: transform 0.15s;
+}
+.diffcard.is-open .diff-chev svg {
+  transform: rotate(90deg);
+}
+.diff-body {
+  border-top: 1px solid var(--line-soft);
+}
+.diff-code {
+  font-family: "SF Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  padding: 6px 0;
+  overflow-x: auto;
+  min-width: 0;
+}
+.diff-line {
+  padding: 1px 11px;
+  white-space: pre;
+}
+.diff-line--add {
+  background: rgba(106, 155, 92, 0.12);
+  color: #4d7a42;
+}
+.diff-line--del {
+  background: rgba(184, 80, 72, 0.1);
+  color: #8f433d;
+}
+.diff-foot {
+  padding: 7px 11px;
+  border-top: 1px solid var(--line-soft);
+  background: var(--bg);
+}
+.diff-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--accent);
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 0;
+}
+.diff-open svg {
+  width: 11px;
+  height: 11px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+}

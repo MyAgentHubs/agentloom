@@ -13,6 +13,7 @@ mod memory_blocks;
 mod memory_entries;
 mod message_history;
 mod messages;
+mod schema_golden;
 mod session_lifecycle;
 mod settings;
 mod team_contracts;

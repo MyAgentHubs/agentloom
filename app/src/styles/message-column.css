@@ -1,0 +1,269 @@
+/* ===== Two-state message-column width =====
+   right panel closed = .turn/.composer each centered at max-width (current behavior · retain the app's 760 baseline);
+   right panel open = adaptively fill the column width · leave no large white margins */
+.surface.rpopen .turn {
+  max-width: none;
+}
+.surface.rpopen .composer {
+  max-width: none;
+}
+.composer__pending {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin-bottom: 6px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.composer__pending-label {
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-weight: 700;
+  white-space: nowrap;
+}
+.composer__pending-question {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+}
+.composer__pending-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.composer__pending-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--ink-2);
+  font: inherit;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.composer__pending-option:hover:not(:disabled),
+.composer__pending-option.rec {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.composer__pending-option:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+.composer__pending-option .rec-pill {
+  padding: 1px 4px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 700;
+}
+.composer__quote {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin-bottom: 6px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  background: var(--bg-sunken);
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.composer__quote-icon {
+  flex: 0 0 14px;
+  width: 14px;
+  height: 14px;
+  color: var(--ink-3);
+}
+.composer__quote-label {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+.composer__quote-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer__quote-clear {
+  flex: 0 0 auto;
+  display: inline-flex;
+  padding: 2px;
+  border: none;
+  border-radius: 5px;
+  background: none;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+.composer__quote-clear:hover {
+  background: var(--panel);
+  color: var(--ink-2);
+}
+.composer__quote-clear svg {
+  width: 13px;
+  height: 13px;
+}
+/* msgfix2 Q1: queued messages while running—above the composer, at the same level as the quote chip. */
+.composer__queue {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  margin-bottom: 6px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--bg-sunken);
+}
+.composer__queue-label {
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.composer__queue-paused-hint {
+  color: var(--ink-3);
+}
+.composer__queue-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 4px 6px;
+  border-radius: 6px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+}
+.composer__queue-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.composer__queue-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.composer__queue-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 6px;
+  border: none;
+  border-radius: 5px;
+  background: none;
+  color: var(--ink-3);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.composer__queue-btn:hover {
+  background: var(--bg-sunken);
+  color: var(--ink);
+}
+.composer__queue-btn--send {
+  color: var(--accent);
+  font-weight: 600;
+}
+.composer__queue-btn--remove {
+  font-size: 13px;
+}
+.composer__box {
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--panel);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+}
+.composer__attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 8px;
+}
+.composer__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  padding: 4px 6px 4px 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 11.5px;
+  color: var(--ink-2);
+}
+.composer__chip-ic {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  color: var(--ink-3);
+}
+.composer__chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer__chip-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border: 0;
+  background: none;
+  color: var(--ink-3);
+  cursor: pointer;
+  border-radius: 4px;
+  font-size: 13px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.composer__chip-x:hover {
+  background: var(--bg-sunken);
+  color: var(--ink);
+}
+.composer__input {
+  width: 100%;
+  border: none;
+  border-color: var(--line);
+  background: transparent;
+  resize: none;
+  padding: 12px 14px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ink);
+  outline: none;
+  display: block;
+  min-height: 24px;
+  max-height: 160px;
+  overflow-y: auto;
+  box-sizing: border-box;
+  transition: box-shadow 0.12s;
+}
+.composer__input:disabled {
+  color: var(--ink-4);
+  cursor: not-allowed;
+}

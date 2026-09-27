@@ -313,10 +313,10 @@ describe("App", () => {
     expect(await screen.findByText("orchestrated 短标题")).toBeInTheDocument();
   });
 
-  // T7：worker 唤醒 lead 续跑已统一收归后端 on_worker_settled（报告落账之后才触发，见
-  // member_report_delivery 台账设计），前端不再自行 invoke resume_lead_session——即便
-  // orchestrated worker 终态事件到达且 lead 空闲，也绝不产生这个 invoke（不再有「抢跑」
-  // 空轮的风险）。
+  // The backend on_worker_settled alone wakes the lead after a worker finishes, only after its report
+  // has been recorded. The frontend must never invoke resume_lead_session itself, even when an
+  // orchestrated worker terminal event arrives while the lead is idle, so it cannot race the report
+  // and trigger an empty turn.
   it("worker 完成不再由前端唤醒 lead：orchestrated worker 终态事件 + lead 空闲 → 不 invoke resume_lead_session（唤醒权收归后端 on_worker_settled）", async () => {
     mockBasicApp(agentProfiles, { messages: orchestratedTeamMessages() });
 

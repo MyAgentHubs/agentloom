@@ -1,11 +1,11 @@
-//! engine bridge 桥评测 runner（M2 Phase0 T2）。
+//! Data-driven engine bridge evaluation runner.
 //!
-//! 数据驱动：每个场景一个目录 `evals/engine-bridge/fixtures/<NN-name>/`（manifest.json +
-//! expected.json），本文件不得出现引用具体场景内容/名字/期望值字符串的分支逻辑
-//! （配套内部评测程序文档 G4）。协议由该内部文档规定。
+//! Each scenario lives in `evals/engine-bridge/fixtures/<NN-name>/` with
+//! `manifest.json` and `expected.json`. Keep scenario names, contents, and expected
+//! values out of runner branches so every fixture exercises the same protocol.
 //!
-//! 冻结后（Phase 0 完成、用户 review 通过）本文件与夹具同级 never-edit——
-//! 见配套内部评测程序文档的「Fixed — never edit」清单。
+//! Keep the runner and fixtures fixed once the evaluation baseline is approved
+//! so later engine changes are measured against a stable reference.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -116,7 +116,7 @@ fn fixtures_root() -> PathBuf {
         .join("fixtures")
 }
 
-/// 系统 temp 下建一个进程内唯一子目录（不用 tempfile crate，见 T2 任务书 G3）。
+/// Isolate evaluation files in a unique system temporary directory to prevent collisions.
 fn unique_tmp_dir(tag: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -249,9 +249,10 @@ fn run_replay_driver(scenario_dir: &Path, manifest: &Manifest) -> (i32, Vec<Stri
 }
 
 // ---------------------------------------------------------------------------
-// 消费语义 reducer —— 复刻 lib.rs spawn_and_stream 的真实消费顺序，
-// 所有判断点调产品真函数（parse_harness_line / parse_harness_plan_line /
-// HarnessPlanDisplayFilter::apply / agent::sidecar_exit_error）。
+// Consumption-semantics reducer: reproduces the real consumption order from
+// src/lib/solo_stream.rs, with every decision point calling the real product functions
+// (parse_harness_line / parse_harness_plan_line / HarnessPlanDisplayFilter::apply /
+// agent::sidecar_exit_error).
 // ---------------------------------------------------------------------------
 
 struct ReducedRun {

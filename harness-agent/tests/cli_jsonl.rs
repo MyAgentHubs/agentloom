@@ -219,6 +219,18 @@ fn ask_permission_fails_closed_in_non_interactive_jsonl_mode() {
     assert!(events.iter().any(|event| {
         event["type"] == "run.blocked" && event["payload"]["reason"] == "approval_unavailable"
     }));
+    let step_completed_blocked_index = events.iter().position(|event| {
+        event["type"] == "orchestration.step.completed" && event["payload"]["outcome"] == "blocked"
+    });
+    let run_blocked_index = events
+        .iter()
+        .position(|event| event["type"] == "run.blocked")
+        .expect("run.blocked must be present");
+    assert_eq!(
+        step_completed_blocked_index,
+        Some(run_blocked_index - 1),
+        "orchestration.step.completed(blocked) must be emitted immediately before run.blocked when approval_unavailable_seen triggers Blocked from a Complete verdict"
+    );
 }
 
 #[test]

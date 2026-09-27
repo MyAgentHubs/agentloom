@@ -1,12 +1,18 @@
+mod journal;
+
 use crate::agent_event::{AgentEvent, DispatchMeta};
 use crate::member_runner::TextGranularity;
+use journal::{runs_dir, JournalTee};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::{BTreeMap, VecDeque};
+#[cfg(test)]
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
+#[cfg(test)]
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
@@ -25,6 +31,12 @@ pub(crate) struct SequencedEvent {
     pub event: AgentEvent,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RunIdentity {
+    pub agent_id: Option<String>,
+    pub agent_name_snapshot: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub(crate) struct RunBatch {
     pub session_id: String,
@@ -32,6 +44,10 @@ pub(crate) struct RunBatch {
     pub run_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dispatch: Option<DispatchMeta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_name_snapshot: Option<String>,
     pub events: Vec<SequencedEvent>,
 }
 
@@ -92,6 +108,8 @@ struct Lane {
     session_id: String,
     dispatch: Option<DispatchMeta>,
     granularity: TextGranularity,
+    agent_id: Option<String>,
+    agent_name_snapshot: Option<String>,
     state: Mutex<LaneState>,
     not_full: Condvar,
     parsed_seq: AtomicU64,
@@ -127,33 +145,6 @@ struct DiagnosticCounters {
     retired_parsed_seq: AtomicU64,
     retired_emitted_seq: AtomicU64,
     retired_frontend_applied_seq: AtomicU64,
-}
-
-struct JournalTee {
-    sender: SyncSender<JournalMessage>,
-    diagnostics: Arc<DiagnosticCounters>,
-}
-
-enum JournalMessage {
-    Record(JournalRecord),
-    #[cfg(test)]
-    Flush(mpsc::Sender<()>),
-}
-
-struct JournalRecord {
-    run_id: String,
-    json: String,
-}
-
-#[derive(Serialize)]
-struct JournalEnvelope<'a> {
-    run_id: &'a str,
-    session_id: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dispatch: Option<&'a DispatchMeta>,
-    seq: u64,
-    #[serde(flatten)]
-    event: &'a AgentEvent,
 }
 
 impl EventTransport {
@@ -202,6 +193,7 @@ impl EventTransport {
         session_id: impl Into<String>,
         dispatch: Option<DispatchMeta>,
         granularity: TextGranularity,
+        identity: RunIdentity,
     ) -> Result<(), TransportError> {
         let run_id = run_id.into();
         let mut lanes = lock(&self.inner.lanes);
@@ -215,6 +207,8 @@ impl EventTransport {
                 session_id: session_id.into(),
                 dispatch,
                 granularity,
+                agent_id: identity.agent_id,
+                agent_name_snapshot: identity.agent_name_snapshot,
                 state: Mutex::new(LaneState {
                     lifecycle: Lifecycle::Open,
                     next_seq: 0,
@@ -341,7 +335,7 @@ impl EventTransport {
     /// acquires an external/slot lock. The emit lock remains held from draining
     /// the lane until all sink callbacks have run sequentially and returned.
     ///
-    /// M1 修复轮 P0-1（2026-08-11·opus 深审）：callers must NOT hold the `db::Db` mutex
+    /// Deadlock-prevention invariant: callers must NOT hold the `db::Db` mutex
     /// (session_runtime table) across this call either. `TimedMutex`/`std::sync::Mutex` are
     /// non-reentrant; the release throats (`emit_terminal_after_releasing_run_slot` /
     /// `emit_lead_error_and_release` / `refresh_session_runtime`, all in lib.rs) take and drop
@@ -548,62 +542,6 @@ impl Inner {
     }
 }
 
-impl JournalTee {
-    fn new(root: PathBuf, capacity: usize, diagnostics: Arc<DiagnosticCounters>) -> Self {
-        let (sender, receiver) = mpsc::sync_channel(capacity);
-        let writer_diagnostics = diagnostics.clone();
-        thread::Builder::new()
-            .name("event-journal-writer".into())
-            .spawn(move || journal_writer_loop(root, receiver, writer_diagnostics))
-            .expect("failed to start EventTransport journal writer thread");
-        Self {
-            sender,
-            diagnostics,
-        }
-    }
-
-    fn record(&self, lane: &Lane, dispatch: Option<&DispatchMeta>, seq: u64, event: &AgentEvent) {
-        let envelope = JournalEnvelope {
-            run_id: &lane.run_id,
-            session_id: &lane.session_id,
-            dispatch,
-            seq,
-            event,
-        };
-        let json = match serde_json::to_string(&envelope) {
-            Ok(json) => json,
-            Err(_) => {
-                self.diagnostics
-                    .journal_write_errors
-                    .fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        };
-        match self.sender.try_send(JournalMessage::Record(JournalRecord {
-            run_id: lane.run_id.clone(),
-            json,
-        })) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                self.diagnostics
-                    .journal_dropped
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn flush(&self) {
-        let (sender, receiver) = mpsc::channel();
-        self.sender
-            .send(JournalMessage::Flush(sender))
-            .expect("journal writer stopped during test");
-        receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("journal writer did not flush during test");
-    }
-}
-
 fn tick_loop(inner: Weak<Inner>) {
     loop {
         let Some(inner) = inner.upgrade() else {
@@ -705,6 +643,8 @@ fn batches_for(lane: &Lane, events: Vec<QueuedEvent>) -> Vec<RunBatch> {
                 session_id: lane.session_id.clone(),
                 run_id: lane.run_id.clone(),
                 dispatch: queued.dispatch,
+                agent_id: lane.agent_id.clone(),
+                agent_name_snapshot: lane.agent_name_snapshot.clone(),
                 events: vec![queued.sequenced],
             });
         }
@@ -808,88 +748,6 @@ fn sum_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
         (None, None) => None,
         (left, right) => Some(left.unwrap_or(0).saturating_add(right.unwrap_or(0))),
     }
-}
-
-fn journal_writer_loop(
-    root: PathBuf,
-    receiver: mpsc::Receiver<JournalMessage>,
-    diagnostics: Arc<DiagnosticCounters>,
-) {
-    let mut writers: HashMap<PathBuf, File> = HashMap::new();
-    while let Ok(message) = receiver.recv() {
-        match message {
-            JournalMessage::Record(record) => {
-                let path = root.join(format!("{}.jsonl", safe_run_file_name(&record.run_id)));
-                if !writers.contains_key(&path) {
-                    let opened = fs::create_dir_all(&root)
-                        .and_then(|()| OpenOptions::new().create(true).append(true).open(&path));
-                    match opened {
-                        Ok(writer) => {
-                            writers.insert(path.clone(), writer);
-                        }
-                        Err(_) => {
-                            diagnostics
-                                .journal_write_errors
-                                .fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                    }
-                }
-                let write_failed = writers
-                    .get_mut(&path)
-                    .is_some_and(|writer| writeln!(writer, "{}", record.json).is_err());
-                if write_failed {
-                    writers.remove(&path);
-                    diagnostics
-                        .journal_write_errors
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            #[cfg(test)]
-            JournalMessage::Flush(done) => {
-                for writer in writers.values_mut() {
-                    if writer.flush().is_err() {
-                        diagnostics
-                            .journal_write_errors
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                let _ = done.send(());
-            }
-        }
-    }
-    for writer in writers.values_mut() {
-        let _ = writer.flush();
-    }
-}
-
-fn safe_run_file_name(run_id: &str) -> String {
-    let safe = run_id
-        .chars()
-        .map(|character| {
-            if character.is_alphanumeric() || matches!(character, '-' | '_') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if safe.is_empty() {
-        "run".into()
-    } else {
-        safe
-    }
-}
-
-pub(crate) fn runs_dir() -> PathBuf {
-    home_dir().join(".agentloom").join("runs")
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

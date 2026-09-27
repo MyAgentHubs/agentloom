@@ -167,6 +167,209 @@ describe("App", () => {
     });
   });
 
+  it("session_started batch · remote identity beats the default agent guess", async () => {
+    mockBasicApp([
+      agentProfile(),
+      agentProfile({
+        id: "deepseek",
+        name: "DeepSeek",
+        provider: "deepseek",
+        access: "borrow",
+        sort_order: 1,
+      }),
+    ]);
+    render(<App />);
+    await screen.findByText("Claude Code");
+
+    act(() => {
+      agentEventBatchCb()({
+        payload: {
+          batches: [
+            {
+              session_id: "s1",
+              agent_id: "deepseek",
+              agent_name_snapshot: "DeepSeek",
+              events: [
+                {
+                  seq: 1,
+                  kind: "session_started",
+                  conversation_id: "remote-b1",
+                },
+                { seq: 2, kind: "text_delta", text: "remote streaming b1" },
+              ],
+            },
+          ],
+        },
+      });
+    });
+
+    await screen.findByText("remote streaming b1");
+    const remoteTail = sessionMainProps[
+      sessionMainProps.length - 1
+    ]?.messages?.find((message) =>
+      message.content.some(
+        (block) =>
+          (block as { type?: string; text?: string }).type === "text" &&
+          (block as { text?: string }).text === "remote streaming b1",
+      ),
+    );
+    expect(remoteTail).toMatchObject({
+      engine: "deepseek",
+      agent_id: "deepseek",
+      agent_name_snapshot: "DeepSeek",
+    });
+  });
+
+  it("session_started batch · event identity beats an explicit desktop selection", async () => {
+    mockBasicApp([
+      agentProfile(),
+      agentProfile({
+        id: "deepseek",
+        name: "DeepSeek",
+        provider: "deepseek",
+        access: "borrow",
+        sort_order: 1,
+      }),
+    ]);
+    render(<App />);
+    await screen.findByText("Claude Code");
+    fireEvent.click(screen.getByRole("button", { name: /选择 agent/ }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Claude Code" }));
+
+    act(() => {
+      agentEventBatchCb()({
+        payload: {
+          batches: [
+            {
+              session_id: "s1",
+              agent_id: "deepseek",
+              agent_name_snapshot: "DeepSeek",
+              events: [
+                {
+                  seq: 1,
+                  kind: "session_started",
+                  conversation_id: "remote-b2",
+                },
+                { seq: 2, kind: "text_delta", text: "remote streaming b2" },
+              ],
+            },
+          ],
+        },
+      });
+    });
+
+    await screen.findByText("remote streaming b2");
+    const remoteTail = sessionMainProps[
+      sessionMainProps.length - 1
+    ]?.messages?.find((message) =>
+      message.content.some(
+        (block) =>
+          (block as { type?: string; text?: string }).type === "text" &&
+          (block as { text?: string }).text === "remote streaming b2",
+      ),
+    );
+    expect(remoteTail).toMatchObject({
+      engine: "deepseek",
+      agent_id: "deepseek",
+      agent_name_snapshot: "DeepSeek",
+    });
+  });
+
+  it("session_started batch · resolves a missing event name from local agents", async () => {
+    mockBasicApp([
+      agentProfile(),
+      agentProfile({
+        id: "deepseek",
+        name: "DeepSeek",
+        provider: "deepseek",
+        access: "borrow",
+        sort_order: 1,
+      }),
+    ]);
+    render(<App />);
+    await screen.findByText("Claude Code");
+
+    act(() => {
+      agentEventBatchCb()({
+        payload: {
+          batches: [
+            {
+              session_id: "s1",
+              agent_id: "deepseek",
+              events: [
+                {
+                  seq: 1,
+                  kind: "session_started",
+                  conversation_id: "remote-b3",
+                },
+                { seq: 2, kind: "text_delta", text: "remote streaming b3" },
+              ],
+            },
+          ],
+        },
+      });
+    });
+
+    await screen.findByText("remote streaming b3");
+    const remoteTail = sessionMainProps[
+      sessionMainProps.length - 1
+    ]?.messages?.find((message) =>
+      message.content.some(
+        (block) =>
+          (block as { type?: string; text?: string }).type === "text" &&
+          (block as { text?: string }).text === "remote streaming b3",
+      ),
+    );
+    expect(remoteTail).toMatchObject({
+      engine: "deepseek",
+      agent_id: "deepseek",
+      agent_name_snapshot: "DeepSeek",
+    });
+  });
+
+  it("session_started batch · preserves an unknown event agent identity", async () => {
+    mockBasicApp([agentProfile()]);
+    render(<App />);
+    await screen.findByText("Claude Code");
+
+    act(() => {
+      agentEventBatchCb()({
+        payload: {
+          batches: [
+            {
+              session_id: "s1",
+              agent_id: "gemini-cli",
+              agent_name_snapshot: "Gemini CLI",
+              events: [
+                {
+                  seq: 1,
+                  kind: "session_started",
+                  conversation_id: "remote-b4",
+                },
+                { seq: 2, kind: "text_delta", text: "remote streaming b4" },
+              ],
+            },
+          ],
+        },
+      });
+    });
+
+    await screen.findByText("remote streaming b4");
+    const remoteTail = sessionMainProps[
+      sessionMainProps.length - 1
+    ]?.messages?.find((message) =>
+      message.content.some(
+        (block) =>
+          (block as { type?: string; text?: string }).type === "text" &&
+          (block as { text?: string }).text === "remote streaming b4",
+      ),
+    );
+    expect(remoteTail).toMatchObject({
+      agent_id: "gemini-cli",
+      agent_name_snapshot: "Gemini CLI",
+    });
+  });
+
   it("session_started · 本地 run 已乐观注册时不覆盖 workingTokens", async () => {
     const { sendCalls } = mockBasicApp();
     render(<App />);

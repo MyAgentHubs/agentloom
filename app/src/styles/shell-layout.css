@@ -1,0 +1,546 @@
+/* ============================================================
+   Top-level shell layout provides a full-height sidebar and a window-filling content surface.
+   = Full-height left sidebar .sidebar + one surface (.surface fills the window · rounded left corners · collapsed .full takes over)
+   Source: shell-redesign.html
+   Note: the old three-column seam rules have been removed
+   ============================================================ */
+:root {
+  --chrome-inset: 0; /* Real Overlay traffic lights exist only on macOS; other OSs need no top-left inset */
+}
+html[data-os="macos"] {
+  --chrome-inset: 78px; /* macOS real Overlay traffic-light inset (fixed at the window top left · no fake DOM rendered) */
+}
+.app-shell {
+  display: flex;
+  flex-direction: row;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg);
+}
+.shell-bg {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  min-height: 0;
+  /* flex items default to min-width:auto(=min-content)·under deep WebKit nesting, the inner surface{min-width:0} was not reset to zero,
+     causing shell-bg to stick at min-content instead of shrinking, pushing surface/session-pane past the viewport and producing horizontal scrolling (confirmed by GUI testing).
+     Explicit min-width:0 restores the shrinkage floor to 0 → shell-bg shrinks to app-shell(viewport) width → surface/session-pane shrink correctly. */
+  min-width: 0;
+}
+/* Left sidebar = full-height column · flush with the warm beige base (not a floating card) */
+.sidebar {
+  flex: 0 0 230px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg);
+  position: relative;
+}
+.sidebar.collapsed {
+  display: none;
+}
+.sidebar__resizer {
+  position: absolute;
+  top: 0;
+  right: -2px;
+  bottom: 0;
+  width: 5px;
+  cursor: col-resize;
+  z-index: 5;
+  background: transparent;
+}
+.sidebar__resizer:hover {
+  background: var(--accent, #d97757);
+  opacity: 0.5;
+}
+/* Left sidebar top: real traffic-light inset (no fake dots) + collapse / ← → / search DOM controls */
+.sb-top {
+  height: 46px;
+  flex: 0 0 46px;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 0 8px 0 var(--chrome-inset);
+}
+.sb-scroll {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+/* surface = one main+right surface · fills the window’s top/right/bottom edges · rounded only on the left where it meets the sidebar */
+.surface {
+  flex: 1;
+  margin-left: 8px;
+  background: var(--panel);
+  border-radius: 15px 0 0 15px;
+  box-shadow: -1px 0 3px rgba(28, 26, 23, 0.035);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+.surface.full {
+  margin-left: 0;
+  border-radius: 0;
+}
+/* surface includes its own header (left = session status bar ｜ center = global controls ｜ right = right-panel tabs + window controls) */
+.sf-head {
+  height: 44px;
+  flex: 0 0 44px;
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--line-soft);
+  position: relative;
+}
+/* Left segment = sits above the main(session-pane) column · flex:1 · min-width:0 truncates target text within the main boundary without overflowing into the right-panel control area */
+.sf-head__main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px 0 16px;
+}
+.sf-head.inset .sf-head__main {
+  padding-left: var(--chrome-inset);
+}
+.sf-head__main--compact {
+  flex: 0 0 auto;
+  padding-right: 4px;
+}
+.sf-head__main-content {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+.sf-head__main--compact .sf-head__main-content {
+  display: none;
+}
+/* Right segment = sits above the right-panel column */
+.sf-head__ctl {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+}
+/* Panel open (not maximized): fixed = tools-pane(320) + sf-div(1) = 321 · border-left overlays the column-boundary vertical rule */
+.sf-head__ctl--open {
+  flex: 0 0 321px;
+  padding: 0 8px 0 0;
+  border-left: 1px solid var(--line-soft);
+}
+/* Maximized: the right segment takes over the full width */
+.sf-head__ctl--max {
+  flex: 1 1 auto;
+}
+/* GUI acceptance correction: right-segment controls are right-aligned against the window’s right edge (aligned with prototype .sf-tabs margin-left:auto).
+   The original margin-left:0 left alignment was a misjudgment (opposite the prototype) · reverted. */
+.sf-collapsed-ctrls {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  margin-right: 6px;
+}
+.sf-ctx {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+.sf-tabs {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  overflow: visible;
+  scrollbar-width: none;
+  max-width: 360px;
+}
+.sf-tabs::-webkit-scrollbar {
+  height: 0;
+}
+.sf-body {
+  flex: 1;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+.session-pane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--panel);
+}
+.session-pane.hidden {
+  display: none;
+}
+.sf-div {
+  width: 1px;
+  background: var(--line-soft);
+  flex: 0 0 auto;
+}
+.tools-pane {
+  flex: 0 0 320px;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.tools-pane.full {
+  flex: 1 1 auto;
+}
+.tools-pane.hidden {
+  display: none;
+}
+.sf-ctx .br {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink-2);
+}
+.sf-ctx .br svg {
+  stroke: var(--ink-3);
+}
+.sf-ctx__title {
+  color: var(--ink);
+  font-weight: 600;
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sf-ctx__sub {
+  color: var(--ink-3);
+  flex: 0 0 auto;
+}
+.sf-ctx .st {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.sf-ctx .st .d {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+}
+.sf-ctx .st.run .d {
+  background: var(--accent);
+}
+.sf-ctx .dots {
+  color: var(--ink-4);
+  cursor: pointer;
+  padding: 0 5px;
+  font-weight: 700;
+}
+.sf-ctx .dots:hover {
+  color: var(--ink-2);
+}
+
+.sf-tabs .topbar__panel {
+  flex: 0 1 auto;
+  border-left: none;
+  padding: 0;
+  background: transparent;
+}
+.sf-tabs .topbar__panel--collapsed {
+  background: transparent;
+  border-left: none;
+}
+.sf-tabs.expanded {
+  margin-left: 0;
+  max-width: none;
+  flex: 1;
+}
+.sf-tabs.expanded .rptabs__tabrow {
+  padding-right: 84px;
+}
+.sf-tabs.expanded .topbar__panel {
+  flex: 1 1 auto;
+}
+
+.ns-av {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+.ns-av--loc {
+  align-items: center;
+  justify-content: center;
+  color: var(--ink-2);
+}
+.ns-av__sq {
+  width: 100%;
+  height: 100%;
+  border-radius: 5px;
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.ns-av__sq--p1 {
+  background: linear-gradient(135deg, #e08562, #b85838);
+}
+.ns-av__sq--p2 {
+  background: linear-gradient(135deg, #6b829a, #455f75);
+  border-radius: 50%;
+}
+.ns-av__badge {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--panel);
+  box-shadow: 0 0 0 1px var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5px;
+}
+.ns-av__badge--gh {
+  color: var(--ink-2);
+}
+
+/* Settings overlay sheet (spec §2.F · source: shell-redesign.html .backdrop/.sheet) */
+.settings-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(28, 26, 23, 0.34);
+  backdrop-filter: blur(2px);
+}
+.settings-sheet {
+  width: 86vw;
+  height: 84vh;
+  max-width: 1080px;
+  max-height: 760px;
+  background: var(--panel);
+  border-radius: 16px;
+  box-shadow: 0 18px 70px rgba(28, 26, 23, 0.4);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  outline: none;
+}
+.settings-sheet__head {
+  height: 48px;
+  flex: 0 0 48px;
+  display: flex;
+  align-items: center;
+  padding: 0 12px 0 18px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.settings-sheet__head .t {
+  font-size: 13.5px;
+  font-weight: 700;
+  flex: 1;
+}
+.settings-sheet__head .kbd {
+  font-size: 10px;
+  color: var(--ink-4);
+  margin-right: 10px;
+}
+.settings-sheet__head .kbd b {
+  background: var(--bg-sunken);
+  border-radius: 4px;
+  padding: 1px 5px;
+  color: var(--ink-3);
+}
+.settings-sheet__x {
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+.settings-sheet__x:hover {
+  background: var(--bg-sunken);
+  color: var(--ink);
+}
+.settings-sheet__x svg {
+  width: 16px;
+  height: 16px;
+}
+.settings-sheet__body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+.settings-sheet__version {
+  flex: 0 0 28px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 0 18px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--ink-4);
+  font-size: 10px;
+  line-height: 1;
+}
+/* sheet-scope: enlarge internal controls to eliminate the “undersized” appearance (do not change the global .st-* baseline · codex reminder) */
+.settings-sheet .st-nav {
+  flex: 0 0 210px;
+}
+.settings-sheet .st-nav-item {
+  font-size: 13px;
+}
+.settings-sheet .st-content {
+  padding: 24px 30px;
+}
+.settings-sheet .st-content.repo {
+  padding: 24px 30px 0;
+}
+.settings-sheet .st-form {
+  max-width: 720px;
+}
+
+/* === Navigation IA · RepoSwitcherDropdown (spec §2.A.3 · mockup section 2) === */
+.repo-switcher {
+  position: absolute;
+  top: 100%;
+  left: 8px;
+  margin-top: 4px;
+  width: 270px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: 0 16px 44px rgba(28, 26, 23, 0.26);
+  padding: 6px;
+  z-index: 30;
+}
+.repo-switcher .rsw-search {
+  margin-bottom: 5px;
+}
+.repo-switcher .rsw-search input {
+  width: 100%;
+  border: none;
+  background: var(--bg-sunken);
+  border-radius: 8px;
+  padding: 7px 9px;
+  font-size: 12px;
+  color: var(--ink);
+}
+.repo-switcher .rsw-search input::placeholder {
+  color: var(--ink-4);
+}
+.repo-switcher .dd-sec {
+  padding: 8px 9px 3px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.repo-switcher .dd-sec .dd-sec-nm {
+  color: var(--ink-2);
+  font-size: 11px;
+  font-weight: 700;
+}
+.repo-switcher .dd-sec .dd-sec-sub {
+  color: var(--ink-4);
+  font-size: 10px;
+}
+.repo-switcher .rsw-empty {
+  padding: 14px 11px;
+  font-size: 11.5px;
+  color: var(--ink-3);
+  text-align: center;
+}
+.repo-switcher .dd-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 9px;
+  border-radius: 7px;
+  font-size: 12.5px;
+  color: var(--ink-2);
+  cursor: pointer;
+}
+.repo-switcher .dd-row:hover {
+  background: var(--bg-sunken);
+}
+.repo-switcher .dd-row.on {
+  background: var(--accent-soft);
+  color: var(--ink);
+  font-weight: 600;
+}
+.repo-switcher .dd-row .dd-row-nm {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.repo-switcher .dd-row .ck {
+  color: var(--accent);
+  font-size: 12px;
+}
+.repo-switcher .dd-row-count {
+  flex: 0 0 auto;
+  color: var(--ink-4);
+  font-size: 10.5px;
+  font-weight: 400;
+}
+.repo-switcher__edit {
+  display: flex;
+  align-items: center;
+  padding: 0 2px;
+  border: 0;
+  background: none;
+  color: var(--ink-3);
+  cursor: pointer;
+  font: inherit;
+  line-height: 1;
+  opacity: 0;
+}
+.repo-switcher .dd-row:hover .repo-switcher__edit,
+.repo-switcher__edit:focus-visible {
+  opacity: 1;
+}
+.repo-switcher .dd-div {
+  height: 1px;
+  background: var(--line-soft);
+  margin: 5px 8px;
+}
+.repo-switcher .dd-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: 7px;
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+}
+.repo-switcher .dd-foot:hover {
+  background: var(--bg-sunken);
+}
+.repo-switcher .dd-foot.muted {
+  color: var(--ink-3);
+}
+.repo-switcher .dd-foot__ic {
+  font-size: 14px;
+  line-height: 1;
+}
+.repo-switcher .dd-foot__err {
+  color: var(--red);
+  font-size: 11.5px;
+  padding: 4px 9px 2px;
+}

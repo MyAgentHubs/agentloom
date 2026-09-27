@@ -1,10 +1,10 @@
-//! 图片附件加载 + provider 图片能力默认表（纯逻辑·CLI/orchestrator 复用）。
+//! Image attachment loading and provider image capability defaults, shared by CLI/orchestrator logic.
 //!
-//! 设计要点（见 T1 brief）：
-//! - 只信魔数，不信扩展名——上传一个改了后缀的假图必须被拒。
-//! - 单张 ≤ 10 MB、单轮 ≤ 8 张，超限直接硬报错（哪张为什么）。
-//! - `ImageBlock` 里的 base64 数据只在内存里流转，绝不落盘到 journal / conversation.json
-//!   （由 `ImageBlock` 的 `Serialize` 跳过 `data_base64` 保证）。
+//! Design highlights:
+//! - Trust magic bytes, not extensions: fake images with renamed extensions must be rejected.
+//! - Limit each image to 10 MB and each turn to 8 images; fail hard with the image and reason.
+//! - `ImageBlock` base64 data stays in memory and never reaches the journal or conversation.json:
+//!   `ImageBlock` serialization via `Serialize` skips the `data_base64` field.
 
 use std::path::{Path, PathBuf};
 
@@ -23,10 +23,11 @@ pub struct ImageBlock {
     pub data_base64: String,
     pub source_path: Option<PathBuf>,
     pub bytes: usize,
-    /// 内容指纹（十六进制 SHA-256），首次加载时算好——resume 重读时优先比这个，
-    /// 而不是只比字节数+media_type（t12-img 第三轮 opus 审 P2-2：同长度换内容检测
-    /// 不到，历史图片会被静默掉包）。`#[serde(default)]`：老 conversation.json 没有
-    /// 这个字段，反序列化补 `None`，重读时退回原来的长度核对，向后兼容。
+    /// Hexadecimal SHA-256 content fingerprint, computed at initial load. On resume,
+    /// prefer this over byte count plus `media_type`: those checks miss same-length
+    /// content replacements and can silently substitute historical images.
+    /// `#[serde(default)]` supplies `None` for older conversation.json files without
+    /// this field; rereading then falls back to byte-count checks for compatibility.
     #[serde(default)]
     pub sha256: Option<String>,
 }
@@ -128,9 +129,9 @@ fn load_one_image(path: &Path) -> Result<ImageBlock> {
     })
 }
 
-/// 十六进制 SHA-256（P2-2 的内容指纹）。逐字节手写十六进制，不依赖 digest 输出类型
-/// 是否实现 `LowerHex`（sha2 0.11 的 `Array` 输出类型不像旧版 `GenericArray` 那样有
-/// 该 impl）。
+/// Hexadecimal SHA-256 content fingerprint, formatted byte by byte without requiring
+/// the digest output to implement `LowerHex`: sha2 0.11's `Array` output does not
+/// implement that trait, unlike the older `GenericArray` output.
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
@@ -166,9 +167,10 @@ pub fn default_supports_images(provider_id: &str) -> bool {
     false
 }
 
-/// 未显式配置 supports_images 时的最终默认值：先查 model 名种子表（T19：GLM 家族按
-/// 型号判——只有 `glm-4v`/`glm-4.1v`/`glm-4.5v`/`glm-4.6v` 这类视觉型号吃图，`glm-5.x`
-/// 等文本型号不吃），查不到再回落 `default_supports_images` 的 provider 家族默认。
+/// Final default when `supports_images` is not explicitly configured: first consult the model-name
+/// seed table. GLM support depends on the specific model: only vision models such as `glm-4v`,
+/// `glm-4.1v`, `glm-4.5v`, and `glm-4.6v` support images; text-only models such as `glm-5.x` do not.
+/// If no seed matches, fall back to the provider-family default from `default_supports_images`.
 pub fn resolve_default_supports_images(provider_id: &str, model: &str) -> bool {
     crate::supports_images_seed::seed_by_model(provider_id, model)
         .unwrap_or_else(|| default_supports_images(provider_id))
@@ -181,9 +183,10 @@ pub fn degraded_notice(file_label: &str, model: &str) -> String {
     )
 }
 
-/// T19 P2-1：厂商实际拒图（`reason:"provider_rejected"`）时的降级说明行——不说「模型不
-/// 支持图片输入」（这是猜的，且经常是错的：真实原因可能是格式/尺寸/张数问题），改说
-/// 「拒绝了图片输入」并附厂商原文摘要，让用户/模型看得到真相而不是被安慰式话术糊弄。
+/// Degradation notice when the provider actually rejects images (`reason:"provider_rejected"`).
+/// Say "rejected image input", not "the model does not support image input": the latter is a guess
+/// and often wrong, since format, size, or image count may be the cause. Include a summary of the
+/// provider's original error so callers and models see the actual failure instead of empty reassurance.
 fn provider_rejected_notice(file_label: &str, provider_error: Option<&str>) -> String {
     match provider_error {
         Some(err) if !err.is_empty() => format!(
@@ -195,11 +198,12 @@ fn provider_rejected_notice(file_label: &str, provider_error: Option<&str>) -> S
     }
 }
 
-/// resume 载回历史图片、但该图片没能随消息发出去时的说明行——措辞按 `reason` 分支。
-/// t12-img 第四轮返工（P3-F）：此前不管 `source_missing`/`source_changed` 还是
-/// `too_many_images` 一律复用「附件已不可用（原文件缺失或内容已变化）」这句话——超 8 张
-/// 上限那条路径里文件既没缺失也没变，这句话是假的，且会被 resume 收尾 `save_conversation`
-/// 固化进会话文本、模型此后每次都读到一句撒谎的说明。
+/// Notice for a historical image reloaded on resume but omitted from the outgoing
+/// message; wording must match `reason`. Previously, `source_missing`,
+/// `source_changed`, and `too_many_images` all claimed the attachment was unavailable
+/// because its source was missing or changed. Exceeding the 8-image limit implies
+/// neither condition. Resume's final `save_conversation` persists this notice in
+/// conversation text, so an inaccurate explanation would mislead every later model read.
 fn stale_notice(file_label: &str, reason: &str) -> String {
     if reason == "too_many_images" {
         format!(
@@ -229,23 +233,27 @@ pub(crate) fn debug_log(msg: &str) {
     }
 }
 
-/// resume 载回历史消息后调用：conversation.json 落盘时 `data_base64` 被
-/// `skip_serializing` 跳过，反序列化永远补空串——这批"图片"元信息还在，但数据已经
-/// 不在这份内存里了。逐条按 `source_path` 重读 + 复用 `load_one_image` 的前置约束
-/// （先 stat 判 `MAX_IMAGE_BYTES` 再读、魔数校验、内容指纹核对——t12-img 第三轮 opus
-/// 审 P2-3：重读此前完全不受 `--image` 首次加载的任何一条约束），成功则续接正常
-/// 出线；失败（路径不存在 / 内容已变化 / 超限）则剥掉该图 + 追加"附件已不可用"说明 +
-/// 记一条 `attachment.dropped`（reason 区分 `source_missing` / `source_changed`）。
-/// 只处理"落盘再载回"产生的空 `data_base64`——本轮刚 `load_images` 出来的图片
-/// `data_base64` 非空，直接跳过，不重读。**先按 `MAX_IMAGES_PER_TURN` 截尾、再重读**
-/// （t12-img 第四轮返工 P3-G：此前截尾排在重读循环之后，第 9…N 张会先被完整读盘+
-/// base64 编码才被丢掉——一个 conversation.json 列了 N 张逼近 10MB 的历史图，就是
-/// N×10MB 读盘 + N×13.3MB 分配换来的全部作废；现在超出上限的直接进
-/// `too_many_images`，一个字节都不读）；截尾之后再对保留的那批逐条重读，同样按
-/// `MAX_IMAGES_PER_TURN` 硬顶——`--image` 首次加载已有这条约束，重读这里补齐
-/// （P2-3）。失败（路径不存在 / 内容已变化 / 超限）则剥掉该图 + 追加对应说明 + 记一条
-/// `attachment.dropped`（reason 区分 `source_missing` / `source_changed` /
-/// `too_many_images`）。
+/// Restore historical images after messages are loaded on resume. In conversation.json,
+/// `skip_serializing` omits `data_base64`; deserialization always supplies an empty
+/// string, leaving image metadata in memory without the image data.
+/// Reread each `source_path` under all `load_one_image` constraints: stat against
+/// `MAX_IMAGE_BYTES` before reading, validate magic bytes, and check the content
+/// fingerprint. Previously, rereads bypassed all constraints of initial `--image`
+/// loading. Successful rereads continue normally; missing paths, changed content,
+/// or size violations remove the image, append an attachment-unavailable notice,
+/// and emit `attachment.dropped` with `source_missing` or `source_changed` as `reason`.
+/// Only empty `data_base64` from persisted and reloaded images needs restoration;
+/// fresh `load_images` results have nonempty data and are skipped without rereading.
+/// **Truncate to `MAX_IMAGES_PER_TURN` before rereading.** Previously, truncation
+/// followed the reload loop, so images 9 through N were fully read and base64-encoded
+/// before being discarded. N historical images near 10MB in conversation.json could
+/// waste N x 10MB of disk reads and N x 13.3MB of allocations on discarded data.
+/// Excess images now receive `too_many_images` without reading a single byte.
+/// Reread the retained images individually under the same `MAX_IMAGES_PER_TURN`
+/// hard limit as initial `--image` loading. For missing paths, changed content, or
+/// exceeded limits, remove the image, append the corresponding notice, and emit
+/// `attachment.dropped`; `reason` distinguishes `source_missing`, `source_changed`,
+/// and `too_many_images`.
 pub fn reload_stale_images(
     messages: &mut [crate::provider::ChatMessage],
     events: &mut crate::events::EventRecorder,
@@ -276,11 +284,11 @@ pub fn reload_stale_images(
             match reload_one_image(&image) {
                 Ok((data_base64, sha256)) => {
                     image.data_base64 = data_base64;
-                    // t12-img 第四轮返工（P3-C）：把刚算出来的指纹回填进
-                    // `ImageBlock.sha256`——老 conversation.json（无 sha256 字段）第一次
-                    // resume 成功之后就自愈升级成有指纹的，此后每次重读都走 P2-2 的
-                    // 内容指纹比对，不会一直退回长度核对（否则「同长度换内容」这个洞对
-                    // 这份会话永远敞着）。
+                    // Backfill the newly computed content fingerprint into `ImageBlock.sha256`.
+                    // An older conversation.json without sha256 upgrades automatically after
+                    // its first successful resume reread. Subsequent rereads compare content
+                    // fingerprints instead of continually falling back to byte-count checks,
+                    // which would otherwise leave same-length replacements undetectable forever.
                     image.sha256 = Some(sha256);
                     kept.push(image);
                 }
@@ -300,8 +308,8 @@ pub fn reload_stale_images(
     Ok(())
 }
 
-/// 剥掉一张重读失败/超限的历史图片：记一条 `attachment.dropped` + 追加一行说明
-/// （说明文案按 `reason` 分支，见 `stale_notice`——P3-F）。
+/// Remove a historical image that failed to reload or exceeded a limit, emit
+/// `attachment.dropped`, and append a notice selected by `reason`; see `stale_notice`.
 fn drop_one_stale_image(
     events: &mut crate::events::EventRecorder,
     image: &ImageBlock,
@@ -323,14 +331,16 @@ fn drop_one_stale_image(
     Ok(())
 }
 
-/// 按记录的 `source_path` 重读一张历史图片；成功返回 `(新编码的 base64, 算出的
-/// sha256 十六进制指纹)`，失败返回事件 reason（`source_missing` | `source_changed`）。
-/// 前置校验序列与 `load_one_image` 对齐：先 `metadata()` 判 `MAX_IMAGE_BYTES` 再决定
-/// 要不要整读（防一个几百 MB 的陈旧路径被整读进内存才判超限——P2-3），再魔数嗅探，
-/// 最后核对内容——有记录的 `sha256` 时优先比哈希（P2-2：同长度换内容此前检测不到）；
-/// 老 conversation.json 没有这个字段时退回原来的字节数核对（向后兼容，t12-img 第四轮
-/// 返工 P3-C：这一路径会 `debug_log` 一行，调用方把返回的指纹回填进 `ImageBlock`
-/// 让老会话自愈升级）。
+/// Reread a historical image from its recorded `source_path`. Success returns
+/// `(newly encoded base64, computed hexadecimal sha256 fingerprint)`; failure returns
+/// an event reason (`source_missing` | `source_changed`). Match `load_one_image`'s
+/// validation order: use `metadata()` to check `MAX_IMAGE_BYTES` before a full read,
+/// avoiding loading a stale file of hundreds of MB into memory just to reject it.
+/// Then sniff magic bytes and verify content, preferring a recorded `sha256` hash:
+/// byte count and media type alone cannot detect same-length content replacements.
+/// For older conversation.json files without this field, fall back to byte-count
+/// checks for compatibility and emit a `debug_log` line. The caller backfills the
+/// returned fingerprint into `ImageBlock`, automatically upgrading older conversations.
 fn reload_one_image(image: &ImageBlock) -> std::result::Result<(String, String), &'static str> {
     let path = image.source_path.as_ref().ok_or("source_missing")?;
     let meta = std::fs::metadata(path).map_err(|_| "source_missing")?;
@@ -390,13 +400,15 @@ pub fn degrade_unsupported_images(
     )
 }
 
-/// 同 `degrade_unsupported_images`，但剥图原因可参数化（T19：出线自愈——厂商实际
-/// 拿 400 拒了带图请求——用 `"provider_rejected"`，与「配置/种子表本就判定不支持」
-/// 的 `"provider_no_image_support"` 在 journal 里区分开）。`provider_error`（T19 P2-1）：
-/// `provider_rejected` 场景下厂商原文截断摘要，随事件 payload 记一份、也拼进说明行；其它
-/// 原因传 `None`。`emit_event`（T19 P2-2）：同一 provider 实例运行时覆盖已生效后的后续
-/// 轮次仍要剥图+追加说明（wire 副本是临时的，每轮都得剥），但不该对同一张图片重复记
-/// `attachment.dropped`——调用方传 `false` 抑制事件、只做剥图+文案。
+/// Like `degrade_unsupported_images`, with a parameterized removal reason for recovery in production.
+/// Use `"provider_rejected"` when the provider actually rejects an image request with HTTP 400;
+/// the journal distinguishes this from `"provider_no_image_support"`, where configuration or the
+/// seed table already indicated no image support. For `provider_rejected`, `provider_error` carries
+/// a truncated summary of the provider's original error into both the event payload and notice;
+/// pass `None` for other reasons. After a runtime override takes effect on the same provider instance,
+/// subsequent turns must still remove images and append notices because wire copies are temporary
+/// and need removal each turn. To avoid duplicate `attachment.dropped` events for the same image,
+/// callers can set `emit_event` to `false`, retaining only image removal and notice updates.
 #[allow(clippy::too_many_arguments)]
 pub fn degrade_images_with_reason(
     messages: &mut [crate::provider::ChatMessage],
@@ -647,8 +659,9 @@ mod tests {
 
     #[test]
     fn default_supports_images_recognizes_bigmodel_alias_via_provider_family() {
-        // P3-1：GLM 官方域名家族的 id 可能是 "bigmodel" 而不含 glm/zhipu/zai 子串——
-        // 复用 provider_family 之外再认这个别名，不能被 fail-closed 误判成不支持图片。
+        // The official GLM domain family may use "bigmodel" as its id, with no glm/zhipu/zai
+        // substring. Recognize this alias alongside `provider_family` grouping so fail-closed
+        // detection does not incorrectly reject image support.
         assert!(default_supports_images("bigmodel"));
         // qwen 家族现在也走 provider_family 的分组（Qwen => false），与原子串猜行为一致。
         assert!(!default_supports_images("qwen"));
@@ -656,9 +669,10 @@ mod tests {
 
     #[test]
     fn load_one_image_rejects_oversize_before_reading_full_file_into_memory() {
-        // P2-3：先 stat 判大小再决定要不要整读——1.5 GiB 稀疏文件只应触发一次 metadata()
-        // 调用就被拒，不应把整个文件读进内存。稀疏文件在多数文件系统上实际占用块很小，
-        // 用耗时而不是 RSS 断言（更可移植），预期是微秒级 stat，不是读 1.5 GiB 的量级。
+        // Verify stat checks size before any full read: a 1.5 GiB sparse file should be
+        // rejected after one `metadata()` call without loading the entire file into memory.
+        // Sparse files occupy few disk blocks on most filesystems, so assert elapsed time
+        // rather than RSS for portability: expect microsecond-scale stat work, not a 1.5 GiB read.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("huge.png");
         let f = std::fs::File::create(&path).unwrap();
@@ -674,9 +688,10 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(err.to_string().contains("exceeds"));
         assert!(
-            // P3-2：50ms 挂钟阈值在负载高的 CI 机器 / 不支持稀疏文件的卷上会假红
-            // （且要建 1.5 GiB 稀疏文件）；放宽到 500ms 仍能挡住"整读 1.5 GiB 才拒绝"
-            // 这种量级的回归（那至少是百毫秒到秒级），不追求区分微秒级 stat。
+            // A 50ms wall-clock limit can falsely fail on busy CI machines or volumes without
+            // sparse-file support, where creating this 1.5 GiB file is costly. Allowing 500ms
+            // still guards against reading all 1.5 GiB before rejection (hundreds of milliseconds
+            // to seconds); this assertion does not aim to distinguish microsecond-scale stat work.
             elapsed < std::time::Duration::from_millis(500),
             "先 stat 判大小应在毫秒级内拒绝，不应读完 1.5 GiB：实测 {elapsed:?}"
         );

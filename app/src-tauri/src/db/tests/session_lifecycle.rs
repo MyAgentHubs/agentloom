@@ -590,10 +590,10 @@ fn recent_milestone_replay_limit_returns_newest_rows_oldest_first() {
     assert!(rows[0].message_id < rows[1].message_id);
 }
 
-/// idlefix-T1 补针 D：running 行必须排在 LIMIT 截断线之前——造出比
-/// `RECENT_MILESTONE_REPLAY_LIMIT` 更多的 idle 会话（挤占空间的"陪跑"），再插入少量
-/// running 会话，断言：① 总行数被封顶在同一个常量；② 全部 running 行都活下来、且排在
-/// 结果最前面，不会被单纯"先来后到"顺序挤出这批补发帧。
+/// Create more idle sessions than `RECENT_MILESTONE_REPLAY_LIMIT`, plus a few running sessions,
+/// to verify that the total row count is capped at that same constant while all running rows
+/// survive and sort first. Running sessions must remain available for replay even when idle
+/// sessions fill the limit, rather than being evicted by plain FIFO ordering.
 #[test]
 fn list_session_runtime_replay_rows_orders_running_first_and_caps_at_shared_limit() {
     let c = mem();
@@ -681,11 +681,11 @@ fn list_expired_trashed_sessions_returns_only_past_grace() {
 
 #[test]
 fn purge_session_cascades_all_session_scoped_rows() {
-    // 🔴 I3 不变量锁(最高风险·漏表=永久孤儿行·codex+opus 双审 I2):delete_session 必须级联清掉
-    //    该 session 的全部 18 张 session-scoped 表 + 3 张 artifact-scoped 表。每张各插一行·
-    //    purge 后逐张断言归零——未来误删任一 DELETE 行→此测试立刻 FAIL(防回归命根)。
-    //    （2026-08-11 M1 修复轮 P2-2：session_runtime 补第 15 张——M1-T1 新增独立运行态镜像表，
-    //    同样按 session_id 键，此前漏了级联删。T-4b 再补 remote_inbox 第 16 张。）
+    // 🔴 Invariant: delete_session must cascade-clear all 18 session-scoped tables and all 3
+    //    artifact-scoped tables, including the session_runtime mirror table and remote_inbox table
+    //    among the session-scoped tables keyed by session_id. Omitting a table leaves orphan rows.
+    //    Insert one row per table, then assert that every table has zero rows after purge.
+    //    This guards against future regressions that remove or omit a required DELETE.
     let c = mem();
     c.execute(
             "INSERT INTO sessions (id,title,repo_id,namespace_id,created_at) VALUES ('s-p','t','local-default','local',1)",

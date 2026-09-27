@@ -16,6 +16,8 @@ fn activity_summary_logical_run_id_uses_dispatch_run_id_when_present_else_batch_
             run_id: Some("lead-run-1".to_owned()),
             ..Default::default()
         }),
+        agent_id: None,
+        agent_name_snapshot: None,
         events: vec![],
     };
     assert_eq!(activity_summary_logical_run_id(&member_batch), "lead-run-1");
@@ -25,6 +27,8 @@ fn activity_summary_logical_run_id_uses_dispatch_run_id_when_present_else_batch_
         session_id: "s".to_owned(),
         run_id: "lead-run-1".to_owned(),
         dispatch: None,
+        agent_id: None,
+        agent_name_snapshot: None,
         events: vec![],
     };
     assert_eq!(activity_summary_logical_run_id(&lead_batch), "lead-run-1");

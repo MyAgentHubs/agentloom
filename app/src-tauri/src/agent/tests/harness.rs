@@ -289,9 +289,9 @@ fn harness_injects_provider_specific_env_alongside_myagent_env() {
     );
 }
 
-/// T3：`agents.api_timeout_ms`（毫秒）→ `MYAGENT_TIMEOUT_SECS`（秒，向上取整，下限 1）。
-/// Normal（solo）与 Worker（member）两条模式共用 `HarnessBackend::build_command_inner`，
-/// 循环两种 mode 确认 env 装配不依赖 ctx.mode——一并盖住 solo/member 两条 spawn 路径。
+/// Both solo and member commands must convert API timeouts from milliseconds to
+/// whole seconds, rounding up with a minimum of one second, so shared command
+/// construction preserves timeout behavior regardless of build mode.
 #[test]
 fn harness_maps_api_timeout_ms_to_myagent_timeout_secs() {
     let _mode = set_harness_mode_for_test(None);

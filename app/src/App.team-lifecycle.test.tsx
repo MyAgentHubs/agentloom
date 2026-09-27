@@ -995,8 +995,8 @@ describe("App", () => {
         ),
     );
     expect(teamAppends).toHaveLength(1);
-    // 块B（GUI 验收折）：该 run 是 a1 done + a2 failed 的多 worker·非 coding run → team_run 任务条**保留**
-    // （BackgroundTaskStack 渲 DONE 队员行·非空壳）+ 完成态 verdict 并存（用户定：任务条 + verdict 都留）。
+    // For a multi-worker, non-coding run with one worker done and another failed, retain team_run alongside the completed verdict:
+    // BackgroundTaskStack still renders the DONE member row, not an empty shell, so both the task entry and verdict remain.
     await waitFor(() =>
       expect(container.querySelector(".lead-summary")).not.toBeNull(),
     );

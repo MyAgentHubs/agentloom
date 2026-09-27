@@ -11,23 +11,23 @@
 pub(super) fn seed_by_model(model: &str) -> Option<u32> {
     let m = model.to_ascii_lowercase();
     // gpt-4o / gpt-4.1（含 -mini/-nano 等变体）/ o1 / o3 推理家族：128K。
-    // 来源：platform.openai.com/docs/models，2026-09-18 核（按模型名前缀匹配，不含更新
+    // Source: platform.openai.com/docs/models (matched by model-name prefix).
     // 换代型号的场景不在此表覆盖范围内，届时以 model_registry 精细登记为准）。
     if m.contains("gpt-4o") || m.contains("gpt-4.1") || m.starts_with("o1") || m.starts_with("o3") {
         return Some(128_000);
     }
     // 老款 gpt-4（非 4o/4.1 的基线版本）：8K。
-    // 来源：platform.openai.com/docs/models（legacy gpt-4 系列标称 8K 上下文），2026-09-18 核。
+    // Source: platform.openai.com/docs/models (legacy gpt-4 has an 8K context window).
     if m.contains("gpt-4") {
         return Some(8_192);
     }
     // gpt-3.5-turbo：16K（现役主线版本）。
-    // 来源：platform.openai.com/docs/models，2026-09-18 核。
+    // Source: platform.openai.com/docs/models (gpt-3.5-turbo has a 16K context window).
     if m.contains("gpt-3.5") {
         return Some(16_384);
     }
     // claude-*：200K（Opus/Sonnet/Haiku 现役各代标称至少 200K）。
-    // 来源：docs.anthropic.com/en/docs/about-claude/models，2026-09-18 核。
+    // Source: docs.anthropic.com/en/docs/about-claude/models.
     if m.contains("claude") {
         return Some(200_000);
     }
@@ -35,8 +35,7 @@ pub(super) fn seed_by_model(model: &str) -> Option<u32> {
     // 时才会落到这里，典型是 "zai"（默认模型即 "glm-4.6"）。200K 对齐
     // `model_registry::glm_spec` 主线档；注意 glm-5.2 真实窗口是 1M，但那只在 provider_id
     // 能被识别成 Glm 家族时才由 registry 精确给出，这里是粗粒度兜底、已知偏保守。
-    // 来源：docs.z.ai/guides/llm/{glm-4.6,glm-5,glm-5-turbo}，2026-08-21 核（沿用
-    // model_registry.rs 已核对日期）。
+    // Source: docs.z.ai/guides/llm/{glm-4.6,glm-5,glm-5-turbo}; consistent with the value in model_registry.rs.
     if m.contains("glm-4.6") || m.contains("glm-5") {
         return Some(200_000);
     }

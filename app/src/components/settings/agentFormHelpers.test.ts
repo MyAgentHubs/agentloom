@@ -75,6 +75,7 @@ describe("PROVIDER_PRESETS 配置表", () => {
       "custom",
       "deepseek",
       "harness-deepseek",
+      "harness-gemini",
       "harness-glm",
       "harness-kimi",
       "kimi",
@@ -487,6 +488,35 @@ describe("inferProviderAccessPoint", () => {
         }),
       ),
     ).toEqual({ providerId: "harness-kimi", accessPointId: null });
+    expect(
+      inferProviderAccessPoint(
+        ag({
+          endpoint: "https://example.test/v1",
+          provider: "gemini",
+          access: "harness",
+        }),
+      ),
+    ).toEqual({ providerId: "harness-gemini", accessPointId: null });
+  });
+  it("endpoint 精确匹配 harness-gemini 预设地址时按地址优先，忽略 provider 字段（含/不含结尾斜杠）", () => {
+    expect(
+      inferProviderAccessPoint(
+        ag({
+          endpoint: "https://generativelanguage.googleapis.com/v1beta/openai/",
+          provider: "deepseek",
+          access: "harness",
+        }),
+      ),
+    ).toEqual({ providerId: "harness-gemini", accessPointId: "default" });
+    expect(
+      inferProviderAccessPoint(
+        ag({
+          endpoint: "https://generativelanguage.googleapis.com/v1beta/openai",
+          provider: "deepseek",
+          access: "harness",
+        }),
+      ),
+    ).toEqual({ providerId: "harness-gemini", accessPointId: "default" });
   });
   it("endpoint 非空但非标准且非 harness access → custom", () => {
     expect(
@@ -829,6 +859,7 @@ describe("engineView", () => {
         kind: "api_key",
         presets: [
           byId("harness-deepseek"),
+          byId("harness-gemini"),
           byId("harness-glm"),
           byId("harness-kimi"),
         ],

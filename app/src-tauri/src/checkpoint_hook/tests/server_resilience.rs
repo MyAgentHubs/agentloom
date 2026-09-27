@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// Kills every worker thread by calling `unblock()` once per worker. **2026-07-30 audit
+/// Kills every worker thread by calling `unblock()` once per worker. **Audit
 /// correction — this fixture does NOT match how a real accept-thread death actually looks and
 /// must not be treated as sole evidence of self-heal working**: a genuine accept-thread death
 /// (e.g. `EMFILE`) pushes exactly *one* `Message::Error` into tiny_http's internal queue, and
@@ -56,7 +56,7 @@ fn kill_all_workers_and_wait_healed(server: &HookServer) {
     }
 }
 
-/// Nail 0 (2026-07-30 audit P0 regression pin — the real death shape, not the N-times-unblock
+/// Regression pin for the real death shape (not the N-times-unblock
 /// stand-in): a real accept-thread death (e.g. `EMFILE`) pushes exactly *one*
 /// `Message::Error` into tiny_http's internal queue — `MessagesQueue::push` calls
 /// `condvar.notify_one()` for it, same as `unblock()`'s single-waiter wakeup (see its own doc
@@ -158,7 +158,7 @@ fn service_self_heals_after_every_worker_thread_dies_and_serves_requests_again()
     let body = r#"{"hook_event_name":"Stop","stop_hook_active":false}"#;
     let response = reqwest::blocking::Client::new()
         .post(&endpoint)
-        // 2026-07-30 audit M3: a "service looks alive but never actually answers" regression
+        // A "service looks alive but never actually answers" regression
         // in this exact path showed up as a *hang*, only failing via the harness's own 30s-ish
         // default — a real bound here turns that failure mode back into a fast, obvious
         // assertion instead of a slow timeout.
@@ -245,7 +245,7 @@ fn bounded_retry_gives_up_after_hook_server_rebuild_attempts_and_never_more() {
     );
 }
 
-/// The concurrency-fix pinning test (2026-07-29 audit version). A slow DB write — simulated
+/// The concurrency-fix pinning test (audit version). A slow DB write — simulated
 /// via `TEST_SLEEP_HEADER` injected *inside* the DB-write closure in `handle_request`, i.e. in
 /// the exact window the old code held `registrations`'s lock across — must not head-of-line
 /// block a second, unrelated request that arrives while the first is still writing.
@@ -386,7 +386,7 @@ fn panic_while_holding_registrations_lock_poisons_it_but_next_request_still_gets
     assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
 }
 
-/// D3 (2026-07-29 delta review) — regression pin for the `catch_unwind` wrapped around
+/// Regression pin for the `catch_unwind` wrapped around
 /// `handle_request` in each worker thread's loop. Without it, a panicking request kills that
 /// worker thread outright (an uncaught panic just ends the OS thread — it doesn't crash the
 /// process, so nothing here would visibly "fail" from a single panic). Once `start_server`

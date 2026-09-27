@@ -68,7 +68,7 @@ describe("runningStatus", () => {
   });
 
   it("记账验证：静默已累到阈值以上后，若下一 tick 传入的 messages 引用变化（模拟 worker delta 更新 dispatch_card），静默立即清零", () => {
-    // 2026-07-24 dogfood 记账验证单测：用户场景报「Silent for 188s」与「事件其实都到了」矛盾。
+    // Isolate advanceStreamActivity accounting: silence resets to zero when the messages reference changes; this does not test the algorithm end-to-end or upstream reference-change wiring.
     // 本测试只验证 advanceStreamActivity 这个纯函数本身的记账契约——不碰算法、不碰上游 wiring。
     // 结论见调用方报告：算法层面，只要传入的 messages 引用确实变了，静默必清零；188s 累积说明
     // 问题更可能在「worker delta 到达时，喂给这个函数的 messages 引用有没有真的变」这层 wiring

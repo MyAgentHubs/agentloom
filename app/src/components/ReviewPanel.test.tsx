@@ -44,11 +44,20 @@ const patchFor = (path: string, body: string[], hunk = true) =>
 
 describe("ReviewPanel", () => {
   it("大量文件含巨型 jsonl 时不渲染数据正文，且每个文件仍保持可见的紧凑行", () => {
+    // Scale note: "data/dump.jsonl" is classified as a data file purely by
+    // extension (isMainstreamDiffFile / MAINSTREAM_DIFF_EXTENSIONS, no "jsonl"
+    // entry), never by line count, so a bigger DATA_LINE_COUNT exercises no
+    // extra branch. FILE_COUNT likewise has no lazy-render/truncation threshold.
+    // Both only need to be "more than one or two" to cover "many files never
+    // get truncated" and "a data file's body is hidden regardless of size";
+    // the old 135/1_000 was pure unnecessary CI cost.
+    const FILE_COUNT = 12;
+    const DATA_LINE_COUNT = 20;
     const dataLines = Array.from(
-      { length: 1_000 },
+      { length: DATA_LINE_COUNT },
       (_, i) => `+{\"row\":${i}}`,
     );
-    const patches = Array.from({ length: 135 }, (_, i) => {
+    const patches = Array.from({ length: FILE_COUNT }, (_, i) => {
       const path = i === 0 ? "data/dump.jsonl" : `src/file-${i}.ts`;
       const body = i === 0 ? dataLines : [`+export const value${i} = ${i};`];
       return [
@@ -63,7 +72,7 @@ describe("ReviewPanel", () => {
     const largeReview: ReviewResult = {
       ...review,
       patch: patches.join("\n"),
-      files_changed: 135,
+      files_changed: FILE_COUNT,
       files: patches.map((_, i) => ({
         path: i === 0 ? "data/dump.jsonl" : `src/file-${i}.ts`,
         undoable: true,
@@ -74,10 +83,10 @@ describe("ReviewPanel", () => {
       <ReviewPanel review={largeReview} onClose={noop} />,
     );
 
-    expect(screen.getByText("改动 · 135 文件")).toBeInTheDocument();
+    expect(screen.getByText("改动 · 12 文件")).toBeInTheDocument();
     expect(screen.getByText("data/dump.jsonl")).toBeInTheDocument();
     expect(screen.getByText("数据文件 · 不显示内容")).toBeInTheDocument();
-    expect(screen.getByText("src/file-134.ts")).toBeInTheDocument();
+    expect(screen.getByText("src/file-11.ts")).toBeInTheDocument();
     expect(container.querySelectorAll(".filediff__line")).toHaveLength(0);
     expect(
       Array.from(container.querySelectorAll<HTMLElement>(".filediff")).every(

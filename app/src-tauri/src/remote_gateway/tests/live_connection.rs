@@ -380,3 +380,47 @@ fn wait_until_generation(inner: &Inner, expected: u64) {
     }
     panic!("connection generation did not reach {expected} within two seconds");
 }
+
+#[test]
+fn connection_loop_flushes_input_ack_outbox_to_relay() {
+    // This is the only end-to-end test that drives the connection_loop.rs
+    // drain_input_ack_outbox call site through a real authenticated connection.
+    // Unit tests call drain_input_ack_outbox_with directly, so removing the
+    // main-loop drain would otherwise go undetected.
+    let inner = test_inner(|_| None, || None);
+    enqueue_failed_input_ack_into(&inner, "cmd-e2e", Some("no_agent"));
+    let (_upstream_tx, upstream_rx) = mpsc::sync_channel(1);
+    let (_milestone_tx, milestone_rx) = mpsc::sync_channel(1);
+    let (addr, frames, server) = spawn_recording_server_after_sync(1);
+    let config = GatewayConfig {
+        relay_url: format!("ws://{addr}"),
+        room_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        active_repo_id: None,
+    };
+    let url = build_ws_url(&config.relay_url, &config.room_id);
+    let k_room = Zeroizing::new([7_u8; 32]);
+    let frame = thread::scope(|scope| {
+        let (i, u, c, k) = (&inner, &url, &config, &k_room);
+        let connection = scope.spawn(move || {
+            run_authenticated_connection(
+                i,
+                u,
+                &DesktopCredential::new(Zeroizing::new("ab".repeat(32))),
+                c,
+                None,
+                &upstream_rx,
+                &milestone_rx,
+                Some(k),
+            )
+        });
+        let frame = frames.recv_timeout(Duration::from_secs(3));
+        inner.shutdown.store(true, Ordering::Release);
+        let _ = connection.join();
+        frame
+    });
+    let _ = server.join();
+    assert_eq!(
+        frame.expect("failed input.ack should reach the relay"),
+        input_ack_json_with_reason("cmd-e2e", AckOutcome::Failed, Some("no_agent"))
+    );
+}

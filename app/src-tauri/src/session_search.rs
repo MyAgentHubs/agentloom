@@ -1,5 +1,5 @@
 //! 全局会话搜索（⌘K）：跨项目搜标题 / 项目名 / 用户消息 / agent 回复，按分数排序。
-//! 移植自外部 PR #3（作者 Freya Wang），原实现内联在 `lib.rs`；本仓 `lib.rs` 已拆分，
+//! Ported from an external contribution originally inlined in `lib.rs`; this repo's `lib.rs` has since been split up,
 //! 落成独立模块，命令在 `lib.rs` 的 `generate_handler!` 里以 `session_search::search_sessions`
 //! 形式登记（沿用 `updater::` / `member_runner::` 已有的模块前缀命令写法）。
 
@@ -291,6 +291,27 @@ fn search_sessions_fallback(
     Ok(rank_and_finish(best_by_session, limit))
 }
 
+// Test-only instrumentation: records how many chars the `fts.text` window column
+// actually was when it crossed the SQL -> Rust boundary, so a test can assert the
+// SQL-side `substr` windowing structurally instead of via wall-clock timing.
+#[cfg(test)]
+thread_local! {
+    static VIA_FTS_ROW_TEXT_CHARS_HIGH_WATERMARK: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_via_fts_row_text_chars(chars: usize) {
+    VIA_FTS_ROW_TEXT_CHARS_HIGH_WATERMARK.with(|c| c.set(c.get().max(chars)));
+}
+
+// Test helper: returns the largest windowed-text length seen since the last call,
+// then resets the watermark for the next test.
+#[cfg(test)]
+fn take_via_fts_row_text_chars_high_watermark() -> usize {
+    VIA_FTS_ROW_TEXT_CHARS_HIGH_WATERMARK.with(|c| c.replace(0))
+}
+
 /// 正文匹配走 `messages_fts`（trigram 索引）的主路径。两个关键修法（对基线
 /// `contains` 全文匹配的回归修复）：
 /// ① 是否命中不再靠 Rust 侧对一个 300 字摘要窗口做 `contains`（窗口外的词永远
@@ -308,6 +329,86 @@ fn search_sessions_via_fts(
     project_sql: &str,
     limit: usize,
 ) -> Result<Vec<GlobalSearchResult>, String> {
+    let (sql, params) = build_fts_query(terms, project_sql);
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let nterms = terms.len();
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let mut flags = Vec::with_capacity(nterms);
+            for i in 0..nterms {
+                flags.push(row.get::<_, bool>(8 + i)?);
+            }
+            let windowed_text = row.get::<_, Option<String>>(5)?.unwrap_or_default();
+            #[cfg(test)]
+            record_via_fts_row_text_chars(windowed_text.chars().count());
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                windowed_text,
+                row.get::<_, i64>(6)?,
+                row.get::<_, bool>(7)?,
+                flags,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut best_by_session: HashMap<String, RankedGlobalSearchResult> = HashMap::new();
+    for row in rows {
+        let (session_id, title, project, archived, message_id, text, updated_at, prefix_cut, flags) =
+            row.map_err(|e| e.to_string())?;
+        let title_lower = title.to_lowercase();
+        let project_lower = project.to_lowercase();
+        if !terms
+            .iter()
+            .enumerate()
+            .all(|(i, term)| title_lower.contains(term) || project_lower.contains(term) || flags[i])
+        {
+            continue;
+        }
+
+        let mut score = 0_i64;
+        for (i, term) in terms.iter().enumerate() {
+            if title_lower == *term {
+                score += 1_000;
+            } else if title_lower.contains(term) {
+                score += 500;
+            }
+            if project_lower.contains(term) {
+                score += 100;
+            }
+            if flags[i] {
+                score += 20;
+            }
+        }
+        let text_matches = flags.iter().any(|f| *f);
+        let snippet = if prefix_cut {
+            truncate_search_snippet_forcing_leading_ellipsis(&text, Some(&terms[0]))
+        } else {
+            truncate_search_snippet(&text, Some(&terms[0]))
+        };
+        let candidate = RankedGlobalSearchResult {
+            result: GlobalSearchResult {
+                session_id: session_id.clone(),
+                message_id: text_matches.then_some(message_id).flatten(),
+                title,
+                project,
+                snippet,
+                archived,
+                updated_at,
+            },
+            score,
+        };
+        upsert_best(&mut best_by_session, session_id, candidate);
+    }
+
+    Ok(rank_and_finish(best_by_session, limit))
+}
+
+fn build_fts_query(terms: &[String], project_sql: &str) -> (String, Vec<String>) {
     let coarse = format!("%{}%", escape_like_pattern(&terms[0]));
 
     let long_terms: Vec<&String> = terms.iter().filter(|t| t.chars().count() >= 3).collect();
@@ -327,16 +428,15 @@ fn search_sessions_via_fts(
         )
     };
 
-    // `fts` 必须是查询里第一个被引用的表、且约束直接挂在 WHERE（不能塞进 LEFT JOIN
-    // 的 ON 里）——FTS5 只有在自己是“驱动表”时才走索引查找，一旦被放进外连接的 ON
-    // 条件，SQLite 对左表每一行都要去探 FTS5，退化成近似全量扫描（实测：几个中文
-    // 关键词从 old ~200ms 飙到 7000~8000ms）。改成 FTS5 命中的消息单独一路查、标题 /
-    // 项目命中单独一路查，两路 `UNION ALL` 后交给 Rust 侧按会话取最佳分数逻辑合并。
+    // Keep FTS first and its predicate in WHERE so FTS5 drives the indexed lookup.
+    // Putting the predicate in a LEFT JOIN's ON clause probes FTS5 per left row,
+    // approaching a full scan (observed Chinese queries rose from ~200ms to 7000-8000ms).
+    // Query body matches and title/project matches separately, then UNION ALL
+    // and let Rust retain the best score per session.
     //
-    // 摘要不把整段 `fts.text`（用户库实测最大单条 3.4MB）整体拉进 Rust 做
-    // `to_lowercase()` + 字符级截窗，改成 SQL 侧先用 `instr` 定位命中起点、`substr`
-    // 只切出命中前后一小段窗口（300 字符）；关键词若不含 ASCII 字母（纯中文/数字/
-    // 符号）跳过 `lower()`，省下大文本转小写的开销。
+    // Window large text in SQL with instr/substr before sending it to Rust
+    // (observed messages reached 3.4MB). Return only 300 characters around the hit.
+    // Skip lower() when the keyword has no ASCII letters.
     let term0_needs_case_fold = terms[0].chars().any(|c| c.is_ascii_alphabetic());
     let window_pos_expr = if term0_needs_case_fold {
         "instr(lower(fts.text), ?3)"
@@ -344,12 +444,12 @@ fn search_sessions_via_fts(
         "instr(fts.text, ?3)"
     };
     let fts_window_expr = format!("substr(fts.text, max(1, {window_pos_expr} - 60), 300)");
-    // 命中位置 > 61 说明 SQL 侧窗口已经从原文中间切起（前面至少被丢了一个字符）；
-    // Rust 侧 `truncate_search_snippet` 只看得到窗口后的短片段，自己判断不出「窗口
-    // 前还有没有被截掉的内容」，靠这个 flag 把结论带过去，前缀省略号才补得回来。
+    // A match position > 61 means SQL cut at least one leading character.
+    // Pass this flag to Rust so it can restore the leading ellipsis even though
+    // truncate_search_snippet only sees the window.
     let fts_prefix_cut_expr = format!("({window_pos_expr} > 61)");
 
-    let first_flag_param = 4usize; // ?1 fts_param，?2 标题/项目 coarse LIKE，?3 term0 窗口定位
+    let first_flag_param = 4usize; // ?1 fts_param, ?2 title/project coarse LIKE, ?3 term0 window position
     let mut flag_params: Vec<String> = Vec::with_capacity(terms.len());
     let fts_flag_exprs: Vec<String> = terms
         .iter()
@@ -415,78 +515,7 @@ fn search_sessions_via_fts(
     let mut params: Vec<String> = vec![fts_param, coarse, terms[0].clone()];
     params.extend(flag_params);
 
-    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-    let nterms = terms.len();
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            let mut flags = Vec::with_capacity(nterms);
-            for i in 0..nterms {
-                flags.push(row.get::<_, bool>(8 + i)?);
-            }
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, bool>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                row.get::<_, i64>(6)?,
-                row.get::<_, bool>(7)?,
-                flags,
-            ))
-        })
-        .map_err(|e| e.to_string())?;
-
-    let mut best_by_session: HashMap<String, RankedGlobalSearchResult> = HashMap::new();
-    for row in rows {
-        let (session_id, title, project, archived, message_id, text, updated_at, prefix_cut, flags) =
-            row.map_err(|e| e.to_string())?;
-        let title_lower = title.to_lowercase();
-        let project_lower = project.to_lowercase();
-        if !terms
-            .iter()
-            .enumerate()
-            .all(|(i, term)| title_lower.contains(term) || project_lower.contains(term) || flags[i])
-        {
-            continue;
-        }
-
-        let mut score = 0_i64;
-        for (i, term) in terms.iter().enumerate() {
-            if title_lower == *term {
-                score += 1_000;
-            } else if title_lower.contains(term) {
-                score += 500;
-            }
-            if project_lower.contains(term) {
-                score += 100;
-            }
-            if flags[i] {
-                score += 20;
-            }
-        }
-        let text_matches = flags.iter().any(|f| *f);
-        let snippet = if prefix_cut {
-            truncate_search_snippet_forcing_leading_ellipsis(&text, Some(&terms[0]))
-        } else {
-            truncate_search_snippet(&text, Some(&terms[0]))
-        };
-        let candidate = RankedGlobalSearchResult {
-            result: GlobalSearchResult {
-                session_id: session_id.clone(),
-                message_id: text_matches.then_some(message_id).flatten(),
-                title,
-                project,
-                snippet,
-                archived,
-                updated_at,
-            },
-            score,
-        };
-        upsert_best(&mut best_by_session, session_id, candidate);
-    }
-
-    Ok(rank_and_finish(best_by_session, limit))
+    (sql, params)
 }
 
 /// 请求序号门控 + 计时；被 `search_sessions` 命令与单测共用。`latest_seq` 由调用方

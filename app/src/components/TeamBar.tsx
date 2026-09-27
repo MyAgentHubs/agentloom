@@ -8,7 +8,7 @@ type Props = {
   leadId: string; // 解析后的当前 Lead（调用方已回退全局）
   rosterIds: string[] | null; // null = 全 enabled
   onSetLead: (id: string) => void;
-  onToggleRoster: (id: string, allEnabledIds: string[]) => void; // 全集上下文·见 T4
+  onToggleRoster: (id: string, allEnabledIds: string[]) => void; // Needs the full enabled-agent set, not just the toggled id, to recompute roster membership.
   runningCount: number | null; // null = 未运行·显名单数
 };
 

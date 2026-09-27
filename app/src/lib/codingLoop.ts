@@ -76,12 +76,12 @@ export function selectCodingVerifier(
   return run ? clean(run.verifier) : "";
 }
 
-/** T4 trust-land 分叉（取代旧 fail-closed「verifyCmd 空→landing_blocked」根因）：
- *  - in-place：finalize 就地写=已落地（后端已置 merged + 记 LandingCommit）→ 直接 applied·
- *    不进 verify/merge/apply。
- *  - app 域受管 workspace：信任落地·跳 verifying，finalize 后直接 merging。
- *  `verifyCmd` 现在不再影响落地分叉（保留入参兼容 + 供展示）；landing_blocked 仍由真实
- *  错误（受保护路径 / ff 冲突·见 isLandingBlockedError）在 driver catch 里触发。 */
+/** Finalize routing reflects where the landing has already been completed:
+ *  - In-place finalize writes land directly; the backend has marked merged and recorded LandingCommit,
+ *    so proceed to applied without verify/merge/apply.
+ *  - App-managed workspaces trust the landing and proceed directly to merging, skipping verifying.
+ *  verifyCmd only remains for call-signature compatibility and display; it does not select the landing branch.
+ *  Real errors (protected paths / fast-forward conflicts; see isLandingBlockedError) still trigger landing_blocked in the driver's catch block. */
 export function phaseAfterFinalize(
   verifyCmd: string,
   isInPlace: boolean,

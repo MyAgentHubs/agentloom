@@ -150,6 +150,8 @@ fn extract_tool_milestones_member_lane_rolls_up_into_dispatch_run_id_not_lane_ru
                 assignment_id: Some("assignment-1".to_owned()),
                 ..Default::default()
             }),
+            agent_id: None,
+            agent_name_snapshot: None,
             events: vec![crate::event_transport::SequencedEvent {
                 seq: 1,
                 event: crate::agent_event::AgentEvent::ToolCompleted {
@@ -200,6 +202,8 @@ fn extract_tool_milestones_member_lane_terminal_does_not_seal_parent_run() {
                     assignment_id: Some(assignment.to_owned()),
                     ..Default::default()
                 }),
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![crate::event_transport::SequencedEvent { seq: 1, event }],
             }],
         }
@@ -286,6 +290,8 @@ fn extract_tool_milestones_member_lane_terminal_does_not_seal_parent_run() {
                 session_id: "sess-team".to_owned(),
                 run_id: "lead-run-1".to_owned(),
                 dispatch: None,
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![crate::event_transport::SequencedEvent {
                     seq: 1,
                     event: crate::agent_event::AgentEvent::Completed {
@@ -367,6 +373,8 @@ fn extract_tool_milestones_member_lane_error_does_not_seal_parent_run() {
                     assignment_id: Some(assignment.to_owned()),
                     ..Default::default()
                 }),
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![crate::event_transport::SequencedEvent { seq: 1, event }],
             }],
         }
@@ -443,6 +451,8 @@ fn extract_tool_milestones_member_lane_error_does_not_seal_parent_run() {
                 session_id: "sess-team-err".to_owned(),
                 run_id: "lead-run-err".to_owned(),
                 dispatch: None,
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![crate::event_transport::SequencedEvent {
                     seq: 1,
                     event: crate::agent_event::AgentEvent::Completed {

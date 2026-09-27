@@ -283,7 +283,7 @@ async fn finalize_infra_red_reported_as_infra_with_observed() {
     assert!(events.contains("infra_red"));
 }
 
-// B3：整盘重验逮「done 任务的 acceptance 后来红了」——直接构造全 Done + 一条 acceptance "false" 测 finalize
+// Finalization must recheck completed tasks and require a decision if their acceptance now fails.
 #[tokio::test]
 async fn finalize_reverify_catches_broken_done_task_acceptance() {
     let ws = tempfile::tempdir().unwrap();
@@ -317,7 +317,7 @@ async fn finalize_reverify_catches_broken_done_task_acceptance() {
     assert!(events.contains("overall_red") && events.contains("t1 acceptance"));
 }
 
-// B1：resume 时 in-progress 任务 acceptance 命中 infra → 挂起（不当没做完重跑）
+// Resuming must suspend on an acceptance infrastructure failure instead of rerunning the in-progress task.
 #[tokio::test]
 async fn resume_in_progress_infra_suspends() {
     let ws = tempfile::tempdir().unwrap();
@@ -367,7 +367,7 @@ async fn resume_without_state_falls_back_to_fresh_run() {
 
 #[tokio::test]
 async fn resume_continues_budget_does_not_reset() {
-    // B5：崩溃前已用掉预算·resume 不归零
+    // Resuming must preserve consumed steps so an exhausted budget prevents pending tasks from running.
     let ws = tempfile::tempdir().unwrap();
     let jr = tempfile::tempdir().unwrap();
     init_git(ws.path());

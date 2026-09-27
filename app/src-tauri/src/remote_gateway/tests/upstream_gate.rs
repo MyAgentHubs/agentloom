@@ -11,6 +11,8 @@ fn multi_event_payload(
                 session_id: format!("sess-{batch_index}"),
                 run_id: format!("run-{batch_index}"),
                 dispatch: None,
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: (0..events_per_batch)
                     .map(|event_index| crate::event_transport::SequencedEvent {
                         seq: event_index as u64,

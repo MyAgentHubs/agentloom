@@ -13,10 +13,10 @@ use crate::plan::contract::{
 };
 use crate::plan::write_audit::Violation;
 
-/// 把一个原子任务翻成任务级 GoalContract（喂给 run_solo·spec §4.2/B6）。
+/// Preserve the atomic task's objective and execution boundaries in the GoalContract for run_solo.
 /// objective=intent · criteria=[acceptance(行为道·硬验收) + artifact_check(按名鞭子·驱动 child·引擎侧 per-task 不否决·spec §2)] · scope=files_scope · constraints⊇forbidden+stop。
 /// 纯函数（无 provider/IO）·新契约不带历史（version=1·update_log 空）。
-/// B1：这张 contract 经 run_solo_task 用于初始化 child GoalState·render_state_frame 渲染 scope/constraints 给 executor。
+/// run_solo_task initializes the child GoalState from this contract so render_state_frame exposes scope and constraints to the executor.
 pub fn task_to_goal_contract(task: &PlanTask) -> GoalContract {
     let mut constraints = Vec::new();
     for f in &task.forbidden_scope {

@@ -1,0 +1,381 @@
+/* ── TaskList (right-panel task list view) ── */
+.tasklist {
+  display: grid;
+  gap: 9px;
+  padding: 16px;
+}
+.task-card {
+  width: 100%;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  padding: 11px 12px;
+  cursor: pointer;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+}
+.task-card:hover {
+  border-color: var(--accent);
+  background: #fffcf7;
+}
+.task-card .tstate {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 8px;
+  align-self: start;
+  margin-top: 5px;
+}
+.task-card .tstate.run {
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(208, 139, 63, 0.15);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+.task-card .tstate.wait {
+  background: transparent;
+  border: 1.5px solid var(--ink-4);
+}
+.task-card .tstate.done {
+  background: var(--green);
+}
+.task-card .tstate.fail {
+  background: var(--red);
+  box-shadow: 0 0 0 3px rgba(184, 80, 72, 0.14);
+}
+.task-card .tcbody {
+  min-width: 0;
+}
+.task-card .tcnm {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  margin: 0 0 3px;
+}
+.task-card .tcsub {
+  font-size: 10.5px;
+  color: var(--ink-3);
+  line-height: 1.45;
+  margin: 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.task-card .tcown {
+  display: inline-block;
+  margin-top: 5px;
+  font-size: 10px;
+  color: var(--ink-3);
+}
+.tc-stop {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--ink-4);
+  cursor: pointer;
+  flex: 0 0 24px;
+  align-self: start;
+  padding: 0;
+}
+.tc-stop svg {
+  width: 10px;
+  height: 10px;
+}
+.tc-stop:hover {
+  border-color: var(--red);
+  color: var(--red);
+  background: rgba(184, 80, 72, 0.06);
+}
+.rp-tasklist-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow-y: auto;
+}
+.rp-tasklist-hd {
+  padding: 14px 16px 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.rp-tasklist-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+/* taskbtn — orchestrated task count button in topbar */
+.taskbtn {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 9px 0 7px;
+  border: 0;
+  background: transparent;
+  border-radius: 7px;
+  color: var(--ink-3);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+}
+.taskbtn:hover {
+  background: rgba(28, 26, 23, 0.06);
+  color: var(--ink-2);
+}
+.taskbtn svg {
+  width: 15px;
+  height: 15px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.8;
+}
+.taskbtn__ct {
+  font-weight: 700;
+  color: var(--accent);
+  font-size: 11px;
+}
+.taskbtn__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px rgba(217, 119, 87, 0.18);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
+/* updbtn — sidebar-footer online-update pill (rendered only when an update or recoverable failure exists) */
+.updbtn {
+  align-self: flex-start;
+  width: auto;
+  max-width: 100%;
+  min-width: 0;
+  height: 30px;
+  padding: 0 11px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+}
+.updbtn:hover {
+  filter: brightness(0.96);
+}
+.updbtn--error {
+  border-color: var(--red);
+  background: var(--red);
+}
+.updbtn:disabled {
+  cursor: default;
+  filter: none;
+}
+.updbtn svg {
+  flex: 0 0 auto;
+}
+.updbtn__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.updbtn__ring {
+  stroke: currentColor;
+}
+.updbtn__ring--spin {
+  animation: spin 1.2s linear infinite;
+  transform-origin: center;
+}
+
+/* updpop — update popover (createPortal to body; position:fixed, anchored above the footer pill) */
+.updpop {
+  position: fixed;
+  z-index: 1000;
+  width: 300px;
+  box-sizing: border-box;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel);
+  box-shadow: 0 8px 24px rgba(72, 54, 35, 0.16);
+}
+.updpop__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-1);
+  margin-bottom: 8px;
+}
+.updpop__notes {
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+.updpop__notes summary {
+  cursor: pointer;
+  color: var(--ink-2);
+}
+.updpop__notes-body {
+  margin-top: 6px;
+  color: var(--ink-2);
+  white-space: pre-wrap;
+}
+.updpop__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.updpop__primary {
+  flex: 1 1 auto;
+  height: 30px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+}
+.updpop__secondary {
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+.updpop__progress {
+  height: 5px;
+  border-radius: 3px;
+  background: rgba(28, 26, 23, 0.08);
+  overflow: hidden;
+  margin-bottom: 6px;
+}
+.updpop__progress-bar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 0.2s ease;
+}
+.updpop__progress-label {
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.updpop__error {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--danger, #c0392b);
+}
+
+/* updsec — online-update area on the About page (shared by SettingsAbout / AboutDialog UpdateSection) */
+.updsec__title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  color: var(--ink-3);
+  margin-bottom: 8px;
+}
+.updsec__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+.updsec__row--disabled {
+  color: var(--ink-3);
+}
+.updsec__check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.updsec__check:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+.updsec__spin {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 1.6px solid var(--ink-3);
+  border-top-color: transparent;
+  animation: spin 0.8s linear infinite;
+}
+.updsec__actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.updsec__notes {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.updsec__notes-title {
+  margin-bottom: 5px;
+  font-weight: 600;
+  color: var(--ink-1);
+}
+.updsec__notes-body {
+  min-width: 0;
+  max-width: 100%;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.updsec__notes-body :is(h1, h2, h3, h4, h5, h6) {
+  margin: 10px 0 4px;
+  color: var(--ink-1);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.updsec__notes-body > :first-child {
+  margin-top: 0;
+}
+.updsec__notes-body p,
+.updsec__notes-body ul,
+.updsec__notes-body ol {
+  margin: 4px 0;
+}
+.updsec__notes-body :is(pre, .mm-code) {
+  max-width: 100%;
+}
+.updsec__notes-body pre {
+  overflow-x: auto;
+}
+.updsec__error {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--danger, #c0392b);
+}

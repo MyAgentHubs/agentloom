@@ -338,7 +338,7 @@ mod tests {
         );
     }
 
-    // T6 校验：队长的 --tools 只读限制（禁 Write/Edit/Bash）下，claude 仍能调 MCP 工具。
+    // Verify that even under the lead's read-only --tools restriction (Write/Edit/Bash denied), claude can still call MCP tools.
     // cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored mcp_lead_tools_restriction --nocapture
     #[test]
     #[ignore]

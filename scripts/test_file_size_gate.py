@@ -60,6 +60,15 @@ class ClassificationTests(unittest.TestCase):
             ("app/src/a.spec.tsx", b"", 1500),
             ("app/src/__tests__/helper.ts", b"", 500),
             ("remote-relay/src/room-do.js", b"", 500),
+            ("remote-relay/test/room-do.test.js", b"", 1500),
+            ("remote-relay/test/x.spec.mjs", b"", 1500),
+            ("remote-relay/test/x.spec.cjs", b"", 1500),
+            ("remote-relay/test/x.test.mjs", b"", 1500),
+            ("remote-relay/test/x.test.cjs", b"", 1500),
+            ("remote-relay/test/x.spec.js", b"", 1500),
+            ("remote-relay/src/test-utils.js", b"", 500),
+            ("remote-relay/src/latest.js", b"", 500),
+            ("harness-agent/src/contest.js", b"", 500),
             ("remote-web/src/helper.mts", b"", 500),
             ("app/src/a_test.ts", b"", 500),
             ("app/src/a.tsx", b"", 500),
@@ -149,6 +158,20 @@ class ClassificationTests(unittest.TestCase):
                         self.assertIn(f"  {name}:\n    needs: file-size-gate\n", source)
                     self.assertEqual(source.count("needs.file-size-gate.outputs.baseline"), 2)
 
+    def test_public_snapshot_gate_fetches_public_main_with_base_flag(self):
+        path = SCRIPT.parent.parent / ".github/workflows/public-snapshot-size-gate.yml"
+        self.assertTrue(path.is_file())
+        source = path.read_text()
+        self.assertIn("git fetch --no-tags https://github.com/MyAgentHubs/agentloom.git "
+                      "+refs/heads/main:refs/remotes/public/main", source)
+        self.assertIn("python3 -I scripts/check_file_size.py --base refs/remotes/public/main", source)
+
+    def test_public_snapshot_gate_pins_fallback_baseline_to_pre_push_sha(self):
+        path = SCRIPT.parent.parent / ".github/workflows/public-snapshot-size-gate.yml"
+        source = path.read_text()
+        self.assertIn("github.event.before", source)
+        self.assertIn("git update-ref refs/remotes/origin/master", source)
+
 
 class RepositoryTests(unittest.TestCase):
     def setUp(self):
@@ -204,26 +227,29 @@ class RepositoryTests(unittest.TestCase):
         self.baseline()
         before = self.git("status", "--porcelain", "--untracked-files=all")
         output = self.run_gate(0, cwd=self.root / "app")
-        self.assertIn("超标总量：0 行；债务总量：100 行", output)
+        self.assertIn("超过拦截线（只降不升）：0 个文件，合计超出 0 行", output)
+        self.assertIn("提醒区间（超过提醒线、未超拦截线，不阻断）：1 个文件", output)
+        self.assertIn("  app/src/big.ts 600/500", output)
         self.assertEqual(before, self.git("status", "--porcelain", "--untracked-files=all"))
 
     def test_existing_growth_and_total_excess(self):
-        self.write("app/src/big.ts", 600)
+        self.write("app/src/big.ts", 1100)
         self.baseline()
-        self.write("app/src/big.ts", 700)
-        self.write("harness-agent/src/new.rs", 900)
+        self.write("app/src/big.ts", 1200)
+        self.write("harness-agent/src/new.rs", 1100)
         output = self.run_gate(1)
-        self.assertIn("超标总量：200 行；债务总量：300 行", output)
+        self.assertIn("超过拦截线（只降不升）：2 个文件，合计超出 300 行", output)
+        self.assertIn("提醒区间（超过提醒线、未超拦截线，不阻断）：0 个文件", output)
         self.assertIn("基线历史额度", output)
         self.assertIn("新文件不享有历史额度", output)
 
     def test_committed_shrink_reduces_allowance(self):
-        self.write("app/src-tauri/src/big.rs", 1000)
+        self.write("app/src-tauri/src/big.rs", 1200)
         self.baseline()
-        self.write("app/src-tauri/src/big.rs", 900)
+        self.write("app/src-tauri/src/big.rs", 1100)
         self.baseline()
-        self.write("app/src-tauri/src/big.rs", 901)
-        self.assertIn(" / 901 / 900 / 基线历史额度", self.run_gate(1))
+        self.write("app/src-tauri/src/big.rs", 1101)
+        self.assertIn(" / 1101 / 1100 / 基线历史额度", self.run_gate(1))
 
     def test_existing_below_cap_can_grow_to_cap(self):
         self.write("app/src/a.ts", 10)
@@ -231,13 +257,63 @@ class RepositoryTests(unittest.TestCase):
         self.write("app/src/a.ts", 500)
         self.run_gate(0)
         self.write("app/src/a.ts", 501)
-        self.assertIn(" / 501 / 500 / 硬上限", self.run_gate(1))
+        output = self.run_gate(0)
+        self.assertIn("提醒区间（超过提醒线、未超拦截线，不阻断）：1 个文件", output)
+        self.assertIn("  app/src/a.ts 501/500", output)
+
+    def test_warn_tier_growth_never_blocks(self):
+        self.write("app/src/a.ts", 400)
+        self.baseline()
+        self.write("app/src/a.ts", 900)
+        output = self.run_gate(0)
+        self.assertIn("超过拦截线（只降不升）：0 个文件，合计超出 0 行", output)
+        self.assertIn("  app/src/a.ts 900/500", output)
+
+    def test_warn_tier_shrink_never_blocks(self):
+        self.write("app/src/a.ts", 950)
+        self.baseline()
+        self.write("app/src/a.ts", 900)
+        output = self.run_gate(0)
+        self.assertIn("提醒区间（超过提醒线、未超拦截线，不阻断）：1 个文件", output)
+        self.assertIn("  app/src/a.ts 900/500", output)
+
+    def test_block_tier_ratchet_allows_shrink_above_hard_cap(self):
+        self.write("app/src/a.ts", 1200)
+        self.baseline()
+        self.write("app/src/a.ts", 1100)
+        output = self.run_gate(0)
+        self.assertIn("超过拦截线（只降不升）：1 个文件，合计超出 100 行", output)
+        self.assertIn("  app/src/a.ts 1100/1000", output)
+        self.assertIn("提醒区间（超过提醒线、未超拦截线，不阻断）：0 个文件", output)
+        self.assertNotIn("  app/src/a.ts 1100/500", output)
+
+    def test_unchanged_file_above_block_tier_is_reported_but_not_blocked(self):
+        self.write("app/src/a.ts", 1200)
+        self.baseline()
+        output = self.run_gate(0)
+        self.assertIn("超过拦截线（只降不升）：1 个文件，合计超出 200 行", output)
+        self.assertIn("  app/src/a.ts 1200/1000", output)
+        self.assertIn("提醒区间（超过提醒线、未超拦截线，不阻断）：0 个文件", output)
+        self.assertNotIn("  app/src/a.ts 1200/500", output)
+        self.assertNotIn("FAIL：", output)
+
+    def test_warn_list_is_descending_and_has_exact_multi_file_format(self):
+        self.baseline()
+        self.write("app/src/lower.ts", 900)
+        self.write("harness-agent/src/higher.rs", 950)
+        output = self.run_gate(0)
+        higher = "  harness-agent/src/higher.rs 950/800"
+        lower = "  app/src/lower.ts 900/500"
+        self.assertIn("提醒区间（超过提醒线、未超拦截线，不阻断）：2 个文件", output)
+        self.assertIn(higher, output)
+        self.assertIn(lower, output)
+        self.assertLess(output.index(higher), output.index(lower))
 
     def test_rename_has_no_history_and_test_suffix_is_production(self):
-        old = self.write("app/src-tauri/src/production.rs", 900)
+        old = self.write("app/src-tauri/src/production.rs", 1100)
         self.baseline()
         self.git("mv", "--", str(old), str(old.with_name("xxx_test.rs")))
-        self.assertIn("Rust 普通源文件 / 900 / 800 / 硬上限（新文件）", self.run_gate(1))
+        self.assertIn("Rust 普通源文件 / 1100 / 1000 / 硬上限（新文件）", self.run_gate(1))
 
     def test_new_files_at_and_above_each_cap(self):
         self.baseline()
@@ -254,28 +330,34 @@ class RepositoryTests(unittest.TestCase):
                 path = self.write(name, cap)
                 self.run_gate(0)
                 path.write_bytes(path.read_bytes() + b"\n")
-                self.assertIn(f" / {cap + 1} / {cap} / 硬上限（新文件）", self.run_gate(1))
+                if cap == 1500:
+                    self.assertIn(f" / {cap + 1} / {cap} / 硬上限（新文件）", self.run_gate(1))
+                else:
+                    output = self.run_gate(0)
+                    self.assertIn(f"  {name} {cap + 1}/{cap}", output)
+                    self.write(name, 1001)
+                    self.assertIn(" / 1001 / 1000 / 硬上限（新文件）", self.run_gate(1))
                 path.unlink()
 
     def test_physical_newlines_include_blank_comments_and_crlf(self):
         self.baseline()
-        path = self.write("app/src/a.ts", 500, b"// comment\r\n")
+        path = self.write("app/src/a.ts", 1000, b"// comment\r\n")
         path.write_bytes(path.read_bytes() + b"unterminated last line")
-        self.assertIn(" / 501 / 500 / ", self.run_gate(1))
+        self.assertIn(" / 1001 / 1000 / ", self.run_gate(1))
         path.write_bytes(path.read_bytes() + b"\n")
-        self.assertIn(" / 501 / 500 / ", self.run_gate(1))
-        self.write("app/src/a.ts", 501, b"\n")
+        self.assertIn(" / 1001 / 1000 / ", self.run_gate(1))
+        self.write("app/src/a.ts", 1001, b"\n")
         self.run_gate(1)
 
     def test_history_uses_the_same_newline_count(self):
-        path = self.write("app/src/a.ts", 600, b"// comment\r\n")
+        path = self.write("app/src/a.ts", 1000, b"// comment\r\n")
         path.write_bytes(path.read_bytes() + b"last line without newline")
         self.baseline()
         self.run_gate(0)
         path.write_bytes(path.read_bytes() + b"\n")
         self.run_gate(0)  # Terminating the existing final line adds no line.
         path.write_bytes(path.read_bytes() + b"another line")
-        self.assertIn(" / 602 / 601 / 基线历史额度", self.run_gate(1))
+        self.assertIn(" / 1002 / 1001 / 基线历史额度", self.run_gate(1))
 
     def test_exclusions_and_untracked_ignored_files(self):
         self.baseline()
@@ -283,7 +365,7 @@ class RepositoryTests(unittest.TestCase):
             self.write(f"app/src/{excluded}/oversized.ts", 2000)
         self.run_gate(0)
         (self.root / ".gitignore").write_text("app/src/ignored.ts\n")
-        self.write("app/src/ignored.ts", 501)
+        self.write("app/src/ignored.ts", 1001)
         self.assertIn("ignored.ts", self.run_gate(1))
 
     def test_archive_and_dist_do_not_exempt_large_files(self):
@@ -305,20 +387,20 @@ class RepositoryTests(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 path = self.write(name, actual, b"const VALUE: u8 = 1;\n" if name.endswith(".rs") else b"void 0;\n")
-                self.assertIn(f" / {actual} / {cap} / ", self.run_gate(1))
+                self.assertIn(f" / {actual} / 1000 / ", self.run_gate(1))
                 path.unlink()
 
     def test_all_newline_styles_current_and_history(self):
         for separator in (b"\n", b"\r\n", b"\r", "\u2028".encode(), "\u2029".encode()):
             with self.subTest(separator=separator):
-                self.write("app/src/a.ts", 500, b"void 0;" + separator)
+                self.write("app/src/a.ts", 1000, b"void 0;" + separator)
                 self.baseline()
-                self.write("app/src/a.ts", 900, b"void 0;" + separator)
-                self.assertIn(" / 900 / 500 / ", self.run_gate(1))
+                self.write("app/src/a.ts", 1100, b"void 0;" + separator)
+                self.assertIn(" / 1100 / 1000 / ", self.run_gate(1))
                 self.baseline()
                 self.run_gate(0)
-                self.write("app/src/a.ts", 901, b"void 0;" + separator)
-                self.assertIn(" / 901 / 900 / 基线历史额度", self.run_gate(1))
+                self.write("app/src/a.ts", 1101, b"void 0;" + separator)
+                self.assertIn(" / 1101 / 1100 / 基线历史额度", self.run_gate(1))
 
     def test_invalid_utf8_current_and_history_fail_closed_in_order(self):
         self.baseline()
@@ -346,11 +428,11 @@ class RepositoryTests(unittest.TestCase):
     def test_local_ref_tampering_passes_ci_is_authoritative(self):
         """Known local bypass, closed by CI fetching origin before candidate code."""
         self.created.add(self.root / "scripts/check_file_size.py")
-        self.write("app/src/a.ts", 900)
+        self.write("app/src/a.ts", 1100)
         looser = self.baseline()
-        self.write("app/src/a.ts", 500)
+        self.write("app/src/a.ts", 1000)
         strict = self.baseline()
-        self.write("app/src/a.ts", 900)
+        self.write("app/src/a.ts", 1100)
         self.baseline()
         self.git("update-ref", "refs/remotes/origin/master", strict)
         self.run_gate(1)
@@ -362,24 +444,24 @@ class RepositoryTests(unittest.TestCase):
 
     def test_staged_worktree_divergence_passes_ci_checks_committed_tree(self):
         """Known local bypass: CI checks the checkout, never this staging split."""
-        self.write("app/src/a.ts", 500)
+        self.write("app/src/a.ts", 1000)
         self.baseline()
-        path = self.write("app/src/a.ts", 900)
+        path = self.write("app/src/a.ts", 1100)
         self.git("add", "--", str(path))
         self.run_gate(1)
-        path.write_bytes(b"void 0;\n" * 500)
-        self.assertEqual(len(self.git("show", ":app/src/a.ts").splitlines()), 900)
+        path.write_bytes(b"void 0;\n" * 1000)
+        self.assertEqual(len(self.git("show", ":app/src/a.ts").splitlines()), 1100)
         self.run_gate(0)  # Intentionally no index inspection in the local gate.
 
     def test_main_ref_fallback_and_master_precedence(self):
-        self.write("app/src/a.ts", 900)
+        self.write("app/src/a.ts", 1100)
         loose = self.baseline()
         self.git("update-ref", "refs/remotes/origin/main", loose)
         self.git("update-ref", "-d", "refs/remotes/origin/master")
         self.assertIn("基线：origin/main", self.run_gate(0))
-        self.write("app/src/a.ts", 500)
+        self.write("app/src/a.ts", 1000)
         strict = self.baseline()
-        self.write("app/src/a.ts", 900)
+        self.write("app/src/a.ts", 1100)
         self.assertIn(strict, self.run_gate(1))
         # An existing invalid master cannot silently fall through to valid main.
         blob = self.git("rev-parse", "HEAD:app/src/a.ts")
@@ -397,8 +479,8 @@ class RepositoryTests(unittest.TestCase):
         path.unlink()
         path.write_bytes(b"void 0;\n" * 500)
         self.run_gate(0)
-        path.write_bytes(b"void 0;\n" * 501)
-        self.assertIn(" / 501 / 500 / 硬上限（新文件）", self.run_gate(1))
+        path.write_bytes(b"void 0;\n" * 1001)
+        self.assertIn(" / 1001 / 1000 / 硬上限（新文件）", self.run_gate(1))
         path.unlink()
         self.run_gate(0)
 
@@ -415,12 +497,12 @@ class RepositoryTests(unittest.TestCase):
         path.write_bytes(path.read_bytes() + b"// one more\n")
         self.assertIn("Rust 测试文件 / 1501 / 1500", self.run_gate(1))
         path.write_bytes(path.read_bytes().replace(b"#![cfg(test)]\n", b"", 1))
-        self.assertIn("Rust 普通源文件 / 1500 / 800", self.run_gate(1))
+        self.assertIn("Rust 普通源文件 / 1500 / 1000", self.run_gate(1))
 
     def test_unicode_and_space_path_output(self):
         self.baseline()
         name = "app/src/含 空格 组件.tsx"
-        self.write(name, 501)
+        self.write(name, 1001)
         self.assertIn('"' + name + '"', self.run_gate(1))
 
     def test_public_snapshot_can_omit_only_untracked_nonhistorical_remote_roots(self):
@@ -448,12 +530,12 @@ class RepositoryTests(unittest.TestCase):
     def test_ci_pr_fetches_missing_ref_before_gate(self):
         for workflow, branch in workflow_variants():
             with self.subTest(branch=branch):
-                self.write("app/src/a.ts", 500)
+                self.write("app/src/a.ts", 1000)
                 strict = self.baseline()
                 # Use a local remote transport, with no dependency on GitHub credentials.
                 self.git("config", "remote.origin.url", str(self.root))
                 self.git("update-ref", f"refs/heads/{branch}", strict)
-                self.write("app/src/a.ts", 900)
+                self.write("app/src/a.ts", 1100)
                 self.git("add", "--", str(self.root / "app/src/a.ts"))
                 self.git("commit", "-q", "-m", "candidate")
                 for ref in gate.BASELINE_REFS:
@@ -461,14 +543,14 @@ class RepositoryTests(unittest.TestCase):
                 self.assertIn("缺少基线", self.run_gate(2))
                 self.run_ci_shell(workflow, "pull_request", "", 0)
                 self.assertEqual(self.git("rev-parse", f"refs/remotes/origin/{branch}"), strict)
-                self.assertIn(" / 900 / 500 / ", self.run_gate(1))
+                self.assertIn(" / 1100 / 1000 / ", self.run_gate(1))
 
     def test_ci_push_pins_before_even_for_multiple_commits_and_later_jobs(self):
         for workflow, branch in workflow_variants():
             with self.subTest(branch=branch):
-                self.write("app/src/a.ts", 500)
+                self.write("app/src/a.ts", 1000)
                 strict = self.baseline()
-                self.write("app/src/a.ts", 900)
+                self.write("app/src/a.ts", 1100)
                 self.baseline()  # First pushed commit contains the growth.
                 candidate = self.baseline()  # Last commit has unchanged file size.
                 self.git("config", "remote.origin.url", str(self.root))
@@ -479,7 +561,7 @@ class RepositoryTests(unittest.TestCase):
                 self.run_gate(0)  # Reproduce checkout's false green before pinning.
                 self.run_ci_shell(workflow, "push", strict, 0)
                 self.assertEqual(self.git("rev-parse", f"refs/remotes/origin/{branch}"), strict)
-                self.assertIn(" / 900 / 500 / ", self.run_gate(1))
+                self.assertIn(" / 1100 / 1000 / ", self.run_gate(1))
                 if branch == "main":
                     self.assertIn("baseline=" + strict, (self.root / "ci-output").read_text())
                     self.git("update-ref", "refs/remotes/origin/main", candidate)
@@ -489,7 +571,7 @@ class RepositoryTests(unittest.TestCase):
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False,
                     )
                     self.assertEqual(result.returncode, 0, result.stdout)
-                    self.assertIn(" / 900 / 500 / ", self.run_gate(1))
+                    self.assertIn(" / 1100 / 1000 / ", self.run_gate(1))
 
     def test_ci_first_import_and_missing_before_fail_closed(self):
         self.write("app/src/a.ts", 1)
@@ -509,9 +591,9 @@ class RepositoryTests(unittest.TestCase):
         self.created.add(self.root / "scripts/check_file_size.py")
         for prefix in gate.SCAN_ROOTS:
             self.write(prefix + "/.keep", 0)
-        self.write("app/src/a.ts", 500)
+        self.write("app/src/a.ts", 1000)
         strict = self.baseline()
-        self.write("app/src/a.ts", 900)
+        self.write("app/src/a.ts", 1100)
         self.baseline()
         candidate = self.baseline()
         for workflow, branch in workflow_variants():
@@ -526,7 +608,7 @@ class RepositoryTests(unittest.TestCase):
                     self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "true")
                     self.run_gate(0)  # Shallow checkout points the baseline at HEAD.
                     self.run_ci_shell(workflow, "push", strict, 0)
-                    self.assertIn(" / 900 / 500 / ", self.run_gate(1))
+                    self.assertIn(" / 1100 / 1000 / ", self.run_gate(1))
                 finally:
                     self.root = original
 
@@ -560,35 +642,97 @@ class RepositoryTests(unittest.TestCase):
                 gate.collect_current(self.root)
 
     def test_arguments_and_environment_cannot_override_ref(self):
-        self.write("app/src/a.ts", 900)
+        self.write("app/src/a.ts", 1100)
         old = self.baseline()
         self.git("branch", "looser", old)
-        self.write("app/src/a.ts", 500)
+        self.write("app/src/a.ts", 1000)
         current = self.baseline()
-        self.write("app/src/a.ts", 900)
-        self.assertIn("不接受命令行参数", self.run_gate(2, "--baseline", "looser"))
+        self.write("app/src/a.ts", 1100)
+        self.assertIn("只接受无参数或", self.run_gate(2, "--baseline", "looser"))
+        self.assertIn("只接受无参数或", self.run_gate(2, "--foo"))
+        self.assertIn("只接受无参数或", self.run_gate(2, "--base"))
+        self.assertIn("只接受无参数或", self.run_gate(2, "--base", "a", "b"))
         env = dict(self.env, BASELINE_REF="looser", FILE_SIZE_BASELINE_REF="looser",
                    GIT_DIR=str(self.root / "missing"), GIT_WORK_TREE=str(self.root / "missing"))
         self.assertIn(current, self.run_gate(1, env=env))
 
+    def test_base_flag_overrides_baseline_ref(self):
+        self.write("app/src-tauri/src/big.rs", 1200)
+        snapshot = self.baseline()
+        self.git("branch", "public-snapshot", snapshot)
+        self.write("app/src-tauri/src/big.rs", 1100)
+        self.baseline()
+        self.write("app/src-tauri/src/big.rs", 1150)
+        output = self.run_gate(1)
+        self.assertIn("超过拦截线（只降不升）：1 个文件，合计超出 150 行", output)
+        self.assertIn("提醒区间（超过提醒线、未超拦截线，不阻断）：0 个文件", output)
+        output = self.run_gate(0, "--base", "refs/heads/public-snapshot")
+        self.assertTrue(output.startswith("基线：refs/heads/public-snapshot ("), output)
+        self.assertIn("超过拦截线（只降不升）：1 个文件，合计超出 150 行", output)
+        self.assertIn("提醒区间（超过提醒线、未超拦截线，不阻断）：0 个文件", output)
+
+    def test_base_falls_back_to_internal_baseline_for_absent_snapshot_root(self):
+        self.write("app/src/a.ts", 10)
+        tag_commit = self.baseline()
+        self.git("branch", "public-tag", tag_commit)
+        self.write("remote-web/src/big.ts", 1100)
+        self.baseline()  # origin/master now carries the file at 1100 lines
+        output = self.run_gate(0, "--base", "refs/heads/public-tag")
+        self.assertIn("回退：remote-web/src（基线 refs/heads/public-tag 不含该根，改按", output)
+
+        # origin/master shrinks to 1050; an uncommitted bump back to 1100 is net
+        # growth and the fallback baseline must still catch it.
+        self.write("remote-web/src/big.ts", 1050)
+        self.baseline()
+        self.write("remote-web/src/big.ts", 1100)
+        self.assertIn(" / 1100 / 1050 / 基线历史额度", self.run_gate(1, "--base", "refs/heads/public-tag"))
+
+        # No internal baseline ref at all: fail closed, never fall through to
+        # the hard cap silently.
+        self.git("update-ref", "-d", "refs/remotes/origin/master")
+        self.assertIn("缺少可回退的内部基线", self.run_gate(2, "--base", "refs/heads/public-tag"))
+
+    def test_default_mode_ignores_skip_rule_for_same_scenario(self):
+        self.write("app/src/a.ts", 10)
+        self.baseline()
+        self.write("remote-web/src/big.ts", 1001)
+        output = self.run_gate(1)
+        self.assertNotIn("跳过：", output)
+        self.assertIn(" / 1001 / 1000 / 硬上限（新文件）", output)
+
+    def test_base_judges_root_normally_when_baseline_tree_has_any_file(self):
+        self.write("app/src/a.ts", 10)
+        self.write("remote-web/src/other.ts", 5)
+        baseline_commit = self.baseline()
+        self.git("branch", "public-tag", baseline_commit)
+        self.write("remote-web/src/big.ts", 1001)
+        output = self.run_gate(1, "--base", "refs/heads/public-tag")
+        self.assertNotIn("跳过：remote-web/src", output)
+        self.assertIn(" / 1001 / 1000 / 硬上限（新文件）", output)
+
+    def test_base_flag_missing_ref_fails_closed(self):
+        self.write("app/src-tauri/src/big.rs", 500)
+        self.baseline()
+        self.assertIn("基线 ref 不存在", self.run_gate(2, "--base", "refs/does/not/exist"))
+
     def test_git_replace_cannot_override_history(self):
-        self.write("app/src/a.ts", 900)
+        self.write("app/src/a.ts", 1100)
         old = self.baseline()
-        self.write("app/src/a.ts", 500)
+        self.write("app/src/a.ts", 1000)
         current = self.baseline()
         self.git("replace", current, old)
-        self.write("app/src/a.ts", 900)
-        self.assertIn(" / 900 / 500 / ", self.run_gate(1))
+        self.write("app/src/a.ts", 1100)
+        self.assertIn(" / 1100 / 1000 / ", self.run_gate(1))
 
     def test_ref_name_collision_cannot_override_history(self):
-        self.write("app/src/a.ts", 900)
+        self.write("app/src/a.ts", 1100)
         old = self.baseline()
         self.git("tag", "origin/master", old)
         self.git("branch", "origin/master", old)
-        self.write("app/src/a.ts", 500)
+        self.write("app/src/a.ts", 1000)
         self.baseline()
-        self.write("app/src/a.ts", 900)
-        self.assertIn(" / 900 / 500 / ", self.run_gate(1))
+        self.write("app/src/a.ts", 1100)
+        self.assertIn(" / 1100 / 1000 / ", self.run_gate(1))
 
 
 if __name__ == "__main__":

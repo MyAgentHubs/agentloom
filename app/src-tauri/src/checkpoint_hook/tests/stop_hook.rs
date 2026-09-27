@@ -338,9 +338,9 @@ fn stop_hook_with_unknown_token_is_rejected_like_any_other_event() {
     assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
 }
 
-// Verbatim (field-for-field) payload shapes captured from a real `claude -p` Stop hook
-// invocation, per the 2026-07-24 packet capture. Kept as fixtures so parsing/behavior is
-// pinned to what Claude Code actually sends, not to our guess at its shape.
+// Fixtures preserve field-for-field payload shapes captured from a real `claude -p`
+// Stop hook invocation, so parsing and behavior stay compatible with the payloads
+// Claude Code actually sends.
 const REAL_STOP_PAYLOAD_NO_TASKS: &str = r#"{
         "session_id": "sess-1",
         "transcript_path": "/tmp/transcript.jsonl",
@@ -452,14 +452,11 @@ fn running_background_task_blocks_even_without_registered_agent_pid() {
     assert!(text.contains("sleep 60"));
 }
 
-/// D2 (2026-07-29 delta review) — regression pin for P1: before all four bare
-/// `registrations.lock()` call sites (`install`, `register_agent_pid`, and `handle_stop`'s
-/// two) were converted to `lock_registrations`, a single poisoning panic (poisoning is
-/// sticky — every later `.lock()` on the same mutex keeps failing forever, `into_inner()`
-/// doesn't clear it) left the Stop-block anti-thrash guard permanently fail-open: every
-/// subsequent Stop request got 204 with no error and nothing logged, instead of correctly
-/// blocking on a still-running background task. This proves Stop-block survives a poisoning
-/// panic caused by a totally unrelated request.
+/// A panic in an unrelated request must not disable the Stop guard for later requests.
+/// Mutex poisoning persists across lock attempts, even after `into_inner()` recovery,
+/// so registration access must consistently recover through `lock_registrations`.
+/// Stop requests must still block while background tasks are running instead of
+/// silently returning 204 after the registrations mutex has been poisoned.
 #[test]
 fn stop_hook_still_blocks_after_a_poisoning_panic() {
     let server = start_server(None).unwrap();

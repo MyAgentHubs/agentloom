@@ -1,4 +1,4 @@
-// B1 后端 propose_team_plan 回传契约的前端镜像（照核实的真实 serde 形状）。
+// This type mirrors the backend propose_team_plan response contract, verified against the actual serde output.
 // ⚠️ ProposeOutcome internally-tagged on `outcome`（camelCase 变体名·Drafted 字段平铺）。
 // ⚠️ assignmentsJson 是 JSON 字符串·parse 后内部 key 是 snake_case（后端 json! 字面量·没走 rename）。
 

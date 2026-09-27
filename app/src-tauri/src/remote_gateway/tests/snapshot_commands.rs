@@ -20,6 +20,8 @@ fn encrypted_control_snapshot_reports_partial_state_then_idle_after_run_closeout
                 session_id: "s-6".to_owned(),
                 run_id: "run-9".to_owned(),
                 dispatch: None,
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![
                     crate::event_transport::SequencedEvent {
                         seq: 5,
@@ -77,6 +79,8 @@ fn encrypted_control_snapshot_reports_partial_state_then_idle_after_run_closeout
                 session_id: "s-6".to_owned(),
                 run_id: "run-9".to_owned(),
                 dispatch: None,
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![crate::event_transport::SequencedEvent {
                     seq: 13,
                     event: crate::agent_event::AgentEvent::RunCloseout {

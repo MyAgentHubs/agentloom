@@ -2,7 +2,7 @@
 
 use super::super::*;
 
-// ---- T6：交付台账段 + pending 占位（M2/C1）--------------------------------------------
+// ---- Delivery ledger section + pending placeholder rows --------------------------------------------
 
 /// 落一条 pending worker 报告（`delivered_at IS NULL`），返回它的 message_id。
 fn insert_pending_report(

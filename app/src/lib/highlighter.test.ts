@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-// @ts-expect-error - Vitest runs in Node, but this frontend tsconfig has no Node type declarations.
-import { readFileSync } from "fs";
+import { readGlobalCss } from "../styles/readGlobalCss";
 
 vi.mock("shiki/core", () => ({
   createHighlighterCore: vi.fn(() => Promise.resolve({ ok: true })),
@@ -36,7 +35,7 @@ describe("highlighter singleton", () => {
   });
 
   it("视觉迭代 Fix A：代码块使用 AgentLoom 浅暖底主题（调浅自暖深褐）", () => {
-    const css = readFileSync("src/styles/global.css", "utf-8");
+    const css = readGlobalCss();
 
     expect(CODE_THEME).toBe("agentloom-warm-dark");
     expect(css).toMatch(/\.mm-code\s*\{[^}]*background:\s*#efe7d6/);

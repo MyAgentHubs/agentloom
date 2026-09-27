@@ -1,9 +1,9 @@
 //! 刀2.1 · Lead Decision Loop 的结构化动作契约（spec §5）。
-//! lead one-shot 每回合只吐一个 LeadAction（6 动作）；本模块负责「文本 → 结构化动作」的解析 + 校验（parser 在 T2）。
+//! Each lead one-shot turn emits exactly one LeadAction (of 6 kinds); this module turns free text into a structured, validated action.
 //! 复刻 lead_draft::parse_driver_draft 的围栏模式。provider 无关（留缝·刀2.x 接 codex/deepseek 当 lead 只换 spawn·不换 parse）。
 
 /// lead 每回合的一个动作（内部 tag enum·变体字段平铺到顶层·与 spec §5 JSON 一致）。
-/// rationale 进 decision_ledger·给用户可审计·校验强制非空（见 T2 validate）。
+/// rationale is persisted for audit trail and validation requires it to be non-empty.
 #[allow(dead_code)] // Plan 2 lead_step 接线（clippy --lib 不认 #[cfg(test)] 调用者）
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]

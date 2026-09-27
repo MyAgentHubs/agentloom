@@ -1,0 +1,619 @@
+/* ===== AssignmentEditor: assignment controls using the application's neutral colors. ===== */
+.assign {
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  /* Allow the reassignment dropdown to extend beyond its assignment container without clipping. */
+  overflow: visible;
+  background: #fffefb;
+}
+.assign__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 11px;
+  border-bottom: 1px solid var(--line-soft);
+  background: #fbf9f4;
+}
+.assign__t {
+  font-size: 11px;
+  font-weight: 700;
+  color: #4a463e;
+}
+.assign__sw {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--ink-3);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 2px 9px;
+  background: #fff;
+  cursor: pointer;
+}
+.assign__sw.is-on {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+.assign__row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 11px;
+  border-bottom: 1px solid #f3eee2;
+}
+.assign__task {
+  flex: 1;
+  min-width: 0;
+}
+.assign__d {
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.assign__f {
+  font-size: 10px;
+  color: #9e9788;
+  font-family: "SF Mono", monospace;
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.assign__chipwrap {
+  position: relative;
+  flex-shrink: 0;
+}
+.assign__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fbf9f4;
+  cursor: pointer;
+}
+.assign__chip:hover {
+  border-color: var(--accent);
+}
+.assign__a {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 8px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.assign__nm {
+  font-size: 11px;
+  font-weight: 600;
+}
+.assign__nm--none {
+  color: #9e9788;
+  font-weight: 500;
+}
+.assign__cv {
+  font-size: 9px;
+  color: #9e9788;
+}
+.assign__dd {
+  position: absolute;
+  right: 0;
+  /* Pop upward: the card normally sits against the bottom of the chat stream (above the composer); downward would hit the viewport floor, while the card body remains visible above. */
+  bottom: calc(100% + 4px);
+  z-index: 20;
+  min-width: 190px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fffefb;
+  box-shadow: 0 4px 14px rgba(28, 26, 23, 0.1);
+  overflow: hidden;
+}
+.assign__dh {
+  font-size: 9px;
+  font-weight: 700;
+  color: #9e9788;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 7px 11px 4px;
+}
+.assign__di {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 6px 11px;
+  font-size: 11px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+}
+.assign__di:hover {
+  background: #f5f2ec;
+}
+.assign__di.is-sel {
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+.assign__ck {
+  margin-left: auto;
+  color: var(--accent);
+}
+.assign__note {
+  font-size: 9px;
+  color: #aca697;
+  padding: 5px 11px 7px;
+  border-top: 1px solid #f3eee2;
+  line-height: 1.4;
+}
+.assign__rm {
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  border: none;
+  background: none;
+  color: #aca697;
+  font-size: 11px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.assign__rm:hover {
+  background: #f6e9e6;
+  color: #b85048;
+}
+.assign__foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 11px;
+  background: #fbf9f4;
+  border-top: 1px solid var(--line-soft);
+  border-radius: 0 0 8px 8px;
+}
+.assign__addb {
+  font-size: 11px;
+  color: var(--accent);
+  font-weight: 600;
+  border: none;
+  background: none;
+  cursor: pointer;
+  padding: 0;
+}
+.assign__lead {
+  margin-left: auto;
+  font-size: 10px;
+  color: #9e9788;
+}
+
+/* ===== DraftFailedCard: three recovery options when the team leader cannot create a draft. ===== */
+.draft-failed {
+  margin: 8px 0 8px 28px;
+  background: #fdf3f1;
+  border: 1px solid #eccfc7;
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.draft-failed__head {
+  font-size: 11px;
+  font-weight: 700;
+  color: #b85048;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 6px;
+}
+.draft-failed__msg {
+  font-size: 12px;
+  color: #4a463e;
+  line-height: 1.5;
+  margin-bottom: 10px;
+}
+.draft-failed__acts {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.draft-failed__btn {
+  font-size: 11.5px;
+  padding: 6px 13px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: #fffefb;
+  color: #4a463e;
+  cursor: pointer;
+}
+.draft-failed__btn.is-primary {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  border-color: var(--accent);
+}
+.team-bar {
+  margin: 0 0 8px;
+}
+.team-bar__row {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  width: 100%;
+  padding: 7px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--bg-sunken);
+  cursor: pointer;
+  font: inherit;
+  color: var(--ink-2);
+}
+.team-bar__row:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.team-bar__seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+.team-bar__seg b {
+  color: var(--ink);
+}
+.team-bar__sep {
+  width: 1px;
+  height: 12px;
+  background: var(--line);
+  margin: 0 11px;
+}
+.team-bar__chev {
+  margin-left: auto;
+  color: var(--ink-4);
+  font-size: 11px;
+}
+.team-bar__panel {
+  margin-top: 6px;
+  border: 1px solid var(--accent);
+  border-radius: 9px;
+  background: var(--panel);
+  padding: 12px 14px;
+}
+.team-bar__title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink);
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.team-bar__h {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin: 12px 0 6px;
+}
+.team-bar__h:first-child {
+  margin-top: 0;
+}
+.team-bar__lead,
+.team-bar__pick {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel);
+  margin-bottom: 5px;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.team-bar__lead.is-sel {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.team-bar__lead:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.team-bar__nm {
+  color: var(--ink);
+  font-size: 12px;
+}
+.team-bar__why {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--ink-4);
+}
+.team-bar__hint {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--ink-3);
+}
+.team-bar__sw {
+  width: 30px;
+  height: 17px;
+  border-radius: 9px;
+  border: none;
+  background: var(--accent);
+  position: relative;
+  flex-shrink: 0;
+  padding: 0;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+.team-bar__sw::after {
+  content: "";
+  position: absolute;
+  right: 2px;
+  top: 2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  transition:
+    left 0.15s,
+    right 0.15s;
+}
+.team-bar__note {
+  font-size: 10px;
+  color: var(--ink-4);
+  margin-top: 5px;
+}
+
+/* autonomy segmented control */
+.team-bar__autonomy {
+  display: flex;
+  gap: 4px;
+  margin: 4px 0;
+}
+.team-bar__auto {
+  flex: 1;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+}
+.team-bar__auto.is-sel {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.lead-ask {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  /* Match the centered message column width so this content stays aligned on wide windows. */
+  max-width: var(--content-max);
+  margin: 8px auto;
+  width: 100%;
+  box-sizing: border-box;
+}
+.lead-ask__q {
+  margin: 0 0 8px;
+}
+.lead-ask__actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.lead-ask__primary {
+  padding: 5px 12px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.lead-ask__ghost {
+  padding: 5px 12px;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.lead-ask__why {
+  margin: 8px 0 0;
+  font-size: 12px;
+  opacity: 0.7;
+}
+.coding-task__why {
+  font-size: 12px;
+  opacity: 0.7;
+  margin-top: 4px;
+}
+.coding-task__why summary {
+  cursor: pointer;
+}
+.review__files {
+  display: flex;
+  flex-direction: column;
+  /* Without min-height:0, a flex child’s minimum height equals its content height and overflow-y never activates (the Review no-scrollbar bug). */
+  flex: 1;
+  min-height: 0;
+  gap: 6px;
+  padding: 8px;
+  overflow-y: auto;
+}
+.review__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: none;
+  color: var(--ink-4, #aca697);
+  cursor: pointer;
+  border-radius: 6px;
+}
+.review__close:hover {
+  background: var(--bg-sunken, #ede9de);
+  color: var(--ink-2, #4a463e);
+}
+.review__close svg {
+  width: 14px;
+  height: 14px;
+}
+.filediff {
+  border: 1px solid var(--line, #e5ddc9);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--panel, #fffefb);
+}
+.filediff__placeholder {
+  flex: 0 0 auto;
+  color: var(--ink-3, #7a7568);
+  font-size: 10px;
+}
+.filediff__head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 11px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+}
+.filediff__head:hover {
+  background: var(--bg, #f5f2ec);
+}
+.filediff__placeholder-head,
+.filediff__placeholder-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 11px;
+  cursor: default;
+}
+.filediff__placeholder-row {
+  padding-top: 0;
+}
+/* Chevron at the start of the row (before the path); SVG points right and rotates 90 degrees downward when expanded (matching the prototype and existing SVG icon family). */
+.filediff__chev {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  color: var(--ink-4, #aca697);
+  display: inline-flex;
+}
+.filediff__chev svg {
+  width: 12px;
+  height: 12px;
+  transition: transform 0.15s;
+}
+.filediff.is-open .filediff__chev svg {
+  transform: rotate(90deg);
+}
+.filediff__path {
+  font-family: "SF Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  color: var(--ink, #1a1814);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.filediff__source {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid rgba(217, 119, 87, 0.3);
+  border-radius: 999px;
+  background: rgba(217, 119, 87, 0.08);
+  color: #a65338;
+  font-size: 9.5px;
+  line-height: 1.25;
+  white-space: nowrap;
+}
+.filediff__source svg {
+  width: 11px;
+  height: 11px;
+  flex: 0 0 auto;
+}
+.filediff__stat {
+  font-family: "SF Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  flex-shrink: 0;
+  display: inline-flex;
+  gap: 6px;
+}
+.filediff__add {
+  color: var(--green, #6a9b5c);
+}
+.filediff__del {
+  color: var(--red, #b85048);
+}
+.filediff__body {
+  margin: 0;
+  border-top: 1px solid var(--line-soft, #efe8d4);
+  font-family: "SF Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  padding: 6px 0;
+  overflow-x: auto;
+}
+.filediff__line {
+  padding: 1px 11px;
+  white-space: pre;
+}
+.filediff__line--add {
+  background: rgba(106, 155, 92, 0.12);
+  color: #4d7a42;
+}
+.filediff__line--del {
+  background: rgba(184, 80, 72, 0.1);
+  color: #8f433d;
+}
+.filediff__line--hunk {
+  color: var(--ink-3, #7a7568);
+  background: var(--bg-sunken, #ede9de);
+}
+.filediff__more {
+  display: block;
+  width: 100%;
+  padding: 6px 11px;
+  border: 0;
+  border-top: 1px solid var(--line-soft, #efe8d4);
+  background: var(--panel, #fffefb);
+  color: var(--ink-3, #7a7568);
+  cursor: pointer;
+  text-align: left;
+}
+.review__foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--line-soft, #efe8d4);
+  font-size: 10px;
+  color: var(--ink-4, #aca697);
+}
+.review__foot-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 2px;
+  flex-shrink: 0;
+  background: #d97757;
+}
+.review__foot-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+  line-height: 1.35;
+}

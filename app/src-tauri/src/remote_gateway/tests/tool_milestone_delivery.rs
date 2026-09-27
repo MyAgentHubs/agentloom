@@ -73,6 +73,8 @@ fn tool_completed_milestone_exists_before_live_budget_drain() {
             session_id: "sess-1".to_owned(),
             run_id: "run-1".to_owned(),
             dispatch: None,
+            agent_id: None,
+            agent_name_snapshot: None,
             events: vec![
                 crate::event_transport::SequencedEvent {
                     seq: 1,

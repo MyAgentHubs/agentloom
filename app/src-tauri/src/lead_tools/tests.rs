@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use super::*;
+use crate::test_support::source_window;
 
 mod dispatch;
 mod interaction;
@@ -9,22 +10,18 @@ mod interaction;
 fn prompt_user_emits_decision_card_resolved_only_inside_changed_branch() {
     // AppHandle 无法在普通 #[test] 中构造；结构性钉死薄壳契约：CAS 调用在前，且 resolved
     // emit 必须实际嵌套在 `if changed` 花括号内。把 emit 挪到该分支前/后都会使本测试变红。
-    let source = include_str!("../lead_tools.rs");
-    let production = source.split("\n#[cfg(test)]\nmod tests;").next().unwrap();
-    let prompt_user = production
-        .split("fn prompt_user(")
-        .nth(1)
-        .expect("必须找到 prompt_user")
-        .split("\nfn unbounded_prompt_never_pending(")
-        .next()
-        .unwrap();
-    let answered = prompt_user
-        .split("crate::WaitOutcome::Answered(opt) => {")
-        .nth(1)
-        .expect("必须找到 Answered 分支")
-        .split("crate::WaitOutcome::TimedOut =>")
-        .next()
-        .unwrap();
+    let source = include_str!("../lead_tools/prompt_flow.rs");
+    let (_, prompt_user_and_rest) = source
+        .split_once("fn prompt_user(")
+        .expect("could not find the fn prompt_user( anchor");
+    let (prompt_user, _) = prompt_user_and_rest
+        .split_once("\nfn unbounded_prompt_never_pending(")
+        .expect("could not find the fn unbounded_prompt_never_pending( anchor");
+    let answered = source_window(
+        prompt_user,
+        "crate::WaitOutcome::Answered(opt) => {",
+        "crate::WaitOutcome::TimedOut =>",
+    );
 
     assert_eq!(
         answered.matches("\"decision-card-resolved\"").count(),
@@ -38,13 +35,7 @@ fn prompt_user_emits_decision_card_resolved_only_inside_changed_branch() {
         .find("if changed {")
         .expect("Answered 分支必须以 changed 门控 emit");
     assert!(update_idx < if_idx, "必须先取得 CAS 结果，再判断是否 emit");
-    let changed_source = answered
-        .split("let (changed, republish) = {")
-        .nth(1)
-        .expect("必须捕获 CAS 是否成功（含 msgfix1 T5 缺口④重发用的 message_id）")
-        .split("if changed {")
-        .next()
-        .unwrap();
+    let changed_source = source_window(answered, "let (changed, republish) = {", "if changed {");
     assert!(
         changed_source.contains(".unwrap_or(None)")
             && changed_source.contains("cas_message_id.is_some()"),

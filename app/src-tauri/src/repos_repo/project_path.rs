@@ -1,4 +1,4 @@
-//! T22 任务 1：编辑项目「换工作目录」业务逻辑。
+//! Business logic for editing a project's "change working directory" action.
 //!
 //! 挂在 `repos_repo::project_path`（而非 lib.rs 顶层新 `mod`）是刻意的——lib.rs 已顶到
 //! check_file_size.py 门禁基线，任何净增行都会让门禁变红；新增 IPC 命令改挂一层，

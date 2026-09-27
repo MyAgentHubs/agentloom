@@ -111,7 +111,7 @@ type Props = {
  * cluster L Phase 3 plan C1 Task 3 · SessionMain
  *  - 删 session 标题（sidebar 已高亮 · 不重复）
  *  - 删冗余 meta 行：mode / engine 信息归 composer，main 顶部不重复
- * 引用功能（2026-05-30）：quoteRef 状态提升至此 · {sessionId,index} 守卫派生（消除切会话误指）。
+ * Quote-reply state lives here; the {sessionId,index} guard is derived so switching sessions can never point at a stale quote.
  */
 export const SessionMain = React.memo(function SessionMain({
   messages,

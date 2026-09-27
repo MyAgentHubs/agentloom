@@ -1,9 +1,10 @@
-//! `default_supports_images` 的 model-name 种子表——型号级判定优先于 provider 家族默认
-//! （T19：真实撞线——`glm-5.2`/coding 端点只按 provider 家族猜「GLM 全都支持图片」，
-//! 厂商直接 400：`messages.content.type is invalid, allowed values: ['text']'`。GLM 家族
-//! 里只有 `glm-4v`/`glm-4.1v`/`glm-4.5v`/`glm-4.6v` 这类显式视觉型号吃图，`glm-5.x`/
-//! `glm-4-plus` 等文本型号不吃）。拆出独立文件（同 `context_tokens_seed.rs`）：避免
-//! `image.rs` 继续逼近文件大小门禁的基线历史额度。
+//! Model-name seed table for `default_supports_images`: model-level judgment always wins over the
+//! provider family default. A family guess is not safe here—`glm-5.2` on the coding endpoint was
+//! once assumed to support images just because "GLM" does, and hit a real vendor 400
+//! (`messages.content.type is invalid, allowed values: ['text']`). Only the explicit vision
+//! variants in the GLM family (`glm-4v` / `glm-4.1v` / `glm-4.5v` / `glm-4.6v`) accept images;
+//! text-only models such as `glm-5.x` / `glm-4-plus` do not. Split into its own file (like
+//! `context_tokens_seed.rs`) to keep `image.rs` under the file-size ratchet.
 use crate::provider::native_search::{provider_family, ProviderFamily};
 
 /// 查不到时返回 `None`，调用方回落 `image::default_supports_images` 家族默认。

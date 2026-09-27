@@ -850,38 +850,41 @@ fn finish_for_locale_on_unfed_reducer_yields_none_unlike_fed_reducer() {
 /// 落库（同款手法见 `lead_production_source_does_not_emit_legacy_agent_event`）。
 #[test]
 fn lead_prespawn_failure_points_persist_before_emit() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let lead = source
-        .split("fn start_lead_session(")
-        .nth(1)
-        .and_then(|tail| tail.split("\n#[tauri::command]\nfn stop_session(").next())
-        .expect("start_lead_session source slice");
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_session/runner_thread.rs"
+    ));
+    let stripped = strip_comments_and_strings(source);
+    let lead = extract_fn_body(&stripped, "fn spawn_lead_runner(", "spawn_lead_runner");
 
     let assert_persist_before_emit = |anchor: &str, label: &str| {
         let idx = lead
             .find(anchor)
             .unwrap_or_else(|| panic!("{label}: anchor not found: {anchor}"));
-        let mut window_end = (idx + 1800).min(lead.len());
-        while !lead.is_char_boundary(window_end) {
-            window_end -= 1;
-        }
-        let window = &lead[idx..window_end];
-        let persist_idx = window
-            .find("persist_lead_prespawn_failure(")
-            .unwrap_or_else(|| {
-                panic!("{label}: persist_lead_prespawn_failure( missing near anchor")
-            });
-        let emit_idx = window
-            .find("emit_lead_error_and_release(")
-            .unwrap_or_else(|| panic!("{label}: emit_lead_error_and_release( missing near anchor"));
+        let window = lead[idx..]
+            .split_once("return None;")
+            .expect("prespawn failure return boundary")
+            .0;
         assert!(
-            persist_idx < emit_idx,
-            "{label}: persist_lead_prespawn_failure 必须在 emit_lead_error_and_release 之前调用"
+            window.contains("abort_lead_prespawn("),
+            "{label}: abort helper missing near anchor"
         );
     };
+    let helper = extract_fn_body(&stripped, "fn abort_lead_prespawn(", "abort_lead_prespawn");
+    let label = "abort_lead_prespawn";
+    let persist_idx = helper
+        .find("persist_lead_prespawn_failure(")
+        .unwrap_or_else(|| panic!("{label}: persist_lead_prespawn_failure( missing near anchor"));
+    let emit_idx = helper
+        .find("emit_lead_error_and_release(")
+        .unwrap_or_else(|| panic!("{label}: emit_lead_error_and_release( missing near anchor"));
+    assert!(
+        persist_idx < emit_idx,
+        "{label}: persist_lead_prespawn_failure 必须在 emit_lead_error_and_release 之前调用"
+    );
 
     assert_persist_before_emit(
-        "let mcp_srv = match mcp_server::start_mcp_server(tools_arc) {",
+        "let mcp_srv = match mcp_server::start_mcp_server(std::mem::take(&mut ctx.tools)) {",
         "McpStart",
     );
     assert_persist_before_emit(

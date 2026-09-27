@@ -1,6 +1,6 @@
-/** T22：编辑项目保存时依次调用的后端命令编排——从 App.tsx 抽出以省 App.tsx 行数
- * （App.tsx 行数已顶到 check_file_size.py 门禁基线，任何净增都可能变红）。
- * 路径没变时不调用 update_project_path（避免无意义地触发后端校验 + last_used_at 刷新）。
+/** Keep the backend command sequence for saving an edited project outside App.tsx
+ * to control the main App component's file size.
+ * Only call update_project_path when the path changes, avoiding needless backend validation and last_used_at refreshes.
  */
 export type InvokeFn = <T>(
   cmd: string,

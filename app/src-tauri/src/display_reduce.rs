@@ -1,6 +1,6 @@
 //! 刀 R（run 回放持久化 loop 协议）—— 归约器：事件流 →（收尾时）该显示的卡片。
 //!
-//! **本文件是 loop 唯一可改文件**（由配套的内部评测程序文档规定）。
+//! **Reducer logic is now split between `display_reduce.rs` and `display_reduce/feed.rs`; the internal evaluator's permitted modification scope covers both files.**
 //! **本文件内不放任何 `#[cfg(test)]` 测试**——判分与安全网全在封存的阅卷器
 //! `app/src-tauri/tests/run_replay_eval.rs`（opus 审查裁定：判分和安全网全在封存层，
 //! 不给考生「自己出题自己判」的空间）。
@@ -10,6 +10,8 @@
 
 use crate::agent_event::{self, AgentEvent, ToolStatus};
 use crate::db::{Block, BlockCardKind, BlockToolStatus, MemberSnapshot};
+
+mod feed;
 
 /// 归约器对单块（含累积后的 tool_output_delta）施加的截断上限（PROGRAM 拍板值·R4）。
 /// 注意：阅卷器按「块序列化后 JSON 字节数」判 64 KB——序列化会加字段名与转义开销，
@@ -27,7 +29,6 @@ const PROSE_CAP: usize = 48 * 1024;
 pub fn run_flush_key(run_id: &str) -> String {
     format!("run_flush:{run_id}")
 }
-
 /// lead 决策卡的防重复键：event_cursor 在作用域内、每步决策唯一且稳定。
 pub fn lead_decision_key(event_cursor: &str) -> String {
     format!("lead_decision:{event_cursor}")
@@ -122,8 +123,8 @@ fn lookup(map: &[(String, usize)], key: &str) -> Option<usize> {
 /// 用前缀 + ToolSearch 判：mcp__agentloom__ 下全部是编排/能力工具（decision 卡/任务条/内部管线
 /// 各有专属持久化路径），逐名单枚举反而漏新增工具。
 ///
-/// F1 例外（2026-07-25）：交付四件套（commit/push/create_pr/publish）从隐藏名单里拎出来，
-/// 历史归约与前端 live 行为保持一致（同款豁免见 streamItems.ts::DELIVERY_TOOLS）。
+/// Exception: the four delivery tools (commit/push/create_pr/publish) are pulled out of the
+/// hidden list so historical reduction matches frontend live behavior (same exemption as streamItems.ts::DELIVERY_TOOLS).
 fn is_hidden_orchestration_tool(tool: &str) -> bool {
     if matches!(
         tool,
@@ -258,166 +259,19 @@ impl DisplayReducer {
         match event {
             AgentEvent::TextDelta { text } => self.append_prose(text, false),
             AgentEvent::ThinkingDelta { text } => self.append_prose(text, true),
-            AgentEvent::ToolStarted {
-                id,
-                tool,
-                summary,
-                card,
-            } => {
-                if is_hidden_orchestration_tool(tool) {
-                    self.hidden_tool_ids.push(id.clone());
-                    if tool == "mcp__agentloom__dispatch_worker" {
-                        self.dispatch_tool_ids.push(id.clone());
-                        self.dispatch_started_at.push((id.clone(), epoch_millis()));
-                    }
-                    return;
-                }
-                self.blocks.push(Block::Tool {
-                    id: id.clone(),
-                    tool: tool.clone(),
-                    summary: summary.clone(),
-                    card: match card {
-                        agent_event::CardKind::Command => BlockCardKind::Command,
-                        agent_event::CardKind::Compact => BlockCardKind::Compact,
-                    },
-                    status: BlockToolStatus::Running,
-                    exit_code: None,
-                    output: None,
-                });
-                self.tool_index.push((id.clone(), self.blocks.len() - 1));
+            event @ (AgentEvent::ToolStarted { .. }
+            | AgentEvent::ToolOutputDelta { .. }
+            | AgentEvent::ToolCompleted { .. }) => self.feed_tool_event(event),
+            event
+            @ (AgentEvent::ApprovalRequested { .. } | AgentEvent::ApprovalResolved { .. }) => {
+                self.feed_approval_event(event)
             }
-            AgentEvent::ToolOutputDelta { id, text } => {
-                if self.hidden_tool_ids.iter().any(|hid| hid == id) {
-                    return;
-                }
-                match self.tool_output.iter_mut().find(|(k, _)| k == id) {
-                    Some((_, acc)) => acc.push_str(text),
-                    None => self.tool_output.push((id.clone(), text.clone())),
-                }
-            }
-            AgentEvent::ToolCompleted {
-                id,
-                status,
-                exit_code,
-                output,
-            } => {
-                if let Some(pos) = self.hidden_tool_ids.iter().position(|hid| hid == id) {
-                    self.hidden_tool_ids.remove(pos);
-                    if let Some(dispatch_pos) = self
-                        .dispatch_tool_ids
-                        .iter()
-                        .position(|dispatch_id| dispatch_id == id)
-                    {
-                        self.dispatch_tool_ids.remove(dispatch_pos);
-                        let started_at = self
-                            .dispatch_started_at
-                            .iter()
-                            .position(|(dispatch_id, _)| dispatch_id == id)
-                            .map(|started_pos| self.dispatch_started_at.remove(started_pos).1)
-                            .unwrap_or_else(epoch_millis);
-                        if let Some(card) = dispatch_card_from_output(output.as_deref(), started_at)
-                        {
-                            self.blocks.push(card);
-                        }
-                    }
-                    return;
-                }
-                if let Some(i) = lookup(&self.tool_index, id) {
-                    let acc = self
-                        .tool_output
-                        .iter()
-                        .find(|(k, _)| k == id)
-                        .map(|(_, v)| v.as_str())
-                        .unwrap_or("");
-                    // 事件自带 output 优先（claude/codex 路径）；harness 路径 output 恒 None，
-                    // 输出只能来自累积的 stdout/stderr delta（台账既知事实 1）。节选存库。
-                    let merged = output.as_deref().filter(|s| !s.is_empty()).unwrap_or(acc);
-                    let excerpt = if merged.is_empty() {
-                        None
-                    } else {
-                        Some(agent_event::truncate_output(merged, TOOL_OUTPUT_CAP))
-                    };
-                    if let Block::Tool {
-                        status: st,
-                        exit_code: ec,
-                        output: out,
-                        ..
-                    } = &mut self.blocks[i]
-                    {
-                        *st = match status {
-                            ToolStatus::Ok => BlockToolStatus::Ok,
-                            ToolStatus::Failed => BlockToolStatus::Failed,
-                        };
-                        *ec = *exit_code;
-                        *out = excerpt;
-                    }
-                }
-            }
-            AgentEvent::ApprovalRequested {
-                approval_id,
-                run_id,
-                tool,
-                command,
-                summary,
-                cwd,
-                request_kind,
-                ..
-            } => {
-                self.blocks.push(Block::Approval {
-                    approval_id: approval_id.clone(),
-                    run_id: run_id.clone(),
-                    tool: tool.clone(),
-                    command: command.clone(),
-                    summary: summary.clone(),
-                    cwd: cwd.clone(),
-                    request_kind: request_kind.clone(),
-                    status: "pending".to_string(),
-                });
-                self.approval_index
-                    .push((approval_id.clone(), self.blocks.len() - 1));
-            }
-            AgentEvent::ApprovalResolved {
-                approval_id,
-                decision,
-                ..
-            } => {
-                if let Some(i) = lookup(&self.approval_index, approval_id) {
-                    if let Block::Approval { status, .. } = &mut self.blocks[i] {
-                        if status == "pending" {
-                            *status = if decision == "approved" {
-                                "approved".to_string()
-                            } else {
-                                "rejected".to_string()
-                            };
-                        }
-                    }
-                }
-            }
-            AgentEvent::NeedsDecision { changes, .. } => {
-                self.blocks.push(Block::ScopeChange {
-                    changes: changes.clone(),
-                });
-            }
-            AgentEvent::Error { message } => {
-                self.last_error = Some(message.clone());
-            }
-            // reason（结构化 budget_exhausted 等判据）本归约器不消费——solo/lead 收尾卡走的
-            // 是 message 全文（已含 harness_needs_decision_message 拼好的人话），member 侧
-            // 才需要 reason 单独分流 failure_kind（见 member_runner.rs）。
-            AgentEvent::Blocked { message, .. } => {
-                self.last_blocked = Some(message.clone());
-            }
-            AgentEvent::Completed { .. } => {
-                self.saw_completed = true;
-            }
-            AgentEvent::ContextCompacted { .. } => {
-                self.blocks.push(Block::ContextCompacted {});
-            }
-            // T7a：头部超限截断——同 ContextCompacted 一样只在当前位置插一行提示块，
-            // 不携带数值、不改其他归约态。
-            AgentEvent::HeadTruncated {} => {
-                self.blocks.push(Block::ContextTruncated {});
-            }
+            event @ (AgentEvent::NeedsDecision { .. }
+            | AgentEvent::Error { .. }
+            | AgentEvent::Blocked { .. }
+            | AgentEvent::Completed { .. }
+            | AgentEvent::ContextCompacted { .. }
+            | AgentEvent::HeadTruncated {}) => self.feed_run_event(event),
             // run 开场/目标/审计类事件：只标记 run 已开始（seen_event 已置），不产卡。
             AgentEvent::UsageDelta { .. }
             | AgentEvent::RunCloseout { .. }

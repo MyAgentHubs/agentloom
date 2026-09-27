@@ -557,10 +557,10 @@ describe("App", () => {
       });
     });
 
-    // T1：裸 reason 码 "no_progress" 必须经 humanizeStopReason 人话化，不裸露给用户。
+    // Raw reason codes like "no_progress" must pass through humanizeStopReason before reaching the user.
     expect(await screen.findByText(/连续多轮没有实质进展/)).toBeInTheDocument();
     expect(screen.queryByText(/^no_progress/)).not.toBeInTheDocument();
-    // T2：在场一张 pending 的 mcp-lead-* 决策卡 → 文案末尾追加停摆点破提示。
+    // A pending mcp-lead-* decision card requires a hint at the end of the message calling out the stall.
     expect(screen.getByText(/还有问题在等你回答/)).toBeInTheDocument();
   });
 

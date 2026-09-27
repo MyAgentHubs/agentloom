@@ -338,7 +338,7 @@ fn setup_local_landed_multiline(
     git(&["config", "user.email", "t@t"]);
     git(&["config", "user.name", "t"]);
     git(&["config", "commit.gpgsign", "false"]);
-    // R-B3 项 2（opus 复核 Major·夹具守护被拆·根锚定回归恢复辨别力）：`diff.relative true`
+    // `diff.relative true` restores the fixture's ability to detect root-anchoring regressions.
     // 让**任何**在这个仓库里跑的 `git diff` / `git diff --numstat`（不必显式传 --relative）
     // 都对 cwd 敏感——若某次回归把 review/landing 的 git cwd 从项目根改回 per-session 子
     // 目录（这里的子目录从不存在真实内容，纯粹是解析出的路径），仓根侧的 base.txt/
@@ -359,7 +359,7 @@ fn setup_local_landed_multiline(
     let landed = crate::worktree::rev_parse_head(project).unwrap();
 
     db::create_session(conn, "s1", "t", "local-default", "local").unwrap();
-    // R-B2 项 2b → R-B3 项 2（Minor-9 注释勘误）：**恢复 NULL scope**（R-B2 曾误置成
+    // Restore NULL scope to preserve fixture sensitivity; the scope was previously set incorrectly to
     // 'root'，把这个夹具的子目录解析结果与根目录解析结果强行拍成同一条路径，使下面
     // `session_review_local_inplace_*` 系列测试对「review/landing 必须根锚定」这条不变
     // 量彻底失去辨别力——置 root 后无论实现读根还是读子目录，两者本就是同一个目录，测试
@@ -387,7 +387,7 @@ fn setup_local_landed_multiline(
         },
     )
     .unwrap();
-    // T2 的缺口：行数存 0（record_inplace_artifact_landing 写 insertions:0/deletions:0）。
+    // Cover missing line counts: record_inplace_artifact_landing stores insertions:0/deletions:0.
     crate::db::insert_landing_commit(
         conn,
         &crate::db::LandingCommit {
@@ -654,7 +654,7 @@ fn assert_spawn_after_lock_released(closure_body: &str, label: &str) {
 /// `slow_marker` 出现的位置——这个判法不依赖具体缩进形状，对当前两种写法都成立，也依然能抓「把
 /// 慢活挪回锁的 block 里」这种回退。
 ///
-/// 2026-07-29 opus 对抗审对着这套 helper 实测出三组假阴性，本版逐条补了：
+/// This helper now guards against three false-negative cases reproduced by an adversarial review:
 /// ① 锁块内注释含孤立 `}`——原始花括号计数会把注释里的 `}` 当成真的收尾，提前判定 guard 已
 ///    释放，掩盖「guard 其实还活到慢活调用之后」的真回归；
 /// ② 双锁横跨——原来只查第一次出现的 `lock_marker`，如果回归是在正确的第一次 lock 之后又插了
@@ -705,7 +705,7 @@ fn strip_comments_and_strings(text: &str) -> String {
 /// 从（已经 `strip_comments_and_strings` 剥干净的）源码文本里精确抠出某个顶层 fn 的函数体：
 /// 定位 `fn_needle`，找函数签名后的第一个 `{`，花括号配对找到匹配的收尾 `}`——不再依赖"下一
 /// 个 fn 名字符串出现的位置"做截断（那种切法在本刀往 `delete_session_inner` 和
-/// `restore_session` 之间插了 `finalize_session_trash` 后会把邻居函数也吃进来，2026-07-29
+/// Inserting `finalize_session_trash` before `restore_session` caused the neighboring function to be included.
 /// opus 对抗审揪出的假阴性之一）。
 fn extract_fn_body<'a>(stripped_source: &'a str, fn_needle: &str, label: &str) -> &'a str {
     let after_sig = stripped_source.split(fn_needle).nth(1).unwrap_or_else(|| {
@@ -731,13 +731,15 @@ fn extract_fn_body<'a>(stripped_source: &'a str, fn_needle: &str, label: &str) -
     panic!("{label}: {fn_needle:?} 的函数体没扫到匹配的收尾 `}}`，测试的切片标记可能已经过期");
 }
 
+use crate::test_support::source_window;
+
 fn test_db() -> db::Db {
     db::Db(crate::perf_probe::TimedMutex::new(
         crate::test_support::mem_db(),
     ))
 }
 
-// 刀 R R3-T1：归约器过滤 lead 编排内部工具（mcp__agentloom__* / ToolSearch）——
+// Verify that the reducer filters internal lead orchestration tools (mcp__agentloom__* / ToolSearch).
 // 与前端 live HIDDEN_TOOLS（app/src/lib/streamItems.ts）同款语义，直接驱动 DisplayReducer。
 
 fn base_run_outcome(run_id: &str) -> display_reduce::RunOutcome {
@@ -835,6 +837,8 @@ mod remote_answers;
 mod remote_delivery_routing;
 #[path = "tests/remote_inbox.rs"]
 mod remote_inbox;
+#[path = "tests/remote_inbox_failure_ack.rs"]
+mod remote_inbox_failure_ack;
 #[path = "tests/remote_input.rs"]
 mod remote_input;
 #[path = "tests/remote_pairing_completion.rs"]
@@ -871,8 +875,15 @@ mod send_plan;
 mod session_deletion;
 #[path = "tests/session_lifecycle.rs"]
 mod session_lifecycle;
+#[path = "tests/session_run_state.rs"]
+mod session_run_state;
 #[path = "tests/source_invariants.rs"]
 mod source_invariants;
+// Mounted once so resume_pending / lead_terminal / source_invariants share the same
+// production_sources() instance, instead of each file mounting its own private copy
+// via `#[path]` and dead-code-flagging whichever helper the other files use.
+#[path = "tests/source_scanner.rs"]
+mod source_scanner;
 #[path = "tests/startup.rs"]
 mod startup;
 #[path = "tests/stop_processes.rs"]

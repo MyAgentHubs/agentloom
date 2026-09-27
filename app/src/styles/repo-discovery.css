@@ -1,0 +1,631 @@
+/* ===== repo discovery list ===== */
+.ob-btn {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: 7px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.ob-btn.primary {
+  background: var(--accent);
+  color: white;
+}
+.ob-disc-main {
+  flex: 1;
+  min-height: 0;
+  padding: 16px 22px;
+  overflow-y: auto;
+}
+.ob-disc-h {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+.ob-disc-h .t {
+  font-size: 15px;
+  font-weight: 600;
+}
+.ob-disc-h .cnt {
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.ob-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 11px;
+  margin: 12px 0 14px;
+}
+.ob-search svg {
+  width: 14px;
+  height: 14px;
+  stroke: var(--ink-4);
+  fill: none;
+}
+.ob-search input,
+.ob-search .ph {
+  font-size: 12px;
+  color: var(--ink-4);
+  border: none;
+  background: none;
+  outline: none;
+  flex: 1;
+}
+.ob-search .filt {
+  font-size: 10.5px;
+  color: var(--ink-3);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 3px 9px;
+  cursor: pointer;
+}
+.ob-search .filt.on {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent-soft);
+  font-weight: 600;
+}
+.ob-grp {
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin: 14px 0 7px;
+}
+.ob-grp:first-of-type {
+  margin-top: 2px;
+}
+.ob-grp span {
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--ink-4);
+  margin-left: 6px;
+}
+.ob-repo {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 13px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  margin-bottom: 6px;
+  background: var(--panel);
+}
+.ob-repo.remote {
+  background: var(--bg);
+  cursor: pointer;
+}
+.ob-repo.remote:hover {
+  border-color: var(--accent);
+}
+.ob-repo .rico {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: var(--bg-sunken);
+}
+.ob-repo .rico svg {
+  width: 14px;
+  height: 14px;
+  stroke: var(--ink-3);
+  fill: none;
+}
+.ob-repo.cloned .rico {
+  background: #e0ebd9;
+}
+.ob-repo.cloned .rico svg {
+  stroke: var(--green);
+}
+.ob-repo .body {
+  /* Self-contained: after the global .body class (the app's three-column
+     shell container) was removed, this rule keeps the repo row's .body
+     rendering exactly as it was before that removal (the old global .body
+     used to set display:flex; restored explicitly here so this component
+     no longer depends on the removed global class).
+     Note: whether the repo row's .body should be row or column here
+     (.meta has margin-top, which suggests it should be column) is a
+     pre-existing question, out of scope for this shell refactor -- leave
+     it for GUI acceptance to eyeball. */
+  display: flex;
+  flex: 1;
+  min-width: 0;
+}
+.ob-repo .nm {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.ob-repo .nm .priv {
+  font-size: 9px;
+  color: var(--ink-4);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 6px;
+  font-weight: 500;
+}
+.ob-repo .meta {
+  font-size: 10.5px;
+  color: var(--ink-3);
+  margin-top: 2px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.ob-repo .meta .lang {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.ob-repo .meta .lang .d {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+.ob-repo .path {
+  font-family: "SF Mono", monospace;
+  font-size: 10px;
+  color: var(--ink-4);
+}
+.ob-repo .right {
+  flex-shrink: 0;
+}
+.ob-open {
+  font-size: 11px;
+  color: var(--ink-3);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 5px 12px;
+  cursor: pointer;
+}
+.ob-repo.remote.sel {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.ob-cb {
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  border: 1.5px solid var(--line);
+  background: var(--panel);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.ob-cb svg {
+  width: 12px;
+  height: 12px;
+  stroke: white;
+  fill: none;
+  opacity: 0;
+}
+.ob-cb.on {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.ob-cb.on svg {
+  opacity: 1;
+}
+.ob-repo .right .ob-cb {
+  margin: 0;
+}
+.ob-batchbar {
+  position: sticky;
+  bottom: 0;
+  margin: 8px -22px -16px;
+  padding: 11px 22px;
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+  box-shadow: 0 -3px 14px rgba(28, 26, 23, 0.06);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.ob-batchbar .summary {
+  font-size: 12px;
+  color: var(--ink-2);
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+.ob-batchbar .summary b {
+  font-weight: 700;
+  color: var(--ink);
+}
+.ob-batchbar .summary .dest {
+  font-family: "SF Mono", monospace;
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.ob-batchbar .ident {
+  font-size: 10px;
+  color: var(--ink-4);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.ob-batchbar .ident .gh {
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
+  background: #1a1814;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.ob-batchbar .ident .gh svg {
+  width: 8px;
+  height: 8px;
+  fill: white;
+}
+.ob-batchbar .ob-btn {
+  margin-left: auto;
+}
+.ob-batchbar .ob-btn.primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 16px;
+}
+.ob-batchbar .ob-btn.primary svg {
+  width: 13px;
+  height: 13px;
+  stroke: white;
+  fill: none;
+}
+
+/* Manage repositories (the "Repositories" sheet page): account header dropdown + three tiers */
+.rm-head {
+  flex: 0 0 auto;
+}
+.sc-h {
+  font-size: 15px;
+  font-weight: 700;
+}
+.sc-sub {
+  font-size: 11.5px;
+  color: var(--ink-3);
+  margin: 3px 0 12px;
+}
+.rm-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  position: relative;
+  margin: 0 0 12px;
+}
+.acct-dd {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 9px;
+  background: var(--bg-sunken);
+  border: 0;
+  border-radius: 8px;
+  font-size: 12px;
+  font-family: inherit;
+  color: var(--ink);
+  cursor: pointer;
+}
+.acct-dd .gh {
+  width: 17px;
+  height: 17px;
+  border-radius: 4px;
+  background: #1a1814;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.acct-dd .gh svg {
+  width: 11px;
+  height: 11px;
+  fill: #fff;
+}
+.acct-dd .chev {
+  color: var(--ink-4);
+  font-size: 8px;
+}
+.rm-account-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 27px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.rm-account-status__spinner {
+  width: 13px;
+  height: 13px;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: rm-spin 0.9s linear infinite;
+}
+.acct-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 5;
+  min-width: 220px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 8px 26px rgba(28, 26, 23, 0.16);
+  padding: 5px;
+}
+.acct-menu-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  font-size: 12px;
+  color: var(--ink-2);
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.acct-menu-item:hover {
+  background: var(--bg-sunken);
+}
+.acct-menu-item.active {
+  color: var(--ink);
+  font-weight: 600;
+}
+.acct-menu-item .gh {
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  background: #1a1814;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.acct-menu-item .gh svg {
+  width: 11px;
+  height: 11px;
+  fill: #fff;
+}
+.rm-state {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+@keyframes rm-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rm-account-status__spinner {
+    animation: none;
+  }
+}
+.rm-fixed {
+  flex: 0 0 auto;
+}
+.rm-list {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  margin: 0 -6px;
+  padding: 0 6px;
+}
+.rm-foot {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding: 11px 0 16px;
+  border-top: 1px solid var(--line-soft);
+  margin-top: 4px;
+}
+/* The clone bar migrated into rm-foot drops the old sticky positioning and negative margin */
+.rm-foot .ob-batchbar {
+  position: static;
+  margin: 0;
+  padding: 0;
+  border-top: 0;
+  box-shadow: none;
+}
+.rm-foot-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border: 0;
+  padding: 7px 13px;
+  border-radius: 9px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.rm-foot-add svg {
+  width: 15px;
+  height: 15px;
+  stroke: currentColor;
+  fill: none;
+}
+.rm-foot-add.secondary {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--line-soft);
+}
+.rm-foot-add.secondary svg {
+  stroke: currentColor;
+}
+
+.overview {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 28px 32px 34px;
+  box-sizing: border-box;
+}
+
+.overview__inner {
+  width: 100%;
+  max-width: var(--content-max);
+  margin: 0 auto;
+}
+
+.overview__head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 0;
+}
+
+.overview__title {
+  font-size: 22px;
+  margin: 0;
+  letter-spacing: 0;
+  line-height: 1.2;
+}
+
+.overview__subtitle {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.overview__empty {
+  font-size: 14px;
+  color: var(--ink-3);
+  line-height: 1.6;
+  margin: 0;
+  padding: 0;
+}
+
+.review {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+}
+.review__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.review__title {
+  font-size: 12px;
+  color: var(--ink-3);
+}
+.review__actions {
+  display: flex;
+  gap: 8px;
+}
+.review__diff {
+  margin: 0;
+  overflow: auto;
+  padding: 8px 16px;
+  font-family: "SF Mono", ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.review__line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.review__line--add {
+  background: #e6f4e6;
+  color: #1a6b1a;
+}
+.review__line--del {
+  background: #f7e0e0;
+  color: #a11;
+}
+.review__line--hunk {
+  color: var(--ink-4);
+}
+.notice {
+  text-align: center;
+  font-size: 12px;
+  color: var(--accent);
+  padding: 6px 16px;
+}
+.iconbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: 7px;
+  background: none;
+  color: var(--ink-3);
+  cursor: pointer;
+  font: inherit;
+}
+.iconbtn:hover {
+  background: var(--bg-sunken);
+}
+.iconbtn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+.iconbtn:disabled:hover {
+  background: none;
+}
+.iconbtn--on {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.rightpanel {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  border-left: none;
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.rptab {
+  border: none;
+  background: none;
+  font: inherit;
+  font-size: 12px;
+  color: var(--ink-3);
+  padding: 5px 9px;
+  border-radius: 6px 6px 0 0;
+  cursor: pointer;
+}
+.rptab:hover {
+  background: var(--bg-sunken);
+  color: var(--ink);
+}
+.rptab--on {
+  color: var(--ink);
+  background: var(--panel);
+  font-weight: 600;
+  box-shadow: 0 -1px 2px rgba(0, 0, 0, 0.04);
+}

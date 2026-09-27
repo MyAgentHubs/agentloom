@@ -80,7 +80,7 @@ const KNOWN_DYNAMIC_AL_ERR_CALLS = [
     ],
   },
   {
-    relativePath: "lib.rs",
+    relativePath: "lib/watchdog.rs",
     lineIncludes: 'ui_msg::al_err(code, &[("detail", detail)])',
     // first_event_watchdog_error receives run.spawnFailed from its caller.
     possibleCodes: ["run.spawnFailed"],
@@ -244,7 +244,7 @@ describe("backend error translation coverage", () => {
     const { codesToCheck, unknownDynamicLocations } = auditBackendErrorSources({
       "lead_step.rs":
         '    crate::ui_msg::al_err(code, &[("detail", format!("{err:?}"))])',
-      "lib.rs": '    ui_msg::al_err(code, &[("detail", detail)])',
+      "lib/watchdog.rs": '    ui_msg::al_err(code, &[("detail", detail)])',
     });
 
     expect(unknownDynamicLocations).toEqual([]);

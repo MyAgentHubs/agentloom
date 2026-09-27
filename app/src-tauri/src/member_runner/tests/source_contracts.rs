@@ -1,14 +1,15 @@
 #![cfg(test)]
 
 use super::*;
+use crate::test_support::source_window;
 
 #[test]
 fn prepare_team_members_resolves_search_creds_with_lock_released() {
-    let source = include_str!("../../member_runner.rs");
+    let source = include_str!("../team_dispatch.rs");
     let production = source.split("\n#[cfg(test)]\nmod tests;").next().unwrap();
     let stripped = strip_comments_and_strings(production);
     let label = "prepare_team_members";
-    let body = extract_fn_body(&stripped, "\nfn prepare_team_members(", label);
+    let body = extract_fn_body(&stripped, "\npub(super) fn prepare_team_members(", label);
     assert_lock_scope_closed_before_marker(
         body,
         "db.0.lock()",
@@ -19,11 +20,11 @@ fn prepare_team_members_resolves_search_creds_with_lock_released() {
 
 #[test]
 fn prepare_single_worker_resolves_search_creds_with_lock_released() {
-    let source = include_str!("../../member_runner.rs");
+    let source = include_str!("../prepare_run_spawn.rs");
     let production = source.split("\n#[cfg(test)]\nmod tests;").next().unwrap();
     let stripped = strip_comments_and_strings(production);
     let label = "prepare_single_worker";
-    let body = extract_fn_body(&stripped, "\nfn prepare_single_worker(", label);
+    let body = extract_fn_body(&stripped, "\npub(super) fn prepare_single_worker(", label);
     assert_lock_scope_closed_before_marker(
         body,
         "db.0.lock()",
@@ -34,33 +35,35 @@ fn prepare_single_worker_resolves_search_creds_with_lock_released() {
 
 #[test]
 fn member_production_sources_do_not_emit_legacy_agent_event() {
-    let source = include_str!("../../member_runner.rs");
+    let source = include_str!("../prepare_run_spawn.rs");
     for function in ["fn run_single_worker(", "pub fn spawn_member("] {
-        let body = source
-            .split(function)
-            .nth(1)
-            .and_then(|tail| tail.split("\n}\n").next())
-            .unwrap_or_else(|| panic!("source slice for {function}"));
+        let body = source_window(source, function, "\n}\n");
         assert!(
             !body.contains("emit_agent_event("),
             "{function} must be exclusive to EventTransport"
         );
     }
+
+    let single_worker_source = include_str!("../single_worker.rs");
+    let single_worker_stripped = strip_comments_and_strings(single_worker_source);
+    let dispatch_body = extract_fn_body(
+        &single_worker_stripped,
+        "fn dispatch_single_worker_run(",
+        "dispatch_single_worker_run",
+    );
+    assert!(
+        !dispatch_body.contains("emit_agent_event("),
+        "dispatch_single_worker_run must be exclusive to EventTransport"
+    );
 }
 
-/// G3-A T2 结构钉子（同款手法：lib.rs 的
-/// `lead_production_source_wires_usage_capture_and_persist`）：`run_single_worker` 是
-/// 队长 `dispatch_worker` MCP 工具当前真实派单入口（lib.rs:7849 调用点），队员消耗要并入
-/// 会话账必须走它的 `emit_fn` 捕获 + 收尾落库两步——两步都可能被静默删掉退回「队员消耗
-/// 恒不入账」，钉源码切片防回归。
+/// Worker usage must reach session accounting through the dispatch entry point,
+/// `dispatch_single_worker_run`. Check its source for terminal usage capture in `emit_fn`
+/// and exactly one persistence call so usage is neither lost nor double-counted.
 #[test]
 fn run_single_worker_source_wires_member_usage_capture_and_persist() {
-    let source = include_str!("../../member_runner.rs");
-    let body = source
-        .split("pub fn run_single_worker(")
-        .nth(1)
-        .and_then(|tail| tail.split("\n}\n").next())
-        .expect("run_single_worker source slice");
+    let source = include_str!("../single_worker.rs");
+    let body = source_window(source, "fn dispatch_single_worker_run(", "\n}\n");
 
     assert!(
         body.contains("member_usage.set(Some((*input_tokens, *output_tokens)))"),
@@ -93,12 +96,8 @@ fn run_single_worker_source_wires_member_usage_capture_and_persist() {
 /// 占槽/guard 两条断言修前必红（`start_team_run` 从不占 Running 槽，审计见 lib.rs:6772 附近）。
 #[test]
 fn globalstop_start_team_run_source_reserves_slot_clears_stop_and_guards_failures() {
-    let source = include_str!("../../member_runner.rs");
-    let body = source
-        .split("pub fn start_team_run(")
-        .nth(1)
-        .and_then(|tail| tail.split("\n}\n").next())
-        .expect("start_team_run source slice");
+    let source = include_str!("../team_dispatch.rs");
+    let body = source_window(source, "pub fn start_team_run(", "\n}\n");
 
     assert!(
         body.contains("crate::reserve_team_run_slot(running.inner(), &session_id)?"),
@@ -153,12 +152,8 @@ fn globalstop_start_team_run_source_reserves_slot_clears_stop_and_guards_failure
 /// 决定"是不是最后一个"），槽必须在这里释放，覆盖 start_team_run 自身返回之后的全部退出路径。
 #[test]
 fn spawn_member_source_releases_team_run_slot_on_run_done() {
-    let source = include_str!("../../member_runner.rs");
-    let body = source
-        .split("pub fn spawn_member(")
-        .nth(1)
-        .and_then(|tail| tail.split("\n}\n").next())
-        .expect("spawn_member source slice");
+    let source = include_str!("../prepare_run_spawn.rs");
+    let body = source_window(source, "pub fn spawn_member(", "\n}\n");
 
     assert!(
             body.contains("crate::release_team_run_slot(&running, &session_id)"),
@@ -166,22 +161,16 @@ fn spawn_member_source_releases_team_run_slot_on_run_done() {
         );
 }
 
-/// M1-T1（remote control M0 §4c）+ M1 修复轮 P1-1（2026-08-11）：team 注册/清空咽喉——
-/// `start_team_run` 起跑占槽成功后必须紧跟着写 session_runtime running；两条清空路径
-/// （`start_team_run` 同步全失败分支 / `spawn_member` 异步 run_done 分支）都必须紧跟
-/// `release_team_run_slot` 重算 session_runtime（P1-1 修复后不再硬编码 idle 字面量，
-/// 改走 `crate::refresh_session_runtime` 统一重算写口）。同上两条 G1 钉子一样，
-/// `start_team_run`/`spawn_member` 是 `#[tauri::command]`/需要真实 AppHandle 的函数，
-/// 仓库没有 mock Tauri app 测试设施，只能源码切片钉住「调了 + 调用顺序对」。
+/// Team slot reservation must publish running state, and both synchronous startup
+/// failure and asynchronous completion must refresh runtime state after release.
+/// Recompute state instead of forcing idle so other active work remains visible.
+/// These entry points require a real AppHandle; without a mock app fixture,
+/// source checks protect the required calls and their ordering.
 #[test]
 fn m1t1_team_run_source_writes_session_runtime_at_reserve_and_release() {
-    let source = include_str!("../../member_runner.rs");
+    let team_dispatch_source = include_str!("../team_dispatch.rs");
 
-    let start_body = source
-        .split("pub fn start_team_run(")
-        .nth(1)
-        .and_then(|tail| tail.split("\n}\n").next())
-        .expect("start_team_run source slice");
+    let start_body = source_window(team_dispatch_source, "pub fn start_team_run(", "\n}\n");
 
     let reserve_pos = start_body
         .find("crate::reserve_team_run_slot(running.inner(), &session_id)?")
@@ -211,11 +200,8 @@ fn m1t1_team_run_source_writes_session_runtime_at_reserve_and_release() {
              release@{sync_release_pos} refresh@{sync_refresh_pos}"
     );
 
-    let spawn_body = source
-        .split("pub fn spawn_member(")
-        .nth(1)
-        .and_then(|tail| tail.split("\n}\n").next())
-        .expect("spawn_member source slice");
+    let prepare_run_spawn_source = include_str!("../prepare_run_spawn.rs");
+    let spawn_body = source_window(prepare_run_spawn_source, "pub fn spawn_member(", "\n}\n");
     let async_release_pos = spawn_body
         .find("crate::release_team_run_slot(&running, &session_id)")
         .expect("spawn_member run_done 分支 release_team_run_slot 调用位置");
@@ -229,13 +215,10 @@ fn m1t1_team_run_source_writes_session_runtime_at_reserve_and_release() {
     );
 }
 
-/// P1 不变量钉子（opus 对抗审·实证反例=老 Team spawn_member 路径漏改·2026-07-25 回炉）：
-/// 「任何 Failed 终态事件必带非空 failure_reason」——生产代码里只要出现
-/// `member_terminal_event(..., StatusTransition::Failed, None, None)` 这个字面 shape，
-/// 就是「Failed 但 result=None」的回归（前端拿不到 failure_reason，退回「worker 未返回
-/// 结果」那条本刀点名过的误导文案）。人肉 review 已经漏过一次（run_single_worker 那三条
-/// 修了、spawn_member 那条漏了）——用源码切片钉死，别再指望人眼。空白全部剥掉再比对，
-/// 不受换行/缩进格式影响。
+/// Failed terminal events need a failure reason so the frontend can explain
+/// the failure instead of reporting a missing result. Reject the literal call
+/// shape that passes no result on any production path, including spawn_member.
+/// Normalize whitespace so line wrapping cannot bypass this source check.
 #[test]
 fn member_production_source_never_emits_failed_terminal_with_none_result() {
     let source = include_str!("../../member_runner.rs");
@@ -243,7 +226,22 @@ fn member_production_source_never_emits_failed_terminal_with_none_result() {
         .split("\n#[cfg(test)]\nmod tests;")
         .next()
         .expect("production source slice (before #[cfg(test)] mod tests)");
-    let normalized: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+    let team_dispatch_source = include_str!("../team_dispatch.rs");
+    let member_result_persist_source = include_str!("../member_result_persist.rs");
+    let attempt_reader_source = include_str!("../attempt_reader.rs");
+    let reader_watchdog_source = include_str!("../reader_watchdog.rs");
+    let single_worker_source = include_str!("../single_worker.rs");
+    let prepare_run_spawn_source = include_str!("../prepare_run_spawn.rs");
+    let lifecycle_finish_setup_source = include_str!("../lifecycle_finish_setup.rs");
+    let stage1_snapshot_source = include_str!("../stage1_snapshot.rs");
+    let worker_inner_transport_source = include_str!("../worker_inner_transport.rs");
+    let goal_dispatch_source = include_str!("../goal_dispatch.rs");
+    let terminal_status_risk_source = include_str!("../terminal_status_risk.rs");
+    let locale_reader_dispatch_source = include_str!("../locale_reader_dispatch.rs");
+    let combined = format!(
+        "{production}{team_dispatch_source}{member_result_persist_source}{attempt_reader_source}{reader_watchdog_source}{single_worker_source}{prepare_run_spawn_source}{lifecycle_finish_setup_source}{stage1_snapshot_source}{worker_inner_transport_source}{goal_dispatch_source}{terminal_status_risk_source}{locale_reader_dispatch_source}"
+    );
+    let normalized: String = combined.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
         !normalized.contains("StatusTransition::Failed,None,None)"),
         "生产代码发现「Failed 终态但 result=None」的字面调用 shape——请改用 \
@@ -269,15 +267,13 @@ fn prepare_team_members_reads_each_members_profile_exactly_once() {
     // 拿到的 `profile` 只能来自循环变量（phase②传下来的、源头是 phase① 的那一份），这段代码里
     // 不应该出现任何形式的「再查一次 profile」，不管用的是 `get_agent(` 还是
     // `get_member_agent_profile(`。
-    let source = include_str!("../../member_runner.rs");
+    let source = include_str!("../team_dispatch.rs");
     let production = source.split("\n#[cfg(test)]\nmod tests;").next().unwrap();
-    let function_body = production
-        .split("fn prepare_team_members(")
-        .nth(1)
-        .unwrap()
-        .split("\npub fn start_team_run(")
-        .next()
-        .unwrap();
+    let function_body = source_window(
+        production,
+        "fn prepare_team_members(",
+        "\npub fn start_team_run(",
+    );
     let phase3_loop = function_body
             .split("for (spec, profile, key, search, wt) in member_ready {")
             .nth(1)
@@ -301,34 +297,37 @@ fn prepare_team_members_reads_each_members_profile_exactly_once() {
 
 #[test]
 fn task_pack_run_single_worker_uses_member_goal_title() {
-    let source = include_str!("../../member_runner.rs");
-    let task_pack_setup = source
-        .split("pub fn run_single_worker(")
-        .nth(1)
-        .and_then(|tail| tail.split("let fallback_spec").next())
-        .expect("run_single_worker task pack setup source slice");
+    let source = include_str!("../prepare_run_spawn.rs");
+    let task_pack_setup = source_window(source, "pub fn run_single_worker(", "let fallback_spec");
 
     assert!(task_pack_setup.contains("member.goal_title.as_deref().unwrap_or(\"\")"));
 }
 
 #[test]
 fn member_report_delivery_production_wiring_uses_atomic_family_for_all_five_branches() {
-    let source = include_str!("../../member_runner.rs");
+    let source = include_str!("../prepare_run_spawn.rs");
+    let single_worker_source = include_str!("../single_worker.rs");
     let production = source
         .split("\n#[cfg(test)]\nmod tests;")
         .next()
         .expect("production source slice");
     let stripped = strip_comments_and_strings(production);
+    let single_worker_stripped = strip_comments_and_strings(single_worker_source);
     let run_body = extract_fn_body(
         &stripped,
         "pub fn run_single_worker(",
         "run_single_worker member report wiring",
     );
+    let dispatch_body = extract_fn_body(
+        &single_worker_stripped,
+        "fn dispatch_single_worker_run(",
+        "dispatch_single_worker_run member report wiring",
+    );
 
     let lifecycle_call = extract_call(
-        run_body,
+        dispatch_body,
         "run_single_worker_lifecycle(",
-        "run_single_worker lifecycle wiring",
+        "dispatch_single_worker_run lifecycle wiring",
     );
     for (helper, label) in [
         ("persist_member_result_message(", "正常结果"),
@@ -368,6 +367,8 @@ fn member_report_delivery_production_wiring_uses_atomic_family_for_all_five_bran
         "prepare_single_worker 与 stage1 snapshot 两条 pre-setup 早退必须各保留一个真实调用点"
     );
 
+    let member_result_persist_stripped =
+        strip_comments_and_strings(include_str!("../member_result_persist.rs"));
     for (fn_needle, label) in [
         (
             "pub(crate) fn persist_member_result_message(",
@@ -382,7 +383,7 @@ fn member_report_delivery_production_wiring_uses_atomic_family_for_all_five_bran
             "persist_member_setup_failure_message",
         ),
     ] {
-        let body = extract_fn_body(&stripped, fn_needle, label);
+        let body = extract_fn_body(&member_result_persist_stripped, fn_needle, label);
         assert_eq!(
             body.matches("crate::db::persist_member_report_atomic(")
                 .count(),
@@ -397,5 +398,9 @@ fn member_report_delivery_production_wiring_uses_atomic_family_for_all_five_bran
     assert!(
         !run_body.contains("append_message_dedup_and_publish("),
         "run_single_worker 的 [Worker report] 生产接线不得直接调用旧 helper"
+    );
+    assert!(
+        !dispatch_body.contains("append_message_dedup_and_publish("),
+        "dispatch_single_worker_run 的 [Worker report] 生产接线不得直接调用旧 helper"
     );
 }

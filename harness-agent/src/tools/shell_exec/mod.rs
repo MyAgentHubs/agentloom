@@ -40,6 +40,179 @@ impl ShellExecToolImpl {
     ) -> Self {
         Self { fs_write_fence }
     }
+
+    fn prepare_request(
+        &self,
+        ctx: &mut ToolContext<'_>,
+        call: &ToolCall,
+    ) -> Result<std::result::Result<(ShellExecRequest, PathBuf), ToolOutcome>> {
+        let request: ShellExecRequest = match serde_json::from_str(&call.function.arguments) {
+            Ok(request) => request,
+            Err(e) => {
+                let msg = format!("bad arguments: {e}");
+                emit_tool_failed(ctx.recorder, self.name(), &call.id, &msg)?;
+                return Ok(Err(ToolOutcome::recoverable(msg)));
+            }
+        };
+        ctx.workspace.canonicalize()?;
+        let cwd = match resolve_cwd(ctx.workspace, request.cwd.as_ref()) {
+            Ok(cwd) => cwd,
+            Err(e) => {
+                let recoverable_explicit_cwd = request.cwd.is_some()
+                    && match &e {
+                        HarnessError::Io(source)
+                            if source.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            ctx.workspace.canonicalize()?;
+                            true
+                        }
+                        HarnessError::Io(_) => false,
+                        HarnessError::PermissionDenied(_) => true,
+                        _ => false,
+                    };
+                if !recoverable_explicit_cwd {
+                    return Err(e);
+                }
+                let requested_cwd = request.cwd.as_ref().expect("explicit cwd is present");
+                let msg = format!(
+                    "shell_exec cwd does not exist or is outside the workspace: {}. Use an existing directory inside the workspace (e.g. a relative path like \".\").",
+                    requested_cwd.to_string_lossy()
+                );
+                emit_tool_failed(ctx.recorder, self.name(), &call.id, &msg)?;
+                return Ok(Err(ToolOutcome::recoverable(msg)));
+            }
+        };
+        // Guard against recognizable footguns by comparing canonical workspace and cwd prefixes.
+        // Canonicalization avoids misclassifying in-workspace paths on systems with path aliases.
+        let ws_canon = ctx
+            .workspace
+            .canonicalize()
+            .unwrap_or_else(|_| ctx.workspace.to_path_buf());
+        if let Some(reason) = crate::safety::dangerous_paths::dangerous_command_scan(
+            &request.command,
+            &cwd,
+            &ws_canon,
+            ctx.fs_read_scope,
+            ctx.extra_read_roots,
+        ) {
+            emit_tool_failed(
+                ctx.recorder,
+                self.name(),
+                &call.id,
+                &format!("blocked: {}", reason.rule),
+            )?;
+            return Ok(Err(ToolOutcome::rejected(serde_json::to_string(&json!({
+                "error": "blocked: dangerous command",
+                "rule": reason.rule,
+                "detail": reason.detail,
+            }))?)));
+        }
+        Ok(Ok((request, cwd)))
+    }
+}
+
+fn emit_output_deltas(
+    recorder: &mut crate::events::EventRecorder,
+    tool: &str,
+    call_id: &str,
+    stdout: &str,
+    stderr: &str,
+) -> Result<()> {
+    if !stdout.is_empty() {
+        recorder.emit(
+            "tool.stdout.delta",
+            json!({
+                "tool_call_id": call_id,
+                "tool": tool,
+                "text": stdout,
+            }),
+        )?;
+    }
+    if !stderr.is_empty() {
+        recorder.emit(
+            "tool.stderr.delta",
+            json!({
+                "tool_call_id": call_id,
+                "tool": tool,
+                "text": stderr,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+struct RanOutcome {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    truncated: bool,
+}
+
+fn handle_ran_outcome(
+    ctx: &mut ToolContext<'_>,
+    tool: &str,
+    call: &ToolCall,
+    request: &ShellExecRequest,
+    started: Instant,
+    timeout_ms: u64,
+    outcome: RanOutcome,
+) -> Result<ToolOutcome> {
+    let RanOutcome {
+        stdout,
+        stderr,
+        exit_code,
+        timed_out,
+        truncated,
+    } = outcome;
+    let duration_ms = started.elapsed().as_millis();
+    emit_output_deltas(ctx.recorder, tool, &call.id, &stdout, &stderr)?;
+
+    if timed_out {
+        let timeout_s = timeout_ms.div_ceil(1000);
+        let msg = format!(
+            "command timed out after {timeout_s}s. Running the same command again unchanged \
+             will likely time out again; try a faster source or mirror, split the command into \
+             smaller steps, or explicitly pass a larger timeout_ms."
+        );
+        emit_tool_failed(ctx.recorder, tool, &call.id, &msg)?;
+        let (wire_stdout, stdout_elided) = cap_for_wire(&stdout, WIRE_OUTPUT_CAP_BYTES);
+        let (wire_stderr, stderr_elided) = cap_for_wire(&stderr, WIRE_OUTPUT_CAP_BYTES);
+        return Ok(ToolOutcome::recoverable(serde_json::to_string(&json!({
+            "error": msg,
+            "stdout": wire_stdout,
+            "stderr": wire_stderr,
+            "exit_code": exit_code,
+            "duration_ms": duration_ms,
+            "truncated": truncated,
+            "timed_out": true,
+            "wire_truncated": stdout_elided || stderr_elided,
+        }))?));
+    }
+
+    emit_tool_completed(
+        ctx.recorder,
+        tool,
+        &call.id,
+        json!({
+            "exit_code": exit_code,
+            "duration_ms": duration_ms,
+            "truncated": truncated,
+        }),
+    )?;
+    let (wire_stdout, stdout_elided) = cap_for_wire(&stdout, WIRE_OUTPUT_CAP_BYTES);
+    let (wire_stderr, stderr_elided) = cap_for_wire(&stderr, WIRE_OUTPUT_CAP_BYTES);
+    let exit_note =
+        exit_code.and_then(|code| crate::safety::exit_semantics::exit_note(&request.command, code));
+    Ok(ToolOutcome::success(serde_json::to_string(&json!({
+        "stdout": wire_stdout,
+        "stderr": wire_stderr,
+        "exit_code": exit_code,
+        "duration_ms": duration_ms,
+        "truncated": truncated,
+        "wire_truncated": stdout_elided || stderr_elided,
+        "exit_note": exit_note,
+    }))?))
 }
 
 fn shell_tool_definition_for_dialect(dialect: ShellDialect) -> Value {
@@ -146,67 +319,10 @@ impl Tool for ShellExecToolImpl {
     }
 
     async fn execute(&self, ctx: &mut ToolContext<'_>, call: &ToolCall) -> Result<ToolOutcome> {
-        let request: ShellExecRequest = match serde_json::from_str(&call.function.arguments) {
-            Ok(request) => request,
-            Err(e) => {
-                let msg = format!("bad arguments: {e}");
-                emit_tool_failed(ctx.recorder, self.name(), &call.id, &msg)?;
-                return Ok(ToolOutcome::recoverable(msg));
-            }
+        let (request, cwd) = match self.prepare_request(ctx, call)? {
+            Ok(prepared) => prepared,
+            Err(outcome) => return Ok(outcome),
         };
-        ctx.workspace.canonicalize()?;
-        let cwd = match resolve_cwd(ctx.workspace, request.cwd.as_ref()) {
-            Ok(cwd) => cwd,
-            Err(e) => {
-                let recoverable_explicit_cwd = request.cwd.is_some()
-                    && match &e {
-                        HarnessError::Io(source)
-                            if source.kind() == std::io::ErrorKind::NotFound =>
-                        {
-                            ctx.workspace.canonicalize()?;
-                            true
-                        }
-                        HarnessError::Io(_) => false,
-                        HarnessError::PermissionDenied(_) => true,
-                        _ => false,
-                    };
-                if !recoverable_explicit_cwd {
-                    return Err(e);
-                }
-                let requested_cwd = request.cwd.as_ref().expect("explicit cwd is present");
-                let msg = format!(
-                    "shell_exec cwd does not exist or is outside the workspace: {}. Use an existing directory inside the workspace (e.g. a relative path like \".\").",
-                    requested_cwd.to_string_lossy()
-                );
-                emit_tool_failed(ctx.recorder, self.name(), &call.id, &msg)?;
-                return Ok(ToolOutcome::recoverable(msg));
-            }
-        };
-        // 防手滑网（设计 §二·非沙箱）：挡便宜能认出的真 footgun。用 canonical workspace
-        // 与 canonical cwd 同前缀比对（macOS tempdir /var→/private/var·否则会把工作区内相对路径误判为越界）。
-        let ws_canon = ctx
-            .workspace
-            .canonicalize()
-            .unwrap_or_else(|_| ctx.workspace.to_path_buf());
-        if let Some(reason) = crate::safety::dangerous_paths::dangerous_command_scan(
-            &request.command,
-            &cwd,
-            &ws_canon,
-            ctx.fs_read_scope,
-            ctx.extra_read_roots,
-        ) {
-            emit_tool_failed(
-                ctx.recorder,
-                self.name(),
-                &call.id,
-                &format!("blocked: {}", reason.rule),
-            )?;
-            return Ok(ToolOutcome::rejected(serde_json::to_string(&json!({
-                "error": "blocked: dangerous command",
-                "rule": reason.rule,
-                "detail": reason.detail,
-            }))?));
-        }
         let timeout_ms = request.timeout_ms.unwrap_or(120_000);
         emit_tool_started(
             ctx.recorder,
@@ -240,7 +356,7 @@ impl Tool for ShellExecToolImpl {
                 return Err(error);
             }
         };
-        let (stdout, stderr, exit_code, timed_out, truncated) = match outcome {
+        let ran_outcome = match outcome {
             ControlledExecOutcome::Blocked { rule } => {
                 // 防御纵深：正常路径已被 orchestrator pre-gate 拦住、这里兜底回灌。
                 emit_tool_failed(
@@ -270,96 +386,23 @@ impl Tool for ShellExecToolImpl {
                 exit_code,
                 timed_out,
                 truncated,
-            } => (stdout, stderr, exit_code, timed_out, truncated),
+            } => RanOutcome {
+                stdout,
+                stderr,
+                exit_code,
+                timed_out,
+                truncated,
+            },
         };
-        if timed_out {
-            let duration_ms = started.elapsed().as_millis();
-            if !stdout.is_empty() {
-                ctx.recorder.emit(
-                    "tool.stdout.delta",
-                    json!({
-                        "tool_call_id": call.id,
-                        "tool": self.name(),
-                        "text": stdout,
-                    }),
-                )?;
-            }
-            if !stderr.is_empty() {
-                ctx.recorder.emit(
-                    "tool.stderr.delta",
-                    json!({
-                        "tool_call_id": call.id,
-                        "tool": self.name(),
-                        "text": stderr,
-                    }),
-                )?;
-            }
-
-            let timeout_s = timeout_ms.div_ceil(1000);
-            let msg = format!(
-                "command timed out after {timeout_s}s. Running the same command again unchanged \
-                 will likely time out again; try a faster source or mirror, split the command into \
-                 smaller steps, or explicitly pass a larger timeout_ms."
-            );
-            emit_tool_failed(ctx.recorder, self.name(), &call.id, &msg)?;
-            let (wire_stdout, stdout_elided) = cap_for_wire(&stdout, WIRE_OUTPUT_CAP_BYTES);
-            let (wire_stderr, stderr_elided) = cap_for_wire(&stderr, WIRE_OUTPUT_CAP_BYTES);
-            return Ok(ToolOutcome::recoverable(serde_json::to_string(&json!({
-                "error": msg,
-                "stdout": wire_stdout,
-                "stderr": wire_stderr,
-                "exit_code": exit_code,
-                "duration_ms": duration_ms,
-                "truncated": truncated,
-                "timed_out": true,
-                "wire_truncated": stdout_elided || stderr_elided,
-            }))?));
-        }
-        let duration_ms = started.elapsed().as_millis();
-        if !stdout.is_empty() {
-            ctx.recorder.emit(
-                "tool.stdout.delta",
-                json!({
-                    "tool_call_id": call.id,
-                    "tool": self.name(),
-                    "text": stdout,
-                }),
-            )?;
-        }
-        if !stderr.is_empty() {
-            ctx.recorder.emit(
-                "tool.stderr.delta",
-                json!({
-                    "tool_call_id": call.id,
-                    "tool": self.name(),
-                    "text": stderr,
-                }),
-            )?;
-        }
-
-        emit_tool_completed(
-            ctx.recorder,
+        handle_ran_outcome(
+            ctx,
             self.name(),
-            &call.id,
-            json!({
-                "exit_code": exit_code,
-                "duration_ms": duration_ms,
-                "truncated": truncated,
-            }),
-        )?;
-        let (wire_stdout, stdout_elided) = cap_for_wire(&stdout, WIRE_OUTPUT_CAP_BYTES);
-        let (wire_stderr, stderr_elided) = cap_for_wire(&stderr, WIRE_OUTPUT_CAP_BYTES);
-        let exit_note = exit_code
-            .and_then(|code| crate::safety::exit_semantics::exit_note(&request.command, code));
-        Ok(ToolOutcome::success(serde_json::to_string(&json!({
-            "stdout": wire_stdout,
-            "stderr": wire_stderr,
-            "exit_code": exit_code,
-            "duration_ms": duration_ms,
-            "truncated": truncated,
-            "wire_truncated": stdout_elided || stderr_elided,
-            "exit_note": exit_note,
-        }))?))
+            call,
+            &request,
+            started,
+            timeout_ms,
+            ran_outcome,
+        )
     }
 }
 

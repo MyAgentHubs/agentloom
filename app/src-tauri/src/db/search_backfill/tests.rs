@@ -67,11 +67,24 @@ fn foreground_insert_stays_fast_and_never_locked_during_backfill() {
 
     let mut max_wait = Duration::from_secs(0);
     let mut concurrent_ids: Vec<i64> = Vec::new();
+    // Deterministic signal: snapshot the `messages_fts` row count each time
+    // the foreground thread grabs the lock. If backfill held the lock for
+    // the whole run (foreground can only sneak in once, at the very end),
+    // this would collect 0-1 distinct values; as long as backfill releases
+    // the lock between batches (this module's design), the foreground gets
+    // in repeatedly across multiple batch gaps, producing several distinct
+    // intermediate values. No wall-clock threshold involved: machine load
+    // only changes *how many times* it sneaks in, not *whether* it does.
+    let mut fts_snapshots: Vec<i64> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(60);
     while !backfill_thread.is_finished() && Instant::now() < deadline {
         let wait_start = Instant::now();
         let conn = db.0.lock().expect("拿 Db 锁失败");
         let waited = wait_start.elapsed();
+        let snapshot: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
+            .unwrap();
+        fts_snapshots.push(snapshot);
         db::append_message(
             &conn,
             "s1",
@@ -89,19 +102,31 @@ fn foreground_insert_stays_fast_and_never_locked_during_backfill() {
     }
     backfill_thread.join().expect("回填线程不应该 panic");
 
-    // 阈值不是 200ms：单条 ~3MB 消息独占一批时，光是把它插进 trigram 索引这一步
-    // 本身（`json_each` 解析 + 逐字符切三元组）单机空载实测就要 ~170ms，全量
-    // `cargo test --lib` 并发跑、CPU 被其它用例分走时会推到 ~210ms——这是「索引
-    // 一条大消息」本身的成本，不是锁设计的问题，压缩批次大小/字节封顶都压不动
-    // 它（它已经是全场最小的可能批次：只装这一条）。用 800ms 卡真正的坏情形：
-    // 旧设计里一批可能同时含 199 条小消息 + 1 条大消息，实测能拖到 3 秒以上。
-    assert!(
-        max_wait < Duration::from_millis(800),
-        "回填期间前台单次拿 Db 锁应远小于旧设计的秒级卡顿，实测 {max_wait:?}"
-    );
+    // Print-only, not asserted: when a single ~3MB message occupies a batch
+    // by itself, indexing it into the trigram index (`json_each` parse +
+    // per-char trigram split) alone measures ~170ms unloaded, and running
+    // the full `cargo test --lib` concurrently with other tests can push it
+    // to ~210ms -- that's the cost of indexing one large message, not a
+    // locking-design issue. This number drifts noticeably under machine
+    // load; the assertion below (batch interleaving) is what actually
+    // guards "not stalled by the whole backfill run". A single batch's
+    // duration is a function of its composition (how many messages, how
+    // many bytes), not the clock -- that composition is guarded separately,
+    // deterministically, by `search_index::tests::backfill_never_bundles_
+    // many_small_messages_with_an_oversized_one`.
+    eprintln!("回填期间前台单次拿 Db 锁最长等待：{max_wait:?}（仅供参考，不作为断言阈值）");
     assert!(
         !concurrent_ids.is_empty(),
         "测试窗口内至少应该插入过一条并发消息"
+    );
+    let distinct_snapshots: std::collections::BTreeSet<i64> =
+        fts_snapshots.iter().copied().collect();
+    assert!(
+        distinct_snapshots.len() >= 3,
+        "前台应该在回填的至少 3 个不同批次间隙里插上队（观察到的 messages_fts 快照 \
+         只有 {} 个不同值：{fts_snapshots:?}）——如果回填一直占着锁到底，前台只能在\
+         最后插一次队，快照就不会出现这么多不同值",
+        distinct_snapshots.len()
     );
 
     let conn = db.0.lock().unwrap();

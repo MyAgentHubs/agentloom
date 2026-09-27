@@ -25,11 +25,11 @@ describe("advanceCodingLoop", () => {
       "finalize_member_artifact",
       expect.objectContaining({ baseSha: "b" }),
     );
-    // 旧契约：有 verifier → "verifying"；新契约（T4）：repo 信任落地·跳 verifying → "merging"。
+    // Repo-managed workspaces trust a successful finalize, skipping verifying and proceeding directly to merging.
     expect(next).toMatchObject({ artifactId: "art-1", phase: "merging" });
   });
   it("Local finalizing -> finalize 即落地·直达 applied·landedHead=run_landing_info 的真 sha（T7）", async () => {
-    // T7：finalize 返回 artifact_id（run-…）·不是 git sha；landedHead 须取 run_landing_info 的真 landed_head。
+    // Finalize returns an artifact id, not a git SHA, so landedHead must use the real landed_head from run_landing_info.
     const inv = vi.fn().mockImplementation((cmd: string) => {
       if (cmd === "finalize_member_artifact")
         return Promise.resolve("run-0001");
@@ -164,7 +164,7 @@ describe("T-C3b b2a verify-first coding loop", () => {
       b2aBase({ verifyCmd: "npm test" }),
       inv,
     );
-    // 旧契约：有 verifier → phase "verifying"；新契约（T4）：repo → "merging"（跳 verifying）。
+    // Repo-managed workspaces trust the landing, so finalize proceeds to merging without verifying.
     expect(next).toMatchObject({
       artifactId: "art-1",
       phase: "merging",
@@ -178,7 +178,7 @@ describe("T-C3b b2a verify-first coding loop", () => {
       throw new Error(cmd);
     }) as any;
     const next = await advanceCodingLoop(b2aBase(), inv);
-    // 旧契约（根因）：verifyCmd 空 → "landing_blocked"（fail-closed）；新契约（T4）：repo → "merging"。
+    // An empty verifyCmd no longer fails closed to landing_blocked: repo-managed workspaces trust the landing and proceed to merging.
     expect(next).toMatchObject({
       artifactId: "art-1",
       phase: "merging",

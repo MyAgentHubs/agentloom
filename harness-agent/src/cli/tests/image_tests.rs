@@ -1,6 +1,6 @@
-//! T1 图片附件：CLI `--image` 参数解析回归测试。从 `cli.rs` 的 `mod tests` 拆出
-//! （避免该文件继续超出文件大小门禁的基线历史额度）。经 `mod` 挂在其 `mod tests`
-//! 下，`use super::*` 沿用父模块（`tests`）已导入的名字。
+//! Regression tests for CLI `--image` argument parsing, split out of `cli.rs`'s
+//! `mod tests` (kept under the file-size ratchet); mounted via `mod` under its own
+//! `mod tests`, so `use super::*` reuses names already imported by the parent module.
 use super::*;
 
 #[test]

@@ -95,9 +95,9 @@ fn history_db_soft_deleted_session_returns_empty_page() {
     assert!(rows.is_empty());
 }
 
-/// msgfix1 T4：`get_message_for_fetch` 四态钉死——命中未删/命中已软删/存在但属他 session/
-/// 完全不存在。这四态是 `msg.fetch` 校验链第①步（forbidden/soft_deleted/not_found 三 code）
-/// 唯一的数据来源，任何一态判错都会导致 wire 层泄露越权/不存在的区分或漏挡越权读取。
+/// Pin down four `get_message_for_fetch` states: found live, found soft-deleted, owned by another session, or absent.
+/// They are the sole data source for the first `msg.fetch` validation step (forbidden/soft_deleted/not_found codes).
+/// Misclassifying any state can make the wire layer reveal unauthorized versus nonexistent data or allow unauthorized reads.
 #[test]
 fn get_message_for_fetch_returns_found_with_original_bytes_when_session_is_live() {
     let c = mem();
@@ -210,12 +210,12 @@ fn get_message_for_fetch_reports_not_found_for_an_unknown_message_id() {
     );
 }
 
-/// msgfix1 T4 返修①（存在性 oracle）：全局 `SELECT 1 FROM messages WHERE id=?1` 兜底会让
-/// "他 repo 的合法 message_id"（回 forbidden）与"纯捏造的 id"（回 not_found）产生不同响应
-/// ——攻击者据此可枚举全库 message_id 是否存在，与仓库归属无关。收紧后跨 repo 存在必须与
-/// 完全不存在**同响应** `NotFound`；只有同 repo 内存在但属别的 session 才回 `WrongSession`
-/// （见 `get_message_for_fetch_reports_wrong_session_for_a_message_owned_elsewhere` 那条同
-/// repo 正例）。
+/// A global `SELECT 1 FROM messages WHERE id=?1` check would distinguish a valid cross-repo message id
+/// (forbidden) from a fabricated id (not_found), letting an attacker enumerate message_id existence
+/// across the entire database regardless of repo ownership. Cross-repo existence must instead return
+/// `NotFound`, exactly like total nonexistence; only an id in the same repo but owned by another session
+/// may return `WrongSession`, as covered by the sibling test
+/// `get_message_for_fetch_reports_wrong_session_for_a_message_owned_elsewhere`.
 #[test]
 fn get_message_for_fetch_reports_not_found_not_wrong_session_for_a_message_in_another_repo() {
     let c = mem();

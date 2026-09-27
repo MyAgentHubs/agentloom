@@ -57,9 +57,9 @@ fn builds_msg_completed_payload_agent_field_optional() {
     );
 }
 
-/// msgfix1 T3（M0 §10.6）：`build_msg_completed_payload` 预算好的 content_ref 必须对
-/// `content_raw` 原文字节计算——sha256/total_bytes 与直接对同一字符串计算的结果逐字节一致；
-/// 非超预算路径顶层不带 `content_ref`（只在 `enqueue_milestone_item` 判定超预算时才附加）。
+/// `build_msg_completed_payload` must derive reference hashes and byte lengths from
+/// `content_raw` exactly. The top-level `content_ref` must remain absent within budget;
+/// `enqueue_milestone_item` attaches it only when the payload exceeds the budget.
 #[test]
 fn msg_completed_payload_ref_source_matches_content_raw_bytes() {
     let content_raw = r#"[{"type":"text","text":"hello"}]"#;
@@ -243,7 +243,7 @@ fn builds_session_index_snapshot_payload_with_repo_summary() {
     assert_eq!(payload["repo"], repo);
 }
 
-// B2（backlog 跟进）：session.index 全量快照发送前尺寸闸。
+// Check the size gate before sending a full session.index snapshot.
 
 #[test]
 fn truncate_session_index_snapshot_rows_passes_through_unchanged_when_within_budget() {
@@ -322,11 +322,11 @@ fn derives_msg_completed_client_msg_id_from_kat() {
 
 #[test]
 fn derives_msg_completed_client_msg_id_revision_matches_kat_vectors() {
-    // msgfix1 T5（缺口④）：revision==1 逐字节沿用旧派生（存量零扰动，同上一条钉死的
-    // 既有向量）；revision>1 在 name 末尾追加 `|<revision>`，与
-    // client-msg-id-derivation-v1.json 里的两条 revision>1 KAT 向量互证——msgfix1 T7 B5：
-    // 这两条向量原先在 pending 版样张里，T5 合入正式文件时已一并带过来并删除 pending 版，
-    // 这里改指正式文件。
+    // Revision one must preserve the existing client message identifier byte for byte.
+    // Later revisions append `|<revision>` to the derivation name so edits receive
+    // revision-specific identifiers. The assertions use the two later-revision
+    // known-answer vectors from the shared client message identifier derivation fixture,
+    // checking compatibility between local derivation and the protocol contract.
     assert_eq!(
         derive_msg_completed_client_msg_id("s-1", "dk-1", 1),
         "73996db9-9424-5e73-acb6-965bf87bfb80",

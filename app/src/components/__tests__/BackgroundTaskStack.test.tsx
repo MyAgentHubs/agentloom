@@ -1,9 +1,8 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-// @ts-expect-error - Vitest runs in Node, but this frontend tsconfig has no Node type declarations.
-import { readFileSync } from "fs";
 import { BackgroundTaskStack } from "../BackgroundTaskStack";
 import type { MemberUnit } from "../../types/agent";
+import { readGlobalCss } from "../../styles/readGlobalCss";
 
 const mk = (o: Partial<MemberUnit>): MemberUnit => ({
   participant_id: "p1",
@@ -69,7 +68,7 @@ describe("BackgroundTaskStack", () => {
     expect(container.querySelector(".task-row.st-fail")).not.toBeNull();
   });
   it("failed task row CSS 有整行失败态，不只靠右侧 badge", () => {
-    const css = readFileSync("src/styles/global.css", "utf-8");
+    const css = readGlobalCss();
     expect(css).toMatch(/\.task-row\.st-fail\s*\{[^}]*border-color:/);
     expect(css).toMatch(/\.task-row\.st-fail\s+\.tprog\s*\{[^}]*color:/);
   });

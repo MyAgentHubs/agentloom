@@ -3,7 +3,7 @@
 use super::*;
 
 // -----------------------------------------------------------------------------------------
-// T5 I5：收尾序全支路——ack commit < slot release < drain。测试名带 `delivery_order` 子串。
+// All completion paths must commit the ack before releasing the slot, then drain; test names include `delivery_order`.
 // -----------------------------------------------------------------------------------------
 
 /// ★ack commit < slot release 的核心证明：writer ack「晚到」时，`resolve_stdin_ack` 必须
@@ -43,7 +43,7 @@ fn delivery_order_ack_commit_waits_for_late_writer_then_marks_delivered_and_acks
     let writer_ack = ack_join.join().unwrap();
     assert_eq!(writer_ack, Ok(()));
 
-    // T8 P1-②：真相源改为 assembly.included_answer_ids（同线程直接捕获）——这里的裸
+    // Use `assembly.included_answer_ids`, captured on the same thread, as the source of truth for the answers included in this round.
     // `_with_conn`/`ack_pending_answers` 单测不经过完整 runner 线程，直接用一个本地字面量
     // 表示「本轮组装实际纳入的答案 id」，不再靠全局侧信道 record/take。
     let in_flight_ids = vec![7i64];
@@ -125,7 +125,7 @@ fn delivery_order_writer_err_leaves_report_pending_and_answers_unacked() {
     );
 }
 
-/// T8-fix：`is_delivery_round_empty_but_pending` 的查询本身失败（DB 损坏/表缺失等）不能被
+/// Query failures in `is_delivery_round_empty_but_pending` (such as database corruption or missing tables) must not be mistaken for an absence of pending work.
 /// `.unwrap_or(false)` 悄悄吞成「查出来没有 pending」——那样会把「读失败」误判成「读到真没
 /// 有」，进而把这一轮当成正常成功清零退避，真正卡住的 session 反而看起来风平浪静。查询 Err
 /// 必须走 `decide_delivery_outcome` 的保守未交付分支（`UndeliveredPendingQueryError`）。
@@ -185,7 +185,7 @@ fn delivery_order_ack_db_unavailable_is_treated_as_ack_failure() {
     );
 }
 
-/// T8 P1-①：本轮零纳入（既没交付新报告也没确认答案）但该 session 在 DB 里仍有 pending
+/// A round that delivers no new reports and acknowledges no answers must remain undelivered if the session still has pending reports in the database.
 /// 报告行——「run 发生了」但什么都没消化掉，必须判定为未交付（不能清零退避，否则真正卡住
 /// 的 session 会被误判成已经交付、autofeed 再也不会重试）。
 #[test]
@@ -300,15 +300,21 @@ fn delivery_order_nonempty_round_is_never_treated_as_undelivered_even_with_other
 /// `note_resume_failure`、成功分支（`DeliveryOutcome::Success`）必须调用
 /// `note_resume_success`——源码断言锁住这道分流，防止有人把判定写好了却忘记接进生产
 /// wrapper（同 `delivery_order_prespawn_and_spawn_failures_...` 那种“逻辑对但没接线”回归）。
-/// T8-fix：判定结果收进 `DeliveryOutcome` 枚举再 match——枚举分支互斥，不再是旧版 `if` guard
+/// Matching mutually exclusive `DeliveryOutcome` variants lets each branch action be checked independently, without relying on the order of `if` guards.
 /// 那种需要判先后顺序的写法，这里改成分别核两条分支各自接对了动作。
 #[test]
 fn delivery_order_wrapper_wires_empty_but_pending_check_before_unconditional_success() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let stripped = strip_comments_and_strings(production);
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/delivery_drain.rs"
+    ));
+    let stripped = strip_comments_and_strings(source);
     let label = "commit_lead_run_delivery";
-    let body = extract_fn_body(&stripped, "\nfn commit_lead_run_delivery(", label);
+    let body = extract_fn_body(
+        &stripped,
+        "\npub(super) fn commit_lead_run_delivery(",
+        label,
+    );
 
     assert!(
         body.contains("is_delivery_round_empty_but_pending("),
@@ -347,43 +353,48 @@ fn delivery_order_wrapper_wires_empty_but_pending_check_before_unconditional_suc
 /// `drain_after_run_release`——I5：状态先于槽释放、槽释放先于 drain。
 #[test]
 fn delivery_order_prespawn_and_spawn_failures_install_backoff_before_slot_release() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let lead = source
-        .split("fn start_lead_session(")
-        .nth(1)
-        .and_then(|tail| tail.split("\n#[tauri::command]\nfn stop_session(").next())
-        .expect("start_lead_session source slice");
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_session/runner_thread.rs"
+    ));
+    let stripped = strip_comments_and_strings(source);
+    let lead = extract_fn_body(&stripped, "fn spawn_lead_runner(", "spawn_lead_runner");
 
     let assert_order = |anchor: &str, label: &str| {
         let idx = lead
             .find(anchor)
             .unwrap_or_else(|| panic!("{label}: anchor not found: {anchor}"));
-        let mut window_end = (idx + 2200).min(lead.len());
-        while !lead.is_char_boundary(window_end) {
-            window_end -= 1;
-        }
-        let window = &lead[idx..window_end];
-        let note_idx = window
-            .find("note_resume_failure(")
-            .unwrap_or_else(|| panic!("{label}: note_resume_failure( missing near anchor"));
-        let emit_idx = window
-            .find("emit_lead_error_and_release(")
-            .unwrap_or_else(|| panic!("{label}: emit_lead_error_and_release( missing near anchor"));
-        let drain_idx = window
-            .find("drain_after_run_release(")
-            .unwrap_or_else(|| panic!("{label}: drain_after_run_release( missing near anchor"));
+        let window = lead[idx..]
+            .split_once("return None;")
+            .expect("prespawn failure return boundary")
+            .0;
         assert!(
-                note_idx < emit_idx,
-                "{label}: note_resume_failure 必须先于 emit_lead_error_and_release（I5：状态先于槽释放）"
-            );
-        assert!(
-            emit_idx < drain_idx,
-            "{label}: emit_lead_error_and_release（槽释放）必须先于 drain_after_run_release"
+            window.contains("abort_lead_prespawn("),
+            "{label}: abort helper missing near anchor"
         );
     };
+    let helper = extract_fn_body(&stripped, "fn abort_lead_prespawn(", "abort_lead_prespawn");
+    let label = "abort_lead_prespawn";
+    let note_idx = helper
+        .find("note_resume_failure(")
+        .unwrap_or_else(|| panic!("{label}: note_resume_failure( missing near anchor"));
+    let emit_idx = helper
+        .find("emit_lead_error_and_release(")
+        .unwrap_or_else(|| panic!("{label}: emit_lead_error_and_release( missing near anchor"));
+    let drain_idx = helper
+        .find("drain_after_run_release(")
+        .unwrap_or_else(|| panic!("{label}: drain_after_run_release( missing near anchor"));
+    assert!(
+        note_idx < emit_idx,
+        "{label}: note_resume_failure 必须先于 emit_lead_error_and_release（I5：状态先于槽释放）"
+    );
+    assert!(
+        emit_idx < drain_idx,
+        "{label}: emit_lead_error_and_release（槽释放）必须先于 drain_after_run_release"
+    );
 
     assert_order(
-        "let mcp_srv = match mcp_server::start_mcp_server(tools_arc) {",
+        "let mcp_srv = match mcp_server::start_mcp_server(std::mem::take(&mut ctx.tools)) {",
         "McpStart",
     );
     assert_order(
@@ -394,7 +405,7 @@ fn delivery_order_prespawn_and_spawn_failures_install_backoff_before_slot_releas
         "match agent::spawn_with_stdin_prompt_ack(&mut cmd, stdin_prompt.as_ref())",
         "ProcessStart",
     );
-    // T8 P2-④：组装失败（Autofeed/LateAnswer 分流的 I2 中止分支）同样必须
+    // Assembly failures that abort Autofeed/LateAnswer runs must also preserve the failure, slot release, and drain ordering below.
     // note_resume_failure < emit_lead_error_and_release < drain_after_run_release。
     assert_order(
         "let assembled_prompt: String = match assembly_outcome {",
@@ -402,55 +413,59 @@ fn delivery_order_prespawn_and_spawn_failures_install_backoff_before_slot_releas
     );
 }
 
-/// T8 P2-④/I2：组装失败时，自动来源（Autofeed/LateAnswer）绝不能只喂兜底句起跑——那等于
+/// After assembly failure, Autofeed/LateAnswer must abort rather than start with only a fallback prompt, which would mistake a run occurring for a delivery.
 /// 把「run 发生了」包装成「run 交付了」；必须中止本轮（不 spawn 后续 command/child）。
 /// UserMessage 来源保留旧行为：兜底句 + 留日志，正常继续起跑（用户主动发的消息不能被吞）。
 #[test]
 fn autofeed_context_assembly_failure_aborts_without_fallback_prompt_for_autofeed_and_late_answer() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let block = production
-        .split("let assembled_prompt: String = match assembly_outcome {")
-        .nth(1)
-        .expect("组装结果分流代码块缺失")
-        .split("\n            let (mut cmd, claude_bin) = match build_result {")
-        .next()
-        .expect("找不到组装分流块与命令构建块的边界");
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_session/runner_thread.rs"
+    ));
+    let stripped = strip_comments_and_strings(source);
+    let production = extract_fn_body(&stripped, "fn spawn_lead_runner(", "spawn_lead_runner");
+    let block = source_window(
+        production,
+        "let assembled_prompt: String = match assembly_outcome {",
+        "\n    let (mut cmd, claude_bin) = match build_result {",
+    );
 
-    let autofeed_arm = block
-        .split("StartOrigin::Autofeed | StartOrigin::LateAnswer => {")
-        .nth(1)
-        .expect("Autofeed/LateAnswer 分支缺失")
-        .split("StartOrigin::UserMessage => {")
-        .next()
-        .expect("找不到与 UserMessage 分支的边界");
+    let autofeed_arm = source_window(
+        block,
+        "StartOrigin::Autofeed | StartOrigin::LateAnswer => {",
+        "StartOrigin::UserMessage => {",
+    );
     assert!(
         !autofeed_arm.contains("message_or_fallback"),
         "Autofeed/LateAnswer 组装失败绝不能只喂兜底句起跑（I2）"
     );
     let failure_idx = autofeed_arm
-        .find("note_resume_failure(&session_id_t);")
-        .expect("必须先装退避");
-    let emit_idx = autofeed_arm
-        .find("emit_lead_error_and_release(")
-        .expect("必须摘槽/terminal");
-    let drain_idx = autofeed_arm
-        .find("drain_after_run_release(")
-        .expect("必须触发 drain 让其余排空源不被卡住");
+        .find("abort_lead_prespawn(")
+        .expect("assembly failure must invoke the abort helper");
     let return_idx = autofeed_arm
-        .find("return;")
+        .find("return None;")
         .expect("必须中止本轮——不能继续往下 spawn command/child");
     assert!(
-        failure_idx < emit_idx && emit_idx < drain_idx && drain_idx < return_idx,
+        failure_idx < return_idx,
         "组装失败中止分支的收尾序必须是 note_resume_failure < emit_lead_error_and_release < \
              drain_after_run_release < return"
     );
-    // T8 P1-③：组装失败轮绝不能 ack 答案——`commit_lead_run_delivery`/`ack_pending_answers`
+    // Assembly failure must leave answers pending for retry, so neither `commit_lead_run_delivery` nor `ack_pending_answers` may be called.
     // 都必须完全没被调用到，答案仍留在 `pending_answer_ids` 里等下一轮重试。
     assert!(
         !autofeed_arm.contains("commit_lead_run_delivery(")
             && !autofeed_arm.contains("ack_pending_answers("),
         "组装失败中止分支绝不能提前 ack 答案——答案必须仍是 pending，留给下一轮重试"
+    );
+    // The call site above only reaches `abort_lead_prespawn(...)`; the actual note/emit/drain
+    // sequence lives inside that helper's own body, so the negative assertion must also scan it
+    // (otherwise a call to `ack_pending_answers`/`commit_lead_run_delivery` inserted inside
+    // `abort_lead_prespawn` would slip past unnoticed).
+    let abort_helper = extract_fn_body(&stripped, "fn abort_lead_prespawn(", "abort_lead_prespawn");
+    assert!(
+        !abort_helper.contains("commit_lead_run_delivery(")
+            && !abort_helper.contains("ack_pending_answers("),
+        "abort_lead_prespawn 收尾也绝不能提前 ack 答案——答案必须仍是 pending，留给下一轮重试"
     );
 
     let user_message_arm = block
@@ -464,7 +479,9 @@ fn autofeed_context_assembly_failure_aborts_without_fallback_prompt_for_autofeed
     assert!(
         !user_message_arm.contains("note_resume_failure(&session_id_t)")
             && !user_message_arm.contains("emit_lead_error_and_release(")
-            && !user_message_arm.contains("return;"),
+            && !user_message_arm.contains("return;")
+            && !user_message_arm.contains("return None;")
+            && !user_message_arm.contains("abort_lead_prespawn("),
         "UserMessage 分支不该中止本轮——只应兜底句 + 留日志后继续起跑"
     );
 }
@@ -474,12 +491,16 @@ fn autofeed_context_assembly_failure_aborts_without_fallback_prompt_for_autofeed
 /// （槽释放），槽释放必须先于最后一次 `drain_after_run_release`——I5 全链路源码顺序证明。
 #[test]
 fn delivery_order_normal_completion_commits_ack_before_slot_release_and_drain() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let lead = source
-        .split("fn start_lead_session(")
-        .nth(1)
-        .and_then(|tail| tail.split("\n#[tauri::command]\nfn stop_session(").next())
-        .expect("start_lead_session source slice");
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_session/stream_closeout.rs"
+    ));
+    let stripped = strip_comments_and_strings(source);
+    let lead = extract_fn_body(
+        &stripped,
+        "fn persist_lead_closeout(",
+        "persist_lead_closeout",
+    );
 
     let commit_idx = lead
         .find("commit_lead_run_delivery(")
@@ -517,11 +538,17 @@ fn delivery_order_normal_completion_commits_ack_before_slot_release_and_drain() 
 /// 类型检查验证过接线正确。
 #[test]
 fn delivery_order_runner_thread_spawn_failure_installs_backoff_before_release_and_drain() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/run_closeout_finalize.rs"
+    ));
     let body = source
-        .split("\nfn handle_lead_runner_thread_spawn_failure(")
+        .split("\npub(super) fn handle_lead_runner_thread_spawn_failure(")
         .nth(1)
-        .and_then(|tail| tail.split("\nfn reconcile_running_dispatch_cards(").next())
+        .and_then(|tail| {
+            tail.split_once("\npub(super) fn reconcile_running_dispatch_cards(")
+                .map(|(before, _after)| before)
+        })
         .expect("handle_lead_runner_thread_spawn_failure source slice");
 
     let note_idx = body
@@ -554,11 +581,11 @@ fn delivery_order_runner_thread_spawn_failure_installs_backoff_before_release_an
 /// refresh）——防将来有人在这两个分支里改错顺序。
 #[test]
 fn delivery_order_runner_thread_builder_spawn_err_handles_before_disarm() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    // 注意：不能用 `.matches(...).count() == 1` 断言唯一——本测试自身的源码字符串字面量
-    // 也含有这段文本（`include_str!` 把整份文件含本测试自己都读进来了），计数天然 > 1；
-    // `.find()` 只取第一次出现，而生产里的真实 `match spawn_result {` 就在
-    // `start_lead_session` 函数体内、远早于本测试模块，第一次命中即是它。
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_commands.rs"
+    ));
+    // `.find()` takes the first occurrence, which is safe because this is pure production source.
     let idx = source
         .find("match spawn_result {")
         .expect("match spawn_result { missing");
@@ -581,7 +608,7 @@ fn delivery_order_runner_thread_builder_spawn_err_handles_before_disarm() {
     );
 }
 
-/// T5-fix B：runner OS 线程创建失败（`std::thread::Builder::spawn` 返回 `Err`）之后，
+/// A runner OS thread creation failure (`std::thread::Builder::spawn` returning `Err`) must propagate an error instead of falling through to shared success.
 /// `match spawn_result { ... }` 必须是 `start_lead_session` 的尾表达式、且 `Err` 分支必须
 /// 真正产出 `Err(...)`——旧 bug 的形状是这个 match 只是一条语句，两个分支都收口于共享的
 /// `Ok(())`（写在 match 之后），于是调用方（`try_resume_pending_with_gate`）看到的永远是
@@ -591,11 +618,13 @@ fn delivery_order_runner_thread_builder_spawn_err_handles_before_disarm() {
 /// `Ok(())`）挂在后面。
 #[test]
 fn delivery_order_runner_thread_builder_spawn_err_returns_err_not_shared_ok() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let stripped = strip_comments_and_strings(production);
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_commands.rs"
+    ));
+    let stripped = strip_comments_and_strings(source);
     let label = "start_lead_session";
-    let fn_body = extract_fn_body(&stripped, "\nfn start_lead_session(", label);
+    let fn_body = extract_fn_body(&stripped, "\npub(super) fn start_lead_session(", label);
 
     let after_match_kw = fn_body
         .split("match spawn_result {")
@@ -699,7 +728,7 @@ fn delivery_order_stopped_handoff_skips_backoff_but_abort_handoff_installs_it() 
     );
 }
 
-/// T5-fix D：`running.0` 锁 poisoned 时，旧实现 `map_err(...)?` 提前 return——从未拿到
+/// When `running.0` is poisoned, an early return through `map_err(...)?` skips acquiring the guard and removing the slot before the caller drains.
 /// guard，也就从未 `slots.remove`，外层调用方（:14554 附近）却仍会在 `Err(_)` 分支照样
 /// `drain_after_run_release`，违反「slot release < drain」顺序不变量。修复后 poisoned
 /// 分支必须借 `PoisonError::into_inner` 拿回 guard，按 Abort 同款真摘槽 + 装退避，再把

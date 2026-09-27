@@ -3,19 +3,19 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use crate::test_support::source_window;
+
 /// 从 `lib.rs` 的 `generate_handler![...]` 抽出全部已注册命令名——切法与
 /// `source_invariants.rs` 的 registry 抽取一致。本仓当前没有任何
 /// `#[tauri::command(rename = ...)]`，命令名 == 函数标识符。
 fn registered_command_names() -> BTreeSet<String> {
     let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
     let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let registry = production
-        .split(".invoke_handler(tauri::generate_handler![")
-        .nth(1)
-        .expect("invoke handler registry should exist")
-        .split("])")
-        .next()
-        .unwrap();
+    let registry = source_window(
+        production,
+        ".invoke_handler(tauri::generate_handler![",
+        "])",
+    );
     registry
         // rustfmt 允许多个命令名挤在同一行（如 `get_messages, session_search::search_sessions,`），
         // 按逗号切才不会漏掉同行里第二个及以后的名字；每项前面可能带一整行注释（如

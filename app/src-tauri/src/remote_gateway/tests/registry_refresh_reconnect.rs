@@ -90,6 +90,108 @@ fn remote_registry_reconnect_resends_unacked_put_after_sync_then_releases_ready(
     server.join().unwrap();
 }
 
+fn run_connection_and_assert_result(
+    inner: &Arc<Inner>,
+    url: &str,
+    config: &GatewayConfig,
+    k_room: Zeroizing<[u8; 32]>,
+    expected: Result<ConnectionExit, ConnectionFailure>,
+    assert_message: Option<&str>,
+) {
+    let (_upstream_tx, upstream_rx) = mpsc::sync_channel(1);
+    let (_milestone_tx, milestone_rx) = mpsc::sync_channel(1);
+    let connection_inner = Arc::clone(inner);
+    let connection_url = url.to_owned();
+    let connection_config = config.clone();
+    let connection = thread::spawn(move || {
+        run_authenticated_connection(
+            &connection_inner,
+            &connection_url,
+            &DesktopCredential::new(Zeroizing::new("ab".repeat(32))),
+            &connection_config,
+            None,
+            &upstream_rx,
+            &milestone_rx,
+            Some(&k_room),
+        )
+    });
+    let result = join_connection_within(connection, inner);
+    if let Some(assert_message) = assert_message {
+        assert_eq!(result, expected, "{assert_message}");
+    } else {
+        assert_eq!(result, expected);
+    }
+}
+
+fn serve_rejected_refresh_then_reconnect(
+    listener: std::net::TcpListener,
+    frames_tx: mpsc::Sender<Value>,
+    server_subject: String,
+    server_request_id: String,
+    new_generation: i64,
+) {
+    // ── 第一条连接：refresh 轮换的 put 被判 rejected ──
+    let (stream, _) = listener.accept().unwrap();
+    let mut socket = tungstenite::accept(stream).unwrap();
+    // 连接建立时的首次 sync：relay 学到 subject 还停在旧代号 5。
+    ack_initial_registry_sync(&mut socket);
+
+    // 首次 sync 之后，outbox 里挂着 refresh 回执的 put（代号 9，来自
+    // enqueue_token_put_for_refresh，见下方 registry 预置）被正常 drain 出来。
+    let Message::Text(text) = socket.read().unwrap() else {
+        panic!("token.put must be text");
+    };
+    let put_frame: Value = serde_json::from_str(text.as_ref()).unwrap();
+    assert_eq!(put_frame["t"], "token.put");
+    assert_eq!(put_frame["subject"], server_subject);
+    assert_eq!(put_frame["generation"], new_generation);
+    frames_tx.send(put_frame).unwrap();
+
+    // relay 判 rejected（模拟它手上仍是代号 5 的旧注册表，拒绝了这次代号 9 的 put）。
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "t": "token.ack",
+                "subject": server_subject,
+                "generation": new_generation,
+                "result": "rejected",
+            })
+            .to_string()
+            .into(),
+        ))
+        .unwrap();
+
+    // 桌面回一帧 fail{put_rejected}（不带 close）——R2 既有行为，本轮不许削弱。
+    let Message::Text(text) = socket.read().unwrap() else {
+        panic!("refresh fail must be text");
+    };
+    let fail_frame: Value = serde_json::from_str(text.as_ref()).unwrap();
+    assert_eq!(fail_frame["t"], "token.refresh.fail");
+    assert_eq!(fail_frame["reason"], "put_rejected");
+    assert_eq!(fail_frame["request_id"], server_request_id);
+    assert!(
+        fail_frame.get("close").is_none(),
+        "R2 既有行为：put_rejected 自愈帧不带 close，不许被本轮削弱"
+    );
+    frames_tx.send(fail_frame).unwrap();
+
+    // 返工三本体：桌面**不**在这条连接上重发 sync——relay 侧再读不到任何后续应用帧，
+    // 只会看到桌面主动断开这条连接（EOF/关闭），不是收到一帧第二次 sync。
+    let closed = matches!(socket.read(), Err(_) | Ok(Message::Close(_)));
+    assert!(
+        closed,
+        "返工三：处理完 rejected 的 refresh put 之后必须主动断开这条连接，\
+             不能在原地等第二次 sync.ack"
+    );
+
+    // ── 第二条连接：既有重连路径的首次 sync 必须带上 DB 当前真相（新代号）──
+    let (stream, _) = listener.accept().unwrap();
+    let mut socket = tungstenite::accept(stream).unwrap();
+    let resync_frame = ack_initial_registry_sync(&mut socket);
+    frames_tx.send(resync_frame).unwrap();
+    let _ = socket.close(None);
+}
+
 #[test]
 fn remote_registry_rejected_refresh_put_disconnects_so_reconnect_carries_db_truth() {
     // S1i1 返工三：refresh 轮换成功后挂着回执的 put 被 relay 判 `rejected`——桌面 DB
@@ -111,66 +213,13 @@ fn remote_registry_rejected_refresh_put_disconnects_so_reconnect_carries_db_trut
     let server_subject = subject.clone();
     let server_request_id = request_id.to_owned();
     let server = thread::spawn(move || {
-        // ── 第一条连接：refresh 轮换的 put 被判 rejected ──
-        let (stream, _) = listener.accept().unwrap();
-        let mut socket = tungstenite::accept(stream).unwrap();
-        // 连接建立时的首次 sync：relay 学到 subject 还停在旧代号 5。
-        ack_initial_registry_sync(&mut socket);
-
-        // 首次 sync 之后，outbox 里挂着 refresh 回执的 put（代号 9，来自
-        // enqueue_token_put_for_refresh，见下方 registry 预置）被正常 drain 出来。
-        let Message::Text(text) = socket.read().unwrap() else {
-            panic!("token.put must be text");
-        };
-        let put_frame: Value = serde_json::from_str(text.as_ref()).unwrap();
-        assert_eq!(put_frame["t"], "token.put");
-        assert_eq!(put_frame["subject"], server_subject);
-        assert_eq!(put_frame["generation"], new_generation);
-        frames_tx.send(put_frame).unwrap();
-
-        // relay 判 rejected（模拟它手上仍是代号 5 的旧注册表，拒绝了这次代号 9 的 put）。
-        socket
-            .send(Message::Text(
-                serde_json::json!({
-                    "t": "token.ack",
-                    "subject": server_subject,
-                    "generation": new_generation,
-                    "result": "rejected",
-                })
-                .to_string()
-                .into(),
-            ))
-            .unwrap();
-
-        // 桌面回一帧 fail{put_rejected}（不带 close）——R2 既有行为，本轮不许削弱。
-        let Message::Text(text) = socket.read().unwrap() else {
-            panic!("refresh fail must be text");
-        };
-        let fail_frame: Value = serde_json::from_str(text.as_ref()).unwrap();
-        assert_eq!(fail_frame["t"], "token.refresh.fail");
-        assert_eq!(fail_frame["reason"], "put_rejected");
-        assert_eq!(fail_frame["request_id"], server_request_id);
-        assert!(
-            fail_frame.get("close").is_none(),
-            "R2 既有行为：put_rejected 自愈帧不带 close，不许被本轮削弱"
+        serve_rejected_refresh_then_reconnect(
+            listener,
+            frames_tx,
+            server_subject,
+            server_request_id,
+            new_generation,
         );
-        frames_tx.send(fail_frame).unwrap();
-
-        // 返工三本体：桌面**不**在这条连接上重发 sync——relay 侧再读不到任何后续应用帧，
-        // 只会看到桌面主动断开这条连接（EOF/关闭），不是收到一帧第二次 sync。
-        let closed = matches!(socket.read(), Err(_) | Ok(Message::Close(_)));
-        assert!(
-            closed,
-            "返工三：处理完 rejected 的 refresh put 之后必须主动断开这条连接，\
-                 不能在原地等第二次 sync.ack"
-        );
-
-        // ── 第二条连接：既有重连路径的首次 sync 必须带上 DB 当前真相（新代号）──
-        let (stream, _) = listener.accept().unwrap();
-        let mut socket = tungstenite::accept(stream).unwrap();
-        let resync_frame = ack_initial_registry_sync(&mut socket);
-        frames_tx.send(resync_frame).unwrap();
-        let _ = socket.close(None);
     });
 
     let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -250,31 +299,18 @@ fn remote_registry_rejected_refresh_put_disconnects_so_reconnect_carries_db_trut
     // `join_connection_within` 把「连接是否真的结束」变成一条硬断言，不靠超时/panic 兜底
     // （G2 变异自证：把下方收敛动作临时改回 no-op，这条 `assert!(finished_in_time, ...)`
     // 会先于其它断言干净地失败）。
-    let (_upstream_tx_1, upstream_rx_1) = mpsc::sync_channel(1);
-    let (_milestone_tx_1, milestone_rx_1) = mpsc::sync_channel(1);
-    let connection_inner = Arc::clone(&inner);
-    let connection_url = url.clone();
-    let connection_config = config.clone();
-    let connection = thread::spawn(move || {
-        run_authenticated_connection(
-            &connection_inner,
-            &connection_url,
-            &DesktopCredential::new(Zeroizing::new("ab".repeat(32))),
-            &connection_config,
-            None,
-            &upstream_rx_1,
-            &milestone_rx_1,
-            Some(&Zeroizing::new([6_u8; 32])),
-        )
-    });
-    let result = join_connection_within(connection, &inner);
-    assert_eq!(
-        result,
+    run_connection_and_assert_result(
+        &inner,
+        &url,
+        &config,
+        Zeroizing::new([6_u8; 32]),
         Err(ConnectionFailure::Other(
-            "refresh put rejected; reconnecting to resync registry".to_owned()
+            "refresh put rejected; reconnecting to resync registry".to_owned(),
         )),
-        "rejected 且挂着 refresh 回执的 put 之后必须是一次可重试的断开（Other），\
-             不能变成 Stopped 那种硬停，也不能在原地等第二次 ack"
+        Some(
+            "rejected 且挂着 refresh 回执的 put 之后必须是一次可重试的断开（Other），\
+             不能变成 Stopped 那种硬停，也不能在原地等第二次 ack",
+        ),
     );
 
     let put_frame = frames_rx.recv().unwrap();
@@ -285,25 +321,14 @@ fn remote_registry_rejected_refresh_put_disconnects_so_reconnect_carries_db_trut
 
     // 第二条连接：既有重连路径（`attempt_once` 重新调 `run_connection_request`）的首次
     // sync 必须带上 DB 当前真相（新代号），不是第一条连接建立时那次 sync 还带着的旧代号。
-    let (_upstream_tx_2, upstream_rx_2) = mpsc::sync_channel(1);
-    let (_milestone_tx_2, milestone_rx_2) = mpsc::sync_channel(1);
-    let connection_inner_2 = Arc::clone(&inner);
-    let connection_url_2 = url.clone();
-    let connection_config_2 = config.clone();
-    let connection_2 = thread::spawn(move || {
-        run_authenticated_connection(
-            &connection_inner_2,
-            &connection_url_2,
-            &DesktopCredential::new(Zeroizing::new("ab".repeat(32))),
-            &connection_config_2,
-            None,
-            &upstream_rx_2,
-            &milestone_rx_2,
-            Some(&Zeroizing::new([6_u8; 32])),
-        )
-    });
-    let result_2 = join_connection_within(connection_2, &inner);
-    assert_eq!(result_2, Ok(ConnectionExit::ClosedByPeer));
+    run_connection_and_assert_result(
+        &inner,
+        &url,
+        &config,
+        Zeroizing::new([6_u8; 32]),
+        Ok(ConnectionExit::ClosedByPeer),
+        None,
+    );
 
     let resync_frame = frames_rx.recv().unwrap();
     assert_eq!(
@@ -328,6 +353,85 @@ fn remote_registry_rejected_refresh_put_disconnects_so_reconnect_carries_db_trut
     );
 
     server.join().unwrap();
+}
+
+fn serve_rejected_refresh_with_relay_input(
+    listener: std::net::TcpListener,
+    frames_tx: mpsc::Sender<Value>,
+    server_subject_and_generation: (String, i64),
+    server_request_id: String,
+    server_room_id: String,
+    server_k_room: Zeroizing<[u8; 32]>,
+    server_command_id: String,
+) {
+    let (server_subject, new_generation) = server_subject_and_generation;
+    let (stream, _) = listener.accept().unwrap();
+    let mut socket = tungstenite::accept(stream).unwrap();
+    ack_initial_registry_sync(&mut socket);
+
+    let Message::Text(text) = socket.read().unwrap() else {
+        panic!("token.put must be text");
+    };
+    let put_frame: Value = serde_json::from_str(text.as_ref()).unwrap();
+    assert_eq!(put_frame["t"], "token.put");
+    assert_eq!(put_frame["subject"], server_subject);
+    assert_eq!(put_frame["generation"], new_generation);
+
+    // relay 判 rejected——桌面即将进入「该收敛了」的状态。
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "t": "token.ack",
+                "subject": server_subject,
+                "generation": new_generation,
+                "result": "rejected",
+            })
+            .to_string()
+            .into(),
+        ))
+        .unwrap();
+
+    // 不等桌面任何回应，紧接着直投一帧在线 input——正是评审描述的「插在收敛动作之间」
+    // 的位置。
+    let envelope = seal_command_envelope(
+        &server_k_room,
+        &server_room_id,
+        7,
+        "input",
+        "s-race",
+        &server_command_id,
+        &serde_json::json!({
+            "t": "input.send",
+            "session": "s-race",
+            "text": "hello from race",
+        }),
+    );
+    socket
+        .send(Message::Text(envelope.to_string().into()))
+        .unwrap();
+
+    // 两帧都必须在同一条连接上被正常处理：先看到 fail（不带 close），再看到
+    // input.ack——证明「正要收敛」的这一刻，relay 紧跟着送来的帧没有被当协议违规吞掉。
+    let Message::Text(text) = socket.read().unwrap() else {
+        panic!("refresh fail must be text");
+    };
+    let fail_frame: Value = serde_json::from_str(text.as_ref()).unwrap();
+    assert_eq!(fail_frame["request_id"], server_request_id);
+    frames_tx.send(fail_frame).unwrap();
+
+    let Message::Text(text) = socket.read().unwrap() else {
+        panic!("input ack must be text");
+    };
+    let input_ack: Value = serde_json::from_str(text.as_ref()).unwrap();
+    frames_tx.send(input_ack).unwrap();
+
+    // 不再送任何东西——桌面必须在这一轮真正安静下来之后自己断开（既有重连路径接手）。
+    let closed = matches!(socket.read(), Err(_) | Ok(Message::Close(_)));
+    assert!(
+        closed,
+        "处理完 relay 插进来的 input 帧之后，桌面仍必须完成收敛断开——不能因为多处理了\
+             一帧就卡住不断"
+    );
 }
 
 #[test]
@@ -364,72 +468,14 @@ fn remote_registry_rejected_refresh_put_disconnect_does_not_drop_relay_pushed_in
     let server_k_room = k_room.clone();
     let server_command_id = command_id.to_owned();
     let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut socket = tungstenite::accept(stream).unwrap();
-        ack_initial_registry_sync(&mut socket);
-
-        let Message::Text(text) = socket.read().unwrap() else {
-            panic!("token.put must be text");
-        };
-        let put_frame: Value = serde_json::from_str(text.as_ref()).unwrap();
-        assert_eq!(put_frame["t"], "token.put");
-        assert_eq!(put_frame["subject"], server_subject);
-        assert_eq!(put_frame["generation"], new_generation);
-
-        // relay 判 rejected——桌面即将进入「该收敛了」的状态。
-        socket
-            .send(Message::Text(
-                serde_json::json!({
-                    "t": "token.ack",
-                    "subject": server_subject,
-                    "generation": new_generation,
-                    "result": "rejected",
-                })
-                .to_string()
-                .into(),
-            ))
-            .unwrap();
-
-        // 不等桌面任何回应，紧接着直投一帧在线 input——正是评审描述的「插在收敛动作之间」
-        // 的位置。
-        let envelope = seal_command_envelope(
-            &server_k_room,
-            &server_room_id,
-            7,
-            "input",
-            "s-race",
-            &server_command_id,
-            &serde_json::json!({
-                "t": "input.send",
-                "session": "s-race",
-                "text": "hello from race",
-            }),
-        );
-        socket
-            .send(Message::Text(envelope.to_string().into()))
-            .unwrap();
-
-        // 两帧都必须在同一条连接上被正常处理：先看到 fail（不带 close），再看到
-        // input.ack——证明「正要收敛」的这一刻，relay 紧跟着送来的帧没有被当协议违规吞掉。
-        let Message::Text(text) = socket.read().unwrap() else {
-            panic!("refresh fail must be text");
-        };
-        let fail_frame: Value = serde_json::from_str(text.as_ref()).unwrap();
-        assert_eq!(fail_frame["request_id"], server_request_id);
-        frames_tx.send(fail_frame).unwrap();
-
-        let Message::Text(text) = socket.read().unwrap() else {
-            panic!("input ack must be text");
-        };
-        let input_ack: Value = serde_json::from_str(text.as_ref()).unwrap();
-        frames_tx.send(input_ack).unwrap();
-
-        // 不再送任何东西——桌面必须在这一轮真正安静下来之后自己断开（既有重连路径接手）。
-        let closed = matches!(socket.read(), Err(_) | Ok(Message::Close(_)));
-        assert!(
-            closed,
-            "处理完 relay 插进来的 input 帧之后，桌面仍必须完成收敛断开——不能因为多处理了\
-                 一帧就卡住不断"
+        serve_rejected_refresh_with_relay_input(
+            listener,
+            frames_tx,
+            (server_subject, new_generation),
+            server_request_id,
+            server_room_id,
+            server_k_room,
+            server_command_id,
         );
     });
 
@@ -504,32 +550,15 @@ fn remote_registry_rejected_refresh_put_disconnect_does_not_drop_relay_pushed_in
         active_repo_id: Some(TEST_DEFAULT_ACTIVE_REPO_ID.to_owned()),
     };
     let url = build_ws_url(&config.relay_url, &config.room_id);
-    let (_upstream_tx, upstream_rx) = mpsc::sync_channel(1);
-    let (_milestone_tx, milestone_rx) = mpsc::sync_channel(1);
-
-    let connection_inner = Arc::clone(&inner);
-    let connection_url = url.clone();
-    let connection_config = config.clone();
-    let connection_k_room = k_room.clone();
-    let connection = thread::spawn(move || {
-        run_authenticated_connection(
-            &connection_inner,
-            &connection_url,
-            &DesktopCredential::new(Zeroizing::new("ab".repeat(32))),
-            &connection_config,
-            None,
-            &upstream_rx,
-            &milestone_rx,
-            Some(&connection_k_room),
-        )
-    });
-    let result = join_connection_within(connection, &inner);
-    assert_eq!(
-        result,
+    run_connection_and_assert_result(
+        &inner,
+        &url,
+        &config,
+        k_room.clone(),
         Err(ConnectionFailure::Other(
-            "refresh put rejected; reconnecting to resync registry".to_owned()
+            "refresh put rejected; reconnecting to resync registry".to_owned(),
         )),
-        "本轮循环最终仍必须走到可重试断开——多处理一帧 input 不该改变收敛结论"
+        Some("本轮循环最终仍必须走到可重试断开——多处理一帧 input 不该改变收敛结论"),
     );
 
     let fail_frame = frames_rx.recv().unwrap();

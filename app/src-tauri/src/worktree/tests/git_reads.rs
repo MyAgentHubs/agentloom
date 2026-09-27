@@ -512,6 +512,38 @@ fn changed_paths_between_flags_protected_workflow_path() {
 }
 
 #[test]
+fn hardened_git_read_prefix_matches_literal_expected_values() {
+    // Deliberate double bookkeeping: this literal must be updated by hand whenever
+    // HARDENED_GIT_READ_PREFIX (worktree/git_read.rs) changes, so that an accidental deletion of
+    // a hardening flag turns this test red instead of silently passing. Do not rewrite this to
+    // compare the constant against itself (for example via `.windows(CONST.len())`), which is
+    // the bug this test guards against.
+    let expected: [&str; 9] = [
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "diff.external=",
+        "-c",
+        "core.attributesFile=/dev/null",
+    ];
+    assert_eq!(HARDENED_GIT_READ_PREFIX, expected);
+
+    let command = git_read_command(Path::new("/tmp"), &["status"]);
+    let args = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        args.windows(expected.len())
+            .any(|window| window == expected),
+        "git_read_command did not apply the hardened read prefix in the expected order: {args:?}"
+    );
+}
+
+#[test]
 fn git_read_command_applies_security_prefix_and_renderer_flags() {
     let command = git_read_command(
         Path::new("/tmp"),

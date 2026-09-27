@@ -2,7 +2,7 @@
 //!
 //! 一题一个 #[tokio::test]，共 12 题（U1–U12·codex xhigh 独立审后按 REVISE 意见
 //! 扩题：U10 第二发射点 engine_finalize、U11 blocked 负范围、U12 fallback）。
-//! 全程离线：wiremock 供 SSE / JSON 夹具（形状锚定 2026-07-10 真 API 录音：
+//! Fully offline: wiremock serves SSE / JSON fixtures (shapes anchored to real API recordings:
 //! DeepSeek 流式 / zai anthropic 非流式，见配套的内部评测录音夹具），
 //! 真 run_solo 端到端跑完，对 events.jsonl 里终态事件的 `usage` 荷载做硬断言。
 //!
@@ -546,7 +546,7 @@ async fn u8_payload_shape_canonical_and_backward_compatible() {
     assert!(payload["usage"]["output_tokens"].is_u64());
     // 既有字段不动：turns 仍在。
     assert_eq!(payload["turns"].as_u64(), Some(1));
-    // 不许夹带发明字段（用户拍过：只存 token 不存钱；total 冗余不进事件）。
+    // No invented fields: persist only token counts, never cost or money; omit the redundant total field from the event.
     for forbidden in [
         "cost_usd",
         "total_tokens",

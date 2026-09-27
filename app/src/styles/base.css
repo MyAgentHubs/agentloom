@@ -1,0 +1,41 @@
+:root {
+  --bg: #f5f2ec;
+  --panel: #fffefb;
+  --ink: #1a1814;
+  --ink-2: #4a463e;
+  --ink-3: #7a7568;
+  --ink-4: #a39d90;
+  --line: #e5ddc9;
+  --line-soft: #efe8d4;
+  --accent: #d97757;
+  --accent-soft: #f3ddd0;
+  --bg-sunken: #ece5d6;
+  /* Danger-action red token (--red is used by .sess-mi--danger etc.) */
+  --red: #b85048;
+  --green: #6a9b5c;
+  --amber: #d08b3f;
+  --amber-ink: #9b5b10;
+  /* main content visual vertical guide token */
+  --content-max: 760px;
+  --content-padding: 24px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue",
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}

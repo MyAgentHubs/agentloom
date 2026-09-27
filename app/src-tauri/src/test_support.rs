@@ -39,3 +39,17 @@ pub fn mem_db() -> Connection {
     .expect("seed local-default repo 失败");
     c
 }
+
+/// Slices `src` to the text strictly between the first `start` and the following `end`.
+/// `str::split(pat).next()` always returns `Some`, so a bare `.split(end).next()` used to widen
+/// the window silently to end-of-file once `end` stopped matching; this panics instead, naming
+/// whichever anchor went missing.
+pub(crate) fn source_window<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+    let tail = src
+        .split_once(start)
+        .map(|(_before, after)| after)
+        .unwrap_or_else(|| panic!("source_window: missing start anchor {start:?}"));
+    tail.split_once(end)
+        .map(|(before, _after)| before)
+        .unwrap_or_else(|| panic!("source_window: missing end anchor {end:?}"))
+}

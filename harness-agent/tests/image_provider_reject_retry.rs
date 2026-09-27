@@ -1,4 +1,4 @@
-//! T19 出线自愈：`supports_images` 判定表（种子表/家族猜）总会有漏。厂商真实拿 400 拒
+//! A provider's `supports_images` guess table can be wrong: on a recognizable "image content not accepted" rejection, the runtime must strip images, retry once, and disable images for that provider instance for the rest of the run.
 //! 一个带图请求（响应体符合「图片内容不被接受」的已知特征）时，运行时必须剥图重发一次、
 //! 并记住这个 provider 实例本轮以后都不要再发图——不能一直撞同一堵墙。
 //! 拆出独立文件（同 `image_resume_wire.rs`/`image_budget_golden_path.rs`）：避免

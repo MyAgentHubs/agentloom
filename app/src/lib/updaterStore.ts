@@ -1,5 +1,5 @@
-// T4：updater 状态外部 store（同 `chatVerbosity.ts` 姿势——模块级单例 +
-// `useSyncExternalStore`，不用 React Context）。
+// Keep updater state in an external store, following chatVerbosity.ts: a module-level singleton
+// plus useSyncExternalStore shares state without React Context.
 //
 // 前端防丢/防倒退（设计 §2D「前端防丢/防倒退」）：`start()` 先
 // `listen("updater://state")` 建立订阅、订阅成功后才 `invoke

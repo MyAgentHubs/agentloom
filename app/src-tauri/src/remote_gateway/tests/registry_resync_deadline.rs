@@ -147,33 +147,29 @@ fn remote_registry_resync_pending_disconnects_within_hard_deadline_when_relay_st
     server.join().unwrap();
 }
 
-#[test]
-fn remote_registry_resync_pending_ping_does_not_disconnect_before_pending_text() {
-    // S1i1 返工四 H1「太急」钉死：rejected 之后 relay 先发一帧 Ping、紧接着（不等桌面
-    // 任何响应）发一帧业务 Text（在线 input）——如果断开判据仍是返工三的
-    // `!frame_delivered`，Ping 那一轮 `frame_delivered` 是假，会被当成「安静」立刻断开，
-    // 永远读不到紧跟在后面、已经在缓冲区里的 Text 帧：`handle_frame` 从未被调用、没有
-    // 本地落账、没有回 ack。修法把判据换成「这一轮 `socket.read()` 真的读超时了」——Ping
-    // 那一轮不是超时，继续用同一套 `match` 正常处理，后面的 Text 帧必须被落账 + 回 ack。
-    // **变异自证**：把判据改回 `!frame_delivered`（丢掉 `read_timed_out_this_round`
-    // 语义），这条测试必须红。
-    let k_room = Zeroizing::new([44_u8; 32]);
-    let room_id = "0123456789abcdef0123456789abcdef".to_owned();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let (frames_tx, frames_rx) = mpsc::channel();
-    let device_id = "99999999-9999-4999-8999-999999999999";
-    let subject = format!("device:{device_id}");
-    let new_generation = 15;
-    let request_id = "req-ping-not-quiet-1";
-    let command_id = "cmd-ping-not-quiet-1";
+struct PendingPingServerConfig {
+    listener: std::net::TcpListener,
+    frames_tx: mpsc::Sender<Value>,
+    subject: String,
+    request_id: String,
+    room_id: String,
+    k_room: Zeroizing<[u8; 32]>,
+    command_id: String,
+    new_generation: i64,
+}
 
-    let server_subject = subject.clone();
-    let server_request_id = request_id.to_owned();
-    let server_room_id = room_id.clone();
-    let server_k_room = k_room.clone();
-    let server_command_id = command_id.to_owned();
-    let server = thread::spawn(move || {
+fn spawn_pending_ping_server(config: PendingPingServerConfig) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let PendingPingServerConfig {
+            listener,
+            frames_tx,
+            subject,
+            request_id,
+            room_id,
+            k_room,
+            command_id,
+            new_generation,
+        } = config;
         let (stream, _) = listener.accept().unwrap();
         let mut socket = tungstenite::accept(stream).unwrap();
         ack_initial_registry_sync(&mut socket);
@@ -183,14 +179,14 @@ fn remote_registry_resync_pending_ping_does_not_disconnect_before_pending_text()
         };
         let put_frame: Value = serde_json::from_str(text.as_ref()).unwrap();
         assert_eq!(put_frame["t"], "token.put");
-        assert_eq!(put_frame["subject"], server_subject);
+        assert_eq!(put_frame["subject"], subject);
         assert_eq!(put_frame["generation"], new_generation);
 
         socket
             .send(Message::Text(
                 serde_json::json!({
                     "t": "token.ack",
-                    "subject": server_subject,
+                    "subject": subject,
                     "generation": new_generation,
                     "result": "rejected",
                 })
@@ -204,12 +200,12 @@ fn remote_registry_resync_pending_ping_does_not_disconnect_before_pending_text()
         // 后面这帧 Text。
         socket.send(Message::Ping(Vec::new().into())).unwrap();
         let envelope = seal_command_envelope(
-            &server_k_room,
-            &server_room_id,
+            &k_room,
+            &room_id,
             7,
             "input",
             "s-ping",
-            &server_command_id,
+            &command_id,
             &serde_json::json!({
                 "t": "input.send",
                 "session": "s-ping",
@@ -225,7 +221,7 @@ fn remote_registry_resync_pending_ping_does_not_disconnect_before_pending_text()
         // 对服务端 Ping 的自动 Pong 回复可能夹在中间到达。
         let fail_frame = recv_text_skip_control(&mut socket);
         assert_eq!(fail_frame["t"], "token.refresh.fail");
-        assert_eq!(fail_frame["request_id"], server_request_id);
+        assert_eq!(fail_frame["request_id"], request_id);
         frames_tx.send(fail_frame).unwrap();
 
         let input_ack = recv_text_skip_control(&mut socket);
@@ -237,11 +233,17 @@ fn remote_registry_resync_pending_ping_does_not_disconnect_before_pending_text()
             closed,
             "处理完 Ping 和紧随其后的业务帧之后，桌面仍必须完成收敛断开"
         );
-    });
+    })
+}
 
+fn prepare_pending_ping_registry(
+    subject: &str,
+    new_generation: i64,
+    request_id: &str,
+) -> Arc<Inner> {
     let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let provider_calls_for_closure = provider_calls.clone();
-    let provider_subject = subject.clone();
+    let provider_subject = subject.to_owned();
     let inner = test_inner_with_registry_providers(
         Box::new(move |_, _| {
             let call = provider_calls_for_closure.fetch_add(1, Ordering::Relaxed);
@@ -270,7 +272,7 @@ fn remote_registry_resync_pending_ping_does_not_disconnect_before_pending_text()
 
     lock(&inner.registry).enqueue_token_put_for_refresh(
         TokenSyncEntry {
-            subject: subject.clone(),
+            subject: subject.to_owned(),
             generation: new_generation,
             scope: "remote".to_owned(),
             current: TokenSyncCurrent {
@@ -282,37 +284,49 @@ fn remote_registry_resync_pending_ping_does_not_disconnect_before_pending_text()
         },
         RefreshOkFrame {
             request_id: request_id.to_owned(),
-            subject: subject.clone(),
+            subject: subject.to_owned(),
             generation: new_generation,
             ct: "refresh-ct".to_owned(),
             n: "refresh-n".to_owned(),
         },
     );
+    inner
+}
 
+fn spawn_pending_ping_connection(
+    address: std::net::SocketAddr,
+    room_id: String,
+    k_room: Zeroizing<[u8; 32]>,
+    inner: Arc<Inner>,
+) -> thread::JoinHandle<Result<ConnectionExit, ConnectionFailure>> {
     let config = GatewayConfig {
         relay_url: format!("ws://{address}"),
-        room_id: room_id.clone(),
+        room_id,
         active_repo_id: None,
     };
     let url = build_ws_url(&config.relay_url, &config.room_id);
     let (_upstream_tx, upstream_rx) = mpsc::sync_channel(1);
     let (_milestone_tx, milestone_rx) = mpsc::sync_channel(1);
 
-    let connection_inner = Arc::clone(&inner);
-    let connection_k_room = k_room.clone();
-    let connection = thread::spawn(move || {
+    thread::spawn(move || {
         run_authenticated_connection(
-            &connection_inner,
+            &inner,
             &url,
             &DesktopCredential::new(Zeroizing::new("ab".repeat(32))),
             &config,
             None,
             &upstream_rx,
             &milestone_rx,
-            Some(&connection_k_room),
+            Some(&k_room),
         )
-    });
-    let result = join_connection_within(connection, &inner);
+    })
+}
+
+fn assert_pending_ping_result(
+    result: Result<ConnectionExit, ConnectionFailure>,
+    frames_rx: &mpsc::Receiver<Value>,
+    command_id: &str,
+) {
     assert_eq!(
         result,
         Err(ConnectionFailure::Other(
@@ -332,6 +346,45 @@ fn remote_registry_resync_pending_ping_does_not_disconnect_before_pending_text()
              被误判成安静就提前断开、永远读不到这帧"
     );
     assert_eq!(input_ack["command_id"], command_id);
+}
+
+#[test]
+fn remote_registry_resync_pending_ping_does_not_disconnect_before_pending_text() {
+    // S1i1 返工四 H1「太急」钉死：rejected 之后 relay 先发一帧 Ping、紧接着（不等桌面
+    // 任何响应）发一帧业务 Text（在线 input）——如果断开判据仍是返工三的
+    // `!frame_delivered`，Ping 那一轮 `frame_delivered` 是假，会被当成「安静」立刻断开，
+    // 永远读不到紧跟在后面、已经在缓冲区里的 Text 帧：`handle_frame` 从未被调用、没有
+    // 本地落账、没有回 ack。修法把判据换成「这一轮 `socket.read()` 真的读超时了」——Ping
+    // 那一轮不是超时，继续用同一套 `match` 正常处理，后面的 Text 帧必须被落账 + 回 ack。
+    // **变异自证**：把判据改回 `!frame_delivered`（丢掉 `read_timed_out_this_round`
+    // 语义），这条测试必须红。
+    let k_room = Zeroizing::new([44_u8; 32]);
+    let room_id = "0123456789abcdef0123456789abcdef".to_owned();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (frames_tx, frames_rx) = mpsc::channel();
+    let device_id = "99999999-9999-4999-8999-999999999999";
+    let subject = format!("device:{device_id}");
+    let new_generation = 15;
+    let request_id = "req-ping-not-quiet-1";
+    let command_id = "cmd-ping-not-quiet-1";
+
+    let server = spawn_pending_ping_server(PendingPingServerConfig {
+        listener,
+        frames_tx,
+        subject: subject.clone(),
+        request_id: request_id.to_owned(),
+        room_id: room_id.clone(),
+        k_room: k_room.clone(),
+        command_id: command_id.to_owned(),
+        new_generation,
+    });
+
+    let inner = prepare_pending_ping_registry(&subject, new_generation, request_id);
+
+    let connection = spawn_pending_ping_connection(address, room_id, k_room, Arc::clone(&inner));
+    let result = join_connection_within(connection, &inner);
+    assert_pending_ping_result(result, &frames_rx, command_id);
 
     server.join().unwrap();
 }

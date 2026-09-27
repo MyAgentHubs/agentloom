@@ -201,6 +201,7 @@ fn request_stop_lead_launching_fast_path_emits_closeout() {
             "s-lead-fast-stop",
             None,
             member_runner::TextGranularity::Line,
+            crate::event_transport::RunIdentity::default(),
         )
         .unwrap();
     let payloads = Arc::new(Mutex::new(Vec::new()));
@@ -772,17 +773,23 @@ fn spawn_abort_register_failure_poison_still_kills_and_waits() {
 
 #[test]
 fn spawn_abort_production_cleanup_uses_bounded_helper_in_both_paths() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/spawn_argv.rs"
+    ));
     let solo = source
         .split("fn spawn_and_stream(")
         .nth(1)
-        .and_then(|tail| tail.split("\n#[tauri::command]").next())
+        .and_then(|tail| {
+            tail.split_once("\npub(super) fn claude_agent_argv(")
+                .map(|(before, _after)| before)
+        })
         .expect("spawn_and_stream source slice");
-    let abort_cleanup = solo
-        .split("if handoff == SpawnHandoffAction::Abort {")
-        .nth(1)
-        .and_then(|tail| tail.split("\n    if let Err(error)").next())
-        .expect("spawn abort cleanup source slice");
+    let abort_cleanup = source_window(
+        solo,
+        "if handoff == SpawnHandoffAction::Abort {",
+        "\n    if let Err(error)",
+    );
     assert!(
         abort_cleanup.contains(concat!(
             "wait_for_aborted_child(guard, || {\n",
@@ -796,11 +803,11 @@ fn spawn_abort_production_cleanup_uses_bounded_helper_in_both_paths() {
         "spawn abort cleanup must not restore an unbounded wait"
     );
 
-    let register_failure_cleanup = solo
-        .split("if let Err(error) = event_transport().register_run")
-        .nth(1)
-        .and_then(|tail| tail.split("\n    guard.disarm();").next())
-        .expect("register-failure cleanup source slice");
+    let register_failure_cleanup = source_window(
+        solo,
+        "if let Err(error) = event_transport().register_run",
+        "\n    guard.disarm();",
+    );
     assert!(
         register_failure_cleanup.contains(concat!(
             "|| {\n",

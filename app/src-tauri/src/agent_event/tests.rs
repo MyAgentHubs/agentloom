@@ -569,8 +569,8 @@ fn result_line_becomes_completed_with_cost_and_final_text() {
     );
 }
 
-/// G3-A T1：result/Completed 事件同样要把缓存字段计入真实输入 token（与 assistant
-/// usage 同一条口径，见 `combined_input_tokens` 注释）。
+/// Completed events must include cache tokens in total input usage so accounting
+/// stays consistent with assistant usage; see `combined_input_tokens`.
 #[test]
 fn result_line_usage_sums_cache_tokens() {
     let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"pong","total_cost_usd":0.046,"usage":{"input_tokens":3,"cache_read_input_tokens":66,"cache_creation_input_tokens":0,"output_tokens":5}}"#;
@@ -717,9 +717,8 @@ fn claude_assistant_partial_usage_preserves_missing_field_as_none() {
     );
 }
 
-/// G3-A T1：assistant usage 含缓存字段——真实输入 token 应为三者相加
-/// （input_tokens + cache_read_input_tokens + cache_creation_input_tokens），
-/// 不是只读 input_tokens（那会在缓存命中时严重低报）。
+/// Assistant input usage must sum input_tokens, cache_read_input_tokens, and
+/// cache_creation_input_tokens so cache hits do not underreport consumption.
 #[test]
 fn claude_assistant_usage_sums_cache_tokens() {
     let line = r#"{"type":"assistant","message":{"content":[],"usage":{"input_tokens":10,"cache_read_input_tokens":200,"cache_creation_input_tokens":5,"output_tokens":30}}}"#;
@@ -732,8 +731,8 @@ fn claude_assistant_usage_sums_cache_tokens() {
     );
 }
 
-/// G3-A T1：缓存字段显式为 null（Anthropic 有时会发 null 而非直接省略该 key）等价于
-/// 缺失——按 0 处理，不当错误、不让整体 input_tokens 塌成 None。
+/// Explicit null cache fields must count as zero, just like missing fields,
+/// so valid base input usage is preserved instead of becoming None.
 #[test]
 fn claude_assistant_usage_null_cache_fields_treated_as_zero() {
     let line = r#"{"type":"assistant","message":{"content":[],"usage":{"input_tokens":10,"cache_read_input_tokens":null,"cache_creation_input_tokens":null,"output_tokens":30}}}"#;
@@ -746,9 +745,8 @@ fn claude_assistant_usage_null_cache_fields_treated_as_zero() {
     );
 }
 
-/// G3-A T1：只有缓存字段、没有 input_tokens 本尊——真实场景理论上不该出现（Anthropic
-/// usage 对象只要存在就总带 input_tokens），但解析层按「缺失按 0」的既定容错处理，
-/// 不因为 base 字段缺失就把整个输入侧判成 None（那两个缓存字段本身就是有效信号）。
+/// Cache tokens remain valid usage even when input_tokens is absent.
+/// Treat the missing base count as zero so cache-only usage is not lost as None.
 #[test]
 fn claude_assistant_usage_cache_only_no_base_input_tokens() {
     let line = r#"{"type":"assistant","message":{"content":[],"usage":{"cache_read_input_tokens":50,"output_tokens":30}}}"#;

@@ -120,7 +120,13 @@ fn lead_terminal_decision_arms_release_then_flush_barrier_terminal_last() {
         let root = tempfile::tempdir().unwrap();
         let transport = event_transport::EventTransport::new_for_test(root.path().to_path_buf());
         transport
-            .register_run(name, name, None, member_runner::TextGranularity::Line)
+            .register_run(
+                name,
+                name,
+                None,
+                member_runner::TextGranularity::Line,
+                crate::event_transport::RunIdentity::default(),
+            )
             .unwrap();
         transport.push(
             name,
@@ -178,7 +184,13 @@ fn lead_runtime_failures_use_barrier_and_closeout_tail() {
         let root = tempfile::tempdir().unwrap();
         let transport = event_transport::EventTransport::new_for_test(root.path().to_path_buf());
         transport
-            .register_run(failure, failure, None, member_runner::TextGranularity::Line)
+            .register_run(
+                failure,
+                failure,
+                None,
+                member_runner::TextGranularity::Line,
+                crate::event_transport::RunIdentity::default(),
+            )
             .unwrap();
         let running = Running::default();
         let team_running = member_runner::TeamRunning::default();
@@ -221,15 +233,36 @@ fn lead_runtime_failures_use_barrier_and_closeout_tail() {
 
 #[test]
 fn lead_production_source_does_not_emit_legacy_agent_event() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let lead = source
-        .split("fn start_lead_session(")
-        .nth(1)
-        .and_then(|tail| tail.split("\n#[tauri::command]\nfn stop_session(").next())
-        .expect("start_lead_session source slice");
+    let lead = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_session/stream_closeout.rs"
+    ));
     assert!(lead.contains("transport.push(&lead_run_id, event)"));
+    let runner = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_session/runner_thread.rs"
+    ));
+    assert!(
+        !runner.contains("emit_agent_event("),
+        "lead streaming and terminal events must be exclusive to EventTransport"
+    );
     assert!(
         !lead.contains("emit_agent_event("),
+        "lead streaming and terminal events must be exclusive to EventTransport"
+    );
+    // `start_lead_session` itself (including its thread-spawn-failure `Err` arm) now lives in
+    // lead_commands.rs; keep scanning it so a regression landing there rather than in the two
+    // files above still gets caught.
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_commands.rs"
+    ));
+    let start_lead_session = source
+        .split("fn start_lead_session(")
+        .nth(1)
+        .expect("start_lead_session source slice");
+    assert!(
+        !start_lead_session.contains("emit_agent_event("),
         "lead streaming and terminal events must be exclusive to EventTransport"
     );
 }
@@ -243,12 +276,10 @@ fn lead_production_source_does_not_emit_legacy_agent_event() {
 /// saw_blocked/saw_needs_decision 实参改回硬编码 false，这条测试立刻变红。
 #[test]
 fn lead_production_source_wires_synthetic_error_and_blocked_needs_decision_witnesses() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let lead = source
-        .split("fn start_lead_session(")
-        .nth(1)
-        .and_then(|tail| tail.split("\n#[tauri::command]\nfn stop_session(").next())
-        .expect("start_lead_session source slice");
+    let lead = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_session/stream_closeout.rs"
+    ));
 
     // Bug A：合成 error 必须真正喂进归约器，不能退化回「只造字符串、reducer 从没见过」。
     assert!(
@@ -258,11 +289,11 @@ fn lead_production_source_wires_synthetic_error_and_blocked_needs_decision_witne
 
     // Bug B：lead_terminal_decision 调用点必须真的把 saw_blocked/saw_needs_decision
     // 见证传进去——不能被改回硬编码 false 或漏传参数。
-    let call = lead
-        .split("let terminal_decision = lead_terminal_decision(")
-        .nth(1)
-        .and_then(|tail| tail.split(");").next())
-        .expect("lead_terminal_decision call-site slice");
+    let call = source_window(
+        lead,
+        "let terminal_decision = lead_terminal_decision(",
+        ");",
+    );
     assert!(
         call.contains("saw_blocked"),
         "lead_terminal_decision 调用点必须传 saw_blocked 实参: {call}"
@@ -273,29 +304,95 @@ fn lead_production_source_wires_synthetic_error_and_blocked_needs_decision_witne
     );
 }
 
-/// G3-A T2 结构钉子（同款手法：`lead_production_source_wires_synthetic_error_and_
-/// blocked_needs_decision_witnesses`）：`start_lead_session` 是巨型 `#[tauri::command]`
-/// 闭包·真跑一次要 spawn 真进程，测不动其内部逐行 wiring，只能钉源码切片。
-/// 钉两件事：① lead 自己 stdout 里的 Completed usage 必须被捕获进 `lead_completed_usage`
-/// （不能被静默删掉退回「lead run 恒 0」）；② 收尾处必须真调 `add_session_usage` 落库
-/// （且只应出现一次——双记账钉在下面的计数断言）。
+/// Pins two more properties of the same call/persist site that a passing boolean-table test
+/// cannot exercise (see the doc comment above): the exact positional argument order of the
+/// `lead_terminal_decision` call, and that the final assistant message is persisted before the
+/// run slot is released.
+#[test]
+fn lead_production_source_pins_terminal_decision_arg_order_and_persist_before_release() {
+    let lead = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_session/stream_closeout.rs"
+    ));
+
+    // Swapping the first two args (Completed vs. Error priority) or substituting `stopped`
+    // (which also accounts for stop_now during Finalizing) with the plain `stop_requested`
+    // parameter must turn this red.
+    let call = source_window(
+        lead,
+        "let terminal_decision = lead_terminal_decision(",
+        ");",
+    );
+    let args: Vec<&str> = call
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    assert_eq!(
+        args,
+        vec![
+            "saw_completed",
+            "saw_error",
+            "saw_blocked",
+            "saw_needs_decision",
+            "exit_success",
+            "stopped",
+        ],
+        "lead_terminal_decision 调用实参顺序/取值被改动: {args:?}"
+    );
+
+    // The final assistant message must be persisted (append_message_dedup_and_publish) before
+    // the run slot is released (emit_terminal_after_releasing_run_slot); a subsequent run must
+    // not be able to start before this run's own final message has landed.
+    let stripped = strip_comments_and_strings(lead);
+    let closeout = extract_fn_body(
+        &stripped,
+        "fn persist_lead_closeout(",
+        "persist_lead_closeout",
+    );
+    let publish_idx = closeout
+        .find("append_message_dedup_and_publish(")
+        .expect("append_message_dedup_and_publish( missing");
+    let release_idx = closeout
+        .find("emit_terminal_after_releasing_run_slot(")
+        .expect("emit_terminal_after_releasing_run_slot( missing");
+    assert!(
+        publish_idx < release_idx,
+        "最终 assistant 消息落库必须先于运行槽释放（emit_terminal_after_releasing_run_slot）"
+    );
+}
+
+/// Source checks protect usage accounting without spawning a real lead process.
+/// Completed usage from lead stdout must be captured in `lead_completed_usage`,
+/// then persisted through exactly one `add_session_usage` call at shutdown.
+/// This prevents both silently recording zero usage and double-counting a run.
 #[test]
 fn lead_production_source_wires_usage_capture_and_persist() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let lead = source
-        .split("fn start_lead_session(")
-        .nth(1)
-        .and_then(|tail| tail.split("\n#[tauri::command]\nfn stop_session(").next())
-        .expect("start_lead_session source slice");
+    let lead = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_session/stream_closeout.rs"
+    ));
 
     assert!(
         lead.contains("lead_completed_usage = Some((*input_tokens, *output_tokens))"),
         "lead 事件循环必须从 stdout 流里的 Completed 事件捕获 usage 到 lead_completed_usage"
     );
 
-    let usage_call_count = lead
-        .matches("db::add_session_usage(&conn, &session_id_t")
-        .count();
+    // Count across both halves of the lead run (stream_closeout.rs + runner_thread.rs): the two
+    // files were split out of the same original thread body, so a double-accounting regression
+    // could just as easily land in the runner-thread half as in this one. Strip comments/string
+    // literals first and match on the bare call name so this cannot be dodged by varying the
+    // argument spelling (`&session_id_t` vs `session_id_t` vs `&ctx.session_id`).
+    let runner = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_session/runner_thread.rs"
+    ));
+    let usage_call_count = strip_comments_and_strings(lead)
+        .matches("add_session_usage(")
+        .count()
+        + strip_comments_and_strings(runner)
+            .matches("add_session_usage(")
+            .count();
     assert_eq!(
         usage_call_count, 1,
         "lead run 落账必须恰好一次调用 add_session_usage（防双记账），实际 {usage_call_count} 次"
@@ -344,12 +441,21 @@ fn context_compacted_latest_event_wins_in_pending_state() {
 
 #[test]
 fn context_compacted_upsert_has_exactly_one_production_call_site() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    // Recursively scans every .rs under src (including modules split out of lib.rs before
+    // this change) instead of a hand-picked file list.
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let sources = source_scanner::production_sources(&src_dir);
+    let call_sites: usize = sources
+        .iter()
+        .map(|source| {
+            strip_comments_and_strings(&source.production)
+                .matches("db::upsert_compact_state(")
+                .count()
+        })
+        .sum();
 
     assert_eq!(
-        production.matches("db::upsert_compact_state(").count(),
-        1,
+        call_sites, 1,
         "compact state must have exactly one production write call shared by solo and lead"
     );
 }

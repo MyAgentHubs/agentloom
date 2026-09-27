@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Read-only local feedback. CI with a freshly fetched baseline is authoritative.
 
-No arguments, environment overrides, baseline files, writes, or rename detection.
+No arguments (or an optional `--base <ref>` to override the baseline ref),
+no environment overrides, baseline files, writes, or rename detection.
 The checked worktree is anchored to this script, not the caller's cwd.
 """
 
@@ -16,6 +17,11 @@ import sys
 
 
 BASELINE_REFS = ("refs/remotes/origin/master", "refs/remotes/origin/main")
+# Reference value, not a definitive verdict: SonarQube's default file-size
+# threshold is 1000 lines for production code. Used only as the hard block
+# tier for production/CSS categories; test-file categories keep their
+# existing cap (1500) as both warn and block tier, unchanged.
+BLOCK_CAP_PRODUCTION_AND_CSS = 1000
 SOURCE_EXTENSIONS = {".rs", ".ts", ".tsx", ".js", ".mts", ".css"}
 SCAN_ROOTS = {
     "app/src": {".ts", ".tsx", ".js", ".mts", ".css"},
@@ -159,11 +165,19 @@ def category(path, data):
         return "Rust 普通源文件", 800
     if path.suffix == ".css":
         return "CSS", 800
-    if path.name.endswith(
-        (".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx")
-    ):
+    if path.name.endswith((
+        ".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx",
+        ".test.js", ".test.jsx", ".spec.js", ".spec.jsx",
+        ".test.mjs", ".spec.mjs", ".test.cjs", ".spec.cjs",
+    )):
         return "前端测试文件", 1500
     return "前端生产文件", 500
+
+
+def block_cap(label, warn_cap):
+    if label in ("Rust 测试文件", "前端测试文件"):
+        return warn_cap
+    return max(warn_cap, BLOCK_CAP_PRODUCTION_AND_CSS)
 
 
 def collect_current(root, commit=None):
@@ -264,40 +278,94 @@ def historical_lines(root, oids):
     return counts
 
 
-def check(root):
+def select_internal_baseline_ref(root):
+    # Fall back only when a ref is absent, never when an existing ref is broken.
+    return next((ref for ref in BASELINE_REFS
+                if git(root, "rev-parse", "--verify", "--quiet", ref, missing_ok=True) is not None), None)
+
+
+def check(root, base=None):
     toplevel = os.fsdecode(git(root, "rev-parse", "--show-toplevel")).rstrip("\n")
     if Path(toplevel).resolve() != root:
         raise GateError("检查器必须位于被检查仓库根目录的 scripts/ 下")
-    # Fall back only when a ref is absent, never when an existing ref is broken.
-    selected = next((ref for ref in BASELINE_REFS
-                     if git(root, "rev-parse", "--verify", "--quiet", ref, missing_ok=True) is not None), None)
-    if selected is None:
-        raise GateError("缺少基线 origin/master 或 origin/main；先显式 fetch 远端历史。"
-                        "首次导入须先建立经审查的基线；禁止退回 HEAD 或跳过。")
-    commit = git(root, "rev-parse", "--verify", selected + "^{commit}").strip().decode("ascii")
-    print(f"基线：{selected.removeprefix('refs/remotes/')} ({commit})", flush=True)
+    fallback_roots, fallback_commit = frozenset(), None
+    if base is not None:
+        # An explicit --base ref (e.g. the previous public snapshot) replaces
+        # the BASELINE_REFS candidates entirely; it must resolve to a commit.
+        resolved = git(root, "rev-parse", "--verify", "--quiet", base + "^{commit}", missing_ok=True)
+        if resolved is None:
+            raise GateError(f"基线 ref 不存在：{base}")
+        commit = resolved.strip().decode("ascii")
+        print(f"基线：{base} ({commit})", flush=True)
+        # Only under an explicit --base: a ref may never have tracked a whole
+        # snapshot-optional root (e.g. the public release strips remote-web
+        # entirely). Such a root is still judged, but against the internal
+        # baseline instead of --base, never silently against the hard cap
+        # alone. A root with even one file in the --base tree is judged
+        # against --base as usual.
+        fallback_roots = frozenset(
+            prefix for prefix in SNAPSHOT_OPTIONAL_ROOTS
+            if prefix in SCAN_ROOTS and not git(root, "ls-tree", "-z", commit, "--", prefix)
+        )
+        if fallback_roots:
+            fallback_ref = select_internal_baseline_ref(root)
+            if fallback_ref is None:
+                raise GateError(
+                    "以下根在基线 " + base + " 中缺失，且缺少可回退的内部基线 origin/master 或 "
+                    "origin/main（先显式 fetch 远端历史）：" + "、".join(sorted(fallback_roots))
+                )
+            fallback_commit = git(root, "rev-parse", "--verify", fallback_ref + "^{commit}").strip().decode("ascii")
+            for prefix in sorted(fallback_roots):
+                print(f"回退：{prefix}（基线 {base} 不含该根，改按 {fallback_ref} 判定）", flush=True)
+    else:
+        selected = select_internal_baseline_ref(root)
+        if selected is None:
+            raise GateError("缺少基线 origin/master 或 origin/main；先显式 fetch 远端历史。"
+                            "首次导入须先建立经审查的基线；禁止退回 HEAD 或跳过。")
+        commit = git(root, "rev-parse", "--verify", selected + "^{commit}").strip().decode("ascii")
+        print(f"基线：{selected.removeprefix('refs/remotes/')} ({commit})", flush=True)
     check_coverage(root)
     baseline = baseline_blobs(root, commit)
+    if fallback_commit is not None:
+        fallback_blobs = baseline_blobs(root, fallback_commit)
+        for path, oid in fallback_blobs.items():
+            if any(path.startswith(prefix + "/") for prefix in fallback_roots):
+                baseline[path] = oid
     files = collect_current(root, commit)
     # Validate UTF-8 on both sides even if the current file is below its cap.
     previous = historical_lines(root, [
         baseline[path] for path in files if path in baseline
     ])
-    excess, debt = 0, 0
+    over_block = []
+    warn_band = []
     violations = []
     for path, (actual, label, cap) in sorted(files.items()):
         prev = previous.get(baseline.get(path), 0)
-        allowed = max(cap, prev)
-        debt += max(0, actual - cap)
-        excess += max(0, actual - allowed)
-        if actual > allowed:
-            source = "基线历史额度" if prev > cap else "硬上限"
+        hard_cap = block_cap(label, cap)
+        block_allowed = max(hard_cap, prev)
+        if actual > hard_cap:
+            over_block.append((path, actual, hard_cap))
+        elif actual > cap:
+            warn_band.append((path, actual, cap))
+        if actual > block_allowed:
+            source = "基线历史额度" if prev > hard_cap else "硬上限"
             if path not in baseline:
                 source += "（新文件）"
             violations.append(
-                f"{json.dumps(path, ensure_ascii=False)} / {label} / {actual} / {allowed} / {source}"
+                f"{json.dumps(path, ensure_ascii=False)} / {label} / {actual} / {block_allowed} / {source}"
             )
-    print(f"扫描文件数：{len(files)}；超标总量：{excess} 行；债务总量：{debt} 行")
+    over_block.sort(key=lambda item: item[1], reverse=True)
+    warn_band.sort(key=lambda item: item[1], reverse=True)
+    print(f"扫描文件数：{len(files)}")
+    print(
+        f"超过拦截线（只降不升）：{len(over_block)} 个文件，合计超出 "
+        f"{sum(actual - hard_cap for path, actual, hard_cap in over_block)} 行"
+    )
+    for path, actual, hard_cap in over_block:
+        print(f"  {path} {actual}/{hard_cap}")
+    print(f"提醒区间（超过提醒线、未超拦截线，不阻断）：{len(warn_band)} 个文件")
+    for path, actual, cap in warn_band:
+        print(f"  {path} {actual}/{cap}")
     if violations:
         print("FAIL：文件 / 类别 / 实际 / allowed / 来源")
         print("\n".join(violations))
@@ -308,12 +376,18 @@ def check(root):
 
 
 def main():
-    if len(sys.argv) != 1:
-        print("ERROR：检查器不接受命令行参数；基线固定按 origin/master、origin/main 选择，"
-              "不支持环境变量覆盖。", file=sys.stderr)
+    base = None
+    if len(sys.argv) == 1:
+        pass
+    elif len(sys.argv) == 3 and sys.argv[1] == "--base":
+        base = sys.argv[2]
+    else:
+        print("ERROR：检查器只接受无参数或 `--base <ref>`；基线默认按 origin/master、origin/main 选择，"
+              "不支持环境变量覆盖；`--base <ref>` 用于改用指定 ref（例如上一版公开快照）算总账。",
+              file=sys.stderr)
         return 2
     try:
-        return check(Path(__file__).resolve().parent.parent)
+        return check(Path(__file__).resolve().parent.parent, base=base)
     except (GateError, OSError, ValueError) as error:
         print(f"ERROR：文件大小门禁无法完成，拒绝放行：{error}", file=sys.stderr)
         return 2

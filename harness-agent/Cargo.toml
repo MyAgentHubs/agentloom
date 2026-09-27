@@ -33,6 +33,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[lints.clippy]
+too_many_lines = "deny"
+cognitive_complexity = "deny"
+
 [dev-dependencies]
 assert_cmd = "2"
 serial_test = "3"

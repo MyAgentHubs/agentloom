@@ -347,9 +347,9 @@ fn inplace_delivery_gate_allows_when_all_session_checkpoint_files_are_committed(
     );
 }
 
-/// R-B1 项 1 端到端：checkpoint 路径落在一个嵌套 git 仓（子目录 `git init`）内部、从未
-/// 提交——修复前，`checkpoint_path_dirty_states` 对这条 pathspec 拿到的 `git status` 输出
-/// 恒空，被当「干净」放行，交付闸门 fail-open；修复后必须拒绝交付。
+/// A checkpoint inside a nested Git repository can yield empty parent-repository
+/// status output despite uncommitted changes. The delivery gate must reject this
+/// blind spot rather than treating empty output as proof of a clean checkpoint.
 #[test]
 fn require_inplace_delivery_committed_rejects_nested_git_repo_blind_spot() {
     let _home_lock = crate::worktree::test_home_lock();
@@ -400,12 +400,10 @@ fn require_inplace_delivery_committed_rejects_nested_git_repo_blind_spot() {
     );
 }
 
-/// R-B2 项 2a（Major-4 接缝测试·新 scope 会话闭环）：NULL scope（方案 A 新行为）的
-/// local-default 会话，agent 实际写文件的目录是 per-session 子目录（`<repo>/<session_id>/`），
-/// checkpoint 账本记的就是子目录下的绝对路径。交付闸门 `require_inplace_delivery_committed`
-/// 走的是根锚定 `checkpoint_path_dirty_states`（cwd=项目根）——子目录只是这个 git 仓库内部
-/// 的普通嵌套路径（不是新顶层，agent 没在里面另起 `git init`），必须照旧能挡住未提交改动，
-/// 证明「两半各自绿、接缝裸奔」这条缝已经补上。
+/// A local-default session with NULL scope writes checkpoints under its session
+/// subdirectory. The delivery gate checks status from the repository root and
+/// must still reject uncommitted files there, preserving enforcement across
+/// session directory routing and checkpoint tracking.
 #[test]
 fn require_inplace_delivery_committed_rejects_uncommitted_file_in_new_scope_session_subdir() {
     let _home_lock = crate::worktree::test_home_lock();
@@ -841,16 +839,11 @@ fn artifact_git_write_commands_reject_user_repo_without_mutation() {
     );
 }
 
-/// M7/M8（2026-07-29 opus 对抗审补测·delta 复审后改调 `run_verifier_artifact_inner`）：
-/// `run_verifier_artifact` 快活路径没人拿真实值验证过——`finalize_verifier_run` 落
-/// `verifications` 行的三个字符串字段（`cmd`/`artifact_sha`/`verdict`）都是 `&str` 同型参数，
-/// 位置传参传错、或 `verdict` 被写死成常量，编译器都挡不住，只有跑一遍真流程比对真实值才杀得
-/// 掉。**这里直接调 `run_verifier_artifact_inner`**（而不是手工重拼 prepare→run_verifier→
-/// finalize 三段）——手工重拼测的是"另一份等价代码"，命令体自己的传参顺序一改，手工重拼版根本
-/// 不会跟着变，等于测不到真正会跑的那份（delta 复审揪出的正是这个）。跑两条命令（一条绿、一条
-/// 会非零退出的），断言落库的三个字段都是真值：不是某个写死的常量（只测绿命令测不出"verdict 被
-/// 写死成 passed"这种回归——绿命令巧合下结果也长得一样——所以特意配一条会失败的命令，指望它落
-/// `verdict = "failed"`，真能证明这个字段是这次真跑出来的、不是常量)，也没有互相传串。
+/// Exercise `run_verifier_artifact_inner` directly so the command's actual
+/// argument wiring is covered. The persisted cmd, artifact_sha, and verdict
+/// fields share a string type, so swapped arguments can compile unnoticed.
+/// Successful and failing commands must persist their actual values, catching
+/// both field mix-ups and a verdict incorrectly hardcoded to passed.
 #[cfg(target_os = "macos")]
 #[test]
 fn run_verifier_artifact_happy_path_persists_correct_fields() {

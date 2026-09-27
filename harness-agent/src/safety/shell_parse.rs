@@ -1,11 +1,11 @@
 //! shell 命令保守解析：只为危险扫描服务·吃不准就让上层对写类 fail-closed。
 //! 不是通用 shell 解析器（解释器/对抗混淆不在防护内·设计 §二）。
 
-/// 写/删类命令（路径越界 + 危险目标即拒·T3 用）。
+/// Write/delete-class commands: rejected on path escape or a dangerous target.
 pub const WRITE_COMMANDS: &[&str] = &[
     "rm", "rmdir", "mv", "cp", "dd", "truncate", "tee", "install", "ln", "touch", "mkdir",
 ];
-/// 读类命令（路径越界即拒·best-effort·T3 用）。
+/// Read-class commands: rejected on path escape, on a best-effort basis.
 pub const READ_COMMANDS: &[&str] = &[
     "cat", "head", "tail", "less", "more", "grep", "awk", "sort", "nl", "od", "hexdump", "strings",
     "wc", "cut",

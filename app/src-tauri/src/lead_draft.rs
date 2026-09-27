@@ -1,12 +1,12 @@
-//! 深水-B1 · gate 后端：队长（driver=Claude）一次性拟结构化 draft → 落 draft 契约。
+//! Keep structured draft generation separate from deterministic parsing, assignment, risk estimation, and persistence.
 //! 确定性编排·LLM 只出草稿（draft）；解析/派单/Tier/落库的机械活归本模块。
-//! 边界：不碰 GateCard UI（B2）/ fan-out·综合（B3）/ Tier 分歧采样（B4）。
+//! Keep gate UI, worker fan-out, synthesis, and disagreement sampling outside this draft backend.
 
 use crate::agent_event::AgentEvent;
 use std::io::{BufRead, BufReader};
 
 /// driver 一次性结构化输出（provider 中立·M2 只接 claude 一条解析路径·gate A4/A5 + 消费半 §3 框死）。
-/// driver 自报的 `tier` 是 hint·B1 不信任·`estimate_tier`（T4）重算覆盖。
+/// Treat the driver-reported tier as a hint; `estimate_tier` must recompute the authoritative value.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DriverDraftOutput {
     pub goal: String,
@@ -25,7 +25,7 @@ pub struct DraftSubtask {
     pub scope_files: Vec<String>,
     #[serde(default)]
     pub acceptance: Vec<DraftCriterion>,
-    /// 该子任务需要的能力标签（如 "reasoning"）·空 = 无特殊要求·T3 用。
+    /// Required capability tags constrain agent selection; an empty list imposes no special requirements.
     #[serde(default)]
     pub needed_caps: Vec<String>,
 }
@@ -37,7 +37,7 @@ pub struct DraftCriterion {
     pub verifier: Option<String>,
 }
 
-/// driver 对「子任务→agent」的建议（hint）·B1 由 `pick_agent_for_subtask`（T3）重定·此字段仅参考。
+/// Treat driver assignments as hints; `pick_agent_for_subtask` determines the actual eligible assignee.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DraftAssignment {
     pub subtask_id: String,
@@ -45,7 +45,7 @@ pub struct DraftAssignment {
     pub agent_id: Option<String>,
 }
 
-/// 解析失败分类（gate A5 确定性围栏·B2 据此走「队长拟失败」三选项）。
+/// Classify parse failures so the gate can offer retry, manual entry, or a return to normal operation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DraftParseError {
     /// final_text 非合法 JSON。
@@ -118,7 +118,7 @@ fn validate_draft(d: &DriverDraftOutput) -> Result<(), DraftParseError> {
     Ok(())
 }
 
-/// driver 拟 draft 的失败枚举（gate A5「队长拟失败」态·B2 据此给 [重试拟]/[手动填 gate]/[退回 Normal]）。
+/// Expose draft failures so the gate can offer retry, manual entry, or a return to normal operation.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum DraftFailure {
@@ -304,7 +304,7 @@ pub fn pick_agent_for_subtask(
             return Ok(a.id.clone());
         }
     }
-    // 兜底轮转（2026-06-10 三轮 GUI 折入）：hint 失配别全堆第一个·确定性按序分散。
+    // Use deterministic round-robin fallback so unmatched hints do not concentrate all work on the first agent.
     if eligible.is_empty() {
         return Err(PickError::NoEligibleAgent {
             needed_caps: needed_caps.to_vec(),
@@ -314,7 +314,7 @@ pub fn pick_agent_for_subtask(
 }
 
 /// 能力标签匹配（cap_reasoning/cap_computer_use 是 Option<String> 标签·is_some=有该能力）。
-/// 未知 cap 标签 B1 不挡（first-cut·M3 严格化）。
+/// Allow unknown capability tags so only recognized capability requirements restrict eligibility.
 fn agent_has_caps(a: &AgentProfile, needed: &[String]) -> bool {
     needed.iter().all(|cap| match cap.as_str() {
         "reasoning" => a.cap_reasoning.is_some(),
@@ -327,10 +327,10 @@ fn agent_has_caps(a: &AgentProfile, needed: &[String]) -> bool {
 pub mod tier_const {
     pub const TIER0_MAX_DISAGREEMENT: f64 = 0.20;
     pub const TIER2_MIN_DISAGREEMENT: f64 = 0.50;
-    #[allow(dead_code)] // B4 分歧采样用·B1 占位不触及。
+    #[allow(dead_code)] // Reserved for future disagreement sampling to cap tier-1 questions at three; currently unused.
     pub const TIER1_MAX_ASK: usize = 3;
-    /// B1 无分歧采样·占位 0.3（用户拍·保守=至少 Tier1·对齐 §12.1 fail-closed「宁可多问一次」）。
-    /// 故 B1 期间 Tier0 结构性不可达（0.3 不<0.20）·B4 接真 Jaccard 后喂低分歧才解锁 Tier0·决策表不变。
+    /// Use a conservative disagreement of 0.3 when sampling is unavailable so confirmation remains required.
+    /// The placeholder exceeds the automatic-approval threshold of 0.20; lower measured disagreement can enable automatic approval.
     pub const B1_PLACEHOLDER_DISAGREEMENT: f64 = 0.3;
     /// §12.2 改动文件数档位边界：low ≤2 / med 3-10 / high >10。
     pub const FILES_LOW_MAX: usize = 2;
@@ -343,11 +343,11 @@ pub struct TierEstimate {
     pub tier: String,
     /// "low" | "med" | "high"
     pub risk_level: String,
-    /// B1 占位（调用方传 B1_PLACEHOLDER_DISAGREEMENT）·B4 传真 Jaccard 分歧分。
+    /// Accept a placeholder or measured Jaccard disagreement without changing the tier decision logic.
     pub disagreement: f64,
 }
 
-/// exists 口径（2026-06-10 用户拍·GUI 验收折入）：只有 worktree 里已存在的 scope 文件
+/// Count only scope files already present in the worktree when estimating the risk of modifying existing files.
 /// 才算「改动文件数」风险——研究类产出的新文件（隔离 worktree·不合回用户 repo）不算。
 pub(crate) fn count_existing_scope_files(draft: &DriverDraftOutput, wt: &std::path::Path) -> usize {
     let mut seen = std::collections::HashSet::new();
@@ -363,10 +363,10 @@ pub(crate) fn count_existing_scope_files(draft: &DriverDraftOutput, wt: &std::pa
         .count()
 }
 
-/// 派单前风险表（B1·从 draft 自身可测信号估·不用 derive_risk_inputs 的事后数据）。
+/// Estimate dispatch risk from observable draft inputs rather than post-execution risk data.
 /// §12.2 三子集取最高档（改动文件数 / 命令危险度 / 可逆性 default low）→ §12.1 决策表 → Tier。
-/// disagreement 作入参：B1 传占位 0.3·B4 传真 Jaccard（决策表逻辑不变·只换喂值）。
-/// existing_files：文件风险 = 触达已存在用户文件数·exists 口径（2026-06-10 二修·调用方经
+/// Take disagreement as an input so placeholder and measured values use the same decision table.
+/// existing_files counts existing scope files to distinguish modification risk from new research outputs.
 /// count_existing_scope_files 算·研究类新产出文件不计入）。
 pub fn estimate_tier(
     draft: &DriverDraftOutput,
@@ -388,7 +388,7 @@ pub fn estimate_tier(
     } else {
         1
     };
-    // B1 命令危险度只判到 med（写类）·high（rm -rf/网络外发/DB 迁移·§12.2）留 M3·故 high 唯一来源=文件数>10。
+    // Write commands contribute at most medium risk here; only more than 10 existing files can produce high risk.
     let cmd_rank = if any_write_cmd { 1 } else { 0 };
     let risk_rank = files_rank.max(cmd_rank);
     let risk_level = match risk_rank {
@@ -413,7 +413,7 @@ pub fn estimate_tier(
     }
 }
 
-/// Tier0 确定性放行（exists 口径·2026-06-10 二修）：全只读 verifier 且不触达任何已存在文件
+/// Allow automatic approval only when every verifier is read-only and no existing scope file is touched.
 /// = 纯研究/新产出类 → 喂 0.0 解锁 Tier0。触达任何已存在文件 → 维持占位 0.3（至少 Tier1·fail-closed）。
 /// 已知残洞（双路交叉确认·诚实标）：「凭空写一堆新代码文件 + 只读 verifier」会被放行——
 /// 但 worker 在隔离 worktree 写新文件·产物不合回用户 repo·用户损失仅算力·prompt 引导兜底。
@@ -430,7 +430,7 @@ pub(crate) fn draft_is_read_only_no_existing_scope(
     existing_files == 0 && !any_write_cmd
 }
 
-/// 派单结果快照（opus P1-3：provider/model 在派单瞬间快照·B3 解冻不漂移）。
+/// Snapshot provider and model at dispatch so later execution cannot drift with configuration changes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Assignee {
     pub agent_id: String,
@@ -439,8 +439,8 @@ pub struct Assignee {
 }
 
 /// 组装 assignments_json（gate A4 schema + 消费半 §3 TaskPack 形）。
-/// 每单元 = subtask_id + subtask(描述文本·B3 喂 worker) + assignee(快照·可 null) + scope_files + acceptance。
-/// picks = (subtask_id, Option<Assignee>) 列表（None = 无可用 agent·assignee 落 null·B2 提示去配置）。
+/// Each assignment retains the subtask text, nullable assignee snapshot, scope files, and acceptance criteria for execution.
+/// Represent unavailable assignees as None in picks and null in JSON so the gate can prompt for configuration.
 pub fn build_assignments_json(
     draft: &DriverDraftOutput,
     picks: &[(String, Option<Assignee>)],
@@ -478,7 +478,7 @@ pub fn build_assignments_json(
     serde_json::to_string(&units).unwrap_or_else(|_| "[]".into())
 }
 
-/// 落 draft 契约：goal_contracts(status='draft' + assignments_json) + 每子任务 task 级 acceptance（pending·B7）。
+/// Persist the draft contract and assignment snapshot together with pending task-level acceptance criteria.
 /// 守 D32：落 app 域 DB·不污染用户 repo。
 pub fn persist_draft_contract(
     conn: &rusqlite::Connection,
@@ -530,7 +530,7 @@ pub fn persist_draft_contract(
     Ok(())
 }
 
-/// B1 默认 driver 重试次数（gate A5 Option A 围栏）。
+/// Bound driver attempts so repeated draft failures return control to the gate.
 pub const DRAFT_MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -544,15 +544,15 @@ pub struct ProposeResult {
     /// "low" | "med" | "high"
     pub risk_level: String,
     pub subtask_count: usize,
-    /// 派不到 enabled agent 的子任务数（codex P1-3·B2 提示去配置白名单）。
+    /// Count subtasks without an enabled assignee so the gate can request agent configuration.
     pub unassigned_count: usize,
-    /// 回传给 B2 直接渲 GateCard（codex BLOCK-4·task acceptance 经既有 list_acceptance 读）。
+    /// Return assignments for direct gate rendering; task acceptance remains available through list_acceptance.
     pub assignments_json: String,
-    /// 恒 "draft"（B7·不冒充已冻结/已验证）。
+    /// Always report "draft" so an unconfirmed plan cannot appear frozen or verified.
     pub status: String,
 }
 
-/// 编排结果（gate A5）：成功落 draft 契约 / 「队长拟失败」态（B2 给三选项）。
+/// Distinguish a ready draft from a generation failure so the gate can render the appropriate recovery actions.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(tag = "outcome", rename_all = "camelCase")]
 pub enum ProposeOutcome {
@@ -561,7 +561,7 @@ pub enum ProposeOutcome {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// 可测核：串 T1-T6。锁纪律——driver 调用不持 DB 锁·锁只裹 DB 阶段（list_agents + persist）。
+/// Keep driver calls outside the database lock; hold it only while listing agents and persisting the draft.
 pub fn run_propose_team_plan(
     db: &crate::db::Db,
     session_id: &str,
@@ -602,7 +602,7 @@ pub fn run_propose_team_plan_with_roster_mode(
         Ok(d) => d,
         Err(failure) => return Ok(ProposeOutcome::DraftFailed { failure }),
     };
-    // exists 口径（2026-06-10 二修）：只数已存在文件·研究类（全只读+纯新产出）放行喂 0.0。
+    // Count existing files only; read-only research with entirely new outputs uses zero disagreement for automatic approval.
     let existing_files = count_existing_scope_files(&draft, wt);
     let disagreement = if draft_is_read_only_no_existing_scope(&draft, existing_files) {
         0.0
@@ -639,15 +639,15 @@ pub fn run_propose_team_plan_with_roster_mode(
                 picks.push((st.id.clone(), assignee));
             }
             Err(_) => {
-                // 派不到不 fail 整 draft·assignee 留 None·记数·B2 提示去配置。
+                // Keep the draft usable when assignment fails; retain None and count it so the gate can request configuration.
                 unassigned_count += 1;
                 picks.push((st.id.clone(), None));
             }
         }
     }
     let assignments_json = build_assignments_json(&draft, &picks);
-    // 拍板③（spec §4·2026-06-10）：Tier0 不落 goal_contracts——拆解只活在卡 + Block::TeamRun 快照；
-    // tier1/2 维持现状写 draft 行（B2 冻结路径继续工作）。
+    // For automatic approval, retain the decomposition only in the card and Block::TeamRun snapshot, without a goal_contracts row.
+    // Persist draft rows for tiers requiring confirmation so the gate can freeze them later.
     if tier.tier != "tier0" {
         persist_draft_contract(
             &conn,
@@ -701,7 +701,7 @@ pub(crate) fn build_draft_prompt(
             p.push_str(ctx);
         }
     }
-    // 喂可派 agent 池（2026-06-10 三轮 GUI 折入·治「全派同一 agent」）：队长不知道用户配了哪些
+    // Supply the actual enabled agent pool so the driver can distribute work by capability instead of inventing agent identifiers.
     // enabled agent 时·建议的 agent_id 全靠瞎编→命中全靠运气。把真实池子告诉它·并要求按能力分活、分散。
     // 调用方只传 enabled 的（lib.rs 锁内 a.enabled 过滤）。
     if !agents.is_empty() {

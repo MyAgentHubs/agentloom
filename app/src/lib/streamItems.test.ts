@@ -1,11 +1,13 @@
-import { describe, expect, it, test } from "vitest";
+import { describe, expect, it, test, vi } from "vitest";
 import {
   blockTier,
+  buildRenderSegments,
   foldByVerbosity,
   groupToolBlocks,
   isHiddenTool,
   type Segment,
 } from "./streamItems";
+import * as imageArtifacts from "./imageArtifacts";
 import type { Block } from "../types/agent";
 
 const tool = (
@@ -473,6 +475,108 @@ function mkTool(
     output: overrides.output ?? null,
   };
 }
+
+describe("buildRenderSegments", () => {
+  it("keeps a single full pass keyed by its source start index", () => {
+    const blocks: Block[] = [{ type: "text", text: "hello" }];
+    const result = buildRenderSegments(blocks, "full", false);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ kind: "pass", keyPrefix: "seg0" });
+    if (result[0].kind !== "pass") throw new Error("expected a pass");
+    expect(result[0].entries[0].item).toEqual({
+      kind: "block",
+      block: blocks[0],
+    });
+  });
+
+  it("assigns a repeated image path only to the first tool item", () => {
+    const path = "/x/a.png";
+    const blocks: Block[] = [
+      mkTool({ id: "first", output: path }),
+      { type: "text", text: "between" },
+      mkTool({ id: "second", output: path }),
+    ];
+    const [result] = buildRenderSegments(blocks, "full", false);
+
+    if (result.kind !== "pass") throw new Error("expected a pass");
+    expect(result.entries.map((entry) => entry.imagePaths)).toEqual([
+      [path],
+      [],
+      [],
+    ]);
+  });
+
+  it("prefers /x/a.png over a.png when both paths are extracted", () => {
+    const first = mkTool({ id: "first", output: "a.png" });
+    const second = mkTool({ id: "second", output: "/x/a.png" });
+    const extract = vi
+      .spyOn(imageArtifacts, "imagePathsFromTool")
+      .mockImplementation((block) =>
+        block === first ? ["a.png"] : ["/x/a.png"],
+      );
+    try {
+      const [result] = buildRenderSegments(
+        [first, { type: "text", text: "between" }, second],
+        "full",
+        false,
+      );
+      if (result.kind !== "pass") throw new Error("expected a pass");
+      expect(result.entries.map((entry) => entry.imagePaths)).toEqual([
+        [],
+        [],
+        ["/x/a.png"],
+      ]);
+    } finally {
+      extract.mockRestore();
+    }
+  });
+
+  it("forwards activity and artifact segments by reference", () => {
+    const blocks: Block[] = [mkTool({ id: "image", output: "/x/a.png" })];
+    let folded: Segment[] | undefined;
+    const originalMap = Array.prototype.map;
+    const map = vi.spyOn(Array.prototype, "map").mockImplementation(function (
+      this: unknown[],
+      callback,
+      thisArg,
+    ) {
+      if (
+        !folded &&
+        this.length === 2 &&
+        this[0] &&
+        typeof this[0] === "object" &&
+        "kind" in this[0] &&
+        this[0].kind === "activity_fold" &&
+        this[1] &&
+        typeof this[1] === "object" &&
+        "kind" in this[1] &&
+        this[1].kind === "artifacts"
+      ) {
+        folded = this as Segment[];
+      }
+      return originalMap.call(this, callback, thisArg);
+    });
+    try {
+      const result = buildRenderSegments(blocks, "summary", false);
+      expect(folded).toBeDefined();
+      expect(result.map((entry) => entry.kind)).toEqual([
+        "activity_fold",
+        "artifacts",
+      ]);
+      if (
+        result[0].kind !== "activity_fold" ||
+        result[1].kind !== "artifacts"
+      ) {
+        throw new Error("expected forwarded segments");
+      }
+      expect(result[0].segment).toBe(folded?.[0]);
+      expect(result[1].segment).toBe(folded?.[1]);
+    } finally {
+      map.mockRestore();
+    }
+  });
+});
 
 function mkApproval(
   status: Extract<Block, { type: "approval" }>["status"],

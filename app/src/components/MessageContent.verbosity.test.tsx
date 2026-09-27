@@ -79,7 +79,7 @@ const member = (o: Partial<MemberUnit>): MemberUnit => ({
 });
 
 // ─────────────────────────────────────────────────────────────────────────
-// V3b（2026-08-26·刀②「桌面 chat verbose 分级」渲染接线）：MessageContent
+// Desktop chat verbosity tiers wire through MessageContent's rendering path:
 // verbosity 折算 + ActivityFold + artifacts 段 + suppressArtifacts + scope_change
 // 顺修断线。设计稿 desktop-verbose-design §2B / §2F 5
 // ─────────────────────────────────────────────────────────────────────────

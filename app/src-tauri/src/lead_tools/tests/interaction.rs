@@ -172,10 +172,10 @@ fn verifier_result_block_ids_are_unique_across_calls() {
     assert_ne!(id_of(a), id_of(b), "每次落卡的块 id 必须互不相同");
 }
 
-// 决策打扰收敛刀 T4：prompt_user / append_decision_echo 都靠 db::append_message 把
-// agent_id/agent_name 落进消息行（本仓无 tauri AppHandle 测试基础设施·无法直接调用
-// 这两个私有函数本体，故在它们依赖的 db 层验证同一份写入形状能原样读回——这正是
-// 两处改动唯一新增的行为：把 None,None 换成真实身份）。
+// prompt_user / append_decision_echo write agent_id/agent_name into the message row via
+// db::append_message. There is no test harness for a real tauri AppHandle here, so this
+// verifies at the db layer that the same write shape round-trips unchanged -- the only new
+// behavior is passing real identity instead of None/None.
 
 #[test]
 fn decision_card_message_round_trips_agent_identity() {
@@ -231,17 +231,17 @@ fn decision_echo_message_round_trips_agent_identity_and_keeps_excluded_tag() {
 
     let msgs = crate::db::get_messages(&conn, "s1").unwrap();
     assert_eq!(msgs.len(), 1);
-    // engine 标记不变——lead_step::build_recent_messages 认这个 tag 排除，改了会破坏 T1。
+    // The engine tag must stay unchanged: build_recent_messages relies on it to exclude this message from the prompt.
     assert_eq!(msgs[0].engine.as_deref(), Some(DECISION_ECHO_ENGINE_TAG));
     assert_eq!(msgs[0].agent_id.as_deref(), Some("lead-claude"));
     assert_eq!(msgs[0].agent_name_snapshot.as_deref(), Some("Claude 队长"));
 }
 
-// 决策打扰收敛刀 T2：propose_verifier 本体依赖 tauri::AppHandle（app.state::<Db>() /
-// app.path() / current_locale(app)），本仓无 tauri AppHandle 测试基础设施（同 T4 一带
-// 注释、也是 worktree.rs 里 cfg(not(target_os = "macos")) 分支只能标"no-op"的同一限制）。
-// 这里在 append_verifier_result_echo 依赖的 db 层验证同一份写入形状能原样读回 +
-// build_recent_messages 排除生效——这正是 T2 唯一新增的落库行为。
+// propose_verifier itself depends on tauri::AppHandle (app.state::<Db>() / app.path() /
+// current_locale(app)); there is no tauri AppHandle test harness in this crate (the same
+// limitation that keeps the worktree.rs non-macOS branch a no-op). So this verifies at the
+// db layer, for append_verifier_result_echo, that the same write shape round-trips and that
+// build_recent_messages still excludes it -- the only new persisted behavior here.
 
 #[test]
 fn verifier_result_echo_message_round_trips_agent_identity_and_keeps_excluded_tag() {
@@ -303,8 +303,8 @@ fn legacy_text_shaped_verifier_echo_still_round_trips() {
     ));
 }
 
-// ---- 决策打扰收敛刀 T1·症状 B：append_decision_echo_message 落库成功须回一条完整
-// db::Message（供外层 emit "lead-message-appended" 用）----
+// ---- append_decision_echo_message must return a full db::Message on successful persist
+// (the caller emits "lead-message-appended" from it) ----
 
 fn seed_session_for_echo(conn: &rusqlite::Connection, session_id: &str) {
     crate::db::create_session(conn, session_id, "x", "local-default", "local").unwrap();
@@ -363,8 +363,8 @@ fn append_decision_echo_message_two_calls_produce_two_distinct_ids() {
     assert_eq!(msgs.len(), 2);
 }
 
-// ---- msgfix1 T5 缺口③：三处「落库+publish 统一链路」调用点各自的 dedup_key 稳定性 +
-// 确实经 publish 链路发出 msg.completed ----
+// ---- Each of the three "persist + publish" call sites needs a stable dedup_key and must
+// actually emit msg.completed through the publish pipeline ----
 
 #[test]
 fn append_decision_card_message_publishes_msg_completed_with_stable_dedup_key() {

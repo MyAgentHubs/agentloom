@@ -1,6 +1,5 @@
-//! T1 图片附件：`--image` clap 参数——四个子命令（run/plan/resume/interactive）共享
-//! 同一份定义（`#[command(flatten)]`），避免 `cli.rs` 继续超出文件大小门禁的基线
-//! 历史额度。
+//! Shared `--image` clap arguments for the run/plan/resume/interactive subcommands
+//! (`#[command(flatten)]`), split out to keep `cli.rs` under the file-size ratchet.
 
 use std::path::PathBuf;
 

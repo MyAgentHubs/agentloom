@@ -36,7 +36,7 @@ fn lead_draft_sys_prompt_constrains_goal_to_one_sentence_smart() {
     assert!(p.contains("Do not put") && p.contains("in goal"));
 }
 
-/// 写类 verifier 的 draft JSON（tier1 fixture·T2 起 valid_draft_json 判 tier0 不再适用落库断言）
+/// A draft JSON with a write-class verifier (tier1 fixture: once valid_draft_json is used, tier0 persistence assertions no longer apply).
 fn write_like_draft_json() -> &'static str {
     r#"{"goal":"改格式","subtasks":[{"id":"s1","desc":"格式化","scope_files":["a.rs"],"acceptance":[{"claim":"格式过","verifier":"rustfmt a.rs"}],"needed_caps":[]}],"assignments":[{"subtask_id":"s1","agent_id":"claude-1"}]}"#
 }
@@ -204,7 +204,7 @@ fn estimate_risk_low_med_high_by_signals() {
 // 决策表三档（disagreement 入参驱动·覆盖 Tier0/1/2）
 #[test]
 fn estimate_tier0_low_risk_low_disagreement() {
-    // 低风险 + 低分歧（B4 真采样场景）→ tier0
+    // Low risk + low disagreement -> tier0
     assert_eq!(
         estimate_tier(&draft_with(2, Some("cargo test")), 0.0, 2).tier,
         "tier0"
@@ -213,7 +213,7 @@ fn estimate_tier0_low_risk_low_disagreement() {
 
 #[test]
 fn estimate_tier1_middle_band() {
-    // 低风险 + B1 占位分歧 0.3（不<0.20·不≥0.50）→ tier1（B1 期间 low 风险也至少 Tier1）
+    // Low risk + mid-band disagreement 0.3 (not < 0.20, not >= 0.50) -> tier1 (low risk still floors at tier1 here)
     assert_eq!(
         estimate_tier(&draft_with(2, Some("cargo test")), 0.3, 2).tier,
         "tier1"
@@ -232,7 +232,7 @@ fn estimate_tier2_high_risk_or_high_disagreement() {
         estimate_tier(&draft_with(11, Some("cargo test")), 0.0, 11).tier,
         "tier2"
     );
-    // 高分歧（≥0.50）→ tier2（即便低风险·B4 场景）
+    // High disagreement (>= 0.50) -> tier2, even at low risk
     assert_eq!(
         estimate_tier(&draft_with(1, Some("cargo test")), 0.6, 1).tier,
         "tier2"
@@ -353,7 +353,7 @@ fn build_assignments_json_shapes_per_unit() {
     let arr = v.as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["subtask_id"], "s1");
-    assert_eq!(arr[0]["subtask"], "d"); // opus P1-2：子任务描述文本（B3 TaskPack.subtask 来源）
+    assert_eq!(arr[0]["subtask"], "d"); // subtask description text, sourced from TaskPack.subtask
     assert_eq!(arr[0]["assignee"]["agent_id"], "claude-1");
     assert_eq!(arr[0]["assignee"]["provider"], "claude"); // opus P1-3：provider 快照
     assert_eq!(arr[0]["assignee"]["model"], "claude-opus");
@@ -386,7 +386,7 @@ fn persist_draft_contract_writes_draft_and_task_acceptance() {
     let crits = crate::db::list_acceptance_by_run(&conn, "s1", "r1").unwrap();
     assert_eq!(crits.len(), 1);
     assert_eq!(crits[0].scope, "task");
-    assert_eq!(crits[0].status, "pending"); // B7：draft 不冒充已验证
+    assert_eq!(crits[0].status, "pending"); // a draft must never claim to be already verified
     assert_eq!(crits[0].task_id, "s1");
 }
 
@@ -714,7 +714,7 @@ fn run_propose_team_plan_drafts_and_persists() {
     assert_eq!(result.status, "draft");
     assert_eq!(result.subtask_count, 1);
     assert_eq!(result.unassigned_count, 0);
-    // 回传面够 B2 渲：contract_id + assignments_json 带 assignee/subtask
+    // The returned surface is enough to render: assignments_json carries assignee/subtask alongside contract_id
     assert!(result.assignments_json.contains("claude-1"));
     let aj: serde_json::Value = serde_json::from_str(&result.assignments_json).unwrap();
     assert_eq!(aj[0]["assignee"]["agent_id"], "claude-1");

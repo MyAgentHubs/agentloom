@@ -22,6 +22,8 @@ fn partial_snapshot_accumulates_across_multiple_sink_calls_and_tracks_last_seq()
                 session_id: "sess-p1".to_owned(),
                 run_id: "run-p1".to_owned(),
                 dispatch: None,
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![
                     crate::event_transport::SequencedEvent {
                         seq: 3,
@@ -49,6 +51,8 @@ fn partial_snapshot_accumulates_across_multiple_sink_calls_and_tracks_last_seq()
                 session_id: "sess-p1".to_owned(),
                 run_id: "run-p1".to_owned(),
                 dispatch: None,
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![crate::event_transport::SequencedEvent {
                     seq: 9,
                     event: AgentEvent::TextDelta {
@@ -106,6 +110,8 @@ fn partial_snapshot_rebuilds_reducer_when_run_id_changes_for_same_session() {
                 session_id: "sess-p2".to_owned(),
                 run_id: "run-new".to_owned(),
                 dispatch: None,
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![crate::event_transport::SequencedEvent {
                     seq: 4,
                     event: AgentEvent::TextDelta {
@@ -148,6 +154,8 @@ fn partial_snapshot_cleared_when_completed_or_run_closeout_arrives() {
                     session_id: "sess-completed".to_owned(),
                     run_id: "run-completed".to_owned(),
                     dispatch: None,
+                    agent_id: None,
+                    agent_name_snapshot: None,
                     events: vec![
                         crate::event_transport::SequencedEvent {
                             seq: 1,
@@ -177,6 +185,8 @@ fn partial_snapshot_cleared_when_completed_or_run_closeout_arrives() {
                     session_id: "sess-closeout".to_owned(),
                     run_id: "run-closeout".to_owned(),
                     dispatch: None,
+                    agent_id: None,
+                    agent_name_snapshot: None,
                     events: vec![
                         crate::event_transport::SequencedEvent {
                             seq: 1,
@@ -201,6 +211,8 @@ fn partial_snapshot_cleared_when_completed_or_run_closeout_arrives() {
                     session_id: "sess-active".to_owned(),
                     run_id: "run-active".to_owned(),
                     dispatch: None,
+                    agent_id: None,
+                    agent_name_snapshot: None,
                     events: vec![crate::event_transport::SequencedEvent {
                         seq: 1,
                         event: AgentEvent::TextDelta {
@@ -262,6 +274,8 @@ fn partial_snapshot_foreign_lane_terminal_does_not_clear_current_lane() {
                 session_id: "sess-team".to_owned(),
                 run_id: "run-member".to_owned(),
                 dispatch: None,
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![crate::event_transport::SequencedEvent {
                     seq: 1,
                     event: AgentEvent::Completed {
@@ -339,6 +353,8 @@ fn partial_snapshot_own_lane_terminal_still_clears_normally() {
                 session_id: "sess-team-2".to_owned(),
                 run_id: "run-lead".to_owned(),
                 dispatch: None,
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![crate::event_transport::SequencedEvent {
                     seq: 2,
                     event: AgentEvent::RunCloseout {
@@ -406,6 +422,8 @@ fn partial_snapshot_member_lane_streaming_batch_does_not_seize_or_wipe_lead_slot
                     assignment_id: Some("assignment-1".to_owned()),
                     ..Default::default()
                 }),
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![crate::event_transport::SequencedEvent {
                     seq: 1,
                     event: AgentEvent::TextDelta {
@@ -452,6 +470,8 @@ fn partial_snapshot_member_lane_streaming_batch_does_not_seize_or_wipe_lead_slot
                     assignment_id: Some("assignment-1".to_owned()),
                     ..Default::default()
                 }),
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![crate::event_transport::SequencedEvent {
                     seq: 2,
                     event: AgentEvent::Completed {
@@ -515,6 +535,8 @@ fn maintain_partial_snapshots_runs_even_when_upstream_gate_is_closed() {
                 session_id: "sess-disconnected".to_owned(),
                 run_id: "run-disc".to_owned(),
                 dispatch: None,
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![crate::event_transport::SequencedEvent {
                     seq: 3,
                     event: AgentEvent::TextDelta {
@@ -553,6 +575,8 @@ fn maintain_partial_snapshots_runs_even_when_upstream_gate_is_closed() {
                 session_id: "sess-disconnected".to_owned(),
                 run_id: "run-disc".to_owned(),
                 dispatch: None,
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![crate::event_transport::SequencedEvent {
                     seq: 4,
                     event: AgentEvent::Completed {
@@ -624,6 +648,8 @@ fn extract_tool_milestones_runs_even_when_upstream_gate_is_closed_and_can_seal_t
                 session_id: "sess-gate-closed".to_owned(),
                 run_id: "run-gate-closed".to_owned(),
                 dispatch: None,
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![crate::event_transport::SequencedEvent {
                     seq: 1,
                     event: crate::agent_event::AgentEvent::ToolStarted {
@@ -645,6 +671,8 @@ fn extract_tool_milestones_runs_even_when_upstream_gate_is_closed_and_can_seal_t
                 session_id: "sess-gate-closed".to_owned(),
                 run_id: "run-gate-closed".to_owned(),
                 dispatch: None,
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![crate::event_transport::SequencedEvent {
                     seq: 2,
                     event: crate::agent_event::AgentEvent::ToolCompleted {
@@ -674,6 +702,8 @@ fn extract_tool_milestones_runs_even_when_upstream_gate_is_closed_and_can_seal_t
                 session_id: "sess-gate-closed".to_owned(),
                 run_id: "run-gate-closed".to_owned(),
                 dispatch: None,
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![crate::event_transport::SequencedEvent {
                     seq: 3,
                     event: crate::agent_event::AgentEvent::Completed {
@@ -770,6 +800,8 @@ fn partial_snapshot_capacity_rejects_new_session_but_keeps_updating_existing_one
                 session_id: "sess-0".to_owned(),
                 run_id: "run-0".to_owned(),
                 dispatch: None,
+                agent_id: None,
+                agent_name_snapshot: None,
                 events: vec![crate::event_transport::SequencedEvent {
                     seq: 5,
                     event: AgentEvent::TextDelta {

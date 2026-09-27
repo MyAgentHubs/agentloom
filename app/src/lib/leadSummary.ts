@@ -19,13 +19,13 @@ export type SummarySectionId =
   | "fallback";
 
 /**
- * D7 措辞更正（delta 复审终轮·2026-07-26）：用户摘要里的「风险」段只放行这几个 id——
- * 同款白名单已经在后端 member_runner.rs::render_member_result_report 里存在
- * （只挑 transient_error / git_write_blocked 两个 id 拼进 DB 消息），这里镜像同一份
- * 白名单挡住 UI 渲染路径。默认不外显：新增一种 risk 时，除非显式把 id 加进这份白名单 +
- * 配好 i18n，否则不会出现在用户摘要里（避免像 stalled_narrative_on_clean_exit 那样——
- * 排查用的内部黑话中文句子被原样糊进成功 run 的用户摘要、en locale 下还会显中文）。
- * risks 数组本身、DB 里的原始记录不受影响——只是不进这条 UI 渲染路径。
+ * Allow only transient_error and git_write_blocked in the summary's risks section,
+ * mirroring member_runner.rs::render_member_result_report on the backend,
+ * which only splices those two risk ids into DB messages.
+ * Gate this UI rendering path by default: each new risk id must be explicitly allowlisted
+ * and have i18n configured before it can appear in the user-facing summary.
+ * This keeps internal Chinese debugging jargon out of successful-run summaries and prevents untranslated text under the en locale.
+ * The risks array and raw DB record remain unchanged; only this UI rendering path is gated.
  */
 const USER_FACING_RISK_IDS = new Set(["transient_error", "git_write_blocked"]);
 

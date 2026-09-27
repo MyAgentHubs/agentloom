@@ -86,7 +86,13 @@ fn fan_out_sends_identical_payloads_to_sinks_in_registration_order() {
     });
 
     transport
-        .register_run("r", "s", None, TextGranularity::Token)
+        .register_run(
+            "r",
+            "s",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
     transport.push("r", text("first"));
     transport.push("r", text("second"));
@@ -108,7 +114,13 @@ fn tick_fans_out_to_every_sink() {
     transport.start(move |p| lock(&ra).push(p)).unwrap();
     transport.add_sink(move |p| lock(&rb).push(p));
     transport
-        .register_run("r", "s", None, TextGranularity::Token)
+        .register_run(
+            "r",
+            "s",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
     transport.push("r", text("hello"));
     transport.tick_once_for_test();
@@ -126,6 +138,7 @@ fn run_id_is_available_to_native_sinks_but_skipped_from_serialized_batches() {
             "session-public",
             None,
             TextGranularity::Token,
+            RunIdentity::default(),
         )
         .unwrap();
     transport.push("run-private", text("hello"));
@@ -143,6 +156,99 @@ fn run_id_is_available_to_native_sinks_but_skipped_from_serialized_batches() {
 }
 
 #[test]
+fn batch_identity_present_serializes_agent_id_and_name() {
+    let (_root, transport) = test_transport(8);
+    let payloads = recorder(&transport);
+    transport
+        .register_run(
+            "r",
+            "s",
+            None,
+            TextGranularity::Token,
+            RunIdentity {
+                agent_id: Some("deepseek".into()),
+                agent_name_snapshot: Some("DeepSeek".into()),
+            },
+        )
+        .unwrap();
+    transport.push("r", text("hello"));
+    transport.tick_once_for_test();
+
+    let payloads = lock(&payloads);
+    let serialized = serde_json::to_value(&payloads[0].batches[0]).unwrap();
+    assert_eq!(serialized["agent_id"], "deepseek");
+    assert_eq!(serialized["agent_name_snapshot"], "DeepSeek");
+}
+
+#[test]
+fn batch_identity_none_omits_both_keys() {
+    let (_root, transport) = test_transport(8);
+    let payloads = recorder(&transport);
+    transport
+        .register_run(
+            "r",
+            "s",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
+        .unwrap();
+    transport.push("r", text("hello"));
+    transport.tick_once_for_test();
+
+    let payloads = lock(&payloads);
+    let serialized = serde_json::to_value(&payloads[0].batches[0]).unwrap();
+    assert!(serialized.get("agent_id").is_none());
+    assert!(serialized.get("agent_name_snapshot").is_none());
+}
+
+#[test]
+fn batch_identity_two_runs_do_not_cross_contaminate() {
+    let (_root, transport) = test_transport(8);
+    let payloads = recorder(&transport);
+    transport
+        .register_run(
+            "run-a",
+            "session-a",
+            None,
+            TextGranularity::Token,
+            RunIdentity {
+                agent_id: Some("agent-a".into()),
+                agent_name_snapshot: Some("Agent A".into()),
+            },
+        )
+        .unwrap();
+    transport.push("run-a", text("first"));
+    transport.tick_once_for_test();
+
+    transport
+        .register_run(
+            "run-b",
+            "session-b",
+            None,
+            TextGranularity::Token,
+            RunIdentity {
+                agent_id: Some("agent-b".into()),
+                agent_name_snapshot: Some("Agent B".into()),
+            },
+        )
+        .unwrap();
+    transport.push("run-b", text("second"));
+    transport.tick_once_for_test();
+
+    let payloads = lock(&payloads);
+    assert_eq!(payloads.len(), 2);
+    let first = serde_json::to_value(&payloads[0].batches[0]).unwrap();
+    let second = serde_json::to_value(&payloads[1].batches[0]).unwrap();
+    assert_eq!(first["session_id"], "session-a");
+    assert_eq!(first["agent_id"], "agent-a");
+    assert_eq!(first["agent_name_snapshot"], "Agent A");
+    assert_eq!(second["session_id"], "session-b");
+    assert_eq!(second["agent_id"], "agent-b");
+    assert_eq!(second["agent_name_snapshot"], "Agent B");
+}
+
+#[test]
 fn panicking_sink_does_not_block_other_sinks_or_future_batches() {
     let (_root, transport) = test_transport(8);
     let received = Arc::new(Mutex::new(Vec::new()));
@@ -151,14 +257,26 @@ fn panicking_sink_does_not_block_other_sinks_or_future_batches() {
     transport.add_sink(move |payload| lock(&recorded).push(payload));
 
     transport
-        .register_run("tick", "tick", None, TextGranularity::Token)
+        .register_run(
+            "tick",
+            "tick",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
     transport.push("tick", text("first"));
     transport.tick_once_for_test();
     assert_eq!(lock(&received).len(), 1);
 
     transport
-        .register_run("flush", "flush", None, TextGranularity::Token)
+        .register_run(
+            "flush",
+            "flush",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
     transport.push("flush", text("second"));
     assert!(transport
@@ -180,7 +298,13 @@ fn sink_added_later_only_receives_subsequent_payloads() {
         .unwrap();
 
     transport
-        .register_run("first", "first", None, TextGranularity::Token)
+        .register_run(
+            "first",
+            "first",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
     transport.push("first", text("before"));
     transport
@@ -191,7 +315,13 @@ fn sink_added_later_only_receives_subsequent_payloads() {
     let recorded = second_payloads.clone();
     transport.add_sink(move |payload| lock(&recorded).push(payload));
     transport
-        .register_run("second", "second", None, TextGranularity::Token)
+        .register_run(
+            "second",
+            "second",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
     transport.push("second", text("after"));
     transport
@@ -218,7 +348,13 @@ fn preserves_order_and_sequence_with_barrier_terminal_last() {
     let (_root, transport) = test_transport(8);
     let payloads = recorder(&transport);
     transport
-        .register_run("r", "s", None, TextGranularity::Token)
+        .register_run(
+            "r",
+            "s",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
     assert_eq!(transport.push("r", text("a")), Some(1));
     assert_eq!(transport.push("r", tool_started("t")), Some(2));
@@ -260,7 +396,7 @@ fn line_and_token_text_merging_have_exact_newline_boundaries() {
         let (_root, transport) = test_transport(8);
         let payloads = recorder(&transport);
         transport
-            .register_run(run_id, run_id, None, granularity)
+            .register_run(run_id, run_id, None, granularity, RunIdentity::default())
             .unwrap();
         transport.push(run_id, text("first"));
         transport.push(run_id, text(""));
@@ -281,16 +417,21 @@ fn line_and_token_text_merging_have_exact_newline_boundaries() {
     }
 }
 
-/// 2026-07-24 dogfood 回归钉子：DeepSeek 借壳（走 claude 解析器，`ParseFn::Claude` →
-/// `TextGranularity::Token`）逐 token 快吐同批合并的 `TextDelta`，Token 粒度下必须原样零缝拼接
-/// ——修前误用 Line 粒度会在两段中间插 `'\n'`，把 "**DeepSeek**" 断成 "**DeepSe\nek**"，
-/// markdown 渲染成单换行→视觉上词中间出现空格（用户报「DeepSe ek」的根因）。
+/// Token deltas can split words and Markdown markers across event boundaries.
+/// Merging them must concatenate text without inserting characters, preserving
+/// the original word and bold formatting when the transport flushes.
 #[test]
 fn token_granularity_merges_split_word_and_bold_marker_without_inserting_chars() {
     let (_root, transport) = test_transport(8);
     let payloads = recorder(&transport);
     transport
-        .register_run("r", "s", None, TextGranularity::Token)
+        .register_run(
+            "r",
+            "s",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
     transport.push("r", text("**DeepSe"));
     transport.push("r", text("ek**"));
@@ -316,7 +457,13 @@ fn token_granularity_merges_thinking_delta_without_inserting_chars() {
     let (_root, transport) = test_transport(8);
     let payloads = recorder(&transport);
     transport
-        .register_run("r", "s", None, TextGranularity::Token)
+        .register_run(
+            "r",
+            "s",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
     transport.push("r", thinking("**DeepSe"));
     transport.push("r", thinking("ek**"));
@@ -342,7 +489,13 @@ fn line_granularity_still_inserts_newline_between_codex_messages() {
     let (_root, transport) = test_transport(8);
     let payloads = recorder(&transport);
     transport
-        .register_run("r", "s", None, TextGranularity::Line)
+        .register_run(
+            "r",
+            "s",
+            None,
+            TextGranularity::Line,
+            RunIdentity::default(),
+        )
         .unwrap();
     transport.push("r", text("first message"));
     transport.push("r", text("second message"));
@@ -366,7 +519,13 @@ fn thinking_merges_by_granularity_but_tool_boundaries_split_segments() {
     let (_root, transport) = test_transport(16);
     let payloads = recorder(&transport);
     transport
-        .register_run("r", "s", None, TextGranularity::Line)
+        .register_run(
+            "r",
+            "s",
+            None,
+            TextGranularity::Line,
+            RunIdentity::default(),
+        )
         .unwrap();
     transport.push("r", text("a"));
     transport.push("r", text("b"));
@@ -397,7 +556,13 @@ fn token_thinking_merges_without_inserting_a_separator() {
     let (_root, transport) = test_transport(8);
     let payloads = recorder(&transport);
     transport
-        .register_run("r", "s", None, TextGranularity::Token)
+        .register_run(
+            "r",
+            "s",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
     transport.push("r", thinking("Received"));
     transport.push("r", thinking("."));
@@ -416,10 +581,22 @@ fn a_global_tick_groups_runs_without_cross_run_merging() {
     let (_root, transport) = test_transport(8);
     let payloads = recorder(&transport);
     transport
-        .register_run("a", "session-a", None, TextGranularity::Token)
+        .register_run(
+            "a",
+            "session-a",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
     transport
-        .register_run("b", "session-b", None, TextGranularity::Token)
+        .register_run(
+            "b",
+            "session-b",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
     transport.push("a", text("left"));
     transport.push("b", text("right"));
@@ -439,7 +616,13 @@ fn usage_deltas_sum_across_interleaved_events_at_the_last_usage_position() {
     let (_root, transport) = test_transport(8);
     let payloads = recorder(&transport);
     transport
-        .register_run("r", "s", None, TextGranularity::Token)
+        .register_run(
+            "r",
+            "s",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
     transport.push(
         "r",
@@ -514,7 +697,13 @@ fn concurrent_tick_and_barriers_never_emit_after_terminal() {
     for index in 0..RUNS {
         let run = format!("run-{index}");
         transport
-            .register_run(&run, &run, None, TextGranularity::Token)
+            .register_run(
+                &run,
+                &run,
+                None,
+                TextGranularity::Token,
+                RunIdentity::default(),
+            )
             .unwrap();
         for part in 0..12 {
             transport.push(&run, text(&format!("{part},")));
@@ -568,7 +757,13 @@ fn closed_push_counts_protocol_error_and_second_barrier_is_noop() {
     let (_root, transport) = test_transport(8);
     let payloads = recorder(&transport);
     transport
-        .register_run("r", "s", None, TextGranularity::Token)
+        .register_run(
+            "r",
+            "s",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
     assert!(transport
         .flush_barrier("r", vec![terminal("first")])
@@ -592,10 +787,22 @@ fn closed_lane_is_retired_after_two_ticks_without_affecting_active_lane() {
     let (_root, transport) = test_transport(8);
     recorder(&transport);
     transport
-        .register_run("closed", "closed-session", None, TextGranularity::Token)
+        .register_run(
+            "closed",
+            "closed-session",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
     transport
-        .register_run("active", "active-session", None, TextGranularity::Token)
+        .register_run(
+            "active",
+            "active-session",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
     assert_eq!(transport.push("closed", text("streaming")), Some(1));
     assert!(transport
@@ -635,7 +842,13 @@ fn journal_contains_one_original_envelope_per_event_in_sequence() {
         ..DispatchMeta::default()
     };
     transport
-        .register_run("r", "session", Some(dispatch), TextGranularity::Line)
+        .register_run(
+            "r",
+            "session",
+            Some(dispatch),
+            TextGranularity::Line,
+            RunIdentity::default(),
+        )
         .unwrap();
     transport.push("r", text("one"));
     transport.push("r", text("two"));
@@ -695,6 +908,7 @@ fn per_event_dispatch_survives_stream_and_terminal_batches() {
             "session",
             Some(base.clone()),
             TextGranularity::Line,
+            RunIdentity::default(),
         )
         .unwrap();
     transport.push_with_dispatch("member-lane", dispatched.clone(), text("subtask"));
@@ -721,7 +935,13 @@ fn journal_write_failure_is_counted_without_blocking_push() {
     let transport =
         EventTransport::with_config(bad_root.path().to_path_buf(), 8, 8, Duration::from_secs(60));
     transport
-        .register_run("r", "s", None, TextGranularity::Token)
+        .register_run(
+            "r",
+            "s",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
 
     let started = Instant::now();
@@ -736,7 +956,13 @@ fn full_lane_backpressures_until_capacity_is_drained_without_loss() {
     let (_root, transport) = test_transport(1);
     transport.install_emitter_for_test(|_| {});
     transport
-        .register_run("r", "s", None, TextGranularity::Token)
+        .register_run(
+            "r",
+            "s",
+            None,
+            TextGranularity::Token,
+            RunIdentity::default(),
+        )
         .unwrap();
     assert_eq!(transport.push("r", text("first")), Some(1));
 

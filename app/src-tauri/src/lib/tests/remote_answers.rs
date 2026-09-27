@@ -242,15 +242,13 @@ fn pending_remote_answer_and_input_send_queries_are_bidirectionally_isolated() {
 fn startup_pending_remote_answer_rescan_calls_recovery_without_fifo_guard() {
     // 结构护栏：启动后台线程必须并列消费 answer 会话，并保持在线 answer 同款的独立线程语义。
     // 变异自证：删掉 pending_remote_answer_sessions 循环，这条测试会变红。
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib/app_setup.rs"));
     let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let loop_body = production
-        .split("for session_id in pending_remote_answer_sessions {")
-        .nth(1)
-        .expect("setup 启动线程必须逐会话恢复 pending input.answer")
-        .split("\n                }")
-        .next()
-        .unwrap();
+    let loop_body = source_window(
+        production,
+        "for session_id in pending_remote_answer_sessions {",
+        "\n        }",
+    );
     assert!(
         loop_body.contains("startup_recover_pending_remote_answers(&drain_app, &session_id)"),
         "answer 启动重扫必须调用独立恢复薄壳"
@@ -263,15 +261,18 @@ fn startup_pending_remote_answer_rescan_calls_recovery_without_fifo_guard() {
 
 #[test]
 fn remote_gateway_input_answer_handler_spawns_before_processing() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/remote_bridge_input.rs"
+    ));
+    let production = source;
     let handler = production
-        .split("fn remote_gateway_input_answer_handler(")
-        .nth(1)
-        .unwrap()
-        .split("\nfn remote_gateway_control_stop_handler(")
-        .next()
-        .unwrap();
+        .split_once("fn remote_gateway_input_answer_handler(")
+        .map(|(_before, after)| after)
+        .expect("missing remote_gateway_input_answer_handler start anchor in lib/remote_bridge_input.rs")
+        .split_once("\npub(super) fn remote_gateway_control_stop_handler(")
+        .map(|(before, _after)| before)
+        .expect("missing remote_gateway_control_stop_handler end anchor in lib/remote_bridge_input.rs");
     let spawn_idx = handler
         .find("spawn_remote_answer_processing(")
         .expect("input.answer 新行必须启动独立答案线程");

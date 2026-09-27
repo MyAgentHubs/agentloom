@@ -440,9 +440,9 @@ fn dispatch_worker_autofeed_wait_error_also_acks_assignment() {
 
 #[test]
 fn dispatch_worker_rejects_when_session_already_running() {
-    // T2 防重派闸：同 session 已有存活 worker → 拒派、run_worker 绝不被调。
-    // F2：拒绝必须是 Err（MCP isError:true），不能再是带 status 字段的 Ok——见
-    // dispatch_worker_inner 里 is_session_running 分支的 F2 注释。
+    // Reject duplicate dispatches while the session has a live worker, without
+    // invoking run_worker. Rejection must return Err so MCP reports isError: true
+    // instead of treating an Ok payload with a status field as success.
     let ctx = LeadCtx {
         on_result_delivered: noop_result_delivered(),
         on_worker_settled: noop_worker_settled(),

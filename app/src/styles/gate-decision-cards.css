@@ -1,0 +1,641 @@
+/* ===== GateCard: draft approval card with visual hierarchy for attention. ===== */
+.gate-card {
+  background: #f5f2ec;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px 16px 18px;
+  margin: 8px 0;
+}
+
+/* ===== CodingTaskCard (executing-task bar·aligned with coding-loop prototype screen ①) ===== */
+.coding-task {
+  margin: 8px 0;
+  border: 1px solid var(--accent-soft);
+  border-radius: 9px;
+  background: linear-gradient(0deg, var(--panel), var(--bg));
+  overflow: hidden;
+}
+.coding-task__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 13px;
+  min-width: 0;
+}
+.coding-task__worker {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.coding-task__phase {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.coding-task__steps {
+  font-size: 10.5px;
+  color: var(--ink-3);
+  flex-shrink: 0;
+}
+.coding-task__bar {
+  height: 4px;
+  background: var(--bg-sunken);
+}
+.coding-task__bar-fill {
+  height: 100%;
+  background: var(--accent);
+}
+.coding-task__detail {
+  width: 100%;
+  border: 0;
+  border-top: 1px solid var(--line-soft);
+  background: var(--panel);
+  color: var(--accent);
+  padding: 9px 13px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+.coding-task__detail:hover {
+  background: var(--bg);
+}
+.coding-task__detail:focus-visible {
+  outline: 2px solid var(--accent-soft);
+  outline-offset: -2px;
+}
+.coding-ask {
+  border-top: 1px solid var(--line-soft);
+  padding: 12px 13px 13px;
+  background: var(--panel);
+}
+.coding-ask[data-failed] {
+  background: var(--bg);
+}
+.coding-ask__q {
+  margin: 0 0 10px;
+  color: var(--ink-2);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.coding-ask__cmd {
+  width: 100%;
+  min-height: 34px;
+  margin: 0 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-sunken);
+  color: var(--ink);
+  padding: 7px 9px;
+  font: inherit;
+  font-size: 12px;
+}
+.coding-ask__cmd:focus {
+  outline: 2px solid var(--accent-soft);
+  border-color: var(--accent);
+}
+.coding-ask__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.coding-ask__primary,
+.coding-ask__ghost {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.coding-ask__primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--panel);
+}
+.coding-ask__ghost {
+  background: var(--panel);
+  color: var(--ink-2);
+}
+.coding-ask__primary:hover,
+.coding-ask__ghost:hover {
+  filter: brightness(0.98);
+}
+.coding-ask__primary:focus-visible,
+.coding-ask__ghost:focus-visible {
+  outline: 2px solid var(--accent-soft);
+  outline-offset: 2px;
+}
+.dec-foot {
+  margin: 10px 0 0 0;
+  padding: 0 12px 8px;
+  font-size: 11px;
+  color: var(--ink-3);
+  line-height: 1.5;
+}
+.dec-rationale-toggle {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  font: inherit;
+}
+.dec-rationale {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--ink-3);
+  line-height: 1.5;
+}
+.dec-confirm {
+  color: var(--ink-2);
+  font-weight: 600;
+}
+
+/* ===== Decision card (clickable options within the card·click → generate a reply in the main area) ===== */
+.decision-card {
+  margin: 11px 0 0 0;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--panel);
+  overflow: hidden;
+}
+.dc-head {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--bg);
+}
+.dc-head-hint {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--ink-2);
+  margin-bottom: 4px;
+}
+.dc-head-question {
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.6;
+  color: var(--ink-3);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.dc-head-question--open {
+  display: block;
+  -webkit-line-clamp: unset;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.dc-question-toggle {
+  display: inline-block;
+  margin-top: 4px;
+}
+.decision-chosen {
+  margin: 11px 0 0 0;
+  padding: 8px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 11px;
+  background: var(--bg);
+  font-size: 12px;
+  color: var(--ink-3);
+}
+.decision-option {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  border-top: 1px solid var(--line-soft);
+  background: transparent;
+  color: var(--ink);
+  padding: 9px 12px;
+  cursor: pointer;
+  font: inherit;
+}
+.decision-option:first-of-type {
+  border-top: 0;
+}
+.decision-option:hover {
+  background: #fffcf7;
+}
+.decision-option .di-n {
+  width: 21px;
+  height: 21px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--bg-sunken);
+  color: var(--ink-3);
+  font-weight: 700;
+  font-size: 11px;
+  font-family: var(--mono);
+  flex: 0 0 21px;
+}
+.decision-option .di-tx {
+  min-width: 0;
+}
+.decision-option .di-tx b {
+  display: block;
+  font-size: 12.5px;
+  color: var(--ink);
+  margin-bottom: 3px;
+}
+.decision-option .di-tx span {
+  font-size: 11px;
+  color: var(--ink-3);
+  line-height: 1.5;
+}
+.decision-option.rec {
+  background: transparent;
+  box-shadow: inset 3px 0 0 0 var(--accent);
+}
+.decision-option.rec:hover {
+  background: #f6e2d2;
+}
+.decision-option.rec .di-n {
+  background: var(--accent);
+  color: #fff;
+}
+.decision-option.rec .di-tx .rec-pill {
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 8.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  background: var(--panel);
+  border: 1px solid rgba(217, 119, 87, 0.4);
+  border-radius: 5px;
+  padding: 1px 5px;
+  vertical-align: 1px;
+}
+/* GUI #1: propose in-flight light card (pulsing dot indicates "lead is drafting"·distinct from the solid feel of a formed draft card) */
+.gate-proposing {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 28px;
+  padding: 10px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: #fffefb;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.gate-proposing__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: gate-proposing-pulse 1.2s ease-in-out infinite;
+}
+@keyframes gate-proposing-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+/* Terminal completion uses a compact status strip, matching the proposing state with an inline dot and text. */
+.run-terminal {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+  padding: 7px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink-2);
+  font-size: 12px;
+  min-width: 0;
+}
+.run-terminal__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.run-terminal__dot--ok {
+  background: var(--green);
+}
+.run-terminal__dot--warn {
+  background: var(--amber);
+}
+.run-terminal__dot--error {
+  background: var(--red);
+}
+.run-terminal__dot--muted {
+  background: var(--ink-4);
+}
+.run-terminal__label {
+  font-weight: 600;
+  color: var(--ink);
+  flex-shrink: 0;
+}
+.run-terminal__msg {
+  color: var(--ink-3);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gate-card__au {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 7px;
+}
+.gate-card__av {
+  width: 21px;
+  height: 21px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.gate-card__w {
+  font-size: 12px;
+  font-weight: 600;
+}
+.gate-card__r {
+  font-size: 10.5px;
+  color: var(--ink-3);
+}
+.gate-card__say {
+  padding-left: 28px;
+  font-size: 12px;
+  color: #4a463e;
+  line-height: 1.55;
+  margin-bottom: 10px;
+}
+.gate-card__card {
+  margin-left: 28px;
+  background: #fffefb;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  /* GUI #2: visible lets the .assign__dd reassignment dropdown extend beyond the card (overflow clipping ignores z-index)·rounded corners are instead applied to head/foot */
+  overflow: visible;
+}
+.gate-card__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 13px;
+  border-bottom: 1px solid var(--line-soft);
+  background: #fbf9f4;
+  border-radius: 10px 10px 0 0;
+}
+.gate-card__draft {
+  font-size: 8.5px;
+  font-weight: 700;
+  color: #a8742a;
+  background: #fbf1df;
+  padding: 2px 7px;
+  border-radius: 8px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.gate-card__ht {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--ink-3);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.gate-card__tier {
+  margin-left: auto;
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--ink-3);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 1px 6px;
+}
+.gate-card__goal {
+  padding: 11px 13px 12px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.gate-card__lab {
+  font-size: 9px;
+  font-weight: 700;
+  color: #9e9788;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 5px;
+}
+.gate-card__gline {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.gate-card__gtxt {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  font-weight: 500;
+}
+.gate-card__edit {
+  font-size: 10px;
+  color: #aca697;
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border-radius: 5px;
+  border: none;
+  background: none;
+  cursor: pointer;
+}
+.gate-card__edit:hover {
+  background: #f0ece2;
+  color: var(--ink-3);
+}
+.gate-card__goal-input,
+.gate-card__ctx {
+  width: 100%;
+  font-size: 12px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 4px 7px;
+  background: #fffefb;
+}
+.gate-card__acc {
+  padding: 11px 13px 12px;
+  background: #fefcf8;
+  border-bottom: 1px solid var(--line-soft);
+}
+.gate-card__acc-lab {
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 8px;
+}
+.gate-card__hint {
+  font-weight: 600;
+  color: #9e9788;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 10px;
+}
+.gate-card__acc-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+.gate-card__num {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1.4px dashed #c9c2b0;
+  color: #9e9788;
+  font-size: 9px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.gate-card__ctx {
+  flex: 1;
+}
+.gate-card__ib {
+  width: 21px;
+  height: 21px;
+  border-radius: 5px;
+  border: none;
+  background: none;
+  color: #9e9788;
+  font-size: 10px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.gate-card__ib:hover {
+  background: #ede9de;
+  color: #1a1814;
+}
+.gate-card__acc-add,
+.gate-card__more {
+  margin-top: 5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--accent);
+  font-weight: 600;
+  cursor: pointer;
+  padding: 5px 7px;
+  border-radius: 6px;
+  border: none;
+  background: none;
+}
+.gate-card__more {
+  color: var(--ink-3);
+}
+.gate-card__team {
+  padding: 9px 13px;
+}
+.gate-card__trow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: none;
+  background: none;
+  cursor: pointer;
+  padding: 0;
+}
+.gate-card__chev {
+  color: #aca697;
+  font-size: 10px;
+}
+.gate-card__tl {
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.gate-card__stack {
+  display: flex;
+  margin-left: auto;
+}
+.gate-card__a {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 8px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1.5px solid #fffefb;
+  margin-left: -5px;
+}
+.gate-card__a:first-child {
+  margin-left: 0;
+}
+.gate-card__foot {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 11px 13px;
+  border-top: 1px solid var(--line-soft);
+  background: #fbf9f4;
+  flex-wrap: wrap;
+  border-radius: 0 0 10px 10px;
+}
+.gate-card__gbtn {
+  font-size: 11.5px;
+  padding: 7px 14px;
+  border-radius: 7px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  background: #fffefb;
+  color: #4a463e;
+}
+.gate-card__gbtn.is-primary {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  border-color: var(--accent);
+}
+.gate-card__gbtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.gate-card__fnote {
+  margin-left: auto;
+  font-size: 10px;
+  color: #aca697;
+}
+.gate-card__tier-note {
+  font-size: 10.5px;
+  color: #a8742a;
+  background: #fbf6ec;
+  padding: 6px 13px;
+  border-bottom: 1px solid var(--line-soft);
+}

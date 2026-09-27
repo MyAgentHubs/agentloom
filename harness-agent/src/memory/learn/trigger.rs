@@ -157,7 +157,6 @@ mod tests {
     }
     #[test]
     fn fail_fail_success_spans_from_first_fail() {
-        // B9.1 ⑤
         let j = [
             started(1, "a", "cargo build"),
             completed(2, "a", 101),

@@ -372,6 +372,7 @@ fn require_same_device_rejects_different_device_numbers() {
 }
 
 mod staging;
+mod verify_and_guard;
 
 // -------------------------------------------------------------
 // swap / swap_back

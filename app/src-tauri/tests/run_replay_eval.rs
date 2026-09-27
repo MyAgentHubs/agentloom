@@ -5,7 +5,7 @@
 //! 的分支逻辑（配套内部评测程序文档 G4）。判分与安全网全在本文件——
 //! `display_reduce.rs`（loop 唯一可改文件）里不放测试。
 //!
-//! 执行流复刻产品真实链路（`app/src-tauri/src/lib.rs` `spawn_and_stream` 消费顺序）：
+//! The execution flow reproduces the real product path (the consumption order in `src/lib/solo_stream.rs`):
 //! 建库 → 落用户轮次 → 逐行喂事件（`parse_harness_line` / `parse_harness_plan_line` +
 //! `HarnessPlanDisplayFilter`）→ `DisplayReducer::feed` → 组 `RunOutcome` →
 //! `DisplayReducer::finish` → 有产出就 `db::append_message_dedup` → 从 `messages` 表读回
@@ -361,6 +361,7 @@ fn assert_invariants(name: &str, rows: &[MessageRow]) {
 // 断言 —— 只解释 expected.json schema，不引用任何具体考题内容。
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::cognitive_complexity)]
 fn assert_expected(name: &str, expected: &Expected, rows: &[MessageRow]) {
     let user_count = rows.iter().filter(|r| r.role == "user").count() as i64;
     let assistant_count = rows.iter().filter(|r| r.role == "assistant").count() as i64;

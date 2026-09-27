@@ -581,4 +581,49 @@ mod tests {
         assert_eq!(fts_row_count(&conn), 2);
         assert_eq!(fts_text_for(&conn, big_id).unwrap().len(), big_text.len());
     }
+
+    /// Right at the count-cap boundary, a batch of `BACKFILL_BATCH_SIZE - 1`
+    /// small messages followed by an oversized one must NOT absorb that
+    /// oversized message into the same batch (the historical regression
+    /// this guards: a batch holding ~200 small messages plus one ~3MB
+    /// message, which used to drag a single batch's insert workload into
+    /// the multi-second range). The oversized message's size is a fixed
+    /// literal, independent of `BACKFILL_BATCH_BYTE_CAP`, so this doesn't
+    /// just re-derive its own expectation from whatever the cap happens to
+    /// be.
+    #[test]
+    fn backfill_never_bundles_many_small_messages_with_an_oversized_one() {
+        let conn = bare_messages_db();
+        conn.execute_batch(CREATE_VIRTUAL_TABLE_SQL).unwrap();
+
+        let small_count = BACKFILL_BATCH_SIZE - 1;
+        let mut last_small_id = 0i64;
+        for i in 0..small_count {
+            last_small_id = insert_message(&conn, "s1", "user", &text_block(&format!("消息 {i}")));
+        }
+        let big_text = "A".repeat(3 * 1024 * 1024);
+        let big_id = insert_message(&conn, "s1", "user", &text_block(&big_text));
+
+        let upper = prepare_backfill(&conn).unwrap().unwrap();
+
+        let first_batch_max = backfill_next_batch(&conn, 0, upper).unwrap();
+        assert_eq!(
+            first_batch_max,
+            Some(last_small_id),
+            "the byte cap must close the batch right before the oversized message, \
+             even though the count cap alone would still have had room for one more slot"
+        );
+        let first_batch_count = first_batch_max.unwrap(); // after_id was 0, so this is the id count too.
+        assert!(
+            first_batch_count <= BACKFILL_BATCH_SIZE,
+            "a batch must never exceed the production count cap, actually processed {first_batch_count}"
+        );
+
+        let second_batch_max = backfill_next_batch(&conn, last_small_id, upper).unwrap();
+        assert_eq!(
+            second_batch_max,
+            Some(big_id),
+            "the oversized message must land alone in its own batch, not bundled with anything else"
+        );
+    }
 }

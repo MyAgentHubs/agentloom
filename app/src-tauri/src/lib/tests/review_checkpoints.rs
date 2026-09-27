@@ -51,11 +51,9 @@ fn session_review_inplace_checkpointed_tracked_file_is_undoable() {
     );
 }
 
-/// R-B2 项 2a（Major-4 接缝测试·新 scope 会话闭环）：NULL scope（方案 A 新行为）会话的
-/// agent 实际写文件目录是 per-session 子目录，但 Review 走的是根锚定的
-/// `session_review_inner`（`inplace_project_path` = 项目根，不受 scope 影响）；子目录里的
-/// 新文件对 git 而言只是仓库内部一个普通嵌套路径的未跟踪文件，`git status`/`diff` 天然能
-/// 看到——这条测试证明这条接缝真的接得上，不是「两半各自绿、接缝裸奔」。
+/// A NULL-scoped session writes into its own subdirectory, while Review stays anchored
+/// at the project root. Review must include new files from that subdirectory as nested
+/// repository paths so session-local changes remain visible in the project-wide review.
 #[test]
 fn session_review_sees_changes_written_into_new_scope_session_subdir() {
     let _home_lock = crate::worktree::test_home_lock();
@@ -105,10 +103,9 @@ fn session_review_sees_changes_written_into_new_scope_session_subdir() {
     );
 }
 
-/// R-B2 项 2a（Major-4 接缝测试·新 scope 会话闭环）：undo 往返——checkpoint 账本记的是
-/// per-session 子目录下的绝对路径（方案 A 新行为），`undo_run_edits_inner` 最终把这些字节
-/// 写回磁盘时必须精确命中子目录里的文件，不能因为路径多了一层子目录前缀就撤销失败或
-/// 写错地方。
+/// Checkpoints store absolute paths inside the session subdirectory. Undo must restore
+/// the recorded bytes to that exact file, so the extra path component cannot cause a
+/// failed restore or redirect writes elsewhere in the project.
 #[test]
 fn undo_run_edits_restores_checkpoint_recorded_in_new_scope_session_subdir() {
     let _home_lock = crate::worktree::test_home_lock();

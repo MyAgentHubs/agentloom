@@ -10,7 +10,7 @@
 //! （`run` 子命令 cli.rs:637 与 `shell` 交互命令 cli.rs:1052 共用同一个函数）在把
 //! `RunOptions` 交给 entry.rs 之前，早就会用 `config::provider_config_with_model`
 //! 解析出的真实模型名回填 `options.model`（mock 分支 cli.rs:767、真实 provider 分支
-//! cli.rs:775）——这行回填自 2026-06-07 起就存在，比这次的身份注入功能早了两个多
+//! cli.rs:775): this backfill predates identity injection, was not introduced by this change, and needs no fix here.
 //! 月，不是本刀引入也不需要本刀再修。`config::provider_config_with_model` 自身的
 //! override/env/默认解析已有 config.rs 的单元测试钉住（见
 //! `model_override_takes_highest_priority` 等）。

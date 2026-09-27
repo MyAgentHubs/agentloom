@@ -423,7 +423,7 @@ pub enum EvalOutcome {
     Blocked,
 }
 
-/// 综合判定 outcome（B9 的 evaluate_criteria 之后调用）。
+/// Decide the overall outcome (called after `evaluate_criteria` has evaluated the goal contract).
 /// 注意：空 criteria 在此处按 `all()` 真空为真；完成入口必须先通过 `may_finalize`。
 pub fn decide_outcome(goal: &GoalState, exceeded: bool) -> EvalOutcome {
     let all_met = goal

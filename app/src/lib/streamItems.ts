@@ -1,5 +1,5 @@
 import type { Block } from "../types/agent";
-import { collectImageArtifacts } from "./imageArtifacts";
+import { collectImageArtifacts, imagePathsFromTool } from "./imageArtifacts";
 
 export type ToolBlock = Extract<Block, { type: "tool" }>;
 
@@ -18,9 +18,9 @@ export type StreamItem =
 // 用前缀语义判（与后端归约器 display_reduce.rs::is_hidden_orchestration_tool 同款）：
 // mcp__agentloom__ 下全部是编排/能力工具，逐名单枚举会漏新增工具（如 memory_set_extra）。
 //
-// F1 例外（2026-07-25）：交付四件套（commit/push/create_pr/publish）是用户真正关心的
-// 「发生了什么」，从隐藏名单里拎出来显示（人话映射见 lib/toolLabel.ts）；ToolSearch 与其余
-// mcp__agentloom__ 编排工具（ask_user/finish/memory_* 等）继续隐藏。
+// Show the delivery quartet (commit/push/create_pr/publish) because these are the outcomes people care to see happen.
+// Exclude them from hidden tools; human-readable labels live in lib/toolLabel.ts.
+// ToolSearch and the remaining mcp__agentloom__ orchestration tools (ask_user/finish/memory_* etc.) stay hidden.
 const DELIVERY_TOOLS: ReadonlySet<string> = new Set([
   "mcp__agentloom__commit",
   "mcp__agentloom__push",
@@ -66,9 +66,9 @@ export function groupToolBlocks(blocks: Block[]): StreamItem[] {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// V1（2026-08-26·刀②「桌面 chat verbose 分级」）：blockTier / foldByVerbosity。
-// 设计稿 desktop-verbose-design §2A/§2B
-// ─────────────────────────────────────────────────────────────────────────
+// blockTier / foldByVerbosity implement desktop chat verbosity tiers:
+// classify blocks and fold content according to the selected verbosity level
+// so the chat can control detail while preserving the relevant visible content.
 
 export type Verbosity = "full" | "summary" | "minimal";
 
@@ -101,6 +101,15 @@ export type Segment =
       live?: { tool: string; summary: string } | null;
     }
   | { kind: "artifacts"; imagePaths: string[]; sourceStartIndex: number };
+
+export type PassEntry = { item: StreamItem; imagePaths: string[] };
+export type RenderSegment =
+  | { kind: "pass"; keyPrefix: string; entries: PassEntry[] }
+  | {
+      kind: "activity_fold";
+      segment: Extract<Segment, { kind: "activity_fold" }>;
+    }
+  | { kind: "artifacts"; segment: Extract<Segment, { kind: "artifacts" }> };
 
 function computeCounts(blocks: Block[]): ActivityCounts {
   const counts: ActivityCounts = {
@@ -257,4 +266,51 @@ export function foldByVerbosity(
   });
 
   return segments;
+}
+
+// Split blocks by verbosity, then keep pass segments on the existing groupToolBlocks
+// path with image extraction and path-level de-duplication (full stays one pass).
+// Forward activity_fold and artifacts segments unchanged to their renderers.
+export function buildRenderSegments(
+  blocks: Block[],
+  verbosity: Verbosity,
+  streaming: boolean,
+): RenderSegment[] {
+  const segments = foldByVerbosity(blocks, verbosity, streaming);
+  return segments.map((segment): RenderSegment => {
+    if (segment.kind === "activity_fold") {
+      return { kind: "activity_fold", segment };
+    }
+    if (segment.kind === "artifacts") {
+      return { kind: "artifacts", segment };
+    }
+    const items = groupToolBlocks(segment.blocks);
+    const pathsByItem = items.map((item) => {
+      if (item.kind === "toolgroup") {
+        return item.blocks.flatMap(imagePathsFromTool);
+      }
+      return item.block.type === "tool" ? imagePathsFromTool(item.block) : [];
+    });
+    const allPaths = [...new Set(pathsByItem.flat())];
+    const preferredPaths = new Set(
+      allPaths.filter(
+        (path) => !allPaths.some((other) => other.endsWith(`/${path}`)),
+      ),
+    );
+    const seen = new Set<string>();
+    const entries = items.map((item, index) => {
+      const fresh: string[] = [];
+      pathsByItem[index].forEach((path) => {
+        if (!preferredPaths.has(path) || seen.has(path)) return;
+        seen.add(path);
+        fresh.push(path);
+      });
+      return { item, imagePaths: fresh };
+    });
+    return {
+      kind: "pass",
+      keyPrefix: `seg${segment.sourceStartIndex}`,
+      entries,
+    };
+  });
 }

@@ -1,0 +1,677 @@
+/* ===== Background task bar BackgroundTaskStack (neutral cards + scoped .task-badge + tprog truncation) ===== */
+/* Remove the "Background Tasks" heading; each task is an independent bar aligned left with the lead avatar (margin-left 0, as verdict/markdown).
+   The scoped badge on the right declares status; click the row for right-panel details. */
+/* Raise the task-bar turn to sit immediately next to its triggering user message, and suppress the generic agent-team author header. */
+.turn--runbar {
+  margin-top: -10px;
+}
+.taskstack {
+  margin: 2px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.task-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 13px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  cursor: pointer;
+}
+.task-row:hover {
+  background: var(--bg);
+}
+.task-row.st-fail {
+  border-color: rgba(184, 80, 72, 0.28);
+  background: #fff7f5;
+}
+.task-row.st-fail:hover {
+  background: #fff2ef;
+}
+.task-row .tbody {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+/* Agent name: de-emphasize with [] framing (pseudo-element brackets; do not change DOM text or compete with the main content). */
+.task-row .tnm {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-2);
+  margin: 0;
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.task-row .tnm::before {
+  content: "[";
+}
+.task-row .tnm::after {
+  content: "]";
+}
+.task-row .tprog {
+  font-size: 11px;
+  color: var(--ink-3);
+  line-height: 1.5;
+  margin: 0;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-row.st-fail .tprog {
+  color: var(--red);
+  font-weight: 600;
+}
+.task-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap;
+  flex: 0 0 auto;
+  align-self: center;
+}
+.task-badge.st-run {
+  color: var(--amber);
+  background: rgba(208, 139, 63, 0.1);
+}
+.task-badge.st-done {
+  color: var(--green);
+  background: rgba(106, 155, 92, 0.12);
+}
+.task-badge.st-fail {
+  color: var(--red);
+  background: rgba(184, 80, 72, 0.1);
+}
+.task-badge.st-wait {
+  color: var(--ink-3);
+  background: var(--bg-sunken);
+}
+.task-badge.st-cancel {
+  color: var(--ink-3);
+  background: var(--bg-sunken);
+}
+
+.proc-fold {
+  margin: 12px 0 0 0;
+  border-top: 1px solid var(--line-soft);
+  padding-top: 9px;
+}
+.pf-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.pf-tog {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  padding: 2px;
+}
+.pf-tri {
+  width: 11px;
+  height: 11px;
+  flex: 0 0 11px;
+  color: var(--ink-4);
+  transition: transform 0.15s;
+  display: inline-flex;
+}
+.pf-tri svg {
+  width: 11px;
+  height: 11px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2.4;
+}
+.proc-fold.open .pf-tri {
+  transform: rotate(90deg);
+}
+.pf-lab {
+  font-size: 11.5px;
+  color: var(--ink-2);
+}
+.pf-sp {
+  flex: 1;
+}
+.pf-view {
+  border: 0;
+  background: transparent;
+  padding: 2px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.pf-view:hover {
+  text-decoration: underline;
+}
+.pf-list {
+  display: none;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 9px;
+}
+.proc-fold.open .pf-list {
+  display: flex;
+}
+
+/* ComposerAgentSelector: isolated composer-row agent picker */
+.cas {
+  position: relative;
+  display: inline-flex;
+}
+.cas-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 260px;
+  min-height: 28px;
+  padding: 4px 7px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.cas-btn:hover:not(:disabled),
+.cas-btn[aria-expanded="true"]:not(:disabled) {
+  background: var(--bg-sunken);
+  border-color: var(--line);
+}
+.cas-btn:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+.cas-btn .agent-avatar,
+.cas-row .agent-avatar {
+  width: 15px;
+  height: 15px;
+  font-size: 8px;
+}
+.cas-btn__role,
+.cas-btn__members {
+  color: var(--ink-3);
+  font-weight: 700;
+  white-space: nowrap;
+}
+.cas-btn__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cas-btn__members {
+  padding-left: 2px;
+}
+.cas-btn__chev {
+  color: var(--ink-4);
+  flex: 0 0 auto;
+}
+.cas-btn__crown {
+  width: 15px;
+  height: 15px;
+  color: var(--amber);
+  flex: 0 0 auto;
+}
+.cas-btn__crown svg {
+  display: block;
+  width: 15px;
+  height: 15px;
+  fill: currentColor;
+  stroke: currentColor;
+  stroke-width: 1.6;
+}
+.cas-pop {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 7px);
+  width: 322px;
+  max-width: calc(100vw - 16px);
+  max-height: 380px;
+  overflow-y: auto;
+  padding: 5px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  box-shadow: 0 16px 40px rgba(28, 26, 23, 0.22);
+  z-index: 30;
+}
+.cas-title {
+  padding: 8px 9px 5px;
+  color: var(--ink-3);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+.cas-empty {
+  padding: 12px 9px;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.cas-auto {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 9px;
+  border-radius: 8px;
+}
+.cas-auto.is-disabled {
+  cursor: default;
+  opacity: 0.42;
+}
+.cas-auto__icon {
+  width: 21px;
+  height: 21px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-sunken);
+  color: var(--ink-3);
+  flex: 0 0 21px;
+  font-size: 12px;
+  line-height: 1;
+}
+.cas-div {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--line-soft);
+}
+.cas-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.cas-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-height: 36px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  cursor: default;
+}
+.cas-row--solo {
+  display: flex;
+}
+.cas-row:hover:not(.is-row-disabled) {
+  background: var(--bg-sunken);
+}
+.cas-row.is-selected {
+  background: rgba(217, 119, 87, 0.1);
+}
+.cas-row.is-row-disabled {
+  cursor: default;
+}
+.cas-lead-star {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-4);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+.cas-lead-star:hover:not(:disabled),
+.cas-lead-star.is-on {
+  background: rgba(208, 139, 63, 0.1);
+  color: var(--amber);
+}
+.cas-lead-star svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+}
+.cas-lead-star.is-on svg {
+  fill: currentColor;
+  stroke: currentColor;
+}
+.cas-lead-star:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+.cas-lead-star.is-disabled:hover {
+  background: transparent;
+  color: var(--ink-4);
+}
+.cas-ctl {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.cas-main {
+  min-width: 0;
+  flex: 1 1 auto;
+  min-height: 24px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+.cas-main:disabled {
+  cursor: default;
+}
+.cas-main__text {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+}
+.cas-main__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+.cas-main__desc {
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-4);
+  font-size: 9.5px;
+}
+.cas-meta {
+  flex: 0 0 auto;
+  color: var(--ink-4);
+  font-size: 9.5px;
+  font-weight: 700;
+}
+.cas-mtoggle {
+  position: relative;
+  width: 34px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 11px;
+  background: var(--bg-sunken);
+  cursor: pointer;
+  flex: 0 0 34px;
+  transition: background 0.14s ease;
+}
+.cas-mtoggle::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+  transition: left 0.14s ease;
+}
+.cas-mtoggle:hover:not(:disabled),
+.cas-mtoggle.is-on {
+  background: var(--green);
+}
+.cas-mtoggle.is-on::after {
+  left: 16px;
+}
+.cas-mtoggle:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+.cas-foot {
+  margin-top: 4px;
+  padding: 7px 9px 4px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--ink-4);
+  font-size: 9.5px;
+  line-height: 1.5;
+}
+.cas-manage {
+  width: 100%;
+  margin-top: 5px;
+  padding: 7px 8px;
+  border: 0;
+  border-top: 1px solid var(--line-soft);
+  background: transparent;
+  color: var(--accent);
+  text-align: left;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.cas-manage:hover:not(:disabled) {
+  background: var(--bg-sunken);
+}
+.cas-manage:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+/* ===== ChangeBar change bar (two safe states) ===== */
+.changewrap {
+  padding: 0 0 9px;
+}
+.changebar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 8px 7px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel);
+  box-shadow: 0 1px 4px rgba(28, 26, 23, 0.05);
+}
+.cb-loc {
+  font-size: 11px;
+  color: var(--ink-3);
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cb-loc b {
+  color: var(--ink-2);
+  font-weight: 600;
+}
+.cb-loc .scope {
+  color: var(--ink-4);
+}
+.cb-sp {
+  flex: 1;
+}
+.cb-stat {
+  font-family: var(--mono);
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.cb-stat .a {
+  color: var(--green);
+}
+.cb-stat .d {
+  color: var(--red);
+}
+.cb-act {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+.cb-sec {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ink-2);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.cb-sec:hover {
+  background: var(--bg-sunken);
+}
+.cb-sec svg {
+  width: 13px;
+  height: 13px;
+  stroke: var(--ink-3);
+  fill: none;
+  stroke-width: 1.9;
+}
+.cb-pr {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 6px 11px;
+  cursor: pointer;
+}
+.cb-pr:hover {
+  background: #c96748;
+}
+.cb-pr svg {
+  width: 13px;
+  height: 13px;
+  stroke: #fff;
+  fill: none;
+  stroke-width: 2;
+}
+.cb-more {
+  padding: 6px 8px;
+}
+.cb-note {
+  margin: 8px 0 0;
+  font-size: 10.5px;
+  color: var(--ink-4);
+  line-height: 1.5;
+}
+/* ▾ Dropdown menu (inside position:relative .changebar-host; right-aligned beneath the change bar) */
+.cb-more-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  min-width: 132px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel);
+  box-shadow: 0 4px 16px rgba(28, 26, 23, 0.12);
+}
+.cb-more-menu button {
+  text-align: left;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ink-2);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+.cb-more-menu button:hover {
+  background: var(--bg-sunken);
+}
+/* ===== DispatchCard workerrow — aligned to prototype .workerrow (Task 3) ===== */
+.workerrow {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  margin: 6px 0;
+  cursor: pointer;
+}
+.workerrow:hover {
+  background: var(--bg);
+}
+/* Main-row content is isolated: .workerrow only stacks "main row + optional failure-reason row" vertically;
+   it is no longer a horizontal container. This lets the failure reason be added without changing .workerrow flex-wrap,
+   which would affect all running/done rows. */
+.workerrow .wr-main {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.workerrow .agent-avatar {
+  width: 19px;
+  height: 19px;
+  font-size: 8.5px;
+  flex: 0 0 19px;
+}
+.workerrow .wr-nm {
+  font-weight: 600;
+  font-size: 11.5px;
+  color: var(--ink);
+  flex: 0 0 auto;
+}
+.workerrow .wr-sub {
+  font-size: 11px;
+  color: var(--ink-3);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workerrow .wr-view {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.workerrow:hover .wr-view {
+  text-decoration: underline;
+}
+/* Expose the member failure reason: add a plain-language line below the failed/stopped badge so red FAILED is not the only information.
+   padding-left aligns with the name (avoiding the 19px avatar + 9px gap). */
+.workerrow .wr-fail-reason {
+  font-size: 10.5px;
+  color: var(--ink-3);
+  padding-left: 28px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}

@@ -4943,7 +4943,7 @@
     "expect": {
       "status": 413
     },
-    "note": "§9.7 body ≤1KB；T1 钉死超限 → 413"
+    "note": "§9.7 body ≤1KB；超限 → 413（回归样张钉死该行为）"
   },
   {
     "name": "http_claim_credential_hash_invalid_400",
@@ -4962,7 +4962,7 @@
     "expect": {
       "status": 400
     },
-    "note": "§9.7 credential_hash=hex64；T1 钉死非法 → 400"
+    "note": "§9.7 credential_hash=hex64；非法格式 → 400（回归样张钉死该行为）"
   },
   {
     "name": "http_claim_rate_limited_429",
@@ -5023,7 +5023,7 @@
     "expect": {
       "status": 200
     },
-    "note": "§9.7 DELETE 正确 Bearer；T1 钉死成功 → 200"
+    "note": "§9.7 DELETE 正确 Bearer；成功 → 200（回归样张钉死该行为）"
   },
   {
     "name": "http_delete_tombstoned_repeat_410",

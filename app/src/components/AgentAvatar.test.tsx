@@ -62,4 +62,13 @@ describe("AgentAvatar", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("M")).toBeInTheDocument();
   });
+
+  it("gemini → agent-avatar--gemini + svg（非字母 G）", () => {
+    const { container } = render(<AgentAvatar kind="gemini" />);
+    const el = container.querySelector(".agent-avatar--gemini");
+    expect(el).toBeInTheDocument();
+    expect(el?.querySelector("svg")).toBeInTheDocument();
+    const { container: c2 } = render(<AgentAvatar kind="google-gemini-2.5" />);
+    expect(c2.querySelector(".agent-avatar--gemini")).toBeInTheDocument();
+  });
 });

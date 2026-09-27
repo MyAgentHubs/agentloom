@@ -4,29 +4,33 @@ use super::*;
 
 #[test]
 fn send_entries_call_shared_new_session_reservation_boundary() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let send_message_body = production
+    let autofeed_source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/autofeed_resume.rs"
+    ));
+    let message_commands = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/cmd_messages.rs"
+    ));
+    let send_message_body = message_commands
         .split("fn send_message(")
         .nth(1)
-        .unwrap()
-        .split("\nfn parse_goal_title_arg(")
-        .next()
-        .unwrap();
-    let start_lead_body = production
+        .expect("missing send_message anchor");
+    let lead_commands = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_commands.rs"
+    ));
+    let start_lead_body = lead_commands
         .split("fn start_lead_session(")
         .nth(1)
-        .unwrap()
-        .split("\nfn stop_session(")
-        .next()
         .unwrap();
-    let lead_reservation_body = production
-        .split("fn reserve_lead_start_after_globalstop(")
-        .nth(1)
-        .unwrap()
-        .split("\n#[derive(Default)]\nstruct ResumeState {")
-        .next()
-        .unwrap();
+    let lead_reservation_body = autofeed_source
+        .split_once("pub(super) fn reserve_lead_start_after_globalstop(")
+        .expect("missing reserve_lead_start_after_globalstop anchor in lib/autofeed_resume.rs")
+        .1
+        .split_once("\n#[derive(Default)]\npub(super) struct ResumeState {")
+        .expect("missing ResumeState end anchor in lib/autofeed_resume.rs")
+        .0;
 
     assert!(send_message_body.contains("reserve_new_session_run("));
     assert!(start_lead_body.contains("reserve_lead_start_after_globalstop("));
@@ -41,29 +45,26 @@ fn send_entries_call_shared_new_session_reservation_boundary() {
 
 #[test]
 fn lead_step_spawn_closure_releases_db_lock_before_spawning_child() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let body = production
-        .split("let mut spawn = |prompt: &str, hint: Option<&str>| -> Result<String, String> {")
-        .nth(1)
-        .unwrap()
-        .split("\n        let (action, decision_card) = lead_step::run_lead_step(")
-        .next()
-        .unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_step_cmd.rs"
+    ));
+    let body = source_window(
+        production,
+        "let mut spawn = |prompt: &str, hint: Option<&str>| -> Result<String, String> {",
+        "\n    let (action, decision_card) = lead_step::run_lead_step(",
+    );
     assert_spawn_after_lock_released(body, "lead_step 的 spawn 闭包");
 }
 
 #[test]
 fn propose_team_plan_spawn_closure_releases_db_lock_before_spawning_child() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let body = production
-        .split("let spawn = || -> Result<std::process::Child, String> {")
-        .nth(1)
-        .unwrap()
-        .split("\n        if strict_member_pool {")
-        .next()
-        .unwrap();
+    let production = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib/team_plan.rs"));
+    let body = source_window(
+        production,
+        "let spawn = || -> Result<std::process::Child, String> {",
+        "\n        if strict_member_pool {",
+    );
     assert_spawn_after_lock_released(body, "propose_team_plan 的 spawn 闭包");
 }
 
@@ -142,11 +143,17 @@ fn assert_call_after_lock_released(
 
 #[test]
 fn run_verifier_artifact_releases_db_lock_before_running_verifier() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/artifact_landing.rs"
+    ));
     let stripped = strip_comments_and_strings(production);
     let label = "run_verifier_artifact_inner";
-    let body = extract_fn_body(&stripped, "\nfn run_verifier_artifact_inner(", label);
+    let body = extract_fn_body(
+        &stripped,
+        "\npub(super) fn run_verifier_artifact_inner(",
+        label,
+    );
     assert_call_after_lock_released(
         body,
         "db.0.lock()",
@@ -158,11 +165,13 @@ fn run_verifier_artifact_releases_db_lock_before_running_verifier() {
 
 #[test]
 fn delete_session_inner_releases_db_lock_before_trashing_workspace() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/cmd_sessions.rs"
+    ));
     let stripped = strip_comments_and_strings(production);
     let label = "delete_session_inner";
-    let body = extract_fn_body(&stripped, "\nfn delete_session_inner(", label);
+    let body = extract_fn_body(&stripped, "\npub(super) fn delete_session_inner(", label);
     assert_call_after_lock_released(
         body,
         "db.0.lock()",
@@ -176,18 +185,20 @@ fn delete_session_inner_releases_db_lock_before_trashing_workspace() {
 /// `finalize_session_trash` 自己真的会重新拿锁（不是委托了一个其实什么也不做的空函数）。
 #[test]
 fn finalize_session_trash_body_reacquires_db_lock() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/cmd_sessions.rs"
+    ));
     let stripped = strip_comments_and_strings(production);
     let label = "finalize_session_trash";
-    let body = extract_fn_body(&stripped, "\nfn finalize_session_trash(", label);
+    let body = extract_fn_body(&stripped, "\npub(super) fn finalize_session_trash(", label);
     assert!(
         body.contains("db.0.lock()"),
         "{label}: 函数体里应该有 db.0.lock()（delete_session_inner 阶段三重新拿锁的实际落点）"
     );
 }
 
-// ---- P0-2（opus delta 复核·2026-08-11）：两处「guard 在 db 临界区内 drop」重入死锁回归钉子 ----
+// Guard refresh must be attached after database locks are released to prevent reentrant deadlocks.
 //
 // 复用上面 `strip_comments_and_strings` / `extract_fn_body` 这套源码切片基建——运行时单测
 // 测不出「锁持有时长跨越了 guard 的 refresh 触发点」这种时序属性（单线程跑，死锁与不死锁
@@ -329,168 +340,203 @@ fn assert_no_keychain_ipc_in_db_lock_scopes(production: &str, fn_needle: &str, l
 
 #[test]
 fn send_message_resolves_search_creds_with_lock_released() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/cmd_messages.rs"
+    ));
+    production
+        .split("\npub(super) fn send_message(")
+        .nth(1)
+        .expect("missing send_message anchor");
     assert_search_creds_resolved_after_prior_locks(
         production,
-        "\nfn send_message(",
+        "\npub(super) fn send_message(",
         "send_message",
     );
 }
 
 #[test]
 fn lead_summarize_resolves_search_creds_with_lock_released() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/handoff_oneshot.rs"
+    ));
     assert_search_creds_resolved_after_prior_locks(
         production,
-        "\nasync fn lead_summarize(",
+        "\npub(super) async fn lead_summarize(",
         "lead_summarize",
     );
 }
 
 #[test]
 fn start_repo_generation_resolves_search_creds_with_lock_released() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/repo_generation.rs"
+    ));
     assert_search_creds_resolved_after_prior_locks(
         production,
-        "\nfn start_repo_generation(",
-        "start_repo_generation",
+        "\npub(super) fn build_generation_command(",
+        "build_generation_command",
     );
 }
 
 #[test]
 fn generate_handoff_doc_resolves_search_creds_with_lock_released() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/cmd_continuation.rs"
+    ));
     assert_search_creds_resolved_after_prior_locks(
         production,
-        "\nasync fn generate_handoff_doc(",
+        "\npub(super) async fn generate_handoff_doc(",
         "generate_handoff_doc",
     );
 }
 
 #[test]
 fn propose_team_plan_resolves_search_creds_with_lock_released() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib/team_plan.rs"));
     assert_search_creds_resolved_after_prior_locks(
         production,
-        "\nasync fn propose_team_plan(",
+        "\npub(super) async fn propose_team_plan(",
         "propose_team_plan",
     );
 }
 
 #[test]
 fn lead_step_resolves_search_creds_with_lock_released() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_step_cmd.rs"
+    ));
     assert_search_creds_resolved_after_prior_locks(
         production,
-        "\nasync fn lead_step(",
+        "\npub(crate) fn lead_step_blocking(",
         "lead_step",
     );
 }
 
 #[test]
 fn start_repo_generation_resolves_member_key_with_lock_released() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/repo_generation.rs"
+    ));
     assert_member_key_resolved_after_prior_locks(
         production,
-        "\nfn start_repo_generation(",
-        "start_repo_generation",
+        "\npub(super) fn build_generation_command(",
+        "build_generation_command",
     );
 }
 
 #[test]
 fn propose_team_plan_resolves_member_key_with_lock_released() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib/team_plan.rs"));
     assert_member_key_resolved_after_prior_locks(
         production,
-        "\nasync fn propose_team_plan(",
+        "\npub(super) async fn propose_team_plan(",
         "propose_team_plan",
     );
 }
 
 #[test]
 fn lead_step_resolves_member_key_with_lock_released() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    assert_member_key_resolved_after_prior_locks(production, "\nasync fn lead_step(", "lead_step");
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_step_cmd.rs"
+    ));
+    assert_member_key_resolved_after_prior_locks(
+        production,
+        "\npub(crate) fn lead_step_blocking(",
+        "lead_step",
+    );
 }
 
 #[test]
 fn generate_handoff_doc_resolves_member_key_with_lock_released() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/cmd_continuation.rs"
+    ));
     assert_member_key_resolved_after_prior_locks(
         production,
-        "\nasync fn generate_handoff_doc(",
+        "\npub(super) async fn generate_handoff_doc(",
         "generate_handoff_doc",
     );
 }
 
 #[test]
 fn start_continuation_session_resolves_member_key_with_lock_released() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/cmd_continuation.rs"
+    ));
     assert_member_key_resolved_after_prior_locks(
         production,
-        "\nfn start_continuation_session(",
+        "\npub(super) fn start_continuation_session(",
         "start_continuation_session",
     );
 }
 
 #[test]
 fn start_repo_generation_keeps_keychain_ipc_out_of_db_lock_scopes() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/repo_generation.rs"
+    ));
     assert_no_keychain_ipc_in_db_lock_scopes(
         production,
-        "\nfn start_repo_generation(",
-        "start_repo_generation",
+        "\npub(super) fn build_generation_command(",
+        "build_generation_command",
     );
 }
 
 #[test]
 fn propose_team_plan_keeps_keychain_ipc_out_of_db_lock_scopes() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib/team_plan.rs"));
     assert_no_keychain_ipc_in_db_lock_scopes(
         production,
-        "\nasync fn propose_team_plan(",
+        "\npub(super) async fn propose_team_plan(",
         "propose_team_plan",
     );
 }
 
 #[test]
 fn lead_step_keeps_keychain_ipc_out_of_db_lock_scopes() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    assert_no_keychain_ipc_in_db_lock_scopes(production, "\nasync fn lead_step(", "lead_step");
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_step_cmd.rs"
+    ));
+    assert_no_keychain_ipc_in_db_lock_scopes(
+        production,
+        "\npub(crate) fn lead_step_blocking(",
+        "lead_step",
+    );
 }
 
 #[test]
 fn generate_handoff_doc_keeps_keychain_ipc_out_of_db_lock_scopes() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/cmd_continuation.rs"
+    ));
     assert_no_keychain_ipc_in_db_lock_scopes(
         production,
-        "\nasync fn generate_handoff_doc(",
+        "\npub(super) async fn generate_handoff_doc(",
         "generate_handoff_doc",
     );
 }
 
 #[test]
 fn start_continuation_session_keeps_keychain_ipc_out_of_db_lock_scopes() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/cmd_continuation.rs"
+    ));
     assert_no_keychain_ipc_in_db_lock_scopes(
         production,
-        "\nfn start_continuation_session(",
+        "\npub(super) fn start_continuation_session(",
         "start_continuation_session",
     );
 }
@@ -500,11 +546,14 @@ fn start_continuation_session_keeps_keychain_ipc_out_of_db_lock_scopes() {
 /// 这条 provider 的锁 block 里塞钥匙串调用而没有测试拦住。
 #[test]
 fn remote_gateway_session_repo_provider_keeps_keychain_ipc_out_of_db_lock_scopes() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/remote_bridge_registry.rs"
+    ));
+    let production = source;
     assert_no_keychain_ipc_in_db_lock_scopes(
         production,
-        "\nfn remote_gateway_session_repo_provider(",
+        "\npub(super) fn remote_gateway_session_repo_provider(",
         "remote_gateway_session_repo_provider",
     );
 }
@@ -516,13 +565,15 @@ fn remote_gateway_session_repo_provider_keeps_keychain_ipc_out_of_db_lock_scopes
 /// conn 仍锁着的同一线程上重入 `db.0.lock()`——这正是 P0-1 那类死锁的原始形状。
 #[test]
 fn reserve_lead_start_after_globalstop_never_attaches_refresh_itself() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let stripped = strip_comments_and_strings(production);
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/autofeed_resume.rs"
+    ));
+    let stripped = strip_comments_and_strings(source);
     let label = "reserve_lead_start_after_globalstop";
     let body = extract_fn_body(
         &stripped,
-        "\nfn reserve_lead_start_after_globalstop(",
+        "\npub(super) fn reserve_lead_start_after_globalstop(",
         label,
     );
     assert!(
@@ -540,26 +591,28 @@ fn reserve_lead_start_after_globalstop_never_attaches_refresh_itself() {
 /// 才能完整覆盖「早退」分支（函数内部的 drop(guard) 此刻压根没有 refresh 句柄，天然安全）。
 #[test]
 fn start_lead_session_attaches_refresh_only_after_reservation_lock_released() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_session/gate.rs"
+    ));
     let stripped = strip_comments_and_strings(production);
-    let label = "start_lead_session";
-    let body = extract_fn_body(&stripped, "\nfn start_lead_session(", label);
-    assert_call_after_lock_released(body, "db.0.lock()", ".with_refresh(", "db.0.lock()", label);
+    let label = "reserve_lead_slot";
+    let body = extract_fn_body(&stripped, "\npub(crate) fn reserve_lead_slot(", label);
+    assert_lock_scope_closed_before_marker(body, "db.0.lock()", ".with_refresh(", label);
 }
 
-/// idlefix-T1 缺口①：`reserve_lead_start_after_globalstop`（经 `reserve_new_session_run`，
-/// lib.rs:2390）把 session_runtime 写成 running(run_id=None)（占槽当时 run_id 还没现场生
-/// 成）；solo 路径在 lib.rs:11058 有回填，lead 起跑路径此前没有——这条测试钉住
-/// `start_lead_session` 函数体必须仿 solo 写法回填 run_id，否则手机端 appRuntimeCore.ts 的
-/// `runId===null` 守卫会把这个会话之后所有 live delta 全部丢弃。
+/// Reservation publishes running state before a run ID exists. Lead startup
+/// must backfill session_runtime.run_id once available so the mobile runtime
+/// does not discard subsequent live deltas because the run ID is still null.
 #[test]
 fn start_lead_session_backfills_session_runtime_run_id() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
-    let stripped = strip_comments_and_strings(production);
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/lead_commands.rs"
+    ));
+    let stripped = strip_comments_and_strings(source);
     let label = "start_lead_session";
-    let body = extract_fn_body(&stripped, "\nfn start_lead_session(", label);
+    let body = extract_fn_body(&stripped, "\npub(super) fn start_lead_session(", label);
     assert!(
         body.contains("db::set_session_runtime(") && body.contains("Some(&run_id)"),
         "{label}: 必须仿 solo 路径（lib.rs:11058）用 `db::set_session_runtime(..., \
@@ -575,8 +628,10 @@ fn start_lead_session_backfills_session_runtime_run_id() {
 /// 三步任一 `?` 早退都会在 conn 仍持锁的同一线程上重入 `db.0.lock()` 死锁。
 #[test]
 fn start_continuation_solo_closure_attaches_refresh_only_after_conn_scopes_close() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+    let production = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib/cmd_continuation.rs"
+    ));
     let stripped = strip_comments_and_strings(production);
     let label = "start_continuation_session solo 闭包";
     let body = extract_fn_body(
@@ -590,7 +645,7 @@ fn start_continuation_solo_closure_attaches_refresh_only_after_conn_scopes_close
     assert_lock_scope_closed_before_marker(body, ".0.lock()", ".with_refresh(", label);
 }
 
-// ---- 2026-07-29 opus 对抗审：把审计实测出的三组假阴性固化成 helper 自身的单测 ----
+// Test the source-check helpers against false negatives so hidden lock-scope violations are rejected.
 
 /// 假阴性①复现：锁块内的注释含孤立 `}`，且这次 guard **真的**活过了慢活调用（`drop(conn)` 在
 /// `slow_call(` 之后）——不剥注释的旧实现会把注释里的 `}` 当成 block 收尾，提前判定"已释放"，

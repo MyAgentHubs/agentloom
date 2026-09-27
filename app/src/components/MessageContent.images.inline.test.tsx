@@ -39,7 +39,8 @@ vi.mock("@tauri-apps/api/image", () => ({
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { clearAttachmentCache } from "../lib/attachmentCache";
-import { computeImageMenuPosition, MessageContent } from "./MessageContent";
+import { computeImageMenuPosition } from "./ImageContextMenu";
+import { MessageContent } from "./MessageContent";
 
 beforeEach(() => {
   vi.mocked(invoke).mockReset();
