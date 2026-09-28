@@ -320,6 +320,171 @@ describe("updaterStore", () => {
     });
   });
 
+  describe("checking 状态 60s 后重新拉取快照", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    function getStateCalls(): number {
+      return invokeMock.mock.calls.filter(
+        ([cmd]) => cmd === "updater_get_state",
+      ).length;
+    }
+
+    it("事件推来 `checking` 后 60s 拉取并纠正状态，随后停止拉取", async () => {
+      await start();
+      expect(getStateCalls()).toBe(1);
+      emit(snap(2, "checking"));
+      invokeMock.mockResolvedValueOnce(
+        snap(3, "up_to_date", { checked_at: 1 }),
+      );
+
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(getStateCalls()).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(getStateCalls()).toBe(2);
+      expect(getUpdaterSnapshot()).toEqual(
+        snap(3, "up_to_date", { checked_at: 1 }),
+      );
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(getStateCalls()).toBe(2);
+    });
+
+    it("同一 60s 窗口内连续两个 `checking` 事件只拉取一次", async () => {
+      await start();
+      invokeMock.mockClear();
+      emit(snap(2, "checking"));
+      await vi.advanceTimersByTimeAsync(1_000);
+      emit(snap(3, "checking"));
+      invokeMock.mockResolvedValueOnce(
+        snap(4, "up_to_date", { checked_at: 1 }),
+      );
+
+      await vi.advanceTimersByTimeAsync(59_000);
+      expect(getStateCalls()).toBe(1);
+      expect(getUpdaterSnapshot()).toEqual(
+        snap(4, "up_to_date", { checked_at: 1 }),
+      );
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(getStateCalls()).toBe(1);
+    });
+
+    it("`start()` 首次拉取返回 `checking` 后 60s 再拉一次", async () => {
+      invokeMock.mockResolvedValueOnce(snap(1, "checking"));
+      invokeMock.mockResolvedValueOnce(
+        snap(2, "up_to_date", { checked_at: 1 }),
+      );
+      await start();
+      expect(getStateCalls()).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(getStateCalls()).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(getStateCalls()).toBe(2);
+      expect(getUpdaterSnapshot()).toEqual(
+        snap(2, "up_to_date", { checked_at: 1 }),
+      );
+    });
+
+    it("重拉挂起时事件离开 `checking`，旧响应返回后不再重挂", async () => {
+      await start();
+      invokeMock.mockClear();
+      emit(snap(2, "checking"));
+      let pendingResolve!: (value: UpdaterSnapshot) => void;
+      invokeMock.mockImplementationOnce(
+        () =>
+          new Promise<UpdaterSnapshot>((resolve) => {
+            pendingResolve = resolve;
+          }),
+      );
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(getStateCalls()).toBe(1);
+      emit(snap(3, "up_to_date", { checked_at: 1 }));
+      pendingResolve(snap(2, "checking"));
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(getUpdaterSnapshot()).toEqual(
+        snap(3, "up_to_date", { checked_at: 1 }),
+      );
+      expect(getStateCalls()).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(getStateCalls()).toBe(1);
+    });
+
+    it("拉回的快照仍是 `checking` 时每隔 60s 再拉一次", async () => {
+      await start();
+      emit(snap(2, "checking"));
+      invokeMock.mockResolvedValueOnce(snap(3, "checking"));
+      invokeMock.mockResolvedValueOnce(snap(4, "checking"));
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(getStateCalls()).toBe(2);
+      expect(getUpdaterSnapshot().revision).toBe(3);
+      await vi.advanceTimersByTimeAsync(59_000);
+      expect(getStateCalls()).toBe(2);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(getStateCalls()).toBe(3);
+      expect(getUpdaterSnapshot().revision).toBe(4);
+    });
+
+    it("拉回同 revision 的 `checking` 快照后仍每隔 60s 再拉一次", async () => {
+      await start();
+      emit(snap(2, "checking"));
+      const before = getUpdaterSnapshot();
+      invokeMock.mockResolvedValueOnce(snap(2, "checking"));
+      invokeMock.mockResolvedValueOnce(
+        snap(3, "up_to_date", { checked_at: 1 }),
+      );
+
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(getStateCalls()).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(getStateCalls()).toBe(2);
+      expect(getUpdaterSnapshot()).toBe(before);
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(getStateCalls()).toBe(2);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(getStateCalls()).toBe(3);
+      expect(getUpdaterSnapshot().state.kind).toBe("up_to_date");
+    });
+
+    it("60s 前事件推来非 `checking` 状态时取消拉取", async () => {
+      await start();
+      emit(snap(2, "checking"));
+      await vi.advanceTimersByTimeAsync(30_000);
+      emit(snap(3, "up_to_date", { checked_at: 1 }));
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(getStateCalls()).toBe(1);
+      expect(getUpdaterSnapshot().state.kind).toBe("up_to_date");
+    });
+
+    it("纠正调用 `updater_get_state` reject 后保持状态并在 60s 后重试", async () => {
+      await start();
+      emit(snap(2, "checking"));
+      invokeMock.mockRejectedValueOnce(new Error("temporary failure"));
+      invokeMock.mockResolvedValueOnce(
+        snap(3, "up_to_date", { checked_at: 1 }),
+      );
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(getStateCalls()).toBe(2);
+      expect(getUpdaterSnapshot()).toEqual(snap(2, "checking"));
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(getStateCalls()).toBe(2);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(getStateCalls()).toBe(3);
+      expect(getUpdaterSnapshot().state.kind).toBe("up_to_date");
+    });
+  });
+
   it("dismissUpdaterForRun：置位后 isUpdaterDismissedForRun 为 true 且通知订阅者", () => {
     expect(isUpdaterDismissedForRun()).toBe(false);
     const listener = vi.fn();

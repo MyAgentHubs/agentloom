@@ -6,6 +6,8 @@ use crate::updater_install::{Stage, TxnMarker};
 use std::cell::Cell;
 use std::fs;
 
+const TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn strip_comments_and_strings(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -84,18 +86,6 @@ fn marker(bundle: &Path, staged: PathBuf, version: &str) -> TxnMarker {
     }
 }
 
-fn handle_in_state(state: UpdaterState) -> UpdaterHandle {
-    UpdaterHandle {
-        runtime: Mutex::new(Runtime {
-            machine: Machine::in_state(state),
-            pending: None,
-            healthy_confirmed: false,
-            pending_cleanup: None,
-        }),
-        recovery_done: AtomicBool::new(true),
-    }
-}
-
 #[test]
 fn swapped_marker_with_old_running_version_preempts_checks() {
     let tmp = tempfile::tempdir().unwrap();
@@ -130,13 +120,16 @@ fn swapped_marker_with_old_running_version_preempts_checks() {
                 &handle,
                 manual,
                 installed_target_awaiting_reopen_in(tmp.path(), "0.2.9"),
-                || async {
+                || {
                     network_calls.set(network_calls.get() + 1);
-                    CheckRun {
-                        outcome: CheckOutcome::UpToDate,
-                        update: None,
+                    async {
+                        CheckRun {
+                            outcome: CheckOutcome::UpToDate,
+                            update: None,
+                        }
                     }
                 },
+                TEST_DEADLINE,
                 |_| emit_calls.set(emit_calls.get() + 1),
                 |_, _, _| panic!("awaiting-reopen 命中后不应落定网络结果"),
             ));
@@ -173,13 +166,16 @@ fn swapped_marker_in_healthy_window_allows_manual_check() {
         &handle,
         true,
         installed_target_awaiting_reopen_in(tmp.path(), "0.3.0"),
-        || async {
+        || {
             check_calls.set(check_calls.get() + 1);
-            CheckRun {
-                outcome: CheckOutcome::UpToDate,
-                update: None,
+            async {
+                CheckRun {
+                    outcome: CheckOutcome::UpToDate,
+                    update: None,
+                }
             }
         },
+        TEST_DEADLINE,
         |_| {},
         |machine, manual, outcome| machine.on_check_result(manual, outcome),
     ));

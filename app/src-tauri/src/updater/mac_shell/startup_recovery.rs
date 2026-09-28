@@ -1,5 +1,6 @@
 use super::super::{UpdaterSnapshot, UpdaterState};
 use super::*;
+use crate::updater::diag_log::updater_diag;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -127,7 +128,7 @@ pub(super) fn apply_recovery(
                     Some(parent) => {
                         match (fs_ops.cleanup_staged)(parent, &m.staged_path) {
                             Ok(()) => (fs_ops.clear_marker)(),
-                            Err(e) => eprintln!(
+                            Err(e) => updater_diag!(
                                 "updater: 清理已跳过的暂存版本失败（marker 保留，下次启动重试）：{e}"
                             ),
                         }
@@ -167,7 +168,7 @@ pub(super) fn apply_recovery(
         // The staging directory exists but its version cannot be read. Retain the marker, log a
         // warning, and leave the uncertain case for manual review.
         crate::updater_install::RecoveryPlan::Unknown { reason } => {
-            eprintln!("updater: 启动恢复判定 Unknown（{reason}），保留 marker，人工核实");
+            updater_diag!("updater: 启动恢复判定 Unknown（{reason}），保留 marker，人工核实");
             RecoveryOutcome::Idle
         }
 
@@ -209,7 +210,7 @@ pub(super) fn run_pending_cleanup(pending: &PendingCleanupEntry, fs_ops: &mut Pe
     match (fs_ops.cleanup_staged)(&pending.parent, &pending.staged) {
         Ok(()) => (fs_ops.clear_marker)(),
         Err(e) => {
-            eprintln!("updater: 延后清理暂存失败（忽略·marker 保留，下次启动再算一次）：{e}");
+            updater_diag!("updater: 延后清理暂存失败（忽略·marker 保留，下次启动再算一次）：{e}");
         }
     }
 }
@@ -225,7 +226,7 @@ fn wait_for_updater_handle(app: &AppHandle) -> Option<tauri::State<'_, UpdaterHa
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    eprintln!("updater: 启动恢复等不到 UpdaterHandle（忽略）");
+    updater_diag!("updater: 启动恢复等不到 UpdaterHandle（忽略）");
     None
 }
 
@@ -244,14 +245,14 @@ fn recover_on_startup_blocking(app: &AppHandle) {
     let dir = match marker_dir(app) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("updater: 启动恢复读不到 marker 目录（忽略）：{e}");
+            updater_diag!("updater: 启动恢复读不到 marker 目录（忽略）：{e}");
             return;
         }
     };
     let running_exe_bundle = match resolve_bundle_path() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("updater: 启动恢复解析当前 bundle 路径失败（忽略）：{e}");
+            updater_diag!("updater: 启动恢复解析当前 bundle 路径失败（忽略）：{e}");
             return;
         }
     };
@@ -322,7 +323,7 @@ fn recover_on_startup_blocking(app: &AppHandle) {
     let (snap_to_emit, recovery_state_abandoned, cleanup_added) = {
         let mut rt = handle.runtime.lock().expect("updater runtime poisoned");
         if matches!(rt.machine.snapshot().state, UpdaterState::Disabled { .. }) {
-            eprintln!(
+            updater_diag!(
                 "updater: 启动恢复算出需要覆盖状态机/待清理，但当前构建 Disabled，跳过（Disabled 状态机不应产生任何迁移）"
             );
             return;
@@ -344,7 +345,7 @@ fn recover_on_startup_blocking(app: &AppHandle) {
         (snap, abandoned, cleanup_added)
     };
     if recovery_state_abandoned {
-        eprintln!(
+        updater_diag!(
             "updater: 启动恢复结果已过期（revision 从 {recovery_revision} 发生变化），放弃覆盖当前状态"
         );
     }

@@ -1,5 +1,6 @@
 use super::super::{CheckOutcome, DisabledReason, Machine, UpdaterSnapshot};
 use super::*;
+use crate::updater::diag_log::updater_diag;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -21,6 +22,9 @@ pub(in crate::updater) struct Runtime {
     /// Pending cleanup intent produced by healthy cleanup; both conditions converge
     /// with `healthy_confirmed` under the same runtime lock.
     pub(super) pending_cleanup: Option<PendingCleanupEntry>,
+    /// A check task abandoned after a timeout. Aborting cannot interrupt a synchronously
+    /// blocked task, so retain its handle to prevent retries from occupying more workers.
+    pub(in crate::updater) pending_check_task: Option<tauri::async_runtime::JoinHandle<CheckRun>>,
 }
 
 /// Managed state registered through `app.manage(...)`. **This type itself is `pub`** because
@@ -99,7 +103,7 @@ pub(in crate::updater) fn resolve_bundle_path() -> Result<PathBuf, String> {
 
 pub(in crate::updater) fn emit_state(app: &AppHandle, snapshot: &UpdaterSnapshot) {
     if let Err(e) = app.emit("updater://state", snapshot) {
-        eprintln!("updater: emit updater://state 失败（忽略）：{e}");
+        updater_diag!("updater: emit updater://state 失败（忽略）：{e}");
     }
 }
 
@@ -178,6 +182,7 @@ pub fn start(app: &AppHandle) {
             pending: None,
             healthy_confirmed: false,
             pending_cleanup: None,
+            pending_check_task: None,
         }),
         recovery_done: AtomicBool::new(false),
     });
@@ -219,7 +224,7 @@ async fn recovery_gate_allows_check(app: &AppHandle, manual: bool) -> bool {
         ) {
             super::super::CheckRecoveryGate::Proceed => {
                 if !done {
-                    eprintln!(
+                    updater_diag!(
                         "updater: 等启动期恢复完成超过 {}s，放行检查（恢复结果会用 revision CAS，不能覆盖这次检查）",
                         RECOVERY_WAIT_TIMEOUT.as_secs()
                     );
@@ -256,7 +261,7 @@ pub(super) fn maybe_run_pending_cleanup(app: &AppHandle, handle: &UpdaterHandle)
     let dir = match marker_dir(app) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!(
+            updater_diag!(
                 "updater: 延后清理拿不到 marker 目录（忽略·marker 保留，下次启动再算一次）：{e}"
             );
             return;
@@ -297,7 +302,7 @@ pub fn mark_healthy(app: &AppHandle, handle: &UpdaterHandle) {
     maybe_run_pending_cleanup(app, handle);
 }
 
-pub(super) struct CheckRun {
+pub(in crate::updater) struct CheckRun {
     pub(super) outcome: CheckOutcome,
     pub(super) update: Option<Update>,
 }
@@ -351,15 +356,20 @@ pub(super) async fn perform_check_after_recovery_gate<Run, RunFuture, Emit, Fini
     manual: bool,
     awaiting_reopen: bool,
     run_check: Run,
+    deadline: Duration,
     mut emit: Emit,
     finish: Finish,
 ) -> UpdaterSnapshot
 where
     Run: FnOnce() -> RunFuture,
-    RunFuture: std::future::Future<Output = CheckRun>,
+    RunFuture: std::future::Future<Output = CheckRun> + Send + 'static,
     Emit: FnMut(&UpdaterSnapshot),
     Finish: FnOnce(&mut Machine, bool, CheckOutcome) -> UpdaterSnapshot,
 {
+    updater_diag!(
+        "updater: check started ({})",
+        if manual { "manual" } else { "automatic" }
+    );
     if awaiting_reopen {
         let snapshot = {
             let mut rt = handle.runtime.lock().expect("updater runtime poisoned");
@@ -383,7 +393,68 @@ where
     };
     emit(&checking_snapshot);
 
-    let run = run_check().await;
+    let previous_check_still_running = {
+        let mut rt = handle.runtime.lock().expect("updater runtime poisoned");
+        let still_running = matches!(&rt.pending_check_task, Some(h) if !h.inner().is_finished());
+        if !still_running {
+            rt.pending_check_task = None;
+        }
+        still_running
+    };
+    let run = if previous_check_still_running {
+        updater_diag!("updater: check rejected because a previous check is still stuck");
+        CheckRun {
+            outcome: CheckOutcome::Error(crate::ui_msg::al_err(
+                "updater.check_failed",
+                &[(
+                    "detail",
+                    "a previous check is still stuck and has not finished".to_string(),
+                )],
+            )),
+            update: None,
+        }
+    } else {
+        let mut join_handle = tauri::async_runtime::spawn(run_check());
+        match tokio::time::timeout(deadline, &mut join_handle).await {
+            Ok(Ok(run)) => run,
+            Ok(Err(join_error)) => CheckRun {
+                outcome: CheckOutcome::Error(crate::ui_msg::al_err(
+                    "updater.check_failed",
+                    &[(
+                        "detail",
+                        format!("update check task failed to join: {join_error}"),
+                    )],
+                )),
+                update: None,
+            },
+            Err(_) => {
+                updater_diag!("updater: check hard deadline fired after {deadline:?}");
+                // Abort cannot immediately stop a synchronously blocked task; its late result is ignored.
+                join_handle.abort();
+                handle
+                    .runtime
+                    .lock()
+                    .expect("updater runtime poisoned")
+                    .pending_check_task = Some(join_handle);
+                CheckRun {
+                    outcome: CheckOutcome::Error(crate::ui_msg::al_err(
+                        "updater.check_failed",
+                        &[(
+                            "detail",
+                            format!("update check did not finish within {deadline:?}"),
+                        )],
+                    )),
+                    update: None,
+                }
+            }
+        }
+    };
+    let outcome_detail = match &run.outcome {
+        CheckOutcome::UpToDate => "UpToDate".to_string(),
+        CheckOutcome::Available { .. } => "Available".to_string(),
+        CheckOutcome::TargetsNotFound => "TargetsNotFound".to_string(),
+        CheckOutcome::Error(detail) => format!("Error: {detail}"),
+    };
     let snapshot = {
         let mut rt = handle.runtime.lock().expect("updater runtime poisoned");
         let snap = finish(&mut rt.machine, manual, run.outcome);
@@ -394,6 +465,7 @@ where
         }
         snap
     };
+    updater_diag!("updater: check outcome {outcome_detail}");
     emit(&snapshot);
     snapshot
 }
@@ -413,11 +485,13 @@ async fn perform_check(app: &AppHandle, manual: bool) -> UpdaterSnapshot {
     // When the marker and canonical bundle's actual version prove the swap completed, the only
     // sensible check retry is to open it again; evaluate this before ordinary Available/Ready gates.
     let awaiting_reopen = installed_target_awaiting_reopen(app);
+    let app_owned = app.clone();
     perform_check_after_recovery_gate(
         &handle,
         manual,
         awaiting_reopen,
-        || run_plugin_check(app),
+        move || async move { run_plugin_check(&app_owned).await },
+        CHECK_HARD_DEADLINE,
         |snapshot| emit_state(app, snapshot),
         |machine, manual, outcome| {
             let mut cleanup_fn = |staged_path: &str| cleanup_staged_path(staged_path);
@@ -448,6 +522,260 @@ pub async fn check(app: &AppHandle, manual: bool) -> UpdaterSnapshot {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::cell::RefCell;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    #[test]
+    fn manual_check_deadline_exits_checking_and_allows_retry() {
+        let handle = handle_in_state(UpdaterState::Idle);
+        let emitted = RefCell::new(Vec::new());
+        let started = std::time::Instant::now();
+        let snapshot = tauri::async_runtime::block_on(perform_check_after_recovery_gate(
+            &handle,
+            true,
+            false,
+            || async {
+                std::thread::sleep(Duration::from_secs(2));
+                CheckRun {
+                    outcome: CheckOutcome::Available {
+                        version: "9.9.9".into(),
+                        notes: None,
+                        pub_date: None,
+                    },
+                    update: None,
+                }
+            },
+            Duration::from_millis(100),
+            |snapshot| emitted.borrow_mut().push(snapshot.state.clone()),
+            |machine, manual, outcome| machine.on_check_result(manual, outcome),
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        assert!(matches!(
+            &snapshot.state,
+            UpdaterState::Error { msg, .. }
+                if msg.starts_with("AL_ERR:updater.check_failed:")
+                    && msg.contains("update check did not finish within 100ms")
+        ));
+        assert!(matches!(
+            emitted.borrow().as_slice(),
+            [UpdaterState::Checking, UpdaterState::Error { .. }]
+        ));
+        let runtime = handle.runtime.lock().unwrap();
+        assert!(runtime.pending.is_none());
+        assert!(runtime.machine.can_check(true));
+    }
+
+    #[test]
+    fn retry_does_not_spawn_while_previous_check_is_stuck() {
+        let handle = handle_in_state(UpdaterState::Idle);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_calls = Arc::clone(&calls);
+        let first = tauri::async_runtime::block_on(perform_check_after_recovery_gate(
+            &handle,
+            true,
+            false,
+            move || async move {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_secs(2));
+                CheckRun {
+                    outcome: CheckOutcome::Available {
+                        version: "9.9.9".into(),
+                        notes: None,
+                        pub_date: None,
+                    },
+                    update: None,
+                }
+            },
+            Duration::from_millis(100),
+            |_| {},
+            |machine, manual, outcome| machine.on_check_result(manual, outcome),
+        ));
+        assert!(matches!(first.state, UpdaterState::Error { .. }));
+
+        let retry_calls = Arc::clone(&calls);
+        let started = Instant::now();
+        let retry = tauri::async_runtime::block_on(perform_check_after_recovery_gate(
+            &handle,
+            true,
+            false,
+            move || async move {
+                retry_calls.fetch_add(1, Ordering::SeqCst);
+                CheckRun {
+                    outcome: CheckOutcome::UpToDate,
+                    update: None,
+                }
+            },
+            Duration::from_millis(100),
+            |_| {},
+            |machine, manual, outcome| machine.on_check_result(manual, outcome),
+        ));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(matches!(
+            &retry.state,
+            UpdaterState::Error { msg, .. }
+                if msg.starts_with("AL_ERR:updater.check_failed:")
+                    && msg.contains("previous check is still stuck")
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        tauri::async_runtime::block_on(async {
+            tokio::time::sleep(Duration::from_millis(2200)).await;
+        });
+        let final_calls = Arc::clone(&calls);
+        let final_snapshot = tauri::async_runtime::block_on(perform_check_after_recovery_gate(
+            &handle,
+            true,
+            false,
+            move || async move {
+                final_calls.fetch_add(1, Ordering::SeqCst);
+                CheckRun {
+                    outcome: CheckOutcome::UpToDate,
+                    update: None,
+                }
+            },
+            Duration::from_millis(100),
+            |_| {},
+            |machine, manual, outcome| machine.on_check_result(manual, outcome),
+        ));
+        assert!(matches!(
+            final_snapshot.state,
+            UpdaterState::UpToDate { .. }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn late_async_check_result_is_discarded() {
+        let handle = handle_in_state(UpdaterState::Idle);
+        let emitted = RefCell::new(Vec::new());
+        let late_body_ran = Arc::new(AtomicBool::new(false));
+        let late_body_flag = Arc::clone(&late_body_ran);
+        tauri::async_runtime::block_on(async {
+            let snapshot = perform_check_after_recovery_gate(
+                &handle,
+                true,
+                false,
+                move || async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    late_body_flag.store(true, Ordering::SeqCst);
+                    CheckRun {
+                        outcome: CheckOutcome::Available {
+                            version: "9.9.9".into(),
+                            notes: None,
+                            pub_date: None,
+                        },
+                        update: None,
+                    }
+                },
+                Duration::from_millis(50),
+                |snapshot| emitted.borrow_mut().push(snapshot.state.clone()),
+                |machine, manual, outcome| machine.on_check_result(manual, outcome),
+            )
+            .await;
+            assert!(matches!(snapshot.state, UpdaterState::Error { .. }));
+            tokio::time::sleep(Duration::from_millis(450)).await;
+        });
+        assert!(!late_body_ran.load(Ordering::SeqCst));
+        let runtime = handle.runtime.lock().unwrap();
+        assert!(matches!(
+            runtime.machine.snapshot().state,
+            UpdaterState::Error { .. }
+        ));
+        assert!(runtime.pending.is_none());
+        assert_eq!(emitted.borrow().len(), 2);
+    }
+
+    #[test]
+    fn spawned_check_caller_times_out_while_check_body_blocks() {
+        let handle = Arc::new(handle_in_state(UpdaterState::Idle));
+        let started = Instant::now();
+        let join_handle = tauri::async_runtime::spawn(async move {
+            perform_check_after_recovery_gate(
+                &handle,
+                true,
+                false,
+                || async {
+                    std::thread::sleep(Duration::from_secs(2));
+                    CheckRun {
+                        outcome: CheckOutcome::Available {
+                            version: "9.9.9".into(),
+                            notes: None,
+                            pub_date: None,
+                        },
+                        update: None,
+                    }
+                },
+                Duration::from_millis(100),
+                |_| {},
+                |machine, manual, outcome| machine.on_check_result(manual, outcome),
+            )
+            .await
+        });
+        let snapshot = tauri::async_runtime::block_on(join_handle).expect("check caller failed");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            &snapshot.state,
+            UpdaterState::Error { msg, .. } if msg.starts_with("AL_ERR:updater.check_failed:")
+        ));
+    }
+
+    #[test]
+    fn automatic_check_deadline_returns_to_idle() {
+        let handle = handle_in_state(UpdaterState::Idle);
+        let emitted = RefCell::new(Vec::new());
+        let started = std::time::Instant::now();
+        let snapshot = tauri::async_runtime::block_on(perform_check_after_recovery_gate(
+            &handle,
+            false,
+            false,
+            || async {
+                std::thread::sleep(Duration::from_secs(2));
+                CheckRun {
+                    outcome: CheckOutcome::Available {
+                        version: "9.9.9".into(),
+                        notes: None,
+                        pub_date: None,
+                    },
+                    update: None,
+                }
+            },
+            Duration::from_millis(100),
+            |snapshot| emitted.borrow_mut().push(snapshot.state.clone()),
+            |machine, manual, outcome| machine.on_check_result(manual, outcome),
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        assert!(matches!(snapshot.state, UpdaterState::Idle));
+        assert!(matches!(
+            emitted.borrow().as_slice(),
+            [UpdaterState::Checking, UpdaterState::Idle]
+        ));
+        let runtime = handle.runtime.lock().unwrap();
+        assert!(runtime.pending.is_none());
+        assert!(runtime.machine.can_check(true));
+    }
+
+    #[test]
+    fn panicked_check_task_exits_checking() {
+        let handle = handle_in_state(UpdaterState::Idle);
+        let emitted = RefCell::new(Vec::new());
+        let snapshot = tauri::async_runtime::block_on(perform_check_after_recovery_gate(
+            &handle,
+            true,
+            false,
+            || async { panic!("boom") },
+            Duration::from_secs(1),
+            |snapshot| emitted.borrow_mut().push(snapshot.state.clone()),
+            |machine, manual, outcome| machine.on_check_result(manual, outcome),
+        ));
+        assert!(matches!(snapshot.state, UpdaterState::Error { .. }));
+        assert!(matches!(
+            emitted.borrow().as_slice(),
+            [UpdaterState::Checking, UpdaterState::Error { .. }]
+        ));
+    }
 
     #[test]
     fn updater_config_pubkey_configuration_matches_json_value_type() {

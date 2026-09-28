@@ -1,5 +1,6 @@
 use super::super::{Machine, UpdaterSnapshot, UpdaterState};
 use super::*;
+use crate::updater::diag_log::updater_diag;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -261,7 +262,7 @@ fn perform_swap_and_relaunch(
         // already happened; at most log it and continue opening the restored old version. The
         // marker remains so the next launch retains its recovery anchor.
         if let Err(e) = after_swap(&marker) {
-            eprintln!("updater: 交换成功后的持久化动作失败（继续重启，marker 保留）：{e}");
+            updater_diag!("updater: 交换成功后的持久化动作失败（继续重启，marker 保留）：{e}");
         }
         Ok(bundle_path)
     })();

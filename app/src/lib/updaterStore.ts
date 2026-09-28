@@ -31,6 +31,9 @@ const EVENT_NAME = "updater://state";
  */
 const HEALTH_HANDSHAKE_DELAY_MS = 20_000;
 
+// Fallback for a missed updater event. The backend has a 45s hard deadline, so this must exceed 45s.
+const CHECKING_RESYNC_MS = 60_000;
+
 const INITIAL_SNAPSHOT: UpdaterSnapshot = {
   revision: 0,
   state: { kind: "idle" },
@@ -41,10 +44,28 @@ let dismissedForRun = false;
 let started = false;
 let startPromise: Promise<void> | null = null;
 let markedHealthy = false;
+let checkingResyncTimer: ReturnType<typeof setTimeout> | null = null;
 const listeners = new Set<() => void>();
 
 function notify(): void {
   for (const listener of listeners) listener();
+}
+
+function scheduleCheckingResync(): void {
+  checkingResyncTimer = setTimeout(() => {
+    checkingResyncTimer = null;
+    void (async () => {
+      try {
+        const current = await invoke<unknown>("updater_get_state");
+        applyIfNewer(current);
+      } catch {
+        // Retry while checking even if the resync request fails.
+      }
+      if (snapshot?.state.kind === "checking" && checkingResyncTimer === null) {
+        scheduleCheckingResync();
+      }
+    })();
+  }, CHECKING_RESYNC_MS);
 }
 
 /**
@@ -56,6 +77,12 @@ function applyIfNewer(candidate: unknown): void {
   if (snapshot !== null && candidate.revision <= snapshot.revision) return;
   snapshot = candidate;
   notify();
+  if (snapshot.state.kind === "checking") {
+    if (checkingResyncTimer === null) scheduleCheckingResync();
+  } else if (checkingResyncTimer !== null) {
+    clearTimeout(checkingResyncTimer);
+    checkingResyncTimer = null;
+  }
 }
 
 /**
@@ -219,6 +246,8 @@ export function useUpdaterDismissedForRun(): boolean {
 
 /** 仅供测试使用：重置模块级单例状态，不触碰真实 Tauri 运行时。 */
 export function __resetForTests(): void {
+  if (checkingResyncTimer !== null) clearTimeout(checkingResyncTimer);
+  checkingResyncTimer = null;
   snapshot = null;
   dismissedForRun = false;
   started = false;

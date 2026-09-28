@@ -2,10 +2,10 @@
 
 # AgentLoom
 
-**Many models. One workbench. Your machine.**
+**Set the goal. A local agent team carries it to done.**
 
-Run Claude, Codex, DeepSeek, GLM and more — side by side, or as a team.
-The open-source desktop workbench that turns many LLMs into one workforce you control.
+Every step visible, every change undoable — run Claude, Codex, DeepSeek, GLM and more,
+side by side or as a team, all on your machine.
 
 [Website](https://www.myagenthubs.com) · [Download](https://www.myagenthubs.com/agentloom#download) · [Report an issue](https://github.com/MyAgentHubs/agentloom/issues)
 
@@ -34,21 +34,25 @@ working at once — on your machine, under your control.
   hands out tasks in parallel, reviews what comes back and fixes what doesn't fit. Several
   files move at once instead of one, and you pay top-tier prices only for the thinking.
 
-- **Never stuck behind one vendor.** Out of Claude quota at 4pm? Point the same session at
-  GLM, DeepSeek or a local model and keep going — same thread, same context, nothing to
-  copy-paste. Switching vendors is a dropdown, not a migration. And when a session gets long,
-  AgentLoom writes the hand-off brief so the next one starts warm.
-
-- **Cheap models that actually finish the job.** AgentLoom ships its own agent engine,
-  `myagent`, written in Rust — no Claude Code, no Codex, no vendor CLI required. Providers you
-  connect through that engine get the same tool loop, plan mode and checkpoints that the
-  expensive CLIs have, so a pay-as-you-go key gets a real shot at real work.
-  <br>*We measured that claim rather than asserting it — see [Benchmarks](#benchmarks--cheap-models-real-work) below.*
-
 - **See every move. Undo any of them.** Every command and every file write lands as a card you
   can open, plus a Review panel with a file-level ledger. Keep what you like, roll back the
-  rest, file by file. You don't have to be a terminal expert to tell whether the agent did the
-  right thing — and you don't have to trust it blind to let it work.
+  rest, file by file. Each session runs in its own isolated workspace, so nothing leaks into
+  work you haven't reviewed yet. You don't have to be a terminal expert to tell whether the
+  agent did the right thing — and you don't have to trust it blind to let it work.
+
+- **Keeps going until it's actually done.** Long jobs get an auto-feed delivery ledger that
+  keeps handing the agent its next step; if a session goes quiet or gets stuck, AgentLoom
+  notices and nudges it back to work on its own. And you don't have to stay at your desk —
+  pair your phone by QR code to check in, approve a step, or call a halt from wherever you are.
+
+- **Multi-model, not locked to a vendor.** Out of Claude quota at 4pm? Point the same session
+  at GLM, DeepSeek or a local model and keep going — same thread, same context, nothing to
+  copy-paste. Switching vendors is a dropdown, not a migration, and when a session gets long,
+  AgentLoom writes the hand-off brief so the next one starts warm. AgentLoom also ships its own
+  agent engine, `myagent`, written in Rust — no Claude Code, no Codex, no vendor CLI required —
+  so providers you connect through it get the same tool loop, plan mode and checkpoints that
+  the expensive CLIs have.
+  <br>*We measured that claim rather than asserting it — see [Benchmarks](#benchmarks--cheap-models-real-work) below.*
 
 - **Yours, truly.** Open source and local-first. Your API keys live in your OS keychain, your
   conversations in a database on your own disk, and agents work directly in your own

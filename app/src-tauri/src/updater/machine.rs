@@ -1,4 +1,5 @@
 use super::*;
+use crate::updater::diag_log::updater_diag;
 
 /// Pure state machine with no `tauri` dependency. It can be constructed, driven, and asserted
 /// in ordinary `#[test]` functions without starting a Tauri app, network, or file system.
@@ -181,7 +182,9 @@ impl Machine {
                         retry: ErrorRetry::Check,
                     })
                 } else {
-                    eprintln!("updater: 自动检查发现清单缺本平台（TargetsNotFound），静默回 Idle");
+                    updater_diag!(
+                        "updater: 自动检查发现清单缺本平台（TargetsNotFound），静默回 Idle"
+                    );
                     self.bump(UpdaterState::Idle)
                 }
             }
@@ -194,7 +197,7 @@ impl Machine {
                         retry: ErrorRetry::Check,
                     })
                 } else {
-                    eprintln!("updater: 自动检查失败（忽略·不打扰用户）：{msg}");
+                    updater_diag!("updater: 自动检查失败（忽略·不打扰用户）：{msg}");
                     self.bump(UpdaterState::Idle)
                 }
             }

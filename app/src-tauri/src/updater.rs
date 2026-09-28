@@ -48,6 +48,7 @@
 use serde::{Deserialize, Serialize};
 use std::{cmp::Ordering, time::Duration};
 
+pub(crate) mod diag_log;
 mod gate;
 mod machine;
 

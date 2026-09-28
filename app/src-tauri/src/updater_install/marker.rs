@@ -1,3 +1,4 @@
+use crate::updater::diag_log::updater_diag;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -61,7 +62,7 @@ pub(super) fn write_marker_with_dir_sync(
     match sync_dir(dir) {
         Ok(()) => Ok(MarkerDurability::Durable),
         Err(e) => {
-            eprintln!(
+            updater_diag!(
                 "updater: marker rename 已提交（{}），但目录级 fsync 失败：{e}",
                 final_path.display()
             );

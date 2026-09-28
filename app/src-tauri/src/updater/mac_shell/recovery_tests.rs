@@ -361,6 +361,7 @@ fn runtime_with_cleanup(pending_cleanup: Option<PendingCleanupEntry>) -> Runtime
         pending: None,
         healthy_confirmed: false,
         pending_cleanup,
+        pending_check_task: None,
     }
 }
 

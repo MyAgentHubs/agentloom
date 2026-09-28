@@ -3,6 +3,7 @@ use super::mac_shell::{
     marker_dir, resolve_bundle_path, DownloadOutcome, UpdaterHandle,
 };
 use super::{UpdaterSnapshot, UpdaterState};
+use crate::updater::diag_log::updater_diag;
 use std::path::PathBuf;
 use tauri::AppHandle;
 use tauri_plugin_updater::Update;
@@ -46,7 +47,7 @@ pub(super) fn prepare_download(
 
         let pending_version = rt.pending.as_ref().map(|u| u.version.as_str());
         if !super::pending_matches_available(&current_state, pending_version) {
-            eprintln!(
+            updater_diag!(
                 "updater: pending Update 缺失或版本与 Available 不一致，拒绝下载（防御性拦截，正常路径不该到这）"
             );
             return Err(rt.machine.snapshot());
@@ -252,7 +253,9 @@ pub(super) fn finalize_staged(
             cleanup_ok,
         } => {
             if !cleanup_ok {
-                eprintln!("updater: marker 写失败且清理暂存也失败，遗留暂存目录待下次启动人工核实");
+                updater_diag!(
+                    "updater: marker 写失败且清理暂存也失败，遗留暂存目录待下次启动人工核实"
+                );
             }
             let snapshot = {
                 let mut rt = handle.runtime.lock().expect("updater runtime poisoned");
