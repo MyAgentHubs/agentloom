@@ -580,6 +580,7 @@ export class RoomDO {
   }
 
   async webSocketClose(ws) {
+    if (!store.hasTable(this.sql, "room_state")) return; // wiped by deleteAll: do not rebuild
     if (!this.assertRoomLive()) {
       this.closeSocketForTombstone(ws);
       return;
@@ -595,7 +596,7 @@ export class RoomDO {
   }
 
   async webSocketError(ws) {
-    // Reconnecting is the client's job; only re-arm reclaim like a close would.
+    if (!store.hasTable(this.sql, "room_state")) return; // wiped by deleteAll
     touchRoomActivity(this.sql);
     await this.scheduleNextTokenAlarm(Date.now(), ws);
   }
@@ -611,7 +612,6 @@ export class RoomDO {
     // ensureBusinessSchema only runs after desktop/token auth succeeds), whether
     // or not an owner was claimed: an unauthenticated POST /claim can register any
     // hash, so owner presence proves nothing. Authenticated rooms never enter here.
-    // The deadline is re-checked live; after a reclaim a later claim starts a fresh room.
     const unclaimedState = store.getRoomState(this.sql);
     if (!store.hasTable(this.sql, "room_meta") && this.ctx.getWebSockets().length === 0) {
       const createdAt = unclaimedState.created_at == null ? null : Number(unclaimedState.created_at);

@@ -303,7 +303,10 @@ const aliasRow = (validUntil) =>
 // Rooms a phone can still log into, or with in-flight work: never reclaimed.
 const KEEP_ROOM = {
   "active subject with an unexpired alias (phone can still log in)": [ACTIVE_SUBJECT, aliasRow(FUTURE)],
-  "registry_floor > 0 (token generation floor)": ["UPDATE room_state SET registry_floor = 3"],
+  "active subject whose alias has access_expires in the future but valid_until in the past": [
+    ACTIVE_SUBJECT,
+    `INSERT INTO token_aliases (token_hash, subject, kind, generation, access_expires, valid_until) VALUES ('h', 'device:x', 'current', 1, ${FUTURE}, 1)`,
+  ],
   "pending_input (unexpired)": [
     `INSERT INTO pending_input (command_id, envelope, created_at, expires_at) VALUES ('c', '{}', 1, ${FUTURE})`,
   ],
@@ -327,6 +330,9 @@ const RECLAIM_ROOM = {
   "revoked subject with an unexpired alias": [REVOKED_SUBJECT, aliasRow(FUTURE)],
   "active subject whose alias already expired": [ACTIVE_SUBJECT, aliasRow(1)],
   "active subject without any alias": [ACTIVE_SUBJECT],
+  "registry_floor > 0 (only the desktop can raise it; wiping is harmless)": [
+    "UPDATE room_state SET registry_floor = 3",
+  ],
 };
 
 for (const [name, statements] of Object.entries(KEEP_ROOM)) {
@@ -460,3 +466,39 @@ test("R8 abandoned：webSocketError 路径同样重排回收 alarm", async () =>
   const lastActivity = Number(store.getMeta(room.sql, LAST_ACTIVITY_KEY));
   assert.equal(ctx.alarmLog.scheduled, lastActivity + ABANDONED_ROOM_RECLAIM_MS);
 });
+
+test("R8 abandoned：攻击序列 claim→连接→token.sync 一个条目→token.reset 空条目（floor 被置 1、无 token 行），空闲满 7 天被回收", async () => {
+  const { room, ctx } = makeSchemaLessRoom();
+  const ws = await claimAndConnectOnce(room, ctx);
+  const now = Date.now();
+  const entry = {
+    subject: "device:11111111-1111-4111-8111-111111111111",
+    generation: 1,
+    scope: "remote",
+    current: { token_hash: "b".repeat(64), access_expires: now + 60_000, refresh_until: now + 120_000 },
+  };
+  await room.webSocketMessage(ws, JSON.stringify({ t: "token.sync", revision: 1, entries: [entry] }));
+  await room.webSocketMessage(ws, JSON.stringify({ t: "token.reset", revision: 2, entries: [] }));
+  assert.ok(Number(store.getRoomState(room.sql).registry_floor) > 0, "precondition: floor raised");
+  ctx.disconnectWebSocket(ws);
+  await room.webSocketClose(ws);
+  setIdleFor(room, ABANDONED_ROOM_RECLAIM_MS + 1_000);
+
+  await room.alarm();
+
+  assert.equal(ctx.alarmLog.deleteAllCalled, true);
+});
+
+for (const callback of ["webSocketClose", "webSocketError"]) {
+  test(`R8 abandoned：清库后运行时补发的旧 socket ${callback} 回调不抛错，也不重建哨兵`, async () => {
+    const { room, ctx } = await abandonedRoom();
+    const stale = fakeWs();
+    setIdleFor(room, ABANDONED_ROOM_RECLAIM_MS + 1_000);
+    await room.alarm();
+    assert.equal(ctx.alarmLog.deleteAllCalled, true);
+
+    await room[callback](stale);
+
+    assert.equal(store.hasTable(room.sql, "room_state"), false, `${callback} must not rebuild the sentinel`);
+  });
+}

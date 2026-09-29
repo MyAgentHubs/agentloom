@@ -1,7 +1,7 @@
 "use strict";
 
 import { getMeta, setMeta } from "./roomStoreMeta.js";
-import { getRoomState, hasTable } from "./roomStoreSchema.js";
+import { hasTable } from "./roomStoreSchema.js";
 
 // Reclaim of rooms that authenticated once but were then abandoned. Claim is
 // unauthenticated, so anyone can claim a room and connect once with their own
@@ -24,20 +24,22 @@ export function touchRoomActivity(sql, now = Date.now()) {
   if (hasTable(sql, "room_meta")) setMeta(sql, LAST_ACTIVITY_KEY, now);
 }
 
-// A room is worth keeping when a phone can still log into it, the token
-// generation floor is set (wiping would let generations roll back), or work is
-// in flight. Deliberately NOT a reason to keep: events (a desktop-side cache the
-// desktop re-sends on reconnect; a never-paired desktop writes none), stored
-// put fingerprints, pairing_routes (never deleted), and revoked/expired
-// subjects or aliases - an attacker can create all of these with one connection.
+// A room is worth keeping when a phone can still log into it (an active subject
+// with an alias not yet expired by either timestamp - a superset of what
+// resolveTokenAdmission admits) or work is in flight. Deliberately NOT a reason
+// to keep: events (a desktop-side cache the desktop re-sends on reconnect),
+// stored put fingerprints, pairing_routes (never deleted), registry_floor (only
+// the desktop raises it; the desktop takes the max of ack watermarks, so a wipe
+// is harmless), and revoked/expired subjects or aliases. A connected attacker
+// can create all of these cheaply.
 function roomHoldsData(sql, now) {
-  if (Number(getRoomState(sql).registry_floor) > 0) return true;
   if (
     hasTable(sql, "token_aliases") &&
     hasTable(sql, "token_subjects") &&
     sql.exec(
       "SELECT 1 AS present FROM token_aliases a JOIN token_subjects s ON s.subject = a.subject " +
-        "WHERE s.state = 'active' AND a.valid_until > ? LIMIT 1",
+        "WHERE s.state = 'active' AND (a.valid_until > ? OR a.access_expires > ?) LIMIT 1",
+      now,
       now
     ).length > 0
   ) {
