@@ -115,4 +115,36 @@ describe("useComposerDraft", () => {
     window.dispatchEvent(new Event("pagehide"));
     expect(localStorage.getItem("agentloom.draft.__new__")).not.toBeNull();
   });
+
+  it("editFor writes to the origin session's stored draft without touching the live one", () => {
+    localStorage.setItem(
+      KEY("a"),
+      JSON.stringify({ v: 1, text: "old", attachments: [] }),
+    );
+    const { result } = renderHook(() => useComposerDraft("b"));
+    act(() => result.current.setDraft("live"));
+    act(() =>
+      result.current.editFor("a", (d) => ({ ...d, text: d.text + "+more" })),
+    );
+    expect(result.current.draft).toBe("live");
+    expect(JSON.parse(localStorage.getItem(KEY("a")) ?? "{}").text).toBe(
+      "old+more",
+    );
+  });
+
+  it("clear for another session only drops that stored draft", () => {
+    localStorage.setItem(
+      KEY("a"),
+      JSON.stringify({ v: 1, text: "sent", attachments: [] }),
+    );
+    const { result } = renderHook(() => useComposerDraft("b"));
+    act(() => result.current.setDraft("live"));
+    let live = true;
+    act(() => {
+      live = result.current.clear("a");
+    });
+    expect(live).toBe(false);
+    expect(result.current.draft).toBe("live");
+    expect(localStorage.getItem(KEY("a"))).toBeNull();
+  });
 });

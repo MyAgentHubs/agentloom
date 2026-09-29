@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type ClipboardEvent,
@@ -282,6 +283,8 @@ export function InputArea({
     attachments,
     setAttachments,
     clear: clearComposerDraft,
+    editFor,
+    loadSeq,
   } = useComposerDraft(sessionId);
   const [guardHint, setGuardHint] = useState<string | null>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -307,6 +310,9 @@ export function InputArea({
     el.style.height = `${Math.min(el.scrollHeight, MAX_H)}px`;
     el.style.overflowY = el.scrollHeight > MAX_H ? "auto" : "hidden";
   }
+
+  // Re-measure after a stored draft is restored (mount or session switch).
+  useLayoutEffect(() => autosize(), [loadSeq]);
 
   const enabledAgentIds = (agents ?? [])
     .filter((agent) => agent.enabled)
@@ -349,16 +355,17 @@ export function InputArea({
     );
   };
 
-  function mergeAttachmentPaths(paths: string[]) {
-    setAttachments((prev) => {
-      const next = [...prev];
-      const seen = new Set(prev.map((attachment) => attachment.path));
+  // `origin` is the session the async job started in; results never land in another session.
+  function mergeAttachmentPaths(paths: string[], origin: string | null) {
+    editFor(origin, (d) => {
+      const next = [...d.attachments];
+      const seen = new Set(d.attachments.map((attachment) => attachment.path));
       for (const path of paths) {
         if (seen.has(path)) continue;
         next.push({ path, name: path.split(/[\\/]/).pop() ?? path });
         seen.add(path);
       }
-      return next;
+      return { ...d, attachments: next };
     });
   }
 
@@ -366,7 +373,10 @@ export function InputArea({
     if (readonly) return;
     const sel = await openFileDialog({ multiple: true });
     const paths = sel === null ? [] : Array.isArray(sel) ? sel : [sel];
-    mergeAttachmentPaths(await importAttachmentPaths(paths, sessionId));
+    mergeAttachmentPaths(
+      await importAttachmentPaths(paths, sessionId),
+      sessionId,
+    );
     const el = taRef.current;
     el?.focus();
   }
@@ -386,7 +396,7 @@ export function InputArea({
           const imageBase64 = arrayBufferToBase64(await file.arrayBuffer());
           const args = { imageBase64, mediaType: file.type, sessionId };
           const path = await invoke<string>("save_pasted_image", args);
-          mergeAttachmentPaths([path]);
+          mergeAttachmentPaths([path], sessionId);
         } catch (error) {
           console.error("Failed to paste image attachment", error);
         }
@@ -401,14 +411,21 @@ export function InputArea({
     try {
       const args = { text, sessionId };
       const path = await invoke<string>("save_pasted_text", args);
-      mergeAttachmentPaths([path]);
+      mergeAttachmentPaths([path], sessionId);
     } catch (error) {
       console.error("Failed to paste text attachment", error);
       // 落盘失败：回退把原文本插回输入框光标处，宁可卡也不丢用户内容。
       const el = taRef.current;
-      const start = el?.selectionStart ?? draft.length;
-      const end = el?.selectionEnd ?? draft.length;
-      setDraft((prev) => prev.slice(0, start) + text + prev.slice(end));
+      editFor(sessionId, (d, live) => {
+        const start = live
+          ? (el?.selectionStart ?? d.text.length)
+          : d.text.length;
+        const end = live ? (el?.selectionEnd ?? d.text.length) : d.text.length;
+        return {
+          ...d,
+          text: d.text.slice(0, start) + text + d.text.slice(end),
+        };
+      });
     }
   }
 
@@ -442,9 +459,10 @@ export function InputArea({
     return [rawText, ...blocks].filter(Boolean).join("\n\n");
   }
 
-  function resetComposerAfterSubmit() {
+  function resetComposerAfterSubmit(origin: string | null) {
+    // Sent from a session the user has since left: leave the live composer alone.
+    if (!clearComposerDraft(origin)) return;
     setGuardHint(null);
-    clearComposerDraft();
     const el = taRef.current;
     if (el) {
       el.style.height = "auto";
@@ -478,7 +496,7 @@ export function InputArea({
           const composed =
             attachments.length > 0 ? await composeText(text) : text;
           onQueueMessage?.(composed, activeMode);
-          resetComposerAfterSubmit();
+          resetComposerAfterSubmit(sessionId);
           return;
         }
         onMemberIdle?.();
@@ -496,7 +514,7 @@ export function InputArea({
     // 一个全局性的多余异步跳变，坑到一堆同步 fireEvent 断言。
     const composed = attachments.length > 0 ? await composeText(text) : text;
     onSend(composed, activeMode);
-    resetComposerAfterSubmit();
+    resetComposerAfterSubmit(sessionId);
   }
 
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {

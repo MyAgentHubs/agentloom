@@ -26,6 +26,8 @@ export function useComposerDraft(sessionId: string | null) {
   const [state, setState] = useState<ComposerDraft>(() => loadDraft(sessionId));
   const keyRef = useRef<string | null>(sessionId);
   const latestRef = useRef<ComposerDraft>(state);
+  // Bumps whenever a stored draft is loaded for a new session, so callers can re-measure the textarea.
+  const [loadSeq, setLoadSeq] = useState(0);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const cancelTimer = useCallback(() => {
@@ -69,13 +71,41 @@ export function useComposerDraft(sessionId: string | null) {
     [update],
   );
 
-  /** Empty the composer and drop the stored draft immediately (after a send). */
-  const clear = useCallback(() => {
-    cancelTimer();
-    latestRef.current = { text: "", attachments: [] };
-    setState(latestRef.current);
-    clearDraft(keyRef.current);
-  }, [cancelTimer]);
+  /**
+   * Apply an edit to the draft of the session an async job started in. `live`
+   * tells the callback whether that session is still the one on screen.
+   */
+  const editFor = useCallback(
+    (
+      key: string | null,
+      fn: (d: ComposerDraft, live: boolean) => ComposerDraft,
+    ) => {
+      if (key === keyRef.current) return update(fn(latestRef.current, true));
+      saveDraft(key, fn(loadDraft(key), false));
+    },
+    [update],
+  );
+
+  /**
+   * Empty the composer and drop the stored draft immediately (after a send).
+   * Pass the session the send started in: if the user has since switched away,
+   * only that session's stored draft is dropped and the live composer is kept
+   * (returns false in that case).
+   */
+  const clear = useCallback(
+    (key?: string | null) => {
+      if (key !== undefined && key !== keyRef.current) {
+        clearDraft(key);
+        return false;
+      }
+      cancelTimer();
+      latestRef.current = { text: "", attachments: [] };
+      setState(latestRef.current);
+      clearDraft(keyRef.current);
+      return true;
+    },
+    [cancelTimer],
+  );
 
   // Session switch: persist the old content under the old key first, then load the new one.
   useLayoutEffect(() => {
@@ -84,6 +114,7 @@ export function useComposerDraft(sessionId: string | null) {
     keyRef.current = sessionId;
     latestRef.current = loadDraft(sessionId);
     setState(latestRef.current);
+    setLoadSeq((n) => n + 1);
   }, [sessionId, flush]);
 
   // Flush on unmount and when the page is going away.
@@ -103,5 +134,7 @@ export function useComposerDraft(sessionId: string | null) {
     setDraft: setText,
     setAttachments,
     clear,
+    editFor,
+    loadSeq,
   };
 }
