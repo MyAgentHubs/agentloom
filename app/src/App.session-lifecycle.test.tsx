@@ -261,6 +261,33 @@ describe("App", () => {
       );
     });
 
+    it("删除会话 → 同时清掉该会话的输入草稿，其它会话草稿保留", async () => {
+      const s1 = makeSession({ id: "s1", title: "主会话" });
+      const s2 = makeSession({ id: "s2", title: "另一会话" });
+      mockAppWith([s1, s2]);
+      const draft = JSON.stringify({ v: 1, text: "draft", attachments: [] });
+      localStorage.setItem("agentloom.draft.s1", draft);
+      localStorage.setItem("agentloom.draft.s2", draft);
+      const { container } = render(<App />);
+
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith("get_messages", {
+          sessionId: "s1",
+        }),
+      );
+      const row = container.querySelector('[data-session-id="s2"]')!;
+      fireEvent.contextMenu(row);
+      fireEvent.click(row.querySelector('[data-action="delete"]')!);
+      const dialog = screen.getByRole("dialog");
+      fireEvent.click(within(dialog).getByRole("button", { name: "删除" }));
+
+      await waitFor(() =>
+        expect(localStorage.getItem("agentloom.draft.s2")).toBeNull(),
+      );
+      expect(localStorage.getItem("agentloom.draft.s1")).not.toBeNull();
+      localStorage.removeItem("agentloom.draft.s1");
+    });
+
     it("删除失败时 toast 错误而不是未处理 Promise", async () => {
       const s1 = makeSession({ id: "s1", title: "主会话" });
       const s2 = makeSession({ id: "s2", title: "另一会话" });

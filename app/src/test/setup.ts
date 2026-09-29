@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom";
-import { beforeAll } from "vitest";
+import { beforeAll, beforeEach } from "vitest";
 import { preloadMarkdown } from "../lib/useMarkdown";
 
 beforeAll(async () => {
@@ -48,3 +48,15 @@ if (!hasLocalStorage) {
 // Keep existing component tests deterministic: an explicit user locale takes
 // priority over jsdom's default navigator.language (en-US), just as in production.
 globalThis.localStorage.setItem("agentloom.locale.v2", "zh");
+
+// Composer drafts persist to localStorage; drop them between tests so one test's
+// leftover input never shows up in another test's composer.
+beforeEach(() => {
+  const ls = globalThis.localStorage;
+  const stale: string[] = [];
+  for (let i = 0; i < ls.length; i++) {
+    const key = ls.key(i);
+    if (key?.startsWith("agentloom.draft.")) stale.push(key);
+  }
+  stale.forEach((key) => ls.removeItem(key));
+});

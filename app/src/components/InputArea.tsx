@@ -19,6 +19,7 @@ import type {
 } from "../types/agent";
 import { quoteLabel, quotePreview, quoteTooltip } from "../lib/quoteMessage";
 import { useI18n } from "../i18n";
+import { useComposerDraft } from "../hooks/useComposerDraft";
 import {
   advanceStreamActivity,
   type StreamActivityState,
@@ -275,11 +276,14 @@ export function InputArea({
   onQueueMessage,
 }: Props) {
   const { t } = useI18n();
-  const [draft, setDraft] = useState("");
+  const {
+    draft,
+    setDraft,
+    attachments,
+    setAttachments,
+    clear: clearComposerDraft,
+  } = useComposerDraft(sessionId);
   const [guardHint, setGuardHint] = useState<string | null>(null);
-  const [attachments, setAttachments] = useState<
-    { path: string; name: string }[]
-  >([]);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const composingRef = useRef(false);
 
@@ -440,8 +444,7 @@ export function InputArea({
 
   function resetComposerAfterSubmit() {
     setGuardHint(null);
-    setDraft("");
-    setAttachments([]);
+    clearComposerDraft();
     const el = taRef.current;
     if (el) {
       el.style.height = "auto";
