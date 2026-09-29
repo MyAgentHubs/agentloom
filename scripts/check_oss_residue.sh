@@ -5,17 +5,6 @@
 
 set -euo pipefail
 
-ROOT="$(git rev-parse --show-toplevel)"
-cd "$ROOT"
-
-SELF="scripts/check_oss_residue.sh"
-
-MODE="default"
-if [ "${1:-}" = "--public-tree" ]; then
-  MODE="public-tree"
-  shift
-fi
-
 # Private paths are skipped in default mode and forbidden in a public tree.
 PRIVATE_PATHS=(
   "docs/superpowers/*"
@@ -45,6 +34,23 @@ PRIVATE_EXCEPT=(
   "evals/engine-bridge/fixtures/*"
   "evals/run-replay/fixtures/*"
 )
+
+if [ "${1:-}" = "--print-private-paths" ]; then
+  for item in "${PRIVATE_PATHS[@]}"; do printf 'path\t%s\n' "$item"; done
+  for item in "${PRIVATE_EXCEPT[@]}"; do printf 'except\t%s\n' "$item"; done
+  exit 0
+fi
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+SELF="scripts/check_oss_residue.sh"
+
+MODE="default"
+if [ "${1:-}" = "--public-tree" ]; then
+  MODE="public-tree"
+  shift
+fi
 
 # Test-only introspection of the resolved private-path arrays. This adds
 # stderr output without changing the scan or its exit code.

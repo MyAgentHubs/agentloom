@@ -6,19 +6,216 @@
 # "<local ref> <local sha1> <remote ref> <remote sha1>".
 # An all-deletes push (local sha1 all zero) does not trigger the checks.
 # Bypass a single push: git push --no-verify
+# Public pushes also check refs, historical paths, and commit identities.
 # Appended, not prepended: keep the caller's own PATH order (so version
 # managers like nvm/rustup still win) and only fall back to these system
 # dirs when PATH is missing the basics.
 export PATH="$PATH:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
-ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
-cd "$ROOT" || exit 0
-
 zero="0000000000000000000000000000000000000000"
 has_push=0
+restricted_ref_regex='^(internal-|internal/|dispatch/|archive/|agentloom-v)'
+FORBIDDEN_ROOTS='ca01b68b52826a1720f12a65748c5c9b745a2124'
+public_push=0
+AGENTLOOM_PUSH_GUARD_V1=1
+
+reject_public_push() {
+  printf 'pre-push: %s (ref: %s, commit: %s)\n' "$1" "$2" "$3" >&2
+  echo "This is the AgentLoom maintainers' leak-prevention guard. If this push is correct, contact a maintainer." >&2
+  exit 1
+}
+
+is_public_url() {
+  local path="$1"
+  if [[ "$path" == *://* ]]; then
+    path="${path#*://}"
+    [[ "$path" == */* ]] || return 1
+    path="${path#*/}"
+  elif [[ "$path" == *:* && "$path" != /* ]]; then
+    path="${path#*:}"
+  fi
+  path=$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')
+  local segment
+  local -a parts normalized=()
+  IFS=/ read -r -a parts <<< "$path"
+  for segment in "${parts[@]}"; do
+    case "$segment" in
+      ''|.) ;;
+      ..) if [ "${#normalized[@]}" -gt 0 ]; then unset "normalized[$((${#normalized[@]} - 1))]"; fi ;;
+      *) normalized+=("$segment") ;;
+    esac
+  done
+  path=$(IFS=/; echo "${normalized[*]}")
+  path="${path%.git}"
+  [[ "$path" == myagenthubs/agentloom ]]
+}
+
+is_public_url "${2:-}" && public_push=1
+if [[ "${1:-}" == *://* || "${1:-}" == *:* ]]; then
+  is_public_url "$1" && public_push=1
+fi
+for key in "remote.$1.url" "remote.$1.pushurl"; do
+  while IFS= read -r configured_url; do
+    is_public_url "$configured_url" && public_push=1
+  done < <(git config --get-all "$key" 2>/dev/null || true)
+done
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+  [ "$public_push" = "1" ] && reject_public_push 'unable to determine working tree' '(unavailable)' '(unavailable)'
+  exit 0
+}
+HOOK_DIR=$(cd -- "$(dirname -- "$0")" && pwd -P) || {
+  [ "$public_push" = "1" ] && reject_public_push 'unable to locate hooks snapshot' '(unavailable)' '(unavailable)'
+  exit 0
+}
+cd "$ROOT" || {
+  [ "$public_push" = "1" ] && reject_public_push 'unable to determine working tree' '(unavailable)' '(unavailable)'
+  exit 0
+}
+if [ "$HOOK_DIR" != "$ROOT/.githooks" ]; then
+  if [ -f .githooks/pre-push ] && grep -q 'AGENTLOOM_PUSH_GUARD_V1' .githooks/pre-push &&
+     ! cmp -s .githooks/pre-push "$HOOK_DIR/pre-push"; then
+    echo 'hooks snapshot is stale; run scripts/install-hooks.sh' >&2
+  fi
+fi
+
+oss_script="$HOOK_DIR/agentloom-guard/check_oss_residue.sh"
+[ -f "$oss_script" ] || oss_script="$ROOT/scripts/check_oss_residue.sh"
+identity_script="$HOOK_DIR/agentloom-guard/check_commit_identity.sh"
+[ -f "$identity_script" ] || identity_script="$ROOT/scripts/check_commit_identity.sh"
+if [ "$oss_script" != "$HOOK_DIR/agentloom-guard/check_oss_residue.sh" ] && [ -f "$ROOT/scripts/check_commit_identity.sh" ]; then
+  identity_script="$ROOT/scripts/check_commit_identity.sh"
+fi
+
+private_patterns_loaded=0
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ -z "$local_ref" ] && continue
   [ "$local_sha" = "$zero" ] && continue
   has_push=1
+  [ "$public_push" = "1" ] || continue
+
+  for ref in "$local_ref" "$remote_ref"; do
+    short_ref="${ref#refs/heads/}"
+    short_ref="${short_ref#refs/tags/}"
+    if [[ "$short_ref" =~ $restricted_ref_regex ]]; then
+      if [[ "$short_ref" != agentloom-v* || "$ref" == refs/tags/* ]]; then
+        reject_public_push "restricted ref name: $ref" "$local_ref -> $remote_ref" "$local_sha"
+      fi
+    fi
+  done
+
+  [ -f "$oss_script" ] || reject_public_push 'unable to check private paths: script missing' "$local_ref -> $remote_ref" "$local_sha"
+  [ -f "$identity_script" ] || reject_public_push 'unable to check commit identity: script missing' "$local_ref -> $remote_ref" "$local_sha"
+  for root in $FORBIDDEN_ROOTS ${AGENTLOOM_PUSH_GUARD_EXTRA_ROOTS:-}; do
+    if git cat-file -e "$root^{commit}" 2>/dev/null && git merge-base --is-ancestor "$root" "$local_sha^{commit}"; then
+      reject_public_push 'forbidden history root' "$local_ref -> $remote_ref" "$local_sha"
+    fi
+  done
+
+  if [[ "$remote_ref" == refs/tags/* ]]; then
+    tag_sha="$local_sha"
+    while [ "$(git cat-file -t "$tag_sha" 2>/dev/null)" = tag ]; do
+      if ! tag_data=$(git cat-file -p "$tag_sha"); then
+        reject_public_push 'unable to check tagger identity' "$local_ref -> $remote_ref" "$tag_sha"
+      fi
+      tagger_email=$(printf '%s\n' "$tag_data" | sed -nE 's/^tagger [^<]*<([^>]*)>.*/\1/p' | head -1)
+      if [ -z "$tagger_email" ] || ! identity_pattern=$(bash "$identity_script" --print-pattern); then
+        reject_public_push 'unable to check tagger identity' "$local_ref -> $remote_ref" "$tag_sha"
+      fi
+      if grep -Eiq -- "$identity_pattern" <<< "$tagger_email"; then
+        reject_public_push 'prohibited tagger identity' "$local_ref -> $remote_ref" "$tag_sha"
+      fi
+      tag_type=$(printf '%s\n' "$tag_data" | sed -n 's/^type //p' | head -1)
+      [ "$tag_type" = tag ] || break
+      tag_sha=$(printf '%s\n' "$tag_data" | sed -n 's/^object //p' | head -1)
+      [ -n "$tag_sha" ] || reject_public_push 'unable to check tagger identity' "$local_ref -> $remote_ref" "$local_sha"
+      [ "$(git cat-file -t "$tag_sha" 2>/dev/null)" = tag ] || reject_public_push 'unable to check tagger identity' "$local_ref -> $remote_ref" "$tag_sha"
+    done
+  fi
+
+  if [ "$remote_sha" = "$zero" ]; then
+    range_args=("$local_sha" --not "--remotes=$1")
+  else
+    range_args=("$remote_sha..$local_sha")
+  fi
+  if ! commits=$(git rev-list "${range_args[@]}"); then
+    reject_public_push 'unable to determine pushed commits' "$local_ref -> $remote_ref" "$local_sha"
+  fi
+  [ -n "$commits" ] || continue
+
+  if [ "$private_patterns_loaded" = "0" ]; then
+    if ! pattern_lines=$(bash "$oss_script" --print-private-paths); then
+      reject_public_push 'unable to check private paths: pattern query failed' "$local_ref -> $remote_ref" "$local_sha"
+    fi
+    [ -n "$pattern_lines" ] || reject_public_push 'unable to check private paths: no patterns returned' "$local_ref -> $remote_ref" "$local_sha"
+    private_paths=()
+    private_excepts=()
+    while IFS=$'\t' read -r kind pattern; do
+      case "$kind" in
+        path) private_paths+=("$pattern") ;;
+        except) private_excepts+=("$pattern") ;;
+        *) reject_public_push 'unable to check private paths: invalid pattern data' "$local_ref -> $remote_ref" "$local_sha" ;;
+      esac
+    done <<< "$pattern_lines"
+    [ "${#private_paths[@]}" -gt 0 ] || reject_public_push 'unable to check private paths: no private patterns returned' "$local_ref -> $remote_ref" "$local_sha"
+    private_patterns_loaded=1
+  fi
+
+  paths_file=$(mktemp) || reject_public_push 'unable to check private paths: temporary file unavailable' "$local_ref -> $remote_ref" "$local_sha"
+  trap 'rm -f "$paths_file"' EXIT
+  if ! git -c core.quotePath=false log -m -z --format= --name-only "${range_args[@]}" > "$paths_file"; then
+    reject_public_push 'unable to check private paths: commit history unavailable' "$local_ref -> $remote_ref" "$local_sha"
+  fi
+  private_hits=0
+  while IFS= read -r -d '' path; do
+    [ -n "$path" ] || continue
+    excepted=0
+    for pattern in "${private_excepts[@]}"; do
+      case "$path" in $pattern) excepted=1; break ;; esac
+    done
+    [ "$excepted" = "1" ] && continue
+    for pattern in "${private_paths[@]}"; do
+      case "$path" in
+        $pattern)
+          if [ "$private_hits" = "0" ]; then
+            echo 'pre-push: private paths in pushed commits:' >&2
+          fi
+          path_commit=$(git log --format=%h "${range_args[@]}" -- "$path" | head -1)
+          printf '  %s %s\n' "$path_commit" "$path" >&2
+          private_hits=$((private_hits + 1))
+          break
+          ;;
+      esac
+    done
+    [ "$private_hits" -lt 3 ] || break
+  done < "$paths_file"
+  rm -f "$paths_file"
+  trap - EXIT
+  [ "$private_hits" = "0" ] || reject_public_push 'private path found in pushed history' "$local_ref -> $remote_ref" "$local_sha"
+
+  if [ "$remote_sha" != "$zero" ]; then
+    if bash "$identity_script" --range "$remote_sha..$local_sha"; then
+      :
+    else
+      status=$?
+      if [ "$status" = "1" ]; then
+        reject_public_push 'prohibited commit identity in pushed history' "$local_ref -> $remote_ref" "$local_sha"
+      fi
+      reject_public_push 'unable to check commit identity' "$local_ref -> $remote_ref" "$local_sha"
+    fi
+  else
+    # Check each new commit, including side branches merged into the ref.
+    while IFS= read -r commit; do
+      if bash "$identity_script" --range "$commit^!"; then
+        :
+      else
+        status=$?
+        if [ "$status" = "1" ]; then
+          reject_public_push 'prohibited commit identity in pushed history' "$local_ref -> $remote_ref" "$commit"
+        fi
+        reject_public_push 'unable to check commit identity' "$local_ref -> $remote_ref" "$commit"
+      fi
+    done <<< "$commits"
+  fi
 done
 [ "$has_push" = "1" ] || exit 0
 

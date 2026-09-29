@@ -287,9 +287,14 @@ class DevBootstrapTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         hooks_path = subprocess.run(
             ["git", "config", "--get", "core.hooksPath"], cwd=self.repo, env=self.env,
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-        self.assertEqual(hooks_path, ".githooks")
+            check=False, capture_output=True, text=True,
+        )
+        self.assertEqual(hooks_path.returncode, 1)
+        self.assertEqual(hooks_path.stdout.strip(), "")
+        self.assertEqual(
+            (self.repo / ".git/hooks/pre-push").read_bytes(),
+            (self.repo / ".githooks/pre-push").read_bytes(),
+        )
 
     def test_real_directory_conflict_is_preserved(self):
         path = self.repo / "harness-agent/evals"
