@@ -1265,7 +1265,7 @@ test("SEC-3：未认领裸房经失败 upgrade fetch() 武装固定回收 alarm�
   assert.equal(ctx.alarmLog.deleted, true, "alarm() 回收枝应调用 deleteAlarm");
 });
 
-test("SEC-3：已 claim 空房（owner 非 null、无连接）到点 alarm() 不被回收（误杀防线核心断言）", async () => {
+test("SEC-3：已鉴权过的空房（有 room_meta、无连接）到点 alarm() 不被回收（误杀防线核心断言）", async () => {
   const { room } = makeRoom();
   const claimResult = store.claimRoom(room.sql, "a".repeat(64), Date.now());
   assert.equal(claimResult, "claimed");
@@ -1277,24 +1277,23 @@ test("SEC-3：已 claim 空房（owner 非 null、无连接）到点 alarm() 不
 
   const state = store.getRoomState(room.sql);
   assert.equal(state.owner_credential_hash, "a".repeat(64));
-  assert.equal(state.tombstoned_at, null, "已 claim 的空房永远不该被 SEC-3 回收枝误杀");
+  assert.equal(state.tombstoned_at, null, "已鉴权过的空房永远不该被 SEC-3 回收枝误杀");
 });
 
-test("SEC-3：claim 抢在回收 alarm 到点之前提交 → alarm() 实时重查 owner，到点不杀（claim 赢的竞态分支）", async () => {
-  const { room, ctx } = makeRoom();
-  // 造出「已经过了回收窗口」的未认领房，模拟 alarm 即将到点前一刻。
+test("SEC-3：鉴权抢在回收 alarm 到点之前完成（业务 schema 已建）→ alarm() 实时重查 room_meta，到点不杀（鉴权赢的竞态分支）", async () => {
+  const { room, ctx } = makeSchemaLessRoom();
+  // Claimed and past the reclaim window, but not yet authenticated: reclaimable.
+  assert.equal(store.claimRoom(room.sql, "b".repeat(64), Date.now()), "claimed");
   room.sql.exec("UPDATE room_state SET created_at = ?", Date.now() - UNCLAIMED_RECLAIM_MS - 1);
 
-  // 竞态的「claim 先」这一支：DO 单线程、claim 与 alarm 到点之间不交错——
-  // 这里用调用顺序直接体现「claim 先提交」。
-  const result = store.claimRoom(room.sql, "b".repeat(64), Date.now());
-  assert.equal(result, "claimed");
-
+  // DO is single-threaded: auth succeeding (ensureBusinessSchema) right before the
+  // alarm fires must be seen live by alarm(), not a scheduled snapshot.
+  store.ensureBusinessSchema(room.sql);
   await room.alarm();
 
   const state = store.getRoomState(room.sql);
-  assert.equal(state.tombstoned_at, null, "claim 先提交，alarm 到点应放过这个房（不信调度快照，实时重查 owner）");
-  assert.equal(ctx.alarmLog.deleted, false);
+  assert.equal(state.owner_credential_hash, "b".repeat(64), "鉴权先完成，alarm 到点应放过这个房");
+  assert.equal(ctx.alarmLog.deleteAllCalled, false);
 });
 
 test("F2-A：回收 alarm 抢在 claim 之前触发 → 彻底清房后同 id 不是永久 410，而是全新未认领房（reclaim 赢的竞态分支·新语义）", async () => {
@@ -1327,7 +1326,8 @@ test("F2-A：回收 alarm 抢在 claim 之前触发 → 彻底清房后同 id �
 
 test("SEC-3：未认领房与 refresh_requests 候选共存时，scheduleNextTokenAlarm 取更近的那个（min 语义）", async () => {
   const { room, ctx } = makeRoom();
-  // Never-authenticated room (no room_meta) that keeps refresh_requests.
+  // Artificial state (production never has refresh_requests without room_meta):
+  // isolates the min-deadline calculation from the auth-derived reclaim gate.
   room.sql.exec("DROP TABLE room_meta");
   const state = store.getRoomState(room.sql);
   const reclaimAt = state.created_at + UNCLAIMED_RECLAIM_MS;

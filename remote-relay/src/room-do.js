@@ -95,7 +95,7 @@ export const REPLY_ROUTES_ROW_LIMIT = 256;
 // Export the limit so tests can reference it without duplicating it.
 export const REPLY_BYTE_BUDGET_LIMIT_BYTES = 16 * 1024 * 1024;
 export const REPLY_BYTE_BUDGET_WINDOW_MS = 60_000;
-// SEC-3：未认领房（room_state.owner_credential_hash == null）到点自杀回收
+// SEC-3：从未鉴权房（无 room_meta，无论是否已 claim）到点自杀回收
 // 的固定宽限窗——起点是 room_state.created_at（fresh 房=真实建房时刻，存量
 // 迁移房=首次触碰时刻，见 room-store.js initRoomStateSentinel），窗口本身
 // 固定不随后续 fetch()/alarm() 滑动。远大于正常「建房→配对→claim」耗时，
@@ -196,6 +196,8 @@ export class RoomDO {
   }
 
   async fetch(request) {
+    // After alarm()'s deleteAll this instance may still get requests: rebuild the sentinel.
+    if (!store.hasTable(this.sql, "room_state")) store.initRoomStateSentinel(this.sql);
     const url = new URL(request.url);
     const roomIdMatch = url.pathname.match(/^\/room\/([0-9a-f]{32})/);
     const roomId = roomIdMatch ? roomIdMatch[1] : null;
@@ -215,12 +217,11 @@ export class RoomDO {
     }
 
     if (request.headers.get("Upgrade") !== "websocket") {
-      // SEC-3 修复轮（独立 skeptic 复现的真实缺口）：裸 GET / 错路径 POST 等
-      // 非 upgrade 请求撞中这里，跟 rejectUpgradeAuthentication/handleClaim
-      // 一样，从不触达 fetch() 握手成功后的既有 scheduleNextTokenAlarm() 调用
-      // （:339 一线）——不补武装的话，纯用这条比 WS upgrade 尝试更便宜的路径
-      // 探测未认领房，能永远绕过 SEC-3 防刷房回收。owner 非 null 时不进——
-      // 同一个误杀防线不变量。
+      // SEC-3: bare GET / wrong-path POST land here and never reach the
+      // post-handshake scheduleNextTokenAlarm(); arm the reclaim alarm here too,
+      // otherwise this cheap probe could dodge room reclamation forever. Gated on
+      // owner == null only as a cheap filter: handleClaim arms claimed
+      // never-authenticated rooms itself.
       if (store.getRoomState(this.sql).owner_credential_hash == null) {
         await this.scheduleNextTokenAlarm();
       }
@@ -341,11 +342,8 @@ export class RoomDO {
   }
 
   async handleClaim(request) {
-    // SEC-3：claim POST 是「对未认领房的实例化」的另一个 brief 原话例子——
-    // 不论请求体后续解析成不成功、claim 最终成不成功，这条路径也从不会走到
-    // fetch() 握手成功后的既有 scheduleNextTokenAlarm() 调用（:333 一线）。
-    // 放在最前面，覆盖这个入口的所有出口（含下面几处 400 早退）。owner 非
-    // null（已 claim/冲突）时不进——同一个误杀防线不变量。
+    // SEC-3: arm first so every exit below (incl. 400 early returns) is covered;
+    // claimed rooms are armed at the end of this handler instead.
     if (store.getRoomState(this.sql).owner_credential_hash == null) {
       await this.scheduleNextTokenAlarm();
     }
@@ -387,11 +385,9 @@ export class RoomDO {
     const bearer = parseBearerAuthorization(request);
     const ownerHash = store.getRoomState(this.sql).owner_credential_hash;
     if (!bearer.provided || !(await matchesOwnerCredential(bearer.credential, ownerHash))) {
-      // SEC-3 修复轮（独立 skeptic 复现的真实缺口）：DELETE 打未认领房
-      // （owner==null）恒 401，且这条分支从不触达 fetch() 握手成功后的既有
-      // scheduleNextTokenAlarm() 调用（:339 一线）——不补武装的话，纯用
-      // DELETE 探测未认领房能永远绕过 SEC-3 防刷房回收。owner 非 null（房
-      // 已认领、只是凭据错）时不进——同一个误杀防线不变量。
+      // SEC-3: DELETE on an unclaimed room always 401s and never reaches the
+      // post-handshake scheduleNextTokenAlarm(); arm the reclaim alarm here so
+      // this probe cannot dodge reclamation. Claimed rooms were armed at claim.
       if (ownerHash == null) {
         await this.scheduleNextTokenAlarm();
       }
@@ -599,6 +595,7 @@ export class RoomDO {
   }
 
   async alarm() {
+    if (!store.hasTable(this.sql, "room_state")) store.initRoomStateSentinel(this.sql);
     if (!this.assertRoomLive()) {
       this.closeAllSockets();
       return;
@@ -624,15 +621,17 @@ export class RoomDO {
         // tables and key-value data. Explicitly delete the alarm first so cleanup
         // does not depend on compatibility settings that make deleteAll remove it.
         // SQL tables no longer exist afterward; return without accessing this.sql.
-        // Unclaimed room identifiers are 128-bit random values with no legitimate
-        // owner. Reopening one recreates the sentinel as a fresh unclaimed room
-        // that expires again, so retaining a tombstone provides no needed guarantee.
-        // Claimed rooms and explicit deletion take separate paths and retain their
-        // tombstones and 410 responses.
+        // Room identifiers are 128-bit random values and a never-authenticated
+        // room has no legitimate owner (claim is unauthenticated). Reopening one
+        // recreates the sentinel as a fresh room that expires again, so retaining
+        // a tombstone provides no needed guarantee. Explicit deletion takes a
+        // separate path and retains its tombstone and 410 responses.
         await this.ctx.storage.deleteAlarm?.();
         await this.ctx.storage.deleteAll();
         return;
       }
+      // Not due yet: re-arm at the deadline (never in the past, so no hot loop).
+      await this.scheduleNextTokenAlarm();
     }
     // Unauthenticated claims can persist an owner without creating the business
     // schema. Alarms must not create that schema on behalf of such requests.

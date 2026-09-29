@@ -40,8 +40,9 @@ export async function rejectUpgradeAuthentication(room, ipBucketKey, hashPrefix,
   recordBucketHit(room.upgradeCoarseBuckets, ipBucketKey, now);
   // A failed upgrade can instantiate an unclaimed room. This path never reaches
   // the post-handshake alarm scheduling in fetch(), so arm or recompute its
-  // fixed reclamation alarm here. Claimed rooms must not be rescheduled for
-  // reclamation. The error response is returned normally afterward.
+  // fixed reclamation alarm here (claimed rooms that never authenticated are
+  // armed at claim time and reclaimed too). The error response is returned
+  // normally afterward.
   if (store.getRoomState(room.sql).owner_credential_hash == null) {
     await room.scheduleNextTokenAlarm(now);
   }

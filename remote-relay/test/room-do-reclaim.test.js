@@ -119,3 +119,57 @@ test("R8：claim 成功（含同 hash 幂等重放）后未鉴权房的回收 al
   assert.equal(second.status, 200);
   assert.equal(ctx.alarmLog.scheduled, createdAt + UNCLAIMED_RECLAIM_MS);
 });
+
+async function reclaim(room, ctx) {
+  expireRoom(room);
+  await room.alarm();
+  assert.equal(ctx.alarmLog.deleteAllCalled, true, "precondition: room was wiped by deleteAll");
+}
+
+test("R8 hardening：清库后同一内存实例再收到 claim 返回 200（重建哨兵），不抛 no such table", async () => {
+  const { room, ctx } = makeSchemaLessRoom();
+  assert.equal(store.claimRoom(room.sql, "e".repeat(64), Date.now()), "claimed");
+  await reclaim(room, ctx);
+
+  const res = await room.fetch(claimRequest("c".repeat(64)));
+  assert.equal(res.status, 200);
+  assert.equal(store.getRoomState(room.sql).owner_credential_hash, "c".repeat(64));
+});
+
+test("R8 hardening：清库后同一内存实例再收到无凭据 WS upgrade 返回 401，再跑 alarm() 也不抛错", async () => {
+  const { room, ctx } = makeSchemaLessRoom();
+  await reclaim(room, ctx);
+
+  const res = await room.fetch(
+    new Request(`https://relay.example/room/${ROOM}`, { headers: { Upgrade: "websocket" } })
+  );
+  assert.equal(res.status, 401);
+
+  ctx.alarmLog.deleteAllCalled = false;
+  await room.alarm();
+  assert.equal(ctx.alarmLog.deleteAllCalled, false, "fresh sentinel is not yet due");
+});
+
+test("R8 hardening：未到期的未鉴权房 alarm() 触发后重排回收 alarm（差 50ms 到期），不紧密重排", async () => {
+  const { room, ctx } = makeSchemaLessRoom();
+  assert.equal(store.claimRoom(room.sql, "e".repeat(64), Date.now()), "claimed");
+  const createdAt = Date.now() - UNCLAIMED_RECLAIM_MS + 50;
+  room.sql.exec("UPDATE room_state SET created_at = ?", createdAt);
+  ctx.alarmLog.scheduled = null; // the fired alarm is consumed by the runtime
+
+  await room.alarm();
+
+  assert.equal(ctx.alarmLog.deleteAllCalled, false);
+  assert.equal(ctx.alarmLog.scheduled, createdAt + UNCLAIMED_RECLAIM_MS, "reclaim alarm is re-armed at the deadline");
+});
+
+test("R8 hardening：过期但有活连接的未鉴权房 alarm() 不重排（避免过去时刻 alarm 紧密循环）", async () => {
+  const { room, ctx } = makeSchemaLessRoom();
+  expireRoom(room);
+  ctx.acceptWebSocket({ serializeAttachment() {}, deserializeAttachment: () => ({}), send() {}, close() {} });
+  ctx.alarmLog.scheduled = null;
+
+  await room.alarm();
+
+  assert.equal(ctx.alarmLog.scheduled, null, "must not re-arm an alarm in the past");
+});
