@@ -1236,7 +1236,7 @@ test("epoch.changed：desktop 若把它当入站帧发进来，同样被矩阵�
 const UNCLAIMED_RECLAIM_MS = 20 * 60 * 1000;
 
 test("SEC-3：未认领裸房经失败 upgrade fetch() 武装固定回收 alarm；到点 alarm() 自杀回收", async () => {
-  const { room, ctx } = makeRoom();
+  const { room, ctx } = makeSchemaLessRoom();
   const initialState = store.getRoomState(room.sql);
   assert.equal(initialState.owner_credential_hash, null);
   assert.ok(Number.isSafeInteger(initialState.created_at), "构造器应已把 created_at 回填成安全整数");
@@ -1298,7 +1298,7 @@ test("SEC-3：claim 抢在回收 alarm 到点之前提交 → alarm() 实时重�
 });
 
 test("F2-A：回收 alarm 抢在 claim 之前触发 → 彻底清房后同 id 不是永久 410，而是全新未认领房（reclaim 赢的竞态分支·新语义）", async () => {
-  const { room, ctx } = makeRoom();
+  const { room, ctx } = makeSchemaLessRoom();
   room.sql.exec("UPDATE room_state SET created_at = ?", Date.now() - UNCLAIMED_RECLAIM_MS - 1);
 
   await room.alarm();
@@ -1327,6 +1327,8 @@ test("F2-A：回收 alarm 抢在 claim 之前触发 → 彻底清房后同 id �
 
 test("SEC-3：未认领房与 refresh_requests 候选共存时，scheduleNextTokenAlarm 取更近的那个（min 语义）", async () => {
   const { room, ctx } = makeRoom();
+  // Never-authenticated room (no room_meta) that keeps refresh_requests.
+  room.sql.exec("DROP TABLE room_meta");
   const state = store.getRoomState(room.sql);
   const reclaimAt = state.created_at + UNCLAIMED_RECLAIM_MS;
   const subject = "device:99999999-9999-4999-8999-999999999999";
@@ -1448,7 +1450,7 @@ test("alarm()：到点清扫过期 pending_input、广播 input.expired、并重
 // ============================================================================
 
 test("F3：未认领房连续多次失败 upgrade 命中同一个回收时刻，只有第一次真正 setAlarm，后续全部去重跳过", async () => {
-  const { room, ctx } = makeRoom();
+  const { room, ctx } = makeSchemaLessRoom();
 
   // 连续 3 次无凭据 WS 升级尝试——每次都会走 rejectUpgradeAuthentication →
   // scheduleNextTokenAlarm，算出的 nearest（回收候选，created_at 全程不变）
@@ -1503,7 +1505,7 @@ test("F3：新算出的 nearest 比现有 alarm 更早时仍会重排（去重�
 // ============================================================================
 
 test("SEC-3 修复轮：DELETE 到未认领房也武装固定回收 alarm；到点 alarm() 自杀回收", async () => {
-  const { room, ctx } = makeRoom();
+  const { room, ctx } = makeSchemaLessRoom();
   const initialState = store.getRoomState(room.sql);
   assert.equal(initialState.owner_credential_hash, null);
 
@@ -1530,7 +1532,7 @@ test("SEC-3 修复轮：DELETE 到未认领房也武装固定回收 alarm；到�
 });
 
 test("SEC-3 修复轮：裸 GET（426 else 分支）到未认领房也武装固定回收 alarm；到点 alarm() 自杀回收", async () => {
-  const { room, ctx } = makeRoom();
+  const { room, ctx } = makeSchemaLessRoom();
   const initialState = store.getRoomState(room.sql);
   assert.equal(initialState.owner_credential_hash, null);
 
@@ -1593,10 +1595,10 @@ test("F1：未认领 schema-less 房到点 alarm() 正常彻底清房、不建�
   assert.equal(store.hasTable(room.sql, "room_meta"), false, "回收路径不该顺手建出任何业务表");
 });
 
-test("F1 回归：已 claim 但从未鉴权成功过的 schema-less 房到点 alarm() 不误杀、也不再兜底建出业务 schema（修复前应红）", async () => {
-  const { room } = makeSchemaLessRoom();
-  // 生产复现：未鉴权 POST /room/<hex>/claim 用任意 64hex credential_hash 直接
-  // 落 owner——不经过 fetch() 的 WS upgrade 鉴权枝，业务 schema 全程没建过。
+test("R8：已 claim 但从未鉴权成功过的 schema-less 房超过回收时限后被 alarm() 整库回收（room_state 等表一并清空）", async () => {
+  const { room, ctx } = makeSchemaLessRoom();
+  // Unauthenticated POST /room/<hex>/claim persists an owner without ever
+  // creating the business schema (no WS auth happened).
   const claimed = store.claimRoom(room.sql, "e".repeat(64), Date.now());
   assert.equal(claimed, "claimed");
   assert.equal(store.hasTable(room.sql, "room_meta"), false, "claim 本身不该建出任何业务表");
@@ -1605,12 +1607,8 @@ test("F1 回归：已 claim 但从未鉴权成功过的 schema-less 房到点 al
 
   await room.alarm();
 
-  const state = store.getRoomState(room.sql);
-  assert.equal(state.owner_credential_hash, "e".repeat(64), "已 claim 的房不该被回收枝误杀");
-  assert.equal(state.tombstoned_at, null, "已 claim 的房不该被回收枝误杀");
-  assert.equal(
-    store.hasTable(room.sql, "room_meta"),
-    false,
-    "F1 核心断言：alarm() 不该替一次从未鉴权成功的 claim 兜底建出业务 schema（room_meta 等 11 张表）"
-  );
+  const remainingTables = room.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table'");
+  assert.deepEqual(remainingTables, [], "已 claim 未鉴权的房到点应整库清空，room_state 也不剩");
+  assert.equal(ctx.alarmLog.deleteAllCalled, true);
+  assert.equal(ctx.alarmLog.deleted, true);
 });

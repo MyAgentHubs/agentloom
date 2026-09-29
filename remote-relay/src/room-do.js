@@ -378,6 +378,8 @@ export class RoomDO {
     if (result === "rate_limited") return new Response("rate limited", { status: 429 });
     if (result === "tombstoned") return new Response("room gone", { status: 410 });
     if (result === "conflict") return new Response("owner conflict", { status: 409 });
+    // Claimed-but-never-authenticated rooms are reclaimed too: arm the alarm.
+    if (!store.hasTable(this.sql, "room_meta")) await this.scheduleNextTokenAlarm();
     return new Response("ok", { status: 200 });
   }
 
@@ -605,19 +607,15 @@ export class RoomDO {
     // 之前（回收枝只摸 room_state，不需要业务 schema；F2-A 起改走
     // storage.deleteAll 整库清空，不管当时存不存在的其它表，不需要先在这里把
     // 它们建出来）。
-    // ★误杀防线（核心不变量）：硬门 = owner_credential_hash == null，不是
-    // 「无连接」。已 claim 但暂时无连接的正常空房 owner 非 null，永远不会
-    // 进这一枝。getWebSockets().length===0 只是防御性叠加——owner==null 的
-    // 房不可能有活的已认证 socket（desktop 走 bearer 认证，
-    // matchesOwnerCredential 对 null ownerHash 恒 false；remote 走
-    // token_subjects/token_aliases，那两张表只由 desktop 的 token.put 写，
-    // desktop 连不上就永远不会有行，resolveTokenAdmission 永远打不中）。
-    // claim/reclaim 竞态：DO 单线程、都是同步事务不交错；这里到点**实时
-    // 重查** owner（不信调度快照）——claim 先提交则这里看到 owner 非 null、
-    // 跳过；reclaim 先则后续 claim 见 state.tombstoned_at != null，
-    // claimRoom 已有分支回 "tombstoned"，handleClaim 映射成 410。
+    // Reclaim guard: the hard gate is "never authenticated" (room_meta absent;
+    // ensureBusinessSchema only runs after desktop/token auth succeeds), whether
+    // or not an owner was claimed: an unauthenticated POST /claim can register any
+    // hash, so owner presence proves nothing. Rooms that authenticated once have
+    // room_meta and never enter here. No live sockets is an extra defensive check.
+    // claim/reclaim never interleave (single-threaded DO); the deadline is
+    // re-checked live here, and after a reclaim a later claim starts a fresh room.
     const unclaimedState = store.getRoomState(this.sql);
-    if (unclaimedState.owner_credential_hash == null && this.ctx.getWebSockets().length === 0) {
+    if (!store.hasTable(this.sql, "room_meta") && this.ctx.getWebSockets().length === 0) {
       const createdAt = unclaimedState.created_at == null ? null : Number(unclaimedState.created_at);
       if (createdAt != null && Date.now() >= createdAt + UNCLAIMED_RECLAIM_MS) {
         // Fully erase expired unclaimed rooms: retaining a tombstone leaves storage
@@ -1792,13 +1790,13 @@ export class RoomDO {
     if (replyRouteDeadline != null && (nearest == null || replyRouteDeadline < nearest)) {
       nearest = replyRouteDeadline;
     }
-    // SEC-3：未认领空房固定回收截止——第四类候选。owner 非 null（已 claim）
-    // 时不参与这个 min：已 claim 房绝不会被这里排一个回收 alarm（误杀防线，
-    // 与 alarm() 回收枝的硬门同一个不变量）。createdAt 理论上不该是 null
+    // SEC-3：从未鉴权房固定回收截止——第四类候选。判据与 alarm() 回收枝同一个
+    // 硬门：room_meta 不存在（从未鉴权成功），不论是否已 claim；已鉴权过的房
+    // 不参与这个 min。createdAt 理论上不该是 null
     // （initRoomStateSentinel 无条件回填，构造器无条件调它），这里仍防御性
     // 兜底——读不到就不排这个候选，不猜一个时刻。
     const unclaimedState = store.getRoomState(this.sql);
-    if (unclaimedState.owner_credential_hash == null && unclaimedState.created_at != null) {
+    if (!store.hasTable(this.sql, "room_meta") && unclaimedState.created_at != null) {
       const reclaimAt = Number(unclaimedState.created_at) + UNCLAIMED_RECLAIM_MS;
       if (nearest == null || reclaimAt < nearest) nearest = reclaimAt;
     }
