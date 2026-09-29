@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { clearDraft, loadDraft, saveDraft } from "./composerDraftStore";
+import {
+  clearDraft,
+  discardDraft,
+  loadDraft,
+  saveDraft,
+} from "./composerDraftStore";
 
 describe("composerDraftStore", () => {
   beforeEach(() => localStorage.clear());
@@ -70,5 +75,15 @@ describe("composerDraftStore", () => {
     expect(() => saveDraft("s1", { text: "x", attachments: [] })).not.toThrow();
     expect(() => clearDraft("s1")).not.toThrow();
     expect(loadDraft("s1")).toEqual({ text: "", attachments: [] });
+  });
+
+  it("discardDraft drops the stored draft and refuses later writes for that session", () => {
+    saveDraft("gone", { text: "x", attachments: [] });
+    discardDraft("gone");
+    expect(localStorage.getItem("agentloom.draft.gone")).toBeNull();
+    saveDraft("gone", { text: "late flush", attachments: [] });
+    expect(localStorage.getItem("agentloom.draft.gone")).toBeNull();
+    saveDraft("other", { text: "ok", attachments: [] });
+    expect(loadDraft("other").text).toBe("ok");
   });
 });

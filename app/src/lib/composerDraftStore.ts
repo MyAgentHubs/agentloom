@@ -4,6 +4,9 @@ const NEW_SESSION_KEY = "__new__";
 export type ComposerAttachment = { path: string; name: string };
 export type ComposerDraft = { text: string; attachments: ComposerAttachment[] };
 
+// Sessions deleted this run: late flushes must not resurrect their draft (ids are never reused).
+const discarded = new Set<string>();
+
 const EMPTY: ComposerDraft = { text: "", attachments: [] };
 
 function storageKey(sessionId: string | null): string {
@@ -42,6 +45,7 @@ export function saveDraft(
   sessionId: string | null,
   draft: ComposerDraft,
 ): void {
+  if (sessionId !== null && discarded.has(sessionId)) return;
   try {
     if (draft.text === "" && draft.attachments.length === 0) {
       localStorage.removeItem(storageKey(sessionId));
@@ -66,4 +70,10 @@ export function clearDraft(sessionId: string | null): void {
   } catch {
     // storage unavailable — nothing to clear
   }
+}
+
+/** Session deleted: drop its draft and refuse any later write for it. */
+export function discardDraft(sessionId: string): void {
+  discarded.add(sessionId);
+  clearDraft(sessionId);
 }

@@ -43,7 +43,7 @@ import { Lightbox } from "./components/Lightbox";
 import { isAgentAvailable, type RuntimeDetect } from "./lib/agentAvailability";
 import { shouldShowInstallGuide } from "./lib/agentOnboarding";
 import { loadLastAgentId, saveLastAgentId } from "./lib/agentPrefStore";
-import { clearDraft } from "./lib/composerDraftStore";
+import { discardDraft } from "./lib/composerDraftStore";
 import { saveProjectEdits } from "./lib/editProject";
 import {
   applyEventTransportBatch,
@@ -4926,7 +4926,7 @@ function AppContent() {
     setSessionDotStatus(id, null);
     // Deleting a session must clear its queued messages and pause state to prevent orphaned delivery attempts.
     clearSessionQueueState(id);
-    clearDraft(id);
+    discardDraft(id);
     const list = await refreshSessions();
     // 剪枝导航历史：移除所有该会话的条目
     const pruned = pruneNavHistory(

@@ -147,4 +147,29 @@ describe("useComposerDraft", () => {
     expect(result.current.draft).toBe("live");
     expect(localStorage.getItem(KEY("a"))).toBeNull();
   });
+
+  it("a late edit from an unmounted instance only merges into storage", () => {
+    const first = renderHook(() => useComposerDraft("a"));
+    const lateEdit = first.result.current.editFor;
+    first.unmount();
+    const second = renderHook(() => useComposerDraft("a"));
+    act(() => second.result.current.setDraft("new text"));
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    act(() =>
+      lateEdit("a", (d) => ({
+        ...d,
+        attachments: [...d.attachments, { path: "/late/f", name: "f" }],
+      })),
+    );
+    expect(second.result.current.draft).toBe("new text");
+    window.dispatchEvent(new Event("pagehide"));
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+    const saved = JSON.parse(localStorage.getItem(KEY("a")) ?? "{}");
+    expect(saved.text).toBe("new text");
+    expect(saved.attachments).toEqual([{ path: "/late/f", name: "f" }]);
+  });
 });

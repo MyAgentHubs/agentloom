@@ -288,6 +288,32 @@ describe("App", () => {
       localStorage.removeItem("agentloom.draft.s1");
     });
 
+    it("删除当前会话 → 切走时不会把它的草稿写回存储", async () => {
+      const s1 = makeSession({ id: "s1", title: "主会话" });
+      const s2 = makeSession({ id: "s2", title: "另一会话" });
+      mockAppWith([s1, s2]);
+      const { container } = render(<App />);
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith("get_messages", {
+          sessionId: "s1",
+        }),
+      );
+      const box = await screen.findByPlaceholderText(/输入消息/);
+      fireEvent.change(box, { target: { value: "unsent text in s1" } });
+      const row = container.querySelector('[data-session-id="s1"]')!;
+      fireEvent.contextMenu(row);
+      fireEvent.click(row.querySelector('[data-action="delete"]')!);
+      const dialog = screen.getByRole("dialog");
+      fireEvent.click(within(dialog).getByRole("button", { name: "删除" }));
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith("get_messages", {
+          sessionId: "s2",
+        }),
+      );
+      await new Promise((r) => setTimeout(r, 450));
+      expect(localStorage.getItem("agentloom.draft.s1")).toBeNull();
+    });
+
     it("删除失败时 toast 错误而不是未处理 Promise", async () => {
       const s1 = makeSession({ id: "s1", title: "主会话" });
       const s2 = makeSession({ id: "s2", title: "另一会话" });

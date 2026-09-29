@@ -28,6 +28,10 @@ export function useComposerDraft(sessionId: string | null) {
   const latestRef = useRef<ComposerDraft>(state);
   // Bumps whenever a stored draft is loaded for a new session, so callers can re-measure the textarea.
   const [loadSeq, setLoadSeq] = useState(0);
+  // False once this instance unmounted: late async callbacks then only touch storage.
+  const mountedRef = useRef(true);
+  // Only write back what this instance actually changed, so an idle instance never overwrites storage.
+  const dirtyRef = useRef(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const cancelTimer = useCallback(() => {
@@ -39,12 +43,15 @@ export function useComposerDraft(sessionId: string | null) {
 
   const flush = useCallback(() => {
     cancelTimer();
+    if (!dirtyRef.current) return;
+    dirtyRef.current = false;
     saveDraft(keyRef.current, latestRef.current);
   }, [cancelTimer]);
 
   const update = useCallback(
     (next: ComposerDraft) => {
       latestRef.current = next;
+      dirtyRef.current = true;
       setState(next);
       cancelTimer();
       timerRef.current = setTimeout(flush, SAVE_DEBOUNCE_MS);
@@ -80,7 +87,9 @@ export function useComposerDraft(sessionId: string | null) {
       key: string | null,
       fn: (d: ComposerDraft, live: boolean) => ComposerDraft,
     ) => {
-      if (key === keyRef.current) return update(fn(latestRef.current, true));
+      if (mountedRef.current && key === keyRef.current) {
+        return update(fn(latestRef.current, true));
+      }
       saveDraft(key, fn(loadDraft(key), false));
     },
     [update],
@@ -94,11 +103,15 @@ export function useComposerDraft(sessionId: string | null) {
    */
   const clear = useCallback(
     (key?: string | null) => {
-      if (key !== undefined && key !== keyRef.current) {
-        clearDraft(key);
+      if (
+        !mountedRef.current ||
+        (key !== undefined && key !== keyRef.current)
+      ) {
+        clearDraft(key === undefined ? keyRef.current : key);
         return false;
       }
       cancelTimer();
+      dirtyRef.current = false;
       latestRef.current = { text: "", attachments: [] };
       setState(latestRef.current);
       clearDraft(keyRef.current);
@@ -119,12 +132,14 @@ export function useComposerDraft(sessionId: string | null) {
 
   // Flush on unmount and when the page is going away.
   useEffect(() => {
+    mountedRef.current = true;
     window.addEventListener("pagehide", flush);
     window.addEventListener("beforeunload", flush);
     return () => {
       window.removeEventListener("pagehide", flush);
       window.removeEventListener("beforeunload", flush);
       flush();
+      mountedRef.current = false;
     };
   }, [flush]);
 
