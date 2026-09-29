@@ -1,6 +1,6 @@
-[English](README.md) · **简体中文**
-
 # AgentLoom Remote Control relay 骨架
+
+[English](README.md) · **简体中文**
 
 Cloudflare Workers + Durable Objects 版 relay 骨架，覆盖
 **S1 接入与鉴权 / S2 房间 DO / S3 配额与滥用防护** 三块（单层信封、`kind`
@@ -23,7 +23,7 @@ E2EE 的边界，也是整个方案「relay 挂了/被黑了也读不到会话�
 本骨架未包含）如果和 relay 同域托管，解密用的 JS 代码就是 relay 运营方下发
 的——理论上运营方随时能推一份偷钥匙的版本。也就是说**同域托管的 Web 端
 E2EE 防外人、防入侵，不防运营方自己**。这不是本骨架的实现缺陷，是这个拓扑
-形状本身的取舍，等 iOS 原生端（M5）才能给出更完整的承诺。
+形状本身的取舍，等未来的 iOS 原生端才能给出更完整的承诺。
 
 ## 协议形状（单层信封，无外层包装）
 
@@ -102,7 +102,7 @@ AAD = v | room | epoch | kind | session | command_id
   仅接受来自桌面连接。违反方向的一律拒绝 + 回 `{t:"error",
   reason:"role_forbidden"}`，不静默丢弃。
 
-## S4 同域静态托管 + 安全头（T6g1）
+## S4 同域静态托管 + 安全头
 
 `remote-web`（C1 手机 Web 端）构建产物挂在这个 worker 同域下，`wrangler.toml`
 的 `[assets]` 绑定指向 `../remote-web/dist`——**部署/`wrangler dev` 联调静态
@@ -142,8 +142,8 @@ relay 运营方自己」这条已披露的取舍——CSP 挡不住运营方自�
 
 - 生产配额数值（`DEFAULT_MONTHLY_MILESTONE_LIMIT` 是骨架能跑通用的占位值，
   不是产品拍板的数字）。
-- staging 部署 + 手机真机矩阵冒烟 + 首屏预算数值门禁（T6g2，另一张单——本单
-  只做同域托管的代码/配置/安全头，不跑 `wrangler deploy`）。
+- staging 部署 + 手机真机矩阵冒烟 + 首屏预算数值门禁单独跟进；本节
+  只覆盖同域托管的代码/配置/安全头，不跑 `wrangler deploy`。
 - 桌面侧令牌签发 / 配对握手的完整流程在桌面端实现，本目录的 relay 只负责
   登记令牌、比对令牌和执行到期。
 - **速率限流的范围**（跟 S3 的「月度里程碑配额」是两码事，见
@@ -192,8 +192,8 @@ npx wrangler deploy --dry-run   # 只编译校验，不会真的发布
 替身：`ctx.storage.sql` 复用同一套 node:sqlite 适配器；`ctx.acceptWebSocket`
 / `ctx.getWebSockets` 用一个数组当连接登记表；WebSocket 本体只实现
 `send`/`serializeAttachment`/`deserializeAttachment` 三个方法。直接驱动
-`fetch()`（鉴权 401/404、M2 鉴权前置）和 `webSocketMessage()`（消息路由/
-H1 role 方向/H3 配额降级）——这两个是 RoomDO 真正暴露给外界的入口，替身只
+`fetch()`（鉴权 401/404、鉴权前置）和 `webSocketMessage()`（消息路由/
+role 方向校验/配额降级）——这两个是 RoomDO 真正暴露给外界的入口，替身只
 顶掉它们依赖的运行时基础设施，业务逻辑一行没改。
 
 真正跑不进单测的只剩 Hibernation 生命周期本身（`new WebSocketPair()` 到

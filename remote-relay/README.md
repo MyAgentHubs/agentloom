@@ -1,6 +1,6 @@
-**English** · [简体中文](README.zh-CN.md)
-
 # AgentLoom Remote Control relay skeleton
+
+**English** · [简体中文](README.zh-CN.md)
 
 A Cloudflare Workers + Durable Objects relay skeleton covering three areas:
 **S1 access and authentication / S2 room DO / S3 quota and abuse protection**
@@ -29,7 +29,7 @@ operator — in theory the operator could push a key-stealing version at any tim
 In other words, **E2EE for a same-origin-hosted Web client protects against
 outsiders and intruders, not against the operator itself**. This is not an
 implementation defect of this skeleton; it is a trade-off inherent to this
-topology, and a more complete guarantee has to wait for the native iOS client (M5).
+topology, and a more complete guarantee has to wait for a future native iOS client.
 
 ## Protocol shape (single-layer envelope, no outer wrapper)
 
@@ -126,7 +126,7 @@ headers of `src/room-do.js` / `src/envelope.js`.
   only accepted from the desktop connection. Anything violating the direction is
   rejected with `{t:"error", reason:"role_forbidden"}` — not silently dropped.
 
-## S4 same-origin static hosting + security headers (T6g1)
+## S4 same-origin static hosting + security headers
 
 The `remote-web` (C1 mobile Web client) build output is mounted under this
 worker's origin; the `[assets]` binding in `wrangler.toml` points at
@@ -177,9 +177,9 @@ to the topology.
 - Production quota numbers (`DEFAULT_MONTHLY_MILESTONE_LIMIT` is a placeholder
   that lets the skeleton run, not a number settled by the product).
 - Staging deployment + a real-phone device matrix smoke test + a first-screen
-  budget numeric gate (T6g2, a separate task — this task only covers the code /
+  budget numeric gate are tracked separately; this section covers only the code /
   config / security headers for same-origin hosting and does not run
-  `wrangler deploy`).
+  `wrangler deploy`.
 - The complete flow of desktop-side token issuance / pairing handshake is
   implemented in the desktop app; the relay in this directory is only responsible
   for registering tokens, comparing tokens and enforcing expiry.
@@ -237,9 +237,9 @@ quota counting are genuinely verified rather than self-certified.
 `ctx.storage.sql` reuses the same node:sqlite adapter; `ctx.acceptWebSocket` /
 `ctx.getWebSockets` use an array as the connection registry; the WebSocket itself
 implements only the three methods `send`/`serializeAttachment`/
-`deserializeAttachment`. It drives `fetch()` (authentication 401/404, M2
-authentication-first) and `webSocketMessage()` (message routing / H1 role
-direction / H3 quota degradation) directly — these are the two entry points
+`deserializeAttachment`. It drives `fetch()` (authentication 401/404,
+authentication-first) and `webSocketMessage()` (message routing / role
+direction check / quota degradation) directly — these are the two entry points
 RoomDO actually exposes to the outside world, and the stand-in only replaces the
 runtime infrastructure they depend on; not a single line of business logic is
 changed.
