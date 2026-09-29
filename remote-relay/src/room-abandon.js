@@ -1,24 +1,16 @@
 "use strict";
 
 import { getMeta, setMeta } from "./roomStoreMeta.js";
-import { hasTable } from "./roomStoreSchema.js";
+import { getRoomState, hasTable } from "./roomStoreSchema.js";
 
 // Reclaim of rooms that authenticated once but were then abandoned. Claim is
 // unauthenticated, so anyone can claim a room and connect once with their own
 // credential (which creates the business schema); without this those rooms
-// would live forever. A room is only reclaimed when it is provably worthless:
-// no live sockets, no phone pairing, no stored data, and idle for a long time.
+// would live forever. A room is only reclaimed when nobody can use it: no live
+// sockets, no phone able to log in, nothing in flight, and idle for a long time.
 export const ABANDONED_ROOM_RECLAIM_MS = 7 * 24 * 60 * 60 * 1000;
 export const LAST_ACTIVITY_KEY = "last_activity_at";
 
-// Tables where any row means the room holds something a user may still need.
-const ANY_ROW_TABLES = [
-  "token_subjects", // paired phones, including revoked ones
-  "token_aliases",
-  "token_put_fingerprints",
-  "pairing_routes", // pairing in progress
-  "events", // milestone history
-];
 // Tables whose rows only matter until their deadline (alarm purges them later).
 const UNEXPIRED_ROW_TABLES = [
   ["pending_input", "expires_at"], // input waiting for the desktop
@@ -32,9 +24,24 @@ export function touchRoomActivity(sql, now = Date.now()) {
   if (hasTable(sql, "room_meta")) setMeta(sql, LAST_ACTIVITY_KEY, now);
 }
 
+// A room is worth keeping when a phone can still log into it, the token
+// generation floor is set (wiping would let generations roll back), or work is
+// in flight. Deliberately NOT a reason to keep: events (a desktop-side cache the
+// desktop re-sends on reconnect; a never-paired desktop writes none), stored
+// put fingerprints, pairing_routes (never deleted), and revoked/expired
+// subjects or aliases - an attacker can create all of these with one connection.
 function roomHoldsData(sql, now) {
-  for (const table of ANY_ROW_TABLES) {
-    if (hasTable(sql, table) && sql.exec(`SELECT 1 AS present FROM ${table} LIMIT 1`).length > 0) return true;
+  if (Number(getRoomState(sql).registry_floor) > 0) return true;
+  if (
+    hasTable(sql, "token_aliases") &&
+    hasTable(sql, "token_subjects") &&
+    sql.exec(
+      "SELECT 1 AS present FROM token_aliases a JOIN token_subjects s ON s.subject = a.subject " +
+        "WHERE s.state = 'active' AND a.valid_until > ? LIMIT 1",
+      now
+    ).length > 0
+  ) {
+    return true;
   }
   for (const [table, deadlineColumn] of UNEXPIRED_ROW_TABLES) {
     if (

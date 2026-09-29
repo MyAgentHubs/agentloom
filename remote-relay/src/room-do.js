@@ -586,6 +586,7 @@ export class RoomDO {
     }
     this.flushProtocolViolations();
     touchRoomActivity(this.sql);
+    await this.scheduleNextTokenAlarm(Date.now(), ws);
     const att = safeAttachment(ws);
     if (att.role !== "desktop" || (att.registry_ready === true &&
         Number(att.epoch) === store.getCurrentEpoch(this.sql))) {
@@ -593,8 +594,10 @@ export class RoomDO {
     }
   }
 
-  async webSocketError() {
-    // Hibernation API 要求实现这个回调；骨架不做特殊处理——重连是客户端的责任。
+  async webSocketError(ws) {
+    // Reconnecting is the client's job; only re-arm reclaim like a close would.
+    touchRoomActivity(this.sql);
+    await this.scheduleNextTokenAlarm(Date.now(), ws);
   }
 
   async alarm() {
@@ -603,10 +606,7 @@ export class RoomDO {
       this.closeAllSockets();
       return;
     }
-    // SEC-3：未认领空房自杀回收——放在 ensureBusinessSchema 与下面三类逻辑
-    // 之前（回收枝只摸 room_state，不需要业务 schema；F2-A 起改走
-    // storage.deleteAll 整库清空，不管当时存不存在的其它表，不需要先在这里把
-    // 它们建出来）。
+    // SEC-3: reclaim before ensureBusinessSchema; deleteAll wipes whatever tables exist.
     // Reclaim guard: the hard gate is "never authenticated" (room_meta absent;
     // ensureBusinessSchema only runs after desktop/token auth succeeds), whether
     // or not an owner was claimed: an unauthenticated POST /claim can register any
@@ -1760,10 +1760,12 @@ export class RoomDO {
     return false;
   }
 
-  async scheduleNextTokenAlarm(now = Date.now()) {
+  async scheduleNextTokenAlarm(now = Date.now(), closingWs = null) {
     if (typeof this.ctx.storage.setAlarm !== "function") return;
     let nearest = null;
-    for (const ws of this.ctx.getWebSockets()) {
+    // The closing socket may still be listed inside its own close callback.
+    const liveSockets = this.ctx.getWebSockets().filter((ws) => ws !== closingWs);
+    for (const ws of liveSockets) {
       const attachment = safeAttachment(ws);
       if (attachment.role === "desktop" && attachment.scope === "desktop" && attachment.registry_ready !== true) {
         const deadline = Number(attachment.registry_sync_deadline);
@@ -1791,17 +1793,15 @@ export class RoomDO {
     if (replyRouteDeadline != null && (nearest == null || replyRouteDeadline < nearest)) {
       nearest = replyRouteDeadline;
     }
-    // SEC-3：从未鉴权房固定回收截止——第四类候选。判据与 alarm() 回收枝同一个
-    // 硬门：room_meta 不存在（从未鉴权成功），不论是否已 claim；已鉴权过的房
-    // 不参与这个 min。createdAt 理论上不该是 null
-    // （initRoomStateSentinel 无条件回填，构造器无条件调它），这里仍防御性
-    // 兜底——读不到就不排这个候选，不猜一个时刻。
+    // SEC-3: fixed reclaim deadline of never-authenticated rooms (same gate as
+    // alarm(): no room_meta, claimed or not). created_at should never be null;
+    // if it is, skip the candidate rather than guess.
     const unclaimedState = store.getRoomState(this.sql);
     if (!store.hasTable(this.sql, "room_meta") && unclaimedState.created_at != null) {
       const reclaimAt = Number(unclaimedState.created_at) + UNCLAIMED_RECLAIM_MS;
       if (nearest == null || reclaimAt < nearest) nearest = reclaimAt;
     }
-    nearest = withAbandonedCandidate(this.sql, this.ctx.getWebSockets().length, now, nearest);
+    nearest = withAbandonedCandidate(this.sql, liveSockets.length, now, nearest);
     // C1-TTL（dogfood 修障第二批·手机发消息桌面离线无反馈）：pending_input
     // 暂存 TTL 到期时刻——第五类候选，同款「一处算一处设」结构。之前
     // purgeExpiredPendingInput 只在 handleInput 高频路径里顺带触发，没有
