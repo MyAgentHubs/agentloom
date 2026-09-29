@@ -8,9 +8,16 @@ private_repo="${AGENTLOOM_PRIVATE_REPO:-https://github.com/MyAgentHubs/agentloom
 # Split this path so the residue scan (scripts/check_oss_residue.sh) does not flag it.
 sp_dir="docs/""superpowers"
 
+install_hooks() {
+  if [[ -f "$root/scripts/install-hooks.sh" ]]; then
+    (cd "$root" && bash scripts/install-hooks.sh)
+  fi
+}
+
 if [[ ! -e "$private" ]]; then
   if ! git clone "$private_repo" "$private" >/dev/null 2>&1; then
     printf 'private repo unreachable; run gh auth login (or configure git credentials), then rerun.\n'
+    install_hooks
     exit 0
   fi
 elif [[ -e "$private/.git" ]]; then
@@ -76,6 +83,15 @@ if [[ -d "$private/evals" ]]; then
     name="$(basename "$source")"
     destination="$root/evals/$name"
     relative="../.private/evals/$name"
+    if [[ -d "$destination" && ! -L "$destination" && -d "$source" ]]; then
+      for file in "$source"/*; do
+        if [[ -f "$file" && ! -L "$file" ]]; then
+          filename="$(basename "$file")"
+          link_if_present "$file" "$destination/$filename" "../../.private/evals/$name/$filename"
+        fi
+      done
+      continue
+    fi
     if [[ -e "$destination" && ! -L "$destination" ]]; then
       continue
     fi
@@ -84,12 +100,12 @@ if [[ -d "$private/evals" ]]; then
 fi
 
 if (( failed )); then
+  install_hooks
   exit 1
 fi
 if (( mounted == 0 )); then
   printf '.private looks empty/incomplete/not a git checkout; remove it and rerun bootstrap.\n'
+  install_hooks
   exit 0
 fi
-if [[ -f "$root/scripts/install-hooks.sh" ]]; then
-  (cd "$root" && bash scripts/install-hooks.sh)
-fi
+install_hooks

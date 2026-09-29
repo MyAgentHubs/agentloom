@@ -10,6 +10,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 
 SCRIPT = Path(__file__).with_name("dev-bootstrap.sh")
+INSTALL_HOOKS = SCRIPT.with_name("install-hooks.sh")
 # Split this path so the public-snapshot residue scan does not flag it.
 SP_DIR = "/".join(("docs", "superpowers"))
 
@@ -71,6 +72,17 @@ class DevBootstrapTest(unittest.TestCase):
             timeout=timeout,
         )
 
+    def prepare_mixed_evals(self):
+        fixture = self.repo / "evals/engine-bridge/fixtures/f.json"
+        fixture.parent.mkdir(parents=True)
+        fixture.write_text("public bridge\n")
+        self.git(self.repo, "add", "evals/engine-bridge/fixtures/f.json")
+        self.git(self.repo, "commit", "-qm", "public fixture")
+        for name in ("PROGRAM.md", "RESULTS.md", "run_eval.sh"):
+            (self.private / "evals/engine-bridge" / name).write_text(name + "\n")
+        self.git(self.private, "add", "evals/engine-bridge")
+        self.git(self.private, "commit", "-qm", "private eval fixtures")
+
     def test_empty_private_directory_skips_pull_and_hooks(self):
         (self.repo / ".private").mkdir()
         self.git(self.repo, "add", ".")
@@ -88,7 +100,7 @@ class DevBootstrapTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(any("pull" in call.split() for call in calls.read_text().splitlines()))
         self.assertFalse((self.repo / SP_DIR).is_symlink())
-        self.assertFalse((self.repo / "hooks-installed").exists())
+        self.assertTrue((self.repo / "hooks-installed").exists())
         self.assertIn("empty/incomplete/not a git checkout", result.stdout)
 
     def test_regular_file_conflict_is_preserved(self):
@@ -184,6 +196,55 @@ class DevBootstrapTest(unittest.TestCase):
             self.assertFalse(path.is_symlink(), name)
             self.assertEqual(path.read_text(), content)
 
+    def test_real_evals_directory_links_private_files_and_excludes_them(self):
+        self.prepare_mixed_evals()
+        result = self.run_bootstrap()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (self.repo / "evals/engine-bridge/fixtures/f.json").read_text(),
+            "public bridge\n",
+        )
+        exclude = (self.repo / ".git/info/exclude").read_text().splitlines()
+        for name in ("PROGRAM.md", "RESULTS.md", "run_eval.sh", "x.txt"):
+            path = self.repo / "evals/engine-bridge" / name
+            self.assertTrue(path.is_symlink(), name)
+            self.assertEqual(os.readlink(path), f"../../.private/evals/engine-bridge/{name}")
+            self.assertIn(f"/evals/engine-bridge/{name}", exclude)
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=self.repo, env=self.env,
+            check=True, capture_output=True, text=True,
+        ).stdout
+        self.assertNotIn("evals/engine-bridge/", status)
+
+    def test_real_evals_directory_second_run_is_idempotent(self):
+        self.prepare_mixed_evals()
+        first = self.run_bootstrap()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        names = ("PROGRAM.md", "RESULTS.md", "run_eval.sh", "x.txt")
+        before = {
+            name: os.readlink(self.repo / "evals/engine-bridge" / name)
+            for name in names
+        }
+        second = self.run_bootstrap()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(
+            {name: os.readlink(self.repo / "evals/engine-bridge" / name) for name in names},
+            before,
+        )
+        exclude = (self.repo / ".git/info/exclude").read_text().splitlines()
+        for name in names:
+            self.assertEqual(exclude.count(f"/evals/engine-bridge/{name}"), 1, name)
+
+    def test_real_evals_directory_file_conflict_requires_migration(self):
+        self.prepare_mixed_evals()
+        path = self.repo / "evals/engine-bridge/PROGRAM.md"
+        path.write_text("public program\n")
+        result = self.run_bootstrap()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("migrate", result.stdout + result.stderr)
+        self.assertFalse(path.is_symlink())
+        self.assertEqual(path.read_text(), "public program\n")
+
     def test_second_run_is_idempotent_and_exclude_is_unique(self):
         first = self.run_bootstrap()
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -216,7 +277,19 @@ class DevBootstrapTest(unittest.TestCase):
         self.assertIn("private repo unreachable", result.stdout + result.stderr)
         self.assertFalse((self.repo / ".private").exists())
         self.assertFalse((self.repo / SP_DIR).is_symlink())
-        self.assertFalse((self.repo / "hooks-installed").exists())
+        self.assertTrue((self.repo / "hooks-installed").exists())
+
+    def test_unreachable_private_repo_installs_real_hooks(self):
+        self.env["AGENTLOOM_PRIVATE_REPO"] = str(Path(self.temp.name) / "missing")
+        shutil.copy2(INSTALL_HOOKS, self.repo / "scripts/install-hooks.sh")
+        shutil.copytree(SCRIPT.parent.parent / ".githooks", self.repo / ".githooks")
+        result = self.run_bootstrap()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        hooks_path = subprocess.run(
+            ["git", "config", "--get", "core.hooksPath"], cwd=self.repo, env=self.env,
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(hooks_path, ".githooks")
 
     def test_real_directory_conflict_is_preserved(self):
         path = self.repo / "harness-agent/evals"
@@ -227,7 +300,7 @@ class DevBootstrapTest(unittest.TestCase):
         self.assertIn("migrate", result.stdout + result.stderr)
         self.assertFalse(path.is_symlink())
         self.assertEqual((path / "keep.txt").read_text(), "keep\n")
-        self.assertFalse((self.repo / "hooks-installed").exists())
+        self.assertTrue((self.repo / "hooks-installed").exists())
 
     def test_wrong_symlink_conflict_is_preserved(self):
         path = self.repo / SP_DIR
@@ -236,7 +309,7 @@ class DevBootstrapTest(unittest.TestCase):
         result = self.run_bootstrap()
         self.assertEqual(result.returncode, 1)
         self.assertEqual(os.readlink(path), "somewhere-else")
-        self.assertFalse((self.repo / "hooks-installed").exists())
+        self.assertTrue((self.repo / "hooks-installed").exists())
 
 
 if __name__ == "__main__":
