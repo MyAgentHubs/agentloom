@@ -511,20 +511,37 @@ test("check-origin: internal origin has a Chinese error", async () => {
   await assert.rejects(() => updaterManifest.checkOrigin({ repoRoot: "/tmp", exec: async () => ({ stdout: "git@github.com:MyAgentHubs/agentloom-internal.git\n" }) }), /origin.*[\u4e00-\u9fff]/);
 });
 
-test("check-origin: symlinked CLI rejects an internal origin", async () => {
+// Run the CLI through a symlink against a throwaway repo whose origin is
+// `originUrl`; GIT_DIR pins the repo since the CLI's repoRoot ignores cwd.
+async function runSymlinkedCheckOrigin(originUrl) {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "updater-manifest-symlink-"));
   const link = path.join(tempDir, "updater-manifest.mjs");
   try {
     await symlink(path.join(scriptDir, "updater-manifest.mjs"), link);
+    const fakeRepo = path.join(tempDir, "repo");
+    execFileSync("git", ["-c", "init.defaultBranch=main", "init", "-q", fakeRepo]);
+    execFileSync("git", ["-C", fakeRepo, "remote", "add", "origin", originUrl]);
     const result = spawnSync(process.execPath, [link, "check-origin"], {
       cwd: path.resolve(scriptDir, "../.."),
       encoding: "utf8",
+      env: { ...process.env, GIT_DIR: path.join(fakeRepo, ".git") },
     });
-    assert.notEqual(result.status, 0);
-    assert.match(result.stdout + result.stderr, /origin.*[\u4e00-\u9fff]/);
+    return result;
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+}
+
+test("check-origin: symlinked CLI rejects an internal origin", async () => {
+  const result = await runSymlinkedCheckOrigin("git@github.com:MyAgentHubs/agentloom-internal.git");
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout + result.stderr, /origin.*[\u4e00-\u9fff]/);
+});
+
+test("check-origin: symlinked CLI accepts the public origin", async () => {
+  const result = await runSymlinkedCheckOrigin("https://github.com/MyAgentHubs/agentloom.git");
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /check-origin OK/);
 });
 
 test("check-version: local tag differing from origin is rejected without replacement", async () => {
