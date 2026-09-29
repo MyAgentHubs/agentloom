@@ -21,6 +21,7 @@ import type {
 import { quoteLabel, quotePreview, quoteTooltip } from "../lib/quoteMessage";
 import { useI18n } from "../i18n";
 import { useComposerDraft } from "../hooks/useComposerDraft";
+import { useComposerMarkdownKeys } from "../hooks/useComposerMarkdownKeys";
 import {
   advanceStreamActivity,
   type StreamActivityState,
@@ -289,6 +290,7 @@ export function InputArea({
   const [guardHint, setGuardHint] = useState<string | null>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const composingRef = useRef(false);
+  const onKeyDownMd = useComposerMarkdownKeys();
 
   useEffect(() => {
     if (quoteKey) taRef.current?.focus();
@@ -518,10 +520,11 @@ export function InputArea({
   }
 
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key !== "Enter") return;
-
     const composing =
       composingRef.current || e.nativeEvent.isComposing || e.keyCode === 229;
+    if (onKeyDownMd(e, composing)) return;
+    if (e.key !== "Enter") return;
+
     if (e.shiftKey || composing) return;
 
     e.preventDefault();
