@@ -77,6 +77,43 @@ link_if_present "$private/app/.design-sync" "$root/app/.design-sync" "../.privat
 link_if_present "$private/$sp_dir/private-rules/CLAUDE.local.md" "$root/CLAUDE.local.md" ".private/$sp_dir/private-rules/CLAUDE.local.md"
 link_if_present "$private/$sp_dir/private-rules/AGENTS.private.md" "$root/AGENTS.private.md" ".private/$sp_dir/private-rules/AGENTS.private.md"
 
+override="$root/AGENTS.override.md"
+override_marker='<!-- AGENTLOOM_GENERATED_AGENTS_OVERRIDE: AGENTS.md + private AGENTS.private.md; regenerate with scripts/dev-bootstrap.sh -->'
+private_agents="$private/$sp_dir/private-rules/AGENTS.private.md"
+exclude_link "$override"
+if [[ -e "$override" || -L "$override" ]] &&
+  { [[ ! -f "$override" ]] || ! grep -Fq -- "$override_marker" "$override"; }; then
+  printf 'Warning: %s is not generated; leaving it unchanged.\n' "$override" >&2
+elif [[ -f "$private_agents" && -f "$root/AGENTS.md" ]]; then
+  dir="$(git -C "$root" rev-parse --git-common-dir)"
+  if [[ "$dir" != /* ]]; then
+    dir="$root/$dir"
+  fi
+  override_tmp="$(mktemp "$dir/agents.override.XXXXXX")"
+  trap 'rm -f -- "$override_tmp"' EXIT
+  {
+    printf '%s\n\n' "$override_marker"
+    cat "$root/AGENTS.md"
+    printf '\n'
+    cat "$private_agents"
+  } > "$override_tmp"
+  mv -f -- "$override_tmp" "$override"
+  trap - EXIT
+elif [[ -f "$override" ]] && grep -Fq -- "$override_marker" "$override"; then
+  rm -f -- "$override"
+fi
+
+private_skills="$private/$sp_dir/private-rules/skills"
+if [[ -d "$private_skills" ]]; then
+  mkdir -p "$root/.claude/skills"
+  shopt -s nullglob dotglob
+  for source in "$private_skills"/*; do
+    [[ -d "$source" ]] || continue
+    name="$(basename "$source")"
+    link_if_present "$source" "$root/.claude/skills/$name" "../../.private/$sp_dir/private-rules/skills/$name"
+  done
+fi
+
 if [[ -d "$private/evals" ]]; then
   shopt -s nullglob dotglob
   for source in "$private/evals"/*; do

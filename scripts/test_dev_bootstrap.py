@@ -316,6 +316,130 @@ class DevBootstrapTest(unittest.TestCase):
         self.assertEqual(os.readlink(path), "somewhere-else")
         self.assertTrue((self.repo / "hooks-installed").exists())
 
+    def test_generated_override_updates_and_is_excluded(self):
+        agents = self.repo / "AGENTS.md"
+        agents.write_text("public rules\n")
+        self.git(self.repo, "add", "AGENTS.md")
+        self.git(self.repo, "commit", "-qm", "public rules")
+        first = self.run_bootstrap()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        override = self.repo / "AGENTS.override.md"
+        marker = (
+            "<!-- AGENTLOOM_GENERATED_AGENTS_OVERRIDE: AGENTS.md + private "
+            "AGENTS.private.md; regenerate with scripts/dev-bootstrap.sh -->"
+        )
+        self.assertEqual(
+            override.read_text(),
+            f"{marker}\n\npublic rules\n\nagent rules\n",
+        )
+        agents.write_text("updated public rules\n")
+        second = self.run_bootstrap()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(
+            override.read_text(),
+            f"{marker}\n\nupdated public rules\n\nagent rules\n",
+        )
+        exclude = (self.repo / ".git/info/exclude").read_text().splitlines()
+        self.assertEqual(exclude.count("/AGENTS.override.md"), 1)
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=self.repo, env=self.env,
+            check=True, capture_output=True, text=True,
+        ).stdout
+        self.assertNotIn("AGENTS.override.md", status)
+
+    def test_failed_override_generation_cleans_temporary_file(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can read files with mode 000")
+        (self.repo / "AGENTS.md").write_text("public rules\n")
+        first = self.run_bootstrap()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        private_agents = self.repo / ".private" / SP_DIR / "private-rules/AGENTS.private.md"
+        private_agents.chmod(0)
+        try:
+            result = self.run_bootstrap()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(list(self.repo.glob(".AGENTS.override.md.*")), [])
+            self.assertEqual(list((self.repo / ".git").glob("agents.override.*")), [])
+        finally:
+            private_agents.chmod(0o644)
+
+    def test_user_override_is_preserved(self):
+        (self.repo / "AGENTS.md").write_text("public rules\n")
+        override = self.repo / "AGENTS.override.md"
+        override.write_text("my own override\n")
+        result = self.run_bootstrap()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(override.read_text(), "my own override\n")
+        self.assertIn("Warning:", result.stderr)
+
+    def test_missing_private_agents_removes_only_generated_override(self):
+        (self.repo / "AGENTS.md").write_text("public rules\n")
+        first = self.run_bootstrap()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        override = self.repo / "AGENTS.override.md"
+        self.assertTrue(override.exists())
+        (self.repo / ".private" / SP_DIR / "private-rules/AGENTS.private.md").unlink()
+        second = self.run_bootstrap()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertFalse(override.exists())
+        override.write_text("my own override\n")
+        third = self.run_bootstrap()
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertEqual(override.read_text(), "my own override\n")
+        self.assertIn("Warning:", third.stderr)
+
+    def test_missing_private_agents_does_not_create_override(self):
+        (self.repo / "AGENTS.md").write_text("public rules\n")
+        (self.private / SP_DIR / "private-rules/AGENTS.private.md").unlink()
+        self.git(self.private, "add", "-u")
+        self.git(self.private, "commit", "-qm", "remove private rules")
+        result = self.run_bootstrap()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.repo / "AGENTS.override.md").exists())
+        self.assertTrue((self.repo / "hooks-installed").exists())
+
+    def test_private_skills_link_individually_and_keep_other_entries(self):
+        skills = self.private / SP_DIR / "private-rules/skills"
+        for name in ("review", "planning"):
+            path = skills / name
+            path.mkdir(parents=True)
+            (path / "SKILL.md").write_text(name + " rules\n")
+        self.git(self.private, "add", ".")
+        self.git(self.private, "commit", "-qm", "private skills")
+        unrelated = self.repo / ".claude/skills/unrelated"
+        unrelated.mkdir(parents=True)
+        (unrelated / "SKILL.md").write_text("keep\n")
+        for _ in range(2):
+            result = self.run_bootstrap()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for name in ("review", "planning"):
+                path = self.repo / ".claude/skills" / name
+                self.assertTrue(path.is_symlink(), name)
+                self.assertEqual(
+                    os.readlink(path),
+                    f"../../.private/{SP_DIR}/private-rules/skills/{name}",
+                )
+                self.assertEqual((path / "SKILL.md").read_text(), name + " rules\n")
+            self.assertEqual((unrelated / "SKILL.md").read_text(), "keep\n")
+        exclude = (self.repo / ".git/info/exclude").read_text().splitlines()
+        for name in ("review", "planning"):
+            self.assertEqual(exclude.count(f"/.claude/skills/{name}"), 1)
+
+    def test_private_skill_directory_conflict_is_preserved(self):
+        skill = self.private / SP_DIR / "private-rules/skills/review"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("private rules\n")
+        self.git(self.private, "add", ".")
+        self.git(self.private, "commit", "-qm", "private skill")
+        destination = self.repo / ".claude/skills/review"
+        destination.mkdir(parents=True)
+        (destination / "SKILL.md").write_text("keep\n")
+        result = self.run_bootstrap()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("migrate", result.stdout + result.stderr)
+        self.assertEqual((destination / "SKILL.md").read_text(), "keep\n")
+        self.assertTrue((self.repo / "hooks-installed").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -27,6 +27,7 @@ PRIVATE_PATHS=(
   ".private"
   "CLAUDE.local.md"
   "AGENTS.private.md"
+  "AGENTS.override.md"
 )
 # Fixtures that stay scanned and public despite living under a private prefix.
 PRIVATE_EXCEPT=(
