@@ -4,10 +4,14 @@ Rules for AI agents working in this repository. Read this before writing code.
 Human contributors: see [`CONTRIBUTING.md`](CONTRIBUTING.md) — this file is the
 same rules in a form you can hand to a tool.
 
-Also read `CLAUDE.md` (product paradigm, collaboration rules) and
-`GUIDELINES.zh.md` (coding baseline), plus any `AGENTS.*.md` file beside this
-one: maintainers may keep local-only notes there, and they never relax the
-rules in this file.
+This file holds all of the project rules. A maintainer may keep local-only supplements
+(`AGENTS.*.md`, `CLAUDE.local.md`); they only add to this file and never relax it.
+
+## What AgentLoom is
+
+A Tauri, **session-centric** IDE where several LLM agents (Claude, Codex, DeepSeek, Gemini, local models, ...)
+work together across many GitHub repos (multiple accounts and orgs). Code lives in `app/` (React + TypeScript
+frontend, Rust backend) and `harness-agent/` (`myagent`, the built-in Rust agent engine).
 
 ## Before you write any code
 
@@ -106,70 +110,76 @@ has never been a reason for rejection here. Undisclosed slop has.
   wanted; a pull request adding any of them will be declined.
 - User credentials belong in the OS keychain, never in the database, logs, or
   configuration files.
-- AgentLoom's own state (session records, logs, scratch files) must never be
-  written into a user's project working tree.
 
-## Lead mode
+## Product paradigm and design invariants
 
-This section applies to Codex when Codex is acting as lead or coordinator in
-this repository. It does not change the Claude workflow described in
-`CLAUDE.md`, and it does not loosen anything above.
+**The whole app revolves around the session, not the repository.**
 
-### Trigger
+- Switching repos is a low-frequency action: the project switcher at the bottom of the left sidebar (upward popover). No repo list in the topbar.
+- Left sidebar: the current repo's **session list** (high frequency), a project overview menu, a footer.
+- Main area: one session at a time, composer at the bottom, **no tabs** (the sidebar list is the switcher).
+- Right panel (Codex style): collapsed by default; tabs Files / Review / Terminal / Side chat (/ Browser).
+- **Terminal** is the right-panel Terminal tab, not a bottom drawer; plus inline tool-call cards and a pinned live-process widget.
+- **The only search entry** is the Cmd+K floating panel.
+- **Session topology (C')** replaces the old three-mode input switch. Collaboration is session-level: Solo = one agent;
+  Team = one lead plus members; Discussion / Round Table are greyed-out placeholders for later. Entry is the composer
+  agent picker (crown sets the lead, toggles add members), not the old `Agent Team` mode pill or a TeamBar.
+- **Role vs model are decoupled.** A role (lead / member / host / specialist) is a slot; an LLM fills it. Avatar and
+  role pill are independent dimensions; never switch either through a popup.
+- **Agent runtime** = a (provider, model, capabilities, cost) profile; role is not in the profile, it is set at
+  dispatch time. DeepSeek attaches via Claude Code. The dispatch pool is enabled agents filtered by capability tags
+  (namespace-level allowlists come later: the agents table has no namespace foreign key). Multi-account gh:
+  namespace-to-account mapping plus commit identity switching.
+- **Multimodal rendering is first-class**: diff, collapsible thinking, tool-command cards, mermaid, fold-by-default,
+  full-screen routing.
+- **i18n** runs through everything. MVP supports GitHub only; GitLab is left as an interface (adapter pattern).
+- **Product/runtime state isolation (hard invariant).** AgentLoom's own state and run artifacts (session memory,
+  decision ledger, TaskPack, MemberResult, logs, session state, worktrees, branches/refs, temp files) live in the app
+  domain: the app data directory DB, `~/.agentloom/`, and only `agentloom/*` namespaced branches (cleaned up when
+  done). Never write them into the user's repo working tree, never leave non-namespaced branches/refs, never commit
+  to the user's branch unasked.
+  - Boundary: this stops AgentLoom writing its own bookkeeping into the user's repo. An agent changing the user's
+    project source is not covered: that is the product (in-place: the agent works in the project directory, like
+    Claude Code or Codex). "Do not write the user's working tree" does not mean "agents may not edit code". Same
+    family as worktree isolation.
+  - The one explicit exception is session **attachments** (pasted, dropped, or picked files). They go to
+    `<session workspace>/.agentloom/attachments/` and are ignored via `.git/info/exclude` (never the user's
+    `.gitignore`; nothing is written in non-git directories). They are input material for the agent, like Claude
+    Code's in-project `.claude/worktrees/`. Journals, logs, the DB, and worktrees stay in the app domain.
 
-Enter Lead mode when the maintainer says or implies:
+## Visual system
 
-- "先对齐", "不要急着改", "先不要写代码"
-- "只做规划 / 思考 / 拆解 / 定根因 / 方案"
-- Codex is explicitly acting as lead or coordinator
+- Warm beige background `#F5F2EC`, warm orange accent `#D97757`, and **restraint** (anchored on Claude Code / Codex desktop).
+- Linear SVG icons. **No emoji in section headings** (structure comes from typography; emoji only where an image is needed).
+- **Fold by default**: long content, tool output, and thinking start collapsed; expand on demand.
+- Layout, topbar, split-pane, or other global-structure changes must be checked in the real Tauri GUI; tests and grep cannot see layout-only bugs.
+- Debugging layout or CSS overflow: measure, do not guess. For horizontal overflow or a flex child that will not shrink,
+  suspect a missing `min-width: 0` first and measure widths up the ancestor chain in devtools. If a fix has no effect,
+  check the cwd of the dev server (multiple worktrees).
 
-### Lead boundary
+## Two code lines
 
-In Lead mode, Codex does not edit business code, tests, configs, or commits
-unless the maintainer explicitly approves moving from planning into
-implementation.
+- `app/` and `harness-agent/` each own their own source of truth. Align across lines before changing the boundary.
+- Confirm with the engine line first when touching `harness-agent/CONTRACT.md`, `harness-agent/src/vocabulary.rs`,
+  `harness-agent/src/plan/**`, or the display semantics of `plan.*` / `agent.note.delta`.
 
-Codex lead is responsible for:
+## Coding baseline
 
-- Environment probing: repo status, available tools, relevant app/runtime state.
-- Problem framing: goal, non-goals, scope, assumptions, done_when.
-- Root-cause analysis: evidence first, with uncertainty called out.
-- Task decomposition: small atomic tasks with file scope and acceptance.
-- Worker/reviewer prompts when work is delegated.
-- Review and verdict after implementation.
+Guidelines against common LLM coding mistakes (after Andrej Karpathy's observations); they favor caution over speed,
+so use judgment on trivial tasks. A Chinese version is in `GUIDELINES.zh.md`.
 
-Codex lead is not responsible for directly doing the implementation in the
-same planning step.
-
-### Task shape
-
-Each implementation task should be small enough to review independently:
-
-- Single concern.
-- Prefer three files or fewer.
-- Explicit allowed files and forbidden files.
-- One concrete acceptance command or GUI acceptance checklist.
-- Clear stop conditions, including scope expansion, missing tools, or unclear
-  product behavior.
-
-### GUI requirement
-
-For GUI bugs, unit tests or Web UI checks are not enough by themselves.
-The plan must include real desktop GUI verification when the product path runs
-through the Tauri app.
-
-The acceptance should state what a user should see after each click, including
-failure states such as a menu flashing closed, state rollback, toast/error
-display, or disabled controls.
-
-### Review gate
-
-After implementation, Codex should require:
-
-- Code review focused on behavior regressions and missed edge cases.
-- Relevant tests or build checks.
-- GUI verification for GUI-facing changes.
-- A concise verdict before commit or handoff.
+1. **Think before coding.** State assumptions and ask when unsure; lay out multiple readings instead of silently
+   picking one; say when a simpler approach exists; stop and ask where something is unclear.
+2. **Simplicity first.** The least code that solves the problem: no unrequested features, no abstraction for
+   single-use code, no unrequested configurability, no error handling for impossible cases. If 200 lines could be 50, rewrite.
+3. **Surgical changes.** Do not "improve" adjacent code, comments, or formatting; do not refactor what is not broken;
+   match the existing style; mention unrelated dead code instead of deleting it. Remove only what your own change made
+   unused. Every changed line must trace to the request.
+4. **Goal-driven execution.** Turn tasks into verifiable goals ("fix a bug" = a reproducing test, then make it pass;
+   "refactor X" = tests pass before and after). Give multi-step work a short plan with a check per step. Run the
+   verification and read its output before claiming done, fixed, or passing.
+5. **One file, one concern.** New files aim for 500 lines or fewer; past about 800, split by concern into modules.
+   Do not pile new code into an already oversized file; a huge `impl` block or heap of free functions is a signal to split.
 
 ## When to stop and ask
 

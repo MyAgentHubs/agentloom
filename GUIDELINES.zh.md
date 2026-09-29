@@ -1,6 +1,8 @@
 # GUIDELINES.zh.md — AgentLoom 编码与协作基线
 
-> 一套减少 LLM 写代码常见错误的行为准则。源自 Andrej Karpathy 对 LLM coding 陷阱的观察（原始 4 原则：github.com/multica-ai/andrej-karpathy-skills），在此结合 AgentLoom 的多 agent 协作与当前设计阶段语境本地化整理。与项目记忆 CLAUDE.md 配合使用。
+> 本文件是 AGENTS.md `Coding baseline` 一节的中文说明；两者冲突时以 AGENTS.md 为准。
+
+> 一套减少 LLM 写代码常见错误的行为准则。源自 Andrej Karpathy 对 LLM coding 陷阱的观察（原始 4 原则：github.com/multica-ai/andrej-karpathy-skills），在此结合 AgentLoom 的多 agent 协作与当前设计阶段语境本地化整理。与 AGENTS.md 配合使用。
 
 **权衡**：这套准则偏向谨慎而非速度。琐碎任务用判断，别教条。
 
@@ -48,7 +50,7 @@
 
 检验：每一行改动都能直接追溯到用户的需求。
 
-**在 AgentLoom 中**：呼应既有约定「不抢跑下一步」。多 agent 回收时，队长以 `git diff` 复核做闸 —— 子 agent 的改动若超出 task scope 就打回。改 mockup / 文档同理：推新原型后只同步该动的索引与状态条目，不顺手重排无关条目。**同理，运行产物别漏写进用户项目工作树、收尾清掉自己留的命名空间残枝（见 CLAUDE.md「产品/运行时状态隔离」不变量）。**
+**在 AgentLoom 中**：呼应既有约定「不抢跑下一步」。多 agent 回收时，队长以 `git diff` 复核做闸 —— 子 agent 的改动若超出 task scope 就打回。**同理，运行产物别漏写进用户项目工作树、收尾清掉自己留的命名空间残枝（见 AGENTS.md「Product/runtime state isolation」不变量）。**
 
 ## 4. 目标驱动执行
 
