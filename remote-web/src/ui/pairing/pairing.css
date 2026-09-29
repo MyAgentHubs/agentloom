@@ -1,0 +1,102 @@
+/* pairing.css — T6f1 · 配对屏 + 连接/错误态 shell 的移动端布局（新写，见 spec §6「移动端是新
+ * 活」）。视觉对齐桌面克制风：暖米底 + 暖橙 accent、无 emoji；本屏内容量小，暂无需要折叠默认的
+ * 长内容。
+ */
+
+.pairing-screen {
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: stretch;
+  padding:
+    max(24px, env(safe-area-inset-top)) 20px
+    max(24px, env(safe-area-inset-bottom));
+  gap: 16px;
+}
+
+.pairing-heading {
+  margin: 0 0 8px;
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.pairing-hint {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--ink-3);
+}
+
+.pairing-manual-entry textarea {
+  width: 100%;
+  margin: 16px 0 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  /* F4：13px 低于 iOS Safari 自动聚焦放大的 16px 阈值——viewport 已放开 maximum-scale，聚焦这个
+   * textarea 会触发意外缩放。提到 16px，与 composer 输入框同口径。 */
+  font-size: 16px;
+  resize: vertical;
+}
+
+.pairing-manual-entry button {
+  width: 100%;
+  padding: 12px;
+  border: none;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.pairing-error-text {
+  margin-top: 12px;
+  color: var(--red);
+  font-size: 13px;
+}
+
+.pairing-progress {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 40px 0;
+}
+
+.pairing-progress__spinner {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 3px solid var(--line-soft);
+  border-top-color: var(--accent);
+  animation: pairing-spin 0.9s linear infinite;
+}
+
+@keyframes pairing-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.pairing-progress__label {
+  color: var(--ink-3);
+  font-size: 14px;
+}
+
+.pairing-paired,
+.pairing-error {
+  text-align: center;
+}
+
+.pairing-device-id {
+  margin-top: 16px;
+  font-size: 12px;
+  color: var(--ink-4);
+  word-break: break-all;
+}

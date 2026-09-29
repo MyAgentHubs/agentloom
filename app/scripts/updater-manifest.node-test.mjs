@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import * as updaterManifest from "./updater-manifest.mjs";
 
 import {
   checkVersion,
@@ -12,6 +13,156 @@ import {
   verifyLocal,
   verifyRemote,
 } from "./updater-manifest.mjs";
+
+const scriptDir = path.dirname(new URL(import.meta.url).pathname);
+
+async function executable(filePath, content) {
+  await writeFile(filePath, content, { mode: 0o755 });
+}
+
+async function releaseFixture({ assets = [] } = {}) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "release-publish-test-"));
+  const bin = path.join(root, "bin");
+  const artifacts = path.join(root, "artifacts");
+  await mkdir(bin);
+  await mkdir(artifacts);
+  const version = "0.2.8";
+  for (const name of [
+    `AgentLoom_${version}_macOS_aarch64.app.tar.gz`,
+    `AgentLoom_${version}_macOS_x86_64.app.tar.gz`,
+    `AgentLoom_${version}_macOS_aarch64.app.tar.gz.sig`,
+    `AgentLoom_${version}_macOS_x86_64.app.tar.gz.sig`,
+    `AgentLoom_${version}_macOS_arm64.dmg`,
+    `AgentLoom_${version}_macOS_x64.dmg`,
+    "updater-aarch64.json",
+    "updater-x86_64.json",
+  ]) await writeFile(path.join(artifacts, name), name);
+  const notes = path.join(root, "notes.md");
+  await writeFile(notes, "Release notes\n");
+  const log = path.join(root, "gh.log");
+  await executable(path.join(bin, "gh"), `#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["TEST_GH_LOG"], "a") as out:
+    out.write(json.dumps(args) + "\\n")
+if "list" in args:
+    print(json.dumps([{"tagName":"v0.2.7","isLatest":True}]))
+elif "view" in args:
+    print(json.dumps({"isDraft":True,"assets":json.loads(os.environ["TEST_ASSETS"])}))
+`);
+  await executable(path.join(bin, "git"), `#!/usr/bin/env python3
+import sys
+if "show" in sys.argv:
+    print('{"storeVersion":"1.0.13.0"}')
+`);
+  await executable(path.join(bin, "node"), `#!/usr/bin/env python3
+import sys
+if "merge" in sys.argv:
+    args = sys.argv
+    with open(args[args.index("--out") + 1], "w") as out:
+        out.write('{}')
+`);
+  for (const tool of ["npx", "minisign"]) {
+    await executable(path.join(bin, tool), "#!/bin/sh\nexit 0\n");
+  }
+  return {
+    root, bin, artifacts, notes, log,
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, TEST_GH_LOG: log, TEST_ASSETS: JSON.stringify(assets.map(name => ({ name }))) },
+  };
+}
+
+function runRelease(fixture) {
+  return spawnSync("bash", [path.join(scriptDir, "release-publish.sh"), "--version", "0.2.8", "--artifacts", fixture.artifacts, "--notes-file", fixture.notes], { encoding: "utf8", env: fixture.env });
+}
+
+test("release-publish: rejects unknown assets in an existing draft", async () => {
+  const fixture = await releaseFixture({ assets: ["unexpected.exe"] });
+  const result = runRelease(fixture);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /陌生资产|未知资产/);
+  assert.match(result.stderr, /删除该草稿/);
+  const calls = (await readFile(fixture.log, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.equal(calls.some(args => args.includes("upload")), false);
+});
+
+test("release-publish: reusing a clean draft refreshes title and notes", async () => {
+  const fixture = await releaseFixture({ assets: ["SHA256SUMS.txt"] });
+  const result = runRelease(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  const calls = (await readFile(fixture.log, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.ok(calls.some(args => args.includes("edit") && args.includes("--title") && args.includes("v0.2.8") && args.includes("--notes-file") && args.includes(fixture.notes)));
+});
+
+test("release-publish: internal origin leaves an existing local tag untouched", async () => {
+  const fixture = await releaseFixture();
+  const local = path.join(fixture.root, "local");
+  const remote = path.join(fixture.root, "internal.git");
+  execFileSync("git", ["init", "-q", "--bare", remote]);
+  execFileSync("git", ["init", "-q", local]);
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const git = (...args) => execFileSync(realGit, ["-C", local, ...args], { encoding: "utf8" }).trim();
+  git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "origin tag");
+  git("tag", "v0.2.7");
+  git("push", "-q", remote, "v0.2.7");
+  git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "local tag");
+  git("tag", "-f", "v0.2.7");
+  git("remote", "add", "origin", remote);
+  const before = git("rev-parse", "v0.2.7");
+  await executable(path.join(fixture.bin, "node"), `#!/bin/sh\nexec '${process.execPath}' "$@"\n`);
+  await executable(path.join(fixture.bin, "git"), `#!/bin/sh\nif [ "$1" = '-C' ]; then shift 2; fi\nif [ "$1" = 'remote' ] && [ "$2" = 'get-url' ]; then echo 'git@github.com:MyAgentHubs/agentloom-internal.git'; exit 0; fi\nexec "$TEST_REAL_GIT" -C "$TEST_LOCAL_REPO" "$@"\n`);
+  fixture.env.TEST_REAL_GIT = realGit;
+  fixture.env.TEST_LOCAL_REPO = local;
+  const result = runRelease(fixture);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /origin.*[\u4e00-\u9fff]/);
+  assert.equal(git("rev-parse", "v0.2.7"), before);
+});
+
+test("release-publish: internal origin does not fetch an absent local tag", async () => {
+  const fixture = await releaseFixture();
+  const local = path.join(fixture.root, "local");
+  const remote = path.join(fixture.root, "internal.git");
+  execFileSync("git", ["init", "-q", "--bare", remote]);
+  execFileSync("git", ["init", "-q", local]);
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const git = (...args) => execFileSync(realGit, ["-C", local, ...args], { encoding: "utf8" }).trim();
+  const localTagStatus = () => spawnSync(realGit, ["-C", local, "rev-parse", "-q", "--verify", "refs/tags/v0.2.7"], { encoding: "utf8" }).status;
+  git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "origin tag");
+  git("tag", "v0.2.7");
+  git("push", "-q", remote, "v0.2.7");
+  git("tag", "-d", "v0.2.7");
+  git("remote", "add", "origin", remote);
+  assert.equal(localTagStatus(), 1);
+  await executable(path.join(fixture.bin, "node"), `#!/bin/sh\nexec '${process.execPath}' "$@"\n`);
+  await executable(path.join(fixture.bin, "git"), `#!/bin/sh\nif [ "$1" = '-C' ]; then shift 2; fi\nif [ "$1" = 'remote' ] && [ "$2" = 'get-url' ]; then echo 'git@github.com:MyAgentHubs/agentloom-internal.git'; exit 0; fi\nexec "$TEST_REAL_GIT" -C "$TEST_LOCAL_REPO" "$@"\n`);
+  fixture.env.TEST_REAL_GIT = realGit;
+  fixture.env.TEST_LOCAL_REPO = local;
+  const result = runRelease(fixture);
+  assert.notEqual(result.status, 0);
+  assert.equal(localTagStatus(), 1);
+});
+
+test("release-publish: a conflicting local tag keeps git's clobber error and adds guidance", async () => {
+  const fixture = await releaseFixture();
+  await executable(path.join(fixture.bin, "git"), `#!/bin/sh
+if [ "$3" = 'fetch' ]; then
+  echo "fatal: would clobber existing tag" >&2
+  exit 1
+fi
+`);
+  const result = runRelease(fixture);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /would clobber existing tag/);
+  assert.match(result.stderr, /请先核对本地 tag/);
+});
+
+test("release-desktop: verifies its draft marker before deletion", async () => {
+  const source = await readFile(new URL("../../.github/workflows/release-desktop.yml", import.meta.url), "utf8");
+  const markerCheck = source.indexOf("Signed desktop candidates. Verify them before publishing this draft.", source.indexOf("if gh release view"));
+  const deletion = source.indexOf('gh release delete "$tag" --yes');
+  assert.match(source.slice(markerCheck - 250, markerCheck), /gh release view "\$tag" --json body --jq \.body/);
+  assert.ok(markerCheck >= 0 && markerCheck < deletion);
+});
 
 test("release-publish: check-version invocation keeps updater dependency and artifacts gates", async () => {
   const source = await readFile(
@@ -44,6 +195,7 @@ test("release-publish: check-version invocation keeps updater dependency and art
     /(?:^|\s)--artifacts(?:\s|$)/,
     "release-publish.sh check-version invocation must pass --artifacts",
   );
+  assert.doesNotMatch(invocation, /--public-remote/);
 });
 
 function commandExists(command) {
@@ -138,7 +290,7 @@ async function writeArtifactsFixture(dir, { version = "0.2.8" } = {}) {
 
 // Fake `exec` used by check-version tests. Handles:
 //  - `git fetch` (no-op) / `git show <tag>:<path>` (returns fixture content,
-//    or an override, simulating the public remote's tag content)
+//    or an override, simulating origin's tag content)
 //  - `tar -xzf` (no-op extraction; nothing needs to exist on disk because
 //    plutil/lipo below are also mocked, not really reading extracted files)
 //  - `plutil -convert json -o - <plist>` (returns a JSON Info.plist, keyed
@@ -150,14 +302,15 @@ function makeCheckVersionExec({
   version = "0.2.8",
   plistOverrides = {},
   lipoOverrides = {},
-  publicRemoteUrl = "https://github.com/MyAgentHubs/agentloom.git",
+  originUrl = "https://github.com/MyAgentHubs/agentloom.git",
 }) {
   const archOfPath = (p) =>
     p.includes(`${path.sep}x86_64${path.sep}`) ? "x86_64" : "aarch64";
   return async (command, args) => {
     if (command === "git") {
       if (args[0] === "remote" && args[1] === "get-url") {
-        return { stdout: `${publicRemoteUrl}\n`, stderr: "" };
+        assert.deepEqual(args, ["remote", "get-url", "origin"]);
+        return { stdout: `${originUrl}\n`, stderr: "" };
       }
       if (args[0] === "fetch") return { stdout: "", stderr: "" };
       if (args[0] === "show") {
@@ -206,7 +359,6 @@ async function baseCheckVersionArgs(repoRoot, overrides = {}) {
     repoRoot,
     previousStoreVersion: "1.0.13.0",
     releaseTag: `v${version}`,
-    publicRemote: "public",
     artifactsDir,
     exec: makeCheckVersionExec({
       remoteContents,
@@ -214,13 +366,13 @@ async function baseCheckVersionArgs(repoRoot, overrides = {}) {
       version,
       plistOverrides: overrides.plistOverrides ?? {},
       lipoOverrides: overrides.lipoOverrides ?? {},
-      publicRemoteUrl: overrides.publicRemoteUrl,
+      originUrl: overrides.originUrl,
     }),
     ...overrides.extra,
   };
 }
 
-test("check-version: consistent sextet, increasing storeVersion, matching tag/public-tag/artifacts passes", async () => {
+test("check-version: consistent sextet, increasing storeVersion, matching origin tag/artifacts passes", async () => {
   const repoRoot = await mkdtemp(
     path.join(os.tmpdir(), "updater-manifest-test-"),
   );
@@ -287,7 +439,7 @@ test("check-version: release-tag not matching the sextet version fails", async (
   );
 });
 
-test("check-version: public remote tag content disagreeing with working tree fails", async () => {
+test("check-version: origin tag content disagreeing with working tree fails", async () => {
   const repoRoot = await mkdtemp(
     path.join(os.tmpdir(), "updater-manifest-test-"),
   );
@@ -305,7 +457,7 @@ test("check-version: public remote tag content disagreeing with working tree fai
     (error) => {
       assert.match(
         error.message,
-        /public remote "public" tag v0\.2\.8 disagrees/,
+        /origin tag v0\.2\.8 disagrees/,
       );
       assert.match(error.message, /package\.json/);
       return true;
@@ -313,7 +465,7 @@ test("check-version: public remote tag content disagreeing with working tree fai
   );
 });
 
-test("check-version: fetches the public tag into refs/public-tags/ namespace, never touching refs/tags/", async () => {
+test("check-version: fetches the origin tag into refs/tags/ before comparing values", async () => {
   const repoRoot = await mkdtemp(
     path.join(os.tmpdir(), "updater-manifest-test-"),
   );
@@ -334,43 +486,132 @@ test("check-version: fetches the public tag into refs/public-tags/ namespace, ne
   assert.deepEqual(fetchCall.args, [
     "fetch",
     "--no-tags",
-    "public",
-    "+refs/tags/v0.2.8:refs/public-tags/v0.2.8",
+    "origin",
+    "refs/tags/v0.2.8:refs/tags/v0.2.8",
   ]);
   assert.ok(
     calls.some(({ command, args }) => command === "git" && args[0] === "show"),
   );
   for (const { command, args } of calls) {
     if (command === "git" && args[0] === "show") {
-      assert.ok(args[1].startsWith("refs/public-tags/v0.2.8:"));
+      assert.ok(args[1].startsWith("refs/tags/v0.2.8:"));
     }
   }
 });
 
-test("check-version: --public-remote pointing at the right github.com/MyAgentHubs/agentloom passes (default fixture)", async () => {
+test("check-origin: missing origin has a Chinese error", async () => {
+  await assert.rejects(() => updaterManifest.checkOrigin({ repoRoot: "/tmp", exec: async () => { throw new Error("No such remote 'origin'"); } }), /origin.*[\u4e00-\u9fff]/);
+});
+
+test("check-origin: git failure has a Chinese error", async () => {
+  await assert.rejects(() => updaterManifest.checkOrigin({ repoRoot: "/tmp", exec: async () => { throw new Error("git failed"); } }), /origin.*[\u4e00-\u9fff]/);
+});
+
+test("check-origin: internal origin has a Chinese error", async () => {
+  await assert.rejects(() => updaterManifest.checkOrigin({ repoRoot: "/tmp", exec: async () => ({ stdout: "git@github.com:MyAgentHubs/agentloom-internal.git\n" }) }), /origin.*[\u4e00-\u9fff]/);
+});
+
+test("check-origin: symlinked CLI rejects an internal origin", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "updater-manifest-symlink-"));
+  const link = path.join(tempDir, "updater-manifest.mjs");
+  try {
+    await symlink(path.join(scriptDir, "updater-manifest.mjs"), link);
+    const result = spawnSync(process.execPath, [link, "check-origin"], {
+      cwd: path.resolve(scriptDir, "../.."),
+      encoding: "utf8",
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout + result.stderr, /origin.*[\u4e00-\u9fff]/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("check-version: local tag differing from origin is rejected without replacement", async () => {
+  const repoRoot = await mkdtemp(path.join(os.tmpdir(), "tag-clobber-test-"));
+  const remote = path.join(repoRoot, "remote.git");
+  const local = path.join(repoRoot, "local");
+  execFileSync("git", ["init", "-q", "--bare", remote]);
+  execFileSync("git", ["init", "-q", local]);
+  const git = (...args) => execFileSync("git", ["-C", local, ...args], { encoding: "utf8" }).trim();
+  git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "origin");
+  await writeVersionFixture(local);
+  git("add", "app");
+  git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "version fixture");
+  git("tag", "v0.2.8");
+  git("remote", "add", "origin", remote);
+  git("push", "-q", "origin", "v0.2.8");
+  git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "local");
+  git("tag", "-f", "v0.2.8");
+  const before = git("rev-parse", "v0.2.8");
+  const args = await baseCheckVersionArgs(local);
+  args.exec = async (command, commandArgs, options) => {
+    if (commandArgs[0] === "remote") return { stdout: "https://github.com/MyAgentHubs/agentloom.git\n" };
+    const result = spawnSync(command, commandArgs, { ...options, encoding: "utf8" });
+    if (result.status !== 0) throw new Error(result.stderr);
+    return { stdout: result.stdout, stderr: result.stderr };
+  };
+  await assert.rejects(() => checkVersion(args), (error) => {
+    assert.match(error.message, /would clobber existing tag/);
+    assert.match(error.message, /请先核对本地 tag/);
+    return true;
+  });
+  assert.equal(git("rev-parse", "v0.2.8"), before);
+});
+
+test("updater-manifest CLI: --public-remote is rejected", () => {
+  const result = spawnSync(process.execPath, [path.join(scriptDir, "updater-manifest.mjs"), "check-version", "--public-remote", "public"], { encoding: "utf8" });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--public-remote is no longer supported/);
+});
+
+test("check-version: origin pointing at github.com/MyAgentHubs/agentloom passes (default fixture)", async () => {
   const repoRoot = await mkdtemp(
     path.join(os.tmpdir(), "updater-manifest-test-"),
   );
   await writeVersionFixture(repoRoot);
-  // The default fixture's publicRemoteUrl already points at the right
+  // The default fixture's originUrl already points at the right
   // place; this just makes that positive case explicit and named, on top
   // of it being exercised implicitly by every other passing test.
   const result = await checkVersion(await baseCheckVersionArgs(repoRoot));
   assert.equal(result.ok, true);
 });
 
-test("check-version: --public-remote pointing at the wrong repo fails", async () => {
+test("check-version: origin pointing at the wrong repo fails", async () => {
   const repoRoot = await mkdtemp(
     path.join(os.tmpdir(), "updater-manifest-test-"),
   );
   await writeVersionFixture(repoRoot);
   const args = await baseCheckVersionArgs(repoRoot, {
-    publicRemoteUrl: "https://github.com/SomeoneElse/agentloom.git",
+    originUrl: "https://github.com/SomeoneElse/agentloom.git",
   });
   await assert.rejects(
     () => checkVersion(args),
-    /--public-remote "public" does not point at MyAgentHubs\/agentloom on GitHub/,
+    /origin 尚未指向公开仓 MyAgentHubs\/agentloom，仓库切换完成前禁止用本脚本发版/,
   );
+});
+
+test("check-version: origin pointing at the internal repo fails", async () => {
+  const repoRoot = await mkdtemp(
+    path.join(os.tmpdir(), "updater-manifest-test-"),
+  );
+  await writeVersionFixture(repoRoot);
+  const args = await baseCheckVersionArgs(repoRoot, {
+    originUrl: "git@github.com:MyAgentHubs/agentloom-internal.git",
+  });
+  const calls = [];
+  const mockExec = args.exec;
+  args.exec = async (command, commandArgs, options) => {
+    calls.push({ command, args: commandArgs });
+    return mockExec(command, commandArgs, options);
+  };
+  await assert.rejects(
+    () => checkVersion(args),
+    /origin 尚未指向公开仓 MyAgentHubs\/agentloom，仓库切换完成前禁止用本脚本发版/,
+  );
+  assert.deepEqual(calls, [
+    { command: "git", args: ["remote", "get-url", "origin"] },
+  ]);
 });
 
 test("check-version: artifact binding — missing tar.gz for one architecture fails", async () => {

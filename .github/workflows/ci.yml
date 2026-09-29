@@ -71,7 +71,7 @@ jobs:
           git update-ref refs/remotes/origin/main "$SIZE_GATE_BASELINE"
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: app/package-lock.json
       - run: npm ci
@@ -88,7 +88,7 @@ jobs:
         working-directory: harness-agent
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -125,7 +125,7 @@ jobs:
           set -euo pipefail
           git fetch --no-tags origin "$SIZE_GATE_BASELINE"
           git update-ref refs/remotes/origin/main "$SIZE_GATE_BASELINE"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -164,7 +164,7 @@ jobs:
         working-directory: app/src-tauri
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |

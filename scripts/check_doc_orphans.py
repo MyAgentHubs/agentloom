@@ -17,7 +17,7 @@ import sys
 
 
 BASELINE_REFS = ("refs/remotes/origin/master", "refs/remotes/origin/main")
-# Joined at runtime so a public-snapshot residue scan (which greps for the
+# Joined at runtime so the public-tree residue scan (which greps for the
 # literal joined path) does not flag this constant as leftover indexing code.
 DOCS_ROOT = "/".join(("docs", "superpowers"))
 SPEC_DIR = "/".join((DOCS_ROOT, "specs", "2026-05-21-github-fleet-ide"))
@@ -123,6 +123,7 @@ def _within(path, ancestor):
 
 def collect_current(root):
     docs_dir = root / DOCS_ROOT
+    docs_dir_real = Path(os.path.realpath(docs_dir))
     entry_set = set(ENTRY_FILES)
     candidates = []
     for path in sorted(docs_dir.rglob("*")):
@@ -139,7 +140,7 @@ def collect_current(root):
             # judged and must fail closed instead of being silently skipped
             # (is_file() reports False for a broken link).
             target = Path(os.path.realpath(path))
-            if target.exists() and _within(target, docs_dir):
+            if target.exists() and _within(target, docs_dir_real):
                 continue
             raise GateError(f"候选文档符号链接目标缺失或指向 {DOCS_ROOT} 之外：{doc_relative}")
         if not path.is_file():

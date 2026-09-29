@@ -1,0 +1,32 @@
+{
+  "name": "agentloom-remote-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AgentLoom Remote Control · C1 Web 远端客户端（当前只含加密内核·T6a）",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "cd .. && app/node_modules/.bin/eslint --config remote-web/eslint.config.mjs remote-web/src --max-warnings 0"
+  },
+  "dependencies": {
+    "@noble/curves": "^2.3.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.6.0",
+    "fake-indexeddb": "^6.2.5",
+    "jsdom": "^25.0.1",
+    "typescript": "^7.0.2",
+    "vite": "^7.0.4",
+    "vitest": "^4.1.10"
+  }
+}

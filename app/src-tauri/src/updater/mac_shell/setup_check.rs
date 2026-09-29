@@ -524,19 +524,24 @@ mod tests {
     use serde_json::json;
     use std::cell::RefCell;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc};
+
+    const BODY_BLOCK: Duration = Duration::from_secs(5);
 
     #[test]
     fn manual_check_deadline_exits_checking_and_allows_retry() {
         let handle = handle_in_state(UpdaterState::Idle);
         let emitted = RefCell::new(Vec::new());
-        let started = std::time::Instant::now();
+        let (body_tx, body_rx) = mpsc::channel::<()>();
+        let body_finished = Arc::new(AtomicBool::new(false));
+        let body_finished_flag = Arc::clone(&body_finished);
         let snapshot = tauri::async_runtime::block_on(perform_check_after_recovery_gate(
             &handle,
             true,
             false,
-            || async {
-                std::thread::sleep(Duration::from_secs(2));
+            move || async move {
+                let _ = body_rx.recv_timeout(BODY_BLOCK);
+                body_finished_flag.store(true, Ordering::SeqCst);
                 CheckRun {
                     outcome: CheckOutcome::Available {
                         version: "9.9.9".into(),
@@ -550,7 +555,8 @@ mod tests {
             |snapshot| emitted.borrow_mut().push(snapshot.state.clone()),
             |machine, manual, outcome| machine.on_check_result(manual, outcome),
         ));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!body_finished.load(Ordering::SeqCst));
+        drop(body_tx);
 
         assert!(matches!(
             &snapshot.state,
@@ -572,13 +578,17 @@ mod tests {
         let handle = handle_in_state(UpdaterState::Idle);
         let calls = Arc::new(AtomicUsize::new(0));
         let first_calls = Arc::clone(&calls);
+        let (body_tx, body_rx) = mpsc::channel::<()>();
+        let body_finished = Arc::new(AtomicBool::new(false));
+        let body_finished_flag = Arc::clone(&body_finished);
         let first = tauri::async_runtime::block_on(perform_check_after_recovery_gate(
             &handle,
             true,
             false,
             move || async move {
                 first_calls.fetch_add(1, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_secs(2));
+                let _ = body_rx.recv_timeout(BODY_BLOCK);
+                body_finished_flag.store(true, Ordering::SeqCst);
                 CheckRun {
                     outcome: CheckOutcome::Available {
                         version: "9.9.9".into(),
@@ -593,9 +603,9 @@ mod tests {
             |machine, manual, outcome| machine.on_check_result(manual, outcome),
         ));
         assert!(matches!(first.state, UpdaterState::Error { .. }));
+        assert!(!body_finished.load(Ordering::SeqCst));
 
         let retry_calls = Arc::clone(&calls);
-        let started = Instant::now();
         let retry = tauri::async_runtime::block_on(perform_check_after_recovery_gate(
             &handle,
             true,
@@ -611,7 +621,6 @@ mod tests {
             |_| {},
             |machine, manual, outcome| machine.on_check_result(manual, outcome),
         ));
-        assert!(started.elapsed() < Duration::from_millis(500));
         assert!(matches!(
             &retry.state,
             UpdaterState::Error { msg, .. }
@@ -620,25 +629,34 @@ mod tests {
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        tauri::async_runtime::block_on(async {
-            tokio::time::sleep(Duration::from_millis(2200)).await;
-        });
-        let final_calls = Arc::clone(&calls);
-        let final_snapshot = tauri::async_runtime::block_on(perform_check_after_recovery_gate(
-            &handle,
-            true,
-            false,
-            move || async move {
-                final_calls.fetch_add(1, Ordering::SeqCst);
-                CheckRun {
-                    outcome: CheckOutcome::UpToDate,
-                    update: None,
-                }
-            },
-            Duration::from_millis(100),
-            |_| {},
-            |machine, manual, outcome| machine.on_check_result(manual, outcome),
-        ));
+        drop(body_tx);
+        let mut final_snapshot = None;
+        for _ in 0..500 {
+            tauri::async_runtime::block_on(async {
+                tokio::time::sleep(Duration::from_millis(10)).await
+            });
+            let final_calls = Arc::clone(&calls);
+            let snapshot = tauri::async_runtime::block_on(perform_check_after_recovery_gate(
+                &handle,
+                true,
+                false,
+                move || async move {
+                    final_calls.fetch_add(1, Ordering::SeqCst);
+                    CheckRun {
+                        outcome: CheckOutcome::UpToDate,
+                        update: None,
+                    }
+                },
+                Duration::from_millis(100),
+                |_| {},
+                |machine, manual, outcome| machine.on_check_result(manual, outcome),
+            ));
+            if matches!(&snapshot.state, UpdaterState::UpToDate { .. }) {
+                final_snapshot = Some(snapshot);
+                break;
+            }
+        }
+        let final_snapshot = final_snapshot.expect("previous check never finished");
         assert!(matches!(
             final_snapshot.state,
             UpdaterState::UpToDate { .. }
@@ -690,14 +708,17 @@ mod tests {
     #[test]
     fn spawned_check_caller_times_out_while_check_body_blocks() {
         let handle = Arc::new(handle_in_state(UpdaterState::Idle));
-        let started = Instant::now();
+        let (body_tx, body_rx) = mpsc::channel::<()>();
+        let body_finished = Arc::new(AtomicBool::new(false));
+        let body_finished_flag = Arc::clone(&body_finished);
         let join_handle = tauri::async_runtime::spawn(async move {
             perform_check_after_recovery_gate(
                 &handle,
                 true,
                 false,
-                || async {
-                    std::thread::sleep(Duration::from_secs(2));
+                move || async move {
+                    let _ = body_rx.recv_timeout(BODY_BLOCK);
+                    body_finished_flag.store(true, Ordering::SeqCst);
                     CheckRun {
                         outcome: CheckOutcome::Available {
                             version: "9.9.9".into(),
@@ -714,7 +735,8 @@ mod tests {
             .await
         });
         let snapshot = tauri::async_runtime::block_on(join_handle).expect("check caller failed");
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!body_finished.load(Ordering::SeqCst));
+        drop(body_tx);
         assert!(matches!(
             &snapshot.state,
             UpdaterState::Error { msg, .. } if msg.starts_with("AL_ERR:updater.check_failed:")
@@ -725,13 +747,16 @@ mod tests {
     fn automatic_check_deadline_returns_to_idle() {
         let handle = handle_in_state(UpdaterState::Idle);
         let emitted = RefCell::new(Vec::new());
-        let started = std::time::Instant::now();
+        let (body_tx, body_rx) = mpsc::channel::<()>();
+        let body_finished = Arc::new(AtomicBool::new(false));
+        let body_finished_flag = Arc::clone(&body_finished);
         let snapshot = tauri::async_runtime::block_on(perform_check_after_recovery_gate(
             &handle,
             false,
             false,
-            || async {
-                std::thread::sleep(Duration::from_secs(2));
+            move || async move {
+                let _ = body_rx.recv_timeout(BODY_BLOCK);
+                body_finished_flag.store(true, Ordering::SeqCst);
                 CheckRun {
                     outcome: CheckOutcome::Available {
                         version: "9.9.9".into(),
@@ -745,7 +770,8 @@ mod tests {
             |snapshot| emitted.borrow_mut().push(snapshot.state.clone()),
             |machine, manual, outcome| machine.on_check_result(manual, outcome),
         ));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!body_finished.load(Ordering::SeqCst));
+        drop(body_tx);
 
         assert!(matches!(snapshot.state, UpdaterState::Idle));
         assert!(matches!(

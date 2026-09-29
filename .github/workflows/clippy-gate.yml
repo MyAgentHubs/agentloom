@@ -1,0 +1,94 @@
+name: Clippy gate
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clippy-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_TOOLCHAIN: '1.97.0'
+
+jobs:
+  engine-clippy:
+    name: Engine (myagent) clippy
+    runs-on: ${{ github.repository == 'MyAgentHubs/agentloom-internal' && fromJSON('["self-hosted","macOS","ARM64"]') || 'macos-latest' }}
+    defaults:
+      run:
+        working-directory: harness-agent
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup override set "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: harness-agent
+      - name: Clippy with zero errors (too_many_lines / cognitive_complexity deny)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --all-targets --locked 2>&1 | tee /tmp/engine-clippy.log
+          error_count="$(grep -c '^error' /tmp/engine-clippy.log || true)"
+          echo "error count: ${error_count:-0}"
+          if [[ "${error_count:-0}" -ne 0 ]]; then
+            echo "ERROR: engine clippy produced ${error_count} error(s)" >&2
+            exit 1
+          fi
+      - run: cargo test -p myagent --test clippy_allow_ratchet --locked
+
+  app-clippy:
+    name: App backend (Rust) clippy
+    # macOS, not ubuntu: full-tests.yml already proves the app crate needs a
+    # staged myagent sidecar and macOS-only Tauri deps; nothing has verified this
+    # crate on Linux, so this gate doesn't gamble on that either.
+    runs-on: ${{ github.repository == 'MyAgentHubs/agentloom-internal' && fromJSON('["self-hosted","macOS","ARM64"]') || 'macos-latest' }}
+    defaults:
+      run:
+        working-directory: app/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup override set "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            app/src-tauri
+            harness-agent
+      # A fresh checkout has no myagent sidecar; tauri's build script requires it
+      # at binaries/myagent-<host-triple> before anything in src-tauri compiles,
+      # regardless of --no-default-features.
+      - name: Stage myagent sidecar
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --manifest-path ../../harness-agent/Cargo.toml -p myagent
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p binaries
+          cp "../../harness-agent/target/release/myagent" "binaries/myagent-${triple}"
+      - name: Clippy with zero errors (too_many_lines / cognitive_complexity deny)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --all-targets --no-default-features --locked 2>&1 | tee /tmp/app-clippy.log
+          error_count="$(grep -c '^error' /tmp/app-clippy.log || true)"
+          echo "error count: ${error_count:-0}"
+          if [[ "${error_count:-0}" -ne 0 ]]; then
+            echo "ERROR: app backend clippy produced ${error_count} error(s)" >&2
+            exit 1
+          fi
+      - run: cargo test --no-default-features --test clippy_allow_ratchet --locked

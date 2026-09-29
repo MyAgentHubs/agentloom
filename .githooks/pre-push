@@ -1,0 +1,49 @@
+#!/bin/bash
+# AgentLoom local pre-push gate: only the "fast" static checks (fmt /
+# typecheck / lint); no cargo test / clippy / vitest here (too slow, left
+# to CI).
+# Standard pre-push protocol: each stdin line is
+# "<local ref> <local sha1> <remote ref> <remote sha1>".
+# An all-deletes push (local sha1 all zero) does not trigger the checks.
+# Bypass a single push: git push --no-verify
+# Appended, not prepended: keep the caller's own PATH order (so version
+# managers like nvm/rustup still win) and only fall back to these system
+# dirs when PATH is missing the basics.
+export PATH="$PATH:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+cd "$ROOT" || exit 0
+
+zero="0000000000000000000000000000000000000000"
+has_push=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "$local_ref" ] && continue
+  [ "$local_sha" = "$zero" ] && continue
+  has_push=1
+done
+[ "$has_push" = "1" ] || exit 0
+
+failed=0
+
+if [ -f harness-agent/Cargo.toml ]; then
+  ( cd harness-agent && cargo fmt --check ) || { echo "✗ pre-push [harness-agent cargo fmt --check] 未通过" >&2; failed=1; }
+fi
+
+if [ -f app/src-tauri/Cargo.toml ]; then
+  ( cd app/src-tauri && cargo fmt --check ) || { echo "✗ pre-push [app/src-tauri cargo fmt --check] 未通过" >&2; failed=1; }
+fi
+
+if [ -d app/node_modules ]; then
+  ( cd app && npm run typecheck ) || { echo "✗ pre-push [app npm run typecheck] 未通过" >&2; failed=1; }
+  if [ -f app/package.json ] && grep -q '"lint"[[:space:]]*:' app/package.json; then
+    ( cd app && npm run lint ) || { echo "✗ pre-push [app npm run lint] 未通过" >&2; failed=1; }
+  fi
+fi
+
+if [ -d remote-web/node_modules ] && [ -d app/node_modules ] && [ -f remote-web/package.json ] && grep -q '"lint"[[:space:]]*:' remote-web/package.json; then
+  ( cd remote-web && npm run lint ) || { echo "✗ pre-push [remote-web npm run lint] 未通过" >&2; failed=1; }
+fi
+
+if [ "$failed" != "0" ]; then
+  echo "  （确需绕过：git push --no-verify）" >&2
+fi
+exit "$failed"

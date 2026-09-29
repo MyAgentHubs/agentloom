@@ -1,0 +1,205 @@
+name: macOS compat smoke (14/15 boot-trace)
+
+# 目的：真实用户在 macOS 13.0（Ventura·WebView = Safari 16）上装 dmg 白屏，我们在
+# Developers cannot reproduce the boot failure on newer macOS development machines, so a real system boot smoke test must be retained.
+# GitHub 的 13 托管跑手退役、最低支持线无法再诚实验证，最低线抬到 macOS 14.0；
+# push 在 macos-14 跑最低线，workflow_dispatch 在 macos-14 / macos-15 跑全矩阵。
+#
+# 判据：不靠截图肉眼判断，靠 app/src-tauri/src/lib.rs 的 `boot_trace` tauri command
+# 落盘的 <app_data_dir>/logs/boot-trace.log——app/src/main.tsx 的 traceBoot(...) 在
+# PROD 构建下会把启动关键节点（模块开始执行 / React 挂载返回 / 窗口显示 / 挂载后两帧
+# rAF）依次写进这份日志。judge 脚本见 .github/scripts/assert-boot-trace.sh，逐条 AND
+# 判定；任一条缺失 = 判定该 macOS 版本上启动卡在了白屏/冻结状态。
+#
+# 冒烟范围仅到「首屏不白屏」，不覆盖发送消息 / 起会话——engine（myagent）sidecar 虽然
+# 现场用 cargo 真实编译（详见下方 build 步骤，与 release-desktop.yml / build-windows-
+# test-exe.yml 同款命令，非占位假二进制），但冒烟本身不会触发 sidecar 被 spawn（那只在
+# 用户发消息时才懒加载）。
+#
+# 不签名、不公证：`--bundles app` 产出的裸 .app 只做本机 ad-hoc codesign（identity "-"）
+# 以满足 Apple Silicon 内核「可执行文件必须带有效签名才能 exec」这条硬要求，全程不需要
+# 任何 Developer ID 证书 / Apple 账号密钥。
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-compat-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22.23.1'
+  RUST_TOOLCHAIN: '1.97.0'
+
+jobs:
+  boot-smoke:
+    name: Boot smoke on ${{ matrix.runner }}
+    # runner 矩阵在 push 到 master 时只包含 macos-14：它是当前最低支持线，优先守住最容易
+    # 出现兼容问题的一档；workflow_dispatch 手动触发时包含 macos-14 / macos-15 全矩阵，
+    # 方便验证全部受支持系统或做发布前抽查。
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ github.event_name == 'workflow_dispatch' && fromJSON('["macos-14","macos-15"]') || fromJSON('["macos-14"]') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out the dispatched commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install frontend dependencies
+        shell: bash
+        run: npm ci --prefix app
+
+      - name: Install the pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup override set "$RUST_TOOLCHAIN"
+
+      - name: Resolve the host Rust target triple
+        shell: bash
+        run: |
+          set -euo pipefail
+          triple="$(rustc -vV | awk '/^host:/ { print $2 }')"
+          if [[ -z "$triple" ]]; then
+            echo "无法通过 rustc -vV 解析 host target triple" >&2
+            exit 1
+          fi
+          echo "Resolved host target triple: $triple"
+          echo "TARGET_TRIPLE=$triple" >> "$GITHUB_ENV"
+
+      - name: Build the myagent engine for the host target
+        shell: bash
+        run: >-
+          cargo build --locked --release
+          --manifest-path harness-agent/Cargo.toml
+          --bin myagent
+          --target "$TARGET_TRIPLE"
+
+      - name: Build the unsigned macOS .app bundle
+        shell: bash
+        run: >-
+          npm run --prefix app tauri -- build --ci
+          --target "$TARGET_TRIPLE"
+          --bundles app
+          -- --locked
+
+      - name: Locate build outputs and the app-data boot-trace.log path
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_path="app/src-tauri/target/${TARGET_TRIPLE}/release/bundle/macos/AgentLoom.app"
+          if [[ ! -d "$app_path" ]]; then
+            echo "预期的 app bundle 没有产出：$app_path" >&2
+            exit 1
+          fi
+          main_bin="$app_path/Contents/MacOS/agentloom"
+          if [[ ! -f "$main_bin" ]]; then
+            echo "预期的主可执行文件缺失：$main_bin" >&2
+            exit 1
+          fi
+
+          identifier="$(python3 -c 'import json; print(json.load(open("app/src-tauri/tauri.conf.json"))["identifier"])')"
+          boot_trace_log="$HOME/Library/Application Support/${identifier}/logs/boot-trace.log"
+          # 全新 runner 理论上不会有残留，双保险先清一次，避免误读到别的进程写的旧文件。
+          rm -f "$boot_trace_log"
+
+          mkdir -p "$RUNNER_TEMP/compat-smoke"
+
+          {
+            echo "APP_PATH=$app_path"
+            echo "MAIN_BIN=$main_bin"
+            echo "BOOT_TRACE_LOG=$boot_trace_log"
+            echo "LAUNCH_LOG=$RUNNER_TEMP/compat-smoke/launch.log"
+            echo "SCREENSHOT_PNG=$RUNNER_TEMP/compat-smoke/screen.png"
+          } >> "$GITHUB_ENV"
+
+      - name: Ad-hoc codesign the app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          # cargo/rustc 链接的可执行文件本身已经带自动 ad-hoc 签名，但 tauri-bundler 组装
+          # .app 目录结构之后不保证这份签名仍然覆盖整个 bundle；这里显式补签一次
+          # （identity "-" = ad-hoc，不需要任何 Developer ID 证书），确保 Apple Silicon
+          # runner（macos-14 / macos-15 默认就是 arm64）上内核的签名校验一定能过。
+          codesign --force --deep --sign - "$APP_PATH"
+          codesign --verify --deep --strict "$APP_PATH"
+
+      - name: Launch the built app in the background
+        shell: bash
+        env:
+          AGENTLOOM_BOOT_TRACE: '1'
+        run: |
+          set -euo pipefail
+          nohup "$MAIN_BIN" >"$LAUNCH_LOG" 2>&1 &
+          app_pid=$!
+          echo "APP_PID=$app_pid" >> "$GITHUB_ENV"
+          echo "Launched $MAIN_BIN as pid $app_pid, stdout/stderr -> $LAUNCH_LOG"
+
+      - name: Wait for boot-trace.log and assert a non-white-screen boot
+        shell: bash
+        run: |
+          set -euo pipefail
+          poll_seconds=60
+          interval=2
+          elapsed=0
+          while [ "$elapsed" -lt "$poll_seconds" ]; do
+            if [ -f "$BOOT_TRACE_LOG" ] && grep -qF "second rAF" "$BOOT_TRACE_LOG" 2>/dev/null; then
+              echo "boot-trace.log 已出现 second rAF，提前结束等待（用时 ${elapsed}s）"
+              break
+            fi
+            sleep "$interval"
+            elapsed=$((elapsed + interval))
+          done
+          echo "轮询结束（用时 ${elapsed}s，上限 ${poll_seconds}s），开始判据核验"
+          bash .github/scripts/assert-boot-trace.sh "$BOOT_TRACE_LOG"
+
+      - name: Capture a screenshot for diagnostics (best-effort)
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          # GitHub 托管的 macOS runner 有图形会话，但 screencapture 需要「屏幕录制」授权，
+          # runner 上不保证已授予——失败不当硬错误处理，只是少一份诊断材料。
+          screencapture -x "$SCREENSHOT_PNG"
+          exit 0
+
+      - name: Stop the app process
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [[ -n "${APP_PID:-}" ]]; then
+            kill "$APP_PID" 2>/dev/null
+            sleep 1
+            kill -9 "$APP_PID" 2>/dev/null
+          fi
+          pkill -f "/AgentLoom.app/Contents/MacOS/agentloom" 2>/dev/null
+          exit 0
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-compat-smoke-diagnostics-${{ matrix.runner }}
+          path: |
+            ${{ env.BOOT_TRACE_LOG }}
+            ${{ env.LAUNCH_LOG }}
+            ${{ env.SCREENSHOT_PNG }}
+          if-no-files-found: warn
+          retention-days: 14

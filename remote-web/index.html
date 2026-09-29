@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      U4（手机端 composer 与壳层布局重排）：去掉 maximum-scale=1——它禁掉了用户手动缩放（可访问性
+      问题），原本是为压住 iOS 聚焦 <16px 输入框时的自动放大；根修在 composer.css 把
+      `.composer__input` 的 font-size 改成 16px（iOS 不再触发该行为），这条 viewport 约束因此
+      不再需要，用户重新拿回手动缩放能力。
+    -->
+    <!--
+      msgfix2 U6d：`interactive-widget=resizes-content`——iOS/Android 键盘弹出时用视觉视口
+      resize 内容区（而非默认覆盖式浮在内容上），composer 底部输入框弹键盘后不再被系统键盘
+      遮住看不见。保留既有 viewport-fit=cover（U4 安全区适配）不动。
+    -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <title>AgentLoom 远程控制</title>
+    <!--
+      T6g1 · CSP / Referrer-Policy / Cache-Control 等安全响应头由 remote-relay（S4 静态托管单）
+      逐条加在 HTTP 响应上——见 remote-relay/src/security-headers.js + wrangler.toml [assets]。
+    -->
+    <!--
+      T6g1 · fragment bootstrap（M2 C1 spec §3 第 1 条「防线套餐」）：这是页面上第一个会执行的
+      脚本——必须是同步经典脚本（无 type="module"/defer/async），因为经典同步脚本在 HTML 解析
+      期间立即执行，早于任何 type="module" 脚本（模块脚本天然延迟到文档解析完成后才执行，即使
+      写在更靠前的位置）。职责单一：QR 扫码落地时 `location.hash` 带着 `#p=<配对 payload>`，在
+      加载任何业务模块（含 React/WebSocket/IndexedDB）之前，把完整 `location.href`（parseQrPayload
+      的 origin 校验需要协议+host，不能只喂裸 hash，见 src/pairing/qr-payload.ts 文件头注）捕进
+      `window.__agentloomBoot`（纯内存全局·不落 storage），再用 `history.replaceState` 立即清空
+      地址栏 hash——防止配对密钥材料以明文形式在地址栏/浏览历史/相册截图里逗留超过一次同步执行的
+      窗口。`src/app/bootstrapFragment.ts` 的 `defaultGetLocationHref`/`defaultClearFragment` 读取
+      这个全局，读不到时（没有 `#p=` fragment、或本页面走的是非本 index.html 的测试环境）原样退回
+      `window.location.href`/`history.replaceState` 兜底，行为与改动前一致。
+
+      **CSP hash 联动（防手改漂移）**：本脚本的 SHA-256 hash 被写死进
+      remote-relay/src/security-headers.js 的 `BOOTSTRAP_INLINE_SCRIPT_SHA256_BASE64` 常量（CSP
+      的 script-src 白名单靠它放行这段内联脚本，其余内联脚本一律不放行）；
+      remote-relay/test/security-headers.test.js 会在测试时读**这份构建产物**（`../remote-web/
+      dist/index.html`）现算这段脚本的 hash，跟常量断言相等——改了这段脚本文字（哪怕一个空格）却
+      忘了同步更新常量，这条测试会先红，不会等到线上 CSP 悄悄拦掉整个 App。
+    -->
+    <script>(function () {
+      "use strict";
+      if (location.hash.indexOf("#p=") === 0) {
+        window.__agentloomBoot = location.href;
+        history.replaceState(null, "", location.pathname + location.search);
+      }
+    })();</script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

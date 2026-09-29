@@ -1,0 +1,89 @@
+name = "agentloom-remote-relay"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+compatibility_flags = ["nodejs_compat"]
+# workers_dev 必须显式 true 且必须放在根表（放 [assets]/[[routes]] 段后会被归进那个表、
+# wrangler 只报 Unexpected fields 警告然后忽略）：一旦配了 routes，wrangler 默认关掉
+# *.workers.dev 子域——会把已发出去的旧 QR/配对链接和用户已保存的旧 relay 地址当场打断，
+# 所以双域并存。
+workers_dev = true
+
+# ----------------------------------------------------------------------------
+# SEC-2 · 边缘原生限速：Cloudflare Rate Limiting binding（`[[ratelimits]]`，
+# wrangler ≥4.36.0 GA，本仓 4.120.1）。覆盖 claim（POST）与 WS upgrade（GET
+# 带 Upgrade 头）两条路径——之前只有 claim 有 per-isolate 内存桶
+# （claimEdgeBuckets，见 src/index.js），upgrade 完全无边缘限速，刷房洪泛第
+# 一道门是敞开的。这层是外层粗网、best-effort（per-isolate 近似计数，不是
+# 精确分布式计数），叠加在现有内存桶/DO 内细桶之上、不替换——细桶仍是唯一
+# 确定性防线。`period` 只能是 10 或 60；`namespace_id` 账号内唯一正整数
+# 字符串，两个 binding 各领一个避免互相干扰计数。
+[[ratelimits]]
+name = "RL_CLAIM"
+namespace_id = "1001"
+  [ratelimits.simple]
+  limit = 10
+  period = 60
+
+[[ratelimits]]
+name = "RL_UPGRADE"
+namespace_id = "1002"
+  [ratelimits.simple]
+  limit = 60
+  period = 60
+
+# 单次调用封顶（纵深防御，不是速率限速）：**不设 `[limits]` 段**——部署 API 会把
+# 整个 `[limits]` 段当付费 plan 功能，不支持的 plan 上部署会直接失败；而
+# per-request subrequest 默认上限本来就是 50，显式设置纯属冗余。将来若要比默认更
+# 收紧的封顶，再按需加回本段。
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "RoomDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RoomDO"] # DO 内置 SQLite（免费档形态，母文档 R-Q2）
+
+# ----------------------------------------------------------------------------
+# T6g1 · S4 同域静态托管：把 remote-web（C1 手机 Web 端）的构建产物挂在这个 worker 同域下。
+#
+# **部署前必须先 build**：`directory` 指向的是构建产物目录，不是源码——本仓没有配置「wrangler
+# 部署时自动跑 remote-web 的 build」这一步（保持两个独立 npm 包各自的边界，不引入跨包构建耦合），
+# 所以每次要部署/本地 `wrangler dev` 联调静态资源之前，必须先手动：
+#
+#   cd remote-web && npm run build
+#
+# 生成/刷新 `remote-web/dist/`，这个目录不存在或是旧的，`wrangler dev`/`wrangler deploy` 会报
+# 找不到目录，或悄悄把旧版本页面继续served。
+#
+# `run_worker_first = true`：不设这个的话，Cloudflare 的资源绑定默认「静态文件优先」——匹配得上
+# 的路径直接由内部 Asset Worker 应答，根本不经过下面 `src/index.js` 的 `fetch()`，我们就没机会给
+# 它加 CSP/Referrer-Policy 这些安全头（`src/security-headers.js`）。设成 true 后每一个请求都先进
+# `src/index.js`，由它决定哪些走 `/room/*`/`/healthz` 现有路由、哪些转给 `env.ASSETS.fetch()`
+# 再叠加安全头——WS 升级/`/room/*`/healthz 的路由行为完全不变（见 `src/index.js` 注释）。
+#
+# `not_found_handling = "single-page-application"`：手机端是纯 URL fragment 路由的 SPA
+# （`#p=<配对 payload>`，fragment 不上送服务器），没有任何真实存在的服务端路径需要区分——任何没
+# 命中 dist/ 里真实文件的请求都直接拿 index.html 应答（200，不是 3xx 重定向），地址栏路径原样
+# 保留。
+[assets]
+directory = "../remote-web/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = true
+
+# ----------------------------------------------------------------------------
+# 生产自定义域名（母文档 §三·五 组件表 S4 点名 agentloom.myagenthubs.com）。
+# zone myagenthubs.com 与本 worker 同在一个 Cloudflare 账号——custom_domain 模式由
+# Cloudflare 自动建 DNS 记录 + 证书。注意：custom_domain = true 时 pattern 只能是
+# 裸主机名（不许带 /* 路径通配，wrangler 会直接报错）。workers.dev 子域并存开关见
+# 文件顶部根表的 workers_dev = true。
+[[routes]]
+pattern = "agentloom.myagenthubs.com"
+custom_domain = true
+# ----------------------------------------------------------------------------
+
+# 生产环境变量占位——具体数值母文档标注「M1 前定」，本骨架先给代码里的默认值
+# 兜底（见 src/quota.js DEFAULT_MONTHLY_MILESTONE_LIMIT），不在这里写死假数字。
+# [vars]
+# MONTHLY_MILESTONE_LIMIT = "3000"

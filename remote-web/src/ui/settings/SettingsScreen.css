@@ -1,0 +1,123 @@
+/* SettingsScreen.css — msgfix2 U3 · 手机端设置屏布局（新写）。对齐
+ * `sessions/SessionListScreen.css`/`stream/SessionStreamScreen.css` 的克制风与 `tokens.css` 变量
+ * （暖米底 / 暖橙 accent），不发明新配色；返回按钮直接复用 `.app-runtime-back`（见
+ * `SessionStreamScreen.css`），本文件不重复定义。
+ */
+
+.settings-screen {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.settings-screen__head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--line-soft);
+  min-height: 52px;
+}
+
+.settings-screen__title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.settings-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.settings-row {
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.settings-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 14px 16px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.settings-row__body {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-row__label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.settings-row__hint {
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.settings-toggle__track {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 24px;
+  border-radius: 12px;
+  background: var(--line-soft);
+  padding: 2px;
+  display: flex;
+  align-items: center;
+  transition: background-color 0.15s ease;
+}
+
+.settings-toggle--on .settings-toggle__track {
+  background: var(--accent);
+}
+
+.settings-toggle__thumb {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--panel);
+  transition: transform 0.15s ease;
+}
+
+.settings-toggle--on .settings-toggle__thumb {
+  transform: translateX(16px);
+}
+
+/* msgfix2 U4 修单 H2：解除配对——纯动作行（非开关），复用 `.settings-toggle` 的布局壳但去掉轨道，
+ * 标签/说明文字用 `--red`（既有 tokens 变量）标出"这是一次性的、有破坏性"，不发明新颜色。 */
+.settings-action {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 14px 16px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.settings-action--destructive .settings-row__label {
+  color: var(--red);
+}

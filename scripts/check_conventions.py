@@ -63,6 +63,8 @@ COVERAGE_EXEMPT_DIRS = {
     "docs": "Documentation tree; out of scope for the comment-convention ratchet.",
     "harness-agent/docs": "Documentation tree; out of scope for the comment-convention ratchet.",
     "app/.design-sync": "Generated placeholder input for the build, not source.",
+    # Public issue form templates (YAML data, no code comments).
+    ".github/ISSUE_TEMPLATE": "Public issue form templates (YAML data, no code comments).",
 }
 
 # Patterns kept as plain assignments (never inside a "#" comment line) so the

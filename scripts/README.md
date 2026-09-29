@@ -118,21 +118,16 @@ in `doc-orphans-gate.yml`.
 
 ## check_oss_residue.sh
 
-This is the daily/CI mirror of the residue scan that the public-snapshot
-build (`build-oss-snapshot.sh`) also runs on the exported, stripped snapshot;
-running the same six checks against the current worktree catches a leaked
-internal string long before release day. The six checks are: private repo
-names, company identity, secret-shaped tokens (API-key-like patterns),
-internal doc paths, internal absolute paths, and personal identifiers.
+This gate scans tracked files for internal-string residue using six regexes:
+private repo names, company identity, secret-shaped tokens (API-key-like
+patterns), internal doc paths, internal absolute paths, and personal
+identifiers.
 
-The scan range is every tracked file, minus the paths the snapshot build
-would strip or overwrite before it ever scans them (documentation trees,
-CI/agent-tooling directories, files the build replaces with a public draft of
-the same name, and so on), plus the handful of paths under those stripped
-directories that the snapshot build copies back verbatim (test fixtures and
-similar). `test_check_oss_residue.py` asserts this exclude/keep list and the
-six regexes stay in sync with `build-oss-snapshot.sh`'s own copy of them; if
-you touch one side, touch the other and re-run that test.
+By default, it scans every tracked file except private paths that still exist
+in the internal repository. Fixtures listed in `PRIVATE_EXCEPT` stay in scan
+scope despite living under a private prefix. With `--public-tree`, it scans
+every tracked file and also fails if a private path is tracked, apart from
+those fixtures.
 
 Run from the repository root:
 
@@ -140,34 +135,25 @@ Run from the repository root:
 bash scripts/check_oss_residue.sh
 ```
 
-Exit code 0 means no hit on any of the six patterns; 1 means at least one hit
-was found (up to 10 matching lines per pattern are printed).
+Exit code 0 means no hit on any of the six patterns and, in `--public-tree`
+mode, no forbidden private path. Exit code 1 means a pattern or private-path
+check failed (up to 10 matching lines per pattern are printed).
 
 Test with `python3 -I scripts/test_check_oss_residue.py`. CI runs this gate
 in `oss-residue-gate.yml`.
 
 ## check_file_size.py --base <ref>
 
-`check_file_size.py` also accepts an optional `--base <ref>` argument that
-replaces the usual `origin/master` / `origin/main` baseline selection with an
-explicit ref (for example, the previous public-snapshot release commit), so a
-public snapshot can be judged against the last public release rather than
-against the private history it was cut from. Because a public snapshot omits
-three source roots entirely (the remote-web frontend source and the
-remote-relay source/test roots), a root that is absent from the given
-`--base` ref falls back to the normal internal baseline (`origin/master` or
-`origin/main`) for that root only, and the gate prints a `回退：` line naming
-which root fell back and why. If neither the explicit `--base` ref nor an
-internal baseline can supply one of those roots, the gate errors out instead
-of silently skipping it.
+`check_file_size.py` accepts an optional `--base <ref>` argument to use an
+explicit baseline ref instead of the usual `origin/master` / `origin/main`
+selection. If a source root is absent from that ref, the gate falls back to
+the normal baseline (`origin/master` or `origin/main`) for that root only and
+prints a `回退：` line naming the root and the reason. If neither baseline can
+supply the root, the gate errors out instead of silently skipping it.
 
 ```sh
 python3 scripts/check_file_size.py --base <ref>
 ```
-
-CI uses this on every push and pull request against the public snapshot's
-`main` branch, in `public-snapshot-size-gate.yml`, to keep the public repo's
-own size debt from growing across releases.
 
 ## Local git hooks
 
@@ -253,7 +239,6 @@ typescript-eslint does not yet support the TypeScript 7 compiler that
 | Comment conventions | `python3 scripts/check_conventions.py` | `conventions-gate.yml` | `test_check_conventions.py` |
 | Doc orphans | `python3 scripts/check_doc_orphans.py` | `doc-orphans-gate.yml` | `test_check_doc_orphans.py` |
 | OSS residue | `bash scripts/check_oss_residue.sh` | `oss-residue-gate.yml` | `test_check_oss_residue.py` |
-| Public-snapshot file size | `python3 scripts/check_file_size.py --base <ref>` | `public-snapshot-size-gate.yml` | `test_file_size_gate.py` |
 | Function length (Rust) | `cargo clippy --all-targets` (each crate) | `clippy-gate.yml` | `tests/clippy_allow_ratchet.rs` (each crate) |
 | Function length (frontend) | `npm run lint` (in `app/`) | `eslint-gate.yml` | `app/src/eslintLegacyRatchet.test.ts` |
 | Function length (remote-web) | `npm run lint` (in `remote-web/`) | `eslint-gate.yml`, `full-tests.yml` | `remote-web/src/eslintLegacyRatchet.test.ts` |

@@ -39,15 +39,14 @@
 # after a successful publish): the same two commands as above.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
 PUBLIC_REPO="MyAgentHubs/agentloom"
 
 print_usage() {
   cat <<'EOF'
 Usage: release-publish.sh --version <ver> --artifacts <dir> --notes-file <md>
                            [--previous-store-version <x.y.z.w>]
-                           [--public-remote <name>]
 
 Publish a macOS AgentLoom release with its in-app-updater manifest. Expects
 both architectures' release-macos.sh outputs (tarball, .sig, dmg) and
@@ -66,10 +65,6 @@ Options:
                             Defaults to the storeVersion recorded in the
                             public repo's current isLatest release tag
                             (resolved via `gh release list` + `git show`)
-  --public-remote <name>   git remote name that reaches MyAgentHubs/agentloom
-                            (used for the check-version tag comparison and to
-                            resolve the default --previous-store-version);
-                            defaults to "public"
   -h, --help                Show this help
 EOF
 }
@@ -100,7 +95,6 @@ VERSION=""
 ARTIFACTS_DIR=""
 NOTES_FILE=""
 PREVIOUS_STORE_VERSION=""
-PUBLIC_REMOTE="public"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -134,14 +128,6 @@ while [ "$#" -gt 0 ]; do
         exit 2
       fi
       PREVIOUS_STORE_VERSION="$2"
-      shift 2
-      ;;
-    --public-remote)
-      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
-        echo "Error: --public-remote requires a value." >&2
-        exit 2
-      fi
-      PUBLIC_REMOTE="$2"
       shift 2
       ;;
     -h|--help)
@@ -219,6 +205,8 @@ if [ "${#MISSING_INPUTS[@]}" -gt 0 ]; then
   exit 1
 fi
 
+node "${UPDATER_MANIFEST_CLI}" check-origin
+
 # Always resolve the storeVersion recorded in the public repo's current
 # isLatest release: it is the sole authoritative source for
 # --previous-store-version. If the caller supplied a value, it must agree
@@ -235,8 +223,11 @@ if not latest:
     sys.exit("no isLatest release found on the public repo")
 print(latest[0])
 ' "${PREV_RELEASES_JSON}")"
-git -C "${REPO_ROOT}" fetch --no-tags "${PUBLIC_REMOTE}" "+refs/tags/${PREV_TAG}:refs/public-tags/${PREV_TAG}"
-RESOLVED_PREVIOUS_STORE_VERSION="$(git -C "${REPO_ROOT}" show "refs/public-tags/${PREV_TAG}:app/src-tauri/store/msix-identity.json" \
+if ! git -C "${REPO_ROOT}" fetch --no-tags origin "refs/tags/${PREV_TAG}:refs/tags/${PREV_TAG}"; then
+  echo "请先核对本地 tag ${PREV_TAG} 与 origin 是否一致，再继续发版。" >&2
+  exit 1
+fi
+RESOLVED_PREVIOUS_STORE_VERSION="$(git -C "${REPO_ROOT}" show "refs/tags/${PREV_TAG}:app/src-tauri/store/msix-identity.json" \
   | python3 -c 'import json, sys; print(json.load(sys.stdin)["storeVersion"])')"
 
 if [ -z "${PREVIOUS_STORE_VERSION}" ]; then
@@ -253,7 +244,6 @@ echo "check-version..."
 node "${UPDATER_MANIFEST_CLI}" check-version \
   --previous-store-version "${PREVIOUS_STORE_VERSION}" \
   --release-tag "${RELEASE_TAG}" \
-  --public-remote "${PUBLIC_REMOTE}" \
   --artifacts "${ARTIFACTS_DIR}" \
   --pubkey-placeholder-check \
   --require-updater-dep
@@ -288,13 +278,28 @@ echo "Writing ${SHASUMS_FILE}..."
 )
 
 echo "Checking whether release ${RELEASE_TAG} already exists on ${PUBLIC_REPO}..."
-if RELEASE_VIEW_JSON="$(gh -R "${PUBLIC_REPO}" release view "${RELEASE_TAG}" --json isDraft 2>/dev/null)"; then
+if RELEASE_VIEW_JSON="$(gh -R "${PUBLIC_REPO}" release view "${RELEASE_TAG}" --json isDraft,assets 2>/dev/null)"; then
   RELEASE_IS_DRAFT="$(python3 -c 'import json,sys; print("true" if json.loads(sys.argv[1]).get("isDraft") is True else "false")' "${RELEASE_VIEW_JSON}")"
   if [ "${RELEASE_IS_DRAFT}" != "true" ]; then
     echo "Error: release ${RELEASE_TAG} already exists and is published; refusing to overwrite a formal release." >&2
     exit 1
   fi
+  if ! python3 -c '
+import json, sys
+release = json.loads(sys.argv[1])
+allowed = set(sys.argv[2:])
+unknown = [asset["name"] for asset in release["assets"] if asset["name"] not in allowed]
+if unknown:
+    sys.exit("草稿包含未知资产：" + ", ".join(unknown) + "；请先删除该草稿后再发版。")
+' "${RELEASE_VIEW_JSON}" \
+    "$(basename "${TAR_AARCH64}")" "$(basename "${TAR_X86_64}")" \
+    "$(basename "${SIG_AARCH64}")" "$(basename "${SIG_X86_64}")" \
+    "$(basename "${DMG_ARM64}")" "$(basename "${DMG_X64}")" \
+    "$(basename "${SHASUMS_FILE}")" "$(basename "${LATEST_JSON}")"; then
+    exit 1
+  fi
   echo "Reusing existing draft release ${RELEASE_TAG}."
+  gh -R "${PUBLIC_REPO}" release edit "${RELEASE_TAG}" --title "${RELEASE_TAG}" --notes-file "${NOTES_FILE}"
 else
   echo "Creating draft release ${RELEASE_TAG} on ${PUBLIC_REPO} (--verify-tag: the tag must already exist there)..."
   gh -R "${PUBLIC_REPO}" release create "${RELEASE_TAG}" \

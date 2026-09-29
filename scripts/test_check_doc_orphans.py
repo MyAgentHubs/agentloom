@@ -17,7 +17,7 @@ gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
 
 # Reassembled the same way the gate joins it, so this test does not itself
-# reintroduce the literal path the public-snapshot residue scan greps for.
+# reintroduce the literal path the public-tree residue scan greps for.
 DOCS_ROOT = "/".join(("docs", "superpowers"))
 # Likewise built at runtime so the assertion below cannot match its own source.
 HOME_MARKER = "/".join(("", "Users", "ai")) + "/"
@@ -206,6 +206,34 @@ class RepositoryTests(unittest.TestCase):
         # referenced-checked); the real file is still judged on its own path
         # and is a genuine new orphan since nothing references notes/real.md.
         self.assertIn("notes/real.md (not referenced", self.run_gate(1))
+
+    def test_symlink_alias_inside_mounted_docs_root_is_not_a_candidate(self):
+        self.baseline()
+        self.doc("notes/real.md")
+        docs_dir = self.root / gate.DOCS_ROOT
+        mounted_dir = self.root / ".private" / gate.DOCS_ROOT
+        mounted_dir.parent.mkdir(parents=True)
+        docs_dir.rename(mounted_dir)
+        docs_dir.symlink_to(mounted_dir, target_is_directory=True)
+        (docs_dir / "notes/alias.md").symlink_to("real.md")
+
+        output = self.run_gate(1)
+        self.assertIn("notes/real.md (not referenced", output)
+        self.assertNotIn("拒绝放行", output)
+
+    def test_symlink_alias_outside_mounted_docs_root_fails_closed(self):
+        self.baseline()
+        self.doc("notes/real.md")
+        docs_dir = self.root / gate.DOCS_ROOT
+        mounted_dir = self.root / ".private" / gate.DOCS_ROOT
+        mounted_dir.parent.mkdir(parents=True)
+        docs_dir.rename(mounted_dir)
+        docs_dir.symlink_to(mounted_dir, target_is_directory=True)
+        outside = self.root / "outside.md"
+        outside.write_text("outside\n")
+        (docs_dir / "notes/alias.md").symlink_to(outside)
+
+        self.assertIn("拒绝放行", self.run_gate(2))
 
     def test_docs_root_missing_skips_and_exits_zero(self):
         import shutil

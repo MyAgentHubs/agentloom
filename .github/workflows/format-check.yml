@@ -1,0 +1,29 @@
+name: 'Format Check'
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format-check:
+    runs-on: ${{ github.repository == 'MyAgentHubs/agentloom-internal' && fromJSON('["self-hosted","macOS","ARM64"]') || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: 'app/package-lock.json'
+      - run: 'npm ci'
+        working-directory: app
+      - run: 'npm run format:check'
+        working-directory: app

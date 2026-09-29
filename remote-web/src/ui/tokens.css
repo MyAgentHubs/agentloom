@@ -1,0 +1,57 @@
+/* tokens.css — T6f1 · 移动端 design tokens。
+ * 从桌面 app/src/styles/global.css :root 块（1-20 行）裁剪搬——同名变量不改值，见
+ * These tokens are copied from the desktop app's global.css :root block with unchanged values to preserve visual consistency.
+ * 「token(:root 1-21 行)…按段裁剪搬」。暗色模式跳过（MVP 单亮色，同 §6 决策）。
+ */
+:root {
+  --bg: #f5f2ec;
+  --panel: #fffefb;
+  --ink: #1a1814;
+  --ink-2: #4a463e;
+  --ink-3: #7a7568;
+  --ink-4: #a39d90;
+  --line: #e5ddc9;
+  --line-soft: #efe8d4;
+  --accent: #d97757;
+  --accent-soft: #f3ddd0;
+  --bg-sunken: #ece5d6;
+  --red: #b85048;
+  --green: #6a9b5c;
+  --amber: #d08b3f;
+  --amber-ink: #9b5b10;
+  --content-max: 760px;
+  --content-padding: 24px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue",
+    sans-serif;
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* U1：AppRuntime.tsx 里 SessionStreamScreen+Composer 的壳层容器——className 已存在于 JSX
+ * （remote-web/src/app/AppRuntime.tsx:876），此前全仓零 CSS 定义，`.stream-screen{height:100%}` 无从依附、
+ * composer 无法钉底。这里补根容器为 flex 列 + 视口高（dvh 抗移动端地址栏伸缩），跟 html/body/#root
+ * 的 100% 高度链并列，是同一个「根级壳层」的延伸。 */
+.app-runtime-stream {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  min-height: 0;
+}

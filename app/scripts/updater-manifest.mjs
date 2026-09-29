@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-// Four subcommands supporting the app-internal updater release leg
+// Five subcommands supporting the app-internal updater release leg
 // （设计稿 in-app-updater-design §2C）：
 //
+//   check-origin    Verify origin points to the public release repository.
 //   check-version   Verify the six-file/seven-value version lockstep, the
 //                    storeVersion monotonic increase, and the release-tag /
-//                    public-remote-tag binding before a release starts.
+//                    origin-tag binding before a release starts.
 //   merge            Combine the two per-architecture signature fragments
 //                    produced by release-macos.sh into one latest.json.
 //   verify-local     Verify (via the real minisign CLI) that the signed
@@ -68,12 +69,9 @@ const ARCH_TO_MACHO_ARCH = {
 
 const BUNDLE_IDENTIFIER = "com.myagenthubs.agentloom";
 
-// Requirement 6 (U2 second rework): --public-remote must actually point at
-// the public repo, or a mis-set remote name could make check-version fetch
-// tags from -- and verify-remote could later be told to trust -- the wrong
-// place. Matches both HTTPS and SSH remote URL forms, with or without a
-// trailing ".git".
-const PUBLIC_REMOTE_URL_RE = /github\.com[:/]MyAgentHubs\/agentloom(\.git)?$/;
+// Origin must point at the public repo before release tags are fetched.
+// Accept HTTPS and SSH remote URL forms, with or without a trailing ".git".
+const ORIGIN_URL_RE = /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)MyAgentHubs\/agentloom(\.git)?$/;
 
 function parseCargoTomlPackageVersion(text) {
   const packageSection = text.match(/\[package\]([\s\S]*?)(?:\n\[|$)/);
@@ -204,24 +202,26 @@ function assertReleaseTagMatches(releaseTag, version) {
   }
 }
 
-async function assertPublicRemoteUrl({ exec, repoRoot, publicRemote }) {
-  const { stdout } = await exec("git", ["remote", "get-url", publicRemote], {
-    cwd: repoRoot,
-  });
+async function assertOriginIsPublicRepo({ exec = defaultExec, repoRoot }) {
+  let stdout;
+  try {
+    ({ stdout } = await exec("git", ["remote", "get-url", "origin"], {
+      cwd: repoRoot,
+    }));
+  } catch {
+    throw new Error("origin 无法读取，请确认已配置公开仓 MyAgentHubs/agentloom 后再发版");
+  }
   const url = String(stdout).trim();
-  if (!PUBLIC_REMOTE_URL_RE.test(url)) {
-    throw new Error(
-      `check-version: --public-remote "${publicRemote}" does not point at MyAgentHubs/agentloom ` +
-        `on GitHub (git remote get-url ${publicRemote} => "${url}"); refusing to fetch tags from ` +
-        `an unexpected remote`,
-    );
+  if (!ORIGIN_URL_RE.test(url)) {
+    throw new Error("origin 尚未指向公开仓 MyAgentHubs/agentloom，仓库切换完成前禁止用本脚本发版");
   }
 }
+
+export const checkOrigin = assertOriginIsPublicRepo;
 
 async function assertPublicTagMatchesWorkingTree({
   exec,
   repoRoot,
-  publicRemote,
   tag,
   localValues,
 }) {
@@ -230,16 +230,18 @@ async function assertPublicTagMatchesWorkingTree({
     [
       "fetch",
       "--no-tags",
-      publicRemote,
-      `+refs/tags/${tag}:refs/public-tags/${tag}`,
+      "origin",
+      `refs/tags/${tag}:refs/tags/${tag}`,
     ],
     { cwd: repoRoot },
-  );
+  ).catch((error) => {
+    throw new Error(`${error.message}\n请先核对本地 tag ${tag} 与 origin 是否一致，再继续发版`);
+  });
   const remoteContents = {};
   for (const filePath of VERSION_FILE_PATHS) {
     const { stdout } = await exec(
       "git",
-      ["show", `refs/public-tags/${tag}:${filePath}`],
+      ["show", `refs/tags/${tag}:${filePath}`],
       { cwd: repoRoot },
     );
     remoteContents[filePath] = stdout;
@@ -249,7 +251,7 @@ async function assertPublicTagMatchesWorkingTree({
     const remoteValue = remote.values[key];
     if (remoteValue !== localValue) {
       throw new Error(
-        `public remote "${publicRemote}" tag ${tag} disagrees with the working tree for ` +
+        `origin tag ${tag} disagrees with the working tree for ` +
           `${key}: tag=${remoteValue} working-tree=${localValue}`,
       );
     }
@@ -397,7 +399,6 @@ export async function checkVersion({
   exec = defaultExec,
   previousStoreVersion,
   releaseTag,
-  publicRemote,
   artifactsDir,
   pubkeyPlaceholderCheck = false,
   requireUpdaterDep = false,
@@ -408,8 +409,6 @@ export async function checkVersion({
   if (!previousStoreVersion)
     throw new Error("check-version: --previous-store-version is required");
   if (!releaseTag) throw new Error("check-version: --release-tag is required");
-  if (!publicRemote)
-    throw new Error("check-version: --public-remote is required");
   if (!artifactsDir)
     throw new Error(
       "check-version: --artifacts is required (release binding check)",
@@ -424,11 +423,10 @@ export async function checkVersion({
   assertStoreVersionFormat(sextet.storeVersion);
   assertStoreVersionIncreasing(sextet.storeVersion, previousStoreVersion);
   assertReleaseTagMatches(releaseTag, version);
-  await assertPublicRemoteUrl({ exec, repoRoot, publicRemote });
+  await assertOriginIsPublicRepo({ exec, repoRoot });
   await assertPublicTagMatchesWorkingTree({
     exec,
     repoRoot,
-    publicRemote,
     tag: releaseTag,
     localValues: sextet.values,
   });
@@ -744,15 +742,23 @@ export function parseFlags(argv, { boolFlags = [] } = {}) {
 async function runCli(argv, { repoRoot }) {
   const [subcommand, ...rest] = argv;
   switch (subcommand) {
+    case "check-origin": {
+      parseFlags(rest);
+      await checkOrigin({ repoRoot });
+      console.log("check-origin OK");
+      return;
+    }
     case "check-version": {
       const flags = parseFlags(rest, {
         boolFlags: ["pubkey-placeholder-check", "require-updater-dep"],
       });
+      if (flags["public-remote"] !== undefined) {
+        throw new Error("check-version: --public-remote is no longer supported");
+      }
       const result = await checkVersion({
         repoRoot,
         previousStoreVersion: flags["previous-store-version"],
         releaseTag: flags["release-tag"],
-        publicRemote: flags["public-remote"],
         artifactsDir: flags.artifacts,
         pubkeyPlaceholderCheck: Boolean(flags["pubkey-placeholder-check"]),
         requireUpdaterDep: Boolean(flags["require-updater-dep"]),
@@ -798,7 +804,7 @@ async function runCli(argv, { repoRoot }) {
     }
     default:
       throw new Error(
-        `unknown subcommand: ${subcommand ?? "(none)"}; expected one of check-version, merge, ` +
+        `unknown subcommand: ${subcommand ?? "(none)"}; expected one of check-origin, check-version, merge, ` +
           `verify-local, verify-remote`,
       );
   }
@@ -806,7 +812,8 @@ async function runCli(argv, { repoRoot }) {
 
 if (
   process.argv[1] &&
-  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+  nodeFs.realpathSync(process.argv[1]) ===
+    nodeFs.realpathSync(fileURLToPath(import.meta.url))
 ) {
   const repoRoot = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),

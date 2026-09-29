@@ -802,7 +802,7 @@
       "valid": true,
       "consumers": [
         "desktop input_ack_json 带 reason 的输出与样张深比对",
-        "remote-web parseFrame→handleAck→Composer 显示没选 agent 的专用文案（T2）"
+        "remote-web parseFrame→handleAck→Composer 显示没选 agent 的专用文案"
       ]
     }
   ]

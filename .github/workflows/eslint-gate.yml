@@ -1,0 +1,58 @@
+name: ESLint gate
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  eslint-gate:
+    runs-on: ${{ github.repository == 'MyAgentHubs/agentloom-internal' && fromJSON('["self-hosted","macOS","ARM64"]') || 'ubuntu-latest' }}
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint (max-lines-per-function gate)
+        run: npm run lint
+      - name: Legacy list ratchet self-check
+        run: npx vitest run src/eslintLegacyRatchet.test.ts
+
+  remote-web-eslint-gate:
+    runs-on: ${{ github.repository == 'MyAgentHubs/agentloom-internal' && fromJSON('["self-hosted","macOS","ARM64"]') || 'ubuntu-latest' }}
+    defaults:
+      run:
+        working-directory: remote-web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            app/package-lock.json
+            remote-web/package-lock.json
+      - name: Install app dependencies (remote-web lint borrows app's eslint toolchain)
+        working-directory: app
+        run: npm ci
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint (max-lines-per-function gate)
+        run: npm run lint
+      - name: Legacy list ratchet self-check
+        run: npx vitest run src/eslintLegacyRatchet.test.ts

@@ -4,3 +4,7 @@ node_modules/
 /target/
 # Interrupted disposable file-size regression repositories.
 /.file-size-gate-test-*/
+.superpowers/
+
+# Local private repository; bootstrap links are excluded in .git/info/exclude.
+/.private/

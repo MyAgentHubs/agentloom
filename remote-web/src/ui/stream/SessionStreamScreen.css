@@ -1,0 +1,700 @@
+/* SessionStreamScreen.css — T6f2 · 移动端会话流布局（新写，见任务书 §3「移动端布局新写」+
+ * survey note §5「会话流完全没做移动端适配」）。用 tokens.css 里已经裁剪好的桌面 design tokens
+ * （暖米底 / 暖橙 accent），不是发明新配色。
+ *
+ * 范围边界（如实记录）：这里只样式化「屏幕壳层」自己画的元素（`.stream-*` 前缀）——被复用的
+ * 桌面叶子组件（ThinkingBlock/GateCard/...）JSX 里写死的 class name（`.thinking`/`.gate-card`/...）
+ * 目前没有对应的移动端 CSS 规则，会以未样式化的默认外观渲染（功能正确、DOM 正确，但视觉朴素）
+ * ——把桌面 global.css 对应段落裁剪搬过来是后续单的事（survey note §5 "必搬" 清单），不在本单
+ * 范围内，本单验收看 DOM 锚点与逻辑正确性，不看像素级视觉还原。ToolCard 的 compact 分支（手机端
+ * 唯一会渲染到的分支，见 ToolCard.tsx:58-72）样式已在下方"桌面叶子样式搬运"小节搬运，从本条
+ * "未样式化清单"移出；ToolCard 的非 compact（command）分支手机端不会渲染到，暂不涉及。
+ */
+
+/* U1 保险丝：真机灾难现场——ToolStepsFold 的 chevron SVG（无 width/height/fill 属性）在没有
+ * 桌面样式兜底时撑成半屏黑色实心三角，加上 Safari 原生 <details><summary> marker 画出第二个
+ * 三角（双三角）。这三条挡在最前面，任何未来新引入、忘记显式带宽高的裸 SVG / 原生 details
+ * marker 都不会再次失控。 */
+/* F3（P2 保险丝特异性反压叶子）：`:where()` 把这条保险丝的特异性砍到 0——不然
+ * `.stream-scroll svg:not([width]):not([height])`（特异性 (0,3,1)）会压过下面
+ * `.stream-scroll .agent-avatar svg`（特异性 (0,2,1)）这类叶子样式，把填充型 glyph
+ * 掏空成描边、尺寸被夺成 1em。声明内容不变，只降特异性。 */
+:where(.stream-scroll svg:not([width]):not([height])) {
+  width: 1em;
+  height: 1em;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+}
+.stream-scroll summary {
+  list-style: none;
+}
+.stream-scroll summary::-webkit-details-marker {
+  display: none;
+}
+
+.stream-screen {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.stream-screen__head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+/* U4：Stop 按钮从 composer 底部迁到这里（header 右侧）——规格原文"顶部会话行右侧 = Stop 按钮"。
+ * `margin-left: auto` 把状态点/文案推到左边，stop 区块贴右对齐，不再跟 composer 的 Send 按钮
+ * 上下堆叠。 */
+.stream-screen__stop-wrap {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+}
+
+/* The confirm state needs to wrap onto its own row to avoid horizontal overflow on mobile viewports.
+ * 横向溢出冲出手机视口；`.stream-screen__head` 已加 `flex-wrap: wrap`，这条让 stop-wrap 在
+ * 确认态时占满整行强制换行，独占第二排——图标态（无 .stream-screen__stop-confirm 后代）不受
+ * 影响，仍走上面原有的 margin-left:auto 贴右单行布局。 */
+.stream-screen__head .stream-screen__stop-wrap:has(.stream-screen__stop-confirm) {
+  flex: 1 0 100%;
+  min-width: 0;
+}
+
+.stream-screen__stop {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* ≥44×44 触控目标（同 composer__send）。 */
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid var(--red);
+  border-radius: 12px;
+  background: var(--panel);
+  color: var(--red);
+}
+
+.stream-screen__stop:disabled {
+  opacity: 0.6;
+}
+
+/* The confirm state occupies its own full-width row to keep text left-aligned and buttons right-aligned.
+ * 两按钮靠右（justify-content:flex-end）。 */
+.stream-screen__stop-confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  justify-content: flex-end;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+.stream-screen__stop-confirm span {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.stream-screen__stop-confirm button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  border: none;
+  border-radius: 6px;
+  padding: 4px 10px;
+  /* F6：确认按钮触控目标——24px 高不达 ≥40px 的移动触控最小尺寸。 */
+  min-height: 40px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.stream-screen__stop-confirm button[data-testid="stream-stop-confirm-yes"] {
+  background: var(--red);
+  color: #fff;
+}
+
+.stream-screen__stop-confirm button[data-testid="stream-stop-confirm-cancel"] {
+  background: var(--line-soft);
+  color: var(--ink-2);
+}
+
+.stream-screen__stop-badge-row {
+  flex: 0 0 auto;
+  padding: 4px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.stream-screen__stop-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.stream-screen__stop-badge--error {
+  color: var(--red);
+}
+
+.stream-screen__stop-badge button {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  padding: 2px 8px;
+  /* F6：触控目标——同 .stream-screen__stop-confirm button。 */
+  min-height: 40px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+/* U4/F5：返回会话列表按钮——线性 ‹ 字符加大 + ≥44×44 触控目标。F5 前由 `app/AppRuntime.tsx` 在
+ * `.app-runtime-stream` 里独占一整行渲染，跟这个屏幕自己的 `.stream-screen__head` 叠成两条顶栏；
+ * 现在渲染进 `.stream-screen__head` 第一个子元素（本文件 `SessionStreamContent`，`onBack` prop
+ * 控制显隐），类名/testid 原样沿用，这条规则作为 header 内的 flex 子项继续生效，不需要额外作用域
+ * 限定。 */
+.app-runtime-back {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 24px;
+  line-height: 1;
+}
+
+.stream-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ink-4);
+}
+
+.stream-status-dot--running {
+  background: var(--green);
+}
+
+.stream-status-dot--idle {
+  background: var(--ink-4);
+}
+
+.stream-screen__status-label {
+  font-size: 13px;
+  color: var(--ink-3);
+}
+
+.stream-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* 代码块换行：手机屏窄，`<pre>` 默认不换行会横向撑破气泡 */
+.stream-scroll pre,
+.stream-scroll code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.stream-empty {
+  margin: auto 0;
+  text-align: center;
+  color: var(--ink-3);
+  font-size: 14px;
+}
+
+.stream-history-load {
+  align-self: center;
+  padding: 4px 10px;
+  /* F6：触控目标——同 .stream-screen__stop-confirm button。 */
+  min-height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 12px;
+}
+
+.stream-history-error {
+  align-self: center;
+  margin: -6px 0 0;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--panel);
+  text-align: center;
+  color: var(--red);
+  font-size: 12px;
+}
+
+.stream-msg {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  max-width: 100%;
+  /* msgfix2 U6b：iPad 每键卡顿定罪二犯——消息流零 containment 时每次重排范围=整篇长会话。
+     跳过视口外消息的渲染/光栅，白屏时长与消息总数解耦（照搬桌面 global.css:1602-1611 `.turn`
+     的既有规则/注释·remote-web 此前没有这层，这里补齐）。
+     contain-intrinsic-size 给视口外元素一个占位高度估算，保证 scrollHeight 仍可算——
+     ⚠ 与 useStickToBottom 的 scrollTop=scrollHeight 贴底交互需 GUI 验证（jsdom 不跑真布局，
+     测不出这层交互，详本次 worker 报告）。 */
+  content-visibility: auto;
+  contain-intrinsic-size: 0 200px;
+}
+
+.stream-msg--user {
+  flex-direction: row-reverse;
+}
+
+.stream-msg__bubble {
+  min-width: 0;
+  max-width: calc(100% - 40px);
+  background: var(--panel);
+  border: 1px solid var(--line-soft);
+  border-radius: 12px;
+  padding: 12px 14px;
+  overflow-wrap: anywhere;
+  /* msgfix2 U6b：气泡内部排版变化不外溢影响祖先/兄弟重排范围。 */
+  contain: layout paint;
+}
+
+.stream-msg--user .stream-msg__bubble {
+  background: var(--accent-soft);
+  border-color: var(--accent-soft);
+}
+
+.stream-msg--live .stream-msg__bubble {
+  border-color: var(--accent);
+}
+
+.stream-typing {
+  display: inline-block;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.stream-decisions {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Approval/ScopeChange 只读呈现的提示行——pointer-events:none/opacity 那半在 SessionStreamScreen.tsx
+ * 用内联 style 做（jsdom/RTL 直接可测，见该文件注释），这里只管提示文案本身的排版。 */
+.stream-restricted-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+/* Over-budget preview messages use this load-full-text entry point, styled like the restricted-hint bubble for consistent in-bubble access.
+ * 追加的一行,不单独起容器背景,保持轻量。 */
+.stream-msg__fetch-load {
+  margin-top: 8px;
+  padding: 6px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* msgfix2 U3（设计稿 v4.1 §4.1）：L1 活动摘要 chip——折叠态一行，展开态（verbose 开）加一段按
+ * 类别的计数明细列表。折叠态视觉上比正文文字更轻（`--ink-3`），不与真正的对话正文抢注意力。 */
+.stream-activity-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--line-soft);
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.stream-activity-chip--expanded {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.stream-activity-chip__state {
+  flex: 0 0 auto;
+  color: var(--ink-2);
+  font-weight: 600;
+}
+
+.stream-activity-chip__detail {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--ink-3);
+}
+
+.stream-msg__fetch-footer {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.stream-msg__fetch-footer button {
+  padding: 4px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* ============================================================================
+ * U1：桌面叶子样式搬运（从 app/src/styles/global.css 裁剪，同名类名 + 同 token，不自创颜色/间距）。
+ * 这些叶子组件（ThinkingBlock/ToolCard/ToolStepsFold/AgentAvatar/RunLeadTurn 内的决策卡）经 @app
+ * alias 原样复用、只在 `.stream-scroll` 内渲染，故用 `.stream-scroll ` 前缀限定作用域，不裸放全局
+ * 类名（避免未来任何页面复用同名桌面类名时被这里的规则串扰）。字号相对桌面原值上调
+ * 1-1.5px（手机可读性；公司规范 web scale 13-15px 区间内）。
+ * ============================================================================ */
+
+/* ToolStepsFold（"Ran N steps" 折叠条）：修 chevron 撑成半屏三角 + "Ran 2 stepsDone" 粘连（丢了
+ * inline-flex/gap 的 .toolfold__sum） */
+.stream-scroll .toolfold {
+  margin: 7px 0 0 0;
+  display: block;
+  font-size: 11.5px;
+  color: var(--ink-2);
+  padding: 0;
+  font-family: "SF Mono", ui-monospace, monospace;
+  cursor: pointer;
+}
+.stream-scroll .toolfold__sum {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  list-style: none;
+  cursor: pointer;
+}
+.stream-scroll .toolfold__chevron {
+  width: 11px;
+  height: 11px;
+  stroke: var(--ink-4);
+  fill: none;
+  stroke-width: 2;
+  transition: transform 0.15s ease;
+}
+.stream-scroll .toolfold[open] .toolfold__chevron {
+  transform: rotate(90deg);
+}
+.stream-scroll .toolfold__label {
+  color: var(--ink-2);
+}
+.stream-scroll .toolfold__list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+.stream-scroll .toolfold__list .toolcard {
+  margin: 0;
+}
+
+/* ToolCard/ToolStepsFold 共用的状态徽标 */
+.stream-scroll .toolcard__badge {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 10px;
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+.stream-scroll .toolcard__badge--run {
+  background: rgba(106, 155, 92, 0.14);
+  color: var(--green);
+}
+.stream-scroll .toolcard__badge--done {
+  background: var(--bg-sunken);
+  color: var(--ink-3);
+}
+.stream-scroll .toolcard__badge--fail {
+  background: rgba(184, 80, 72, 0.12);
+  color: var(--red, #b85048);
+}
+.stream-scroll .toolcard__badge--intr {
+  background: var(--bg-sunken);
+  color: var(--ink-4);
+}
+
+/* RunLeadTurn 里的"进程"折叠（pf- = process-fold 前缀） */
+.stream-scroll .proc-fold {
+  margin: 12px 0 0 0;
+  border-top: 1px solid var(--line-soft);
+  padding-top: 9px;
+}
+.stream-scroll .pf-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.stream-scroll .pf-tog {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  padding: 2px;
+}
+.stream-scroll .pf-tri {
+  width: 11px;
+  height: 11px;
+  flex: 0 0 11px;
+  color: var(--ink-4);
+  transition: transform 0.15s;
+  display: inline-flex;
+}
+.stream-scroll .pf-tri svg {
+  width: 11px;
+  height: 11px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2.4;
+}
+.stream-scroll .proc-fold.open .pf-tri {
+  transform: rotate(90deg);
+}
+.stream-scroll .pf-lab {
+  font-size: 13px;
+  color: var(--ink-2);
+}
+.stream-scroll .pf-sp {
+  flex: 1;
+}
+.stream-scroll .pf-view {
+  border: 0;
+  background: transparent;
+  padding: 2px;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.stream-scroll .pf-view:hover {
+  text-decoration: underline;
+}
+.stream-scroll .pf-list {
+  display: none;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 9px;
+}
+.stream-scroll .proc-fold.open .pf-list {
+  display: flex;
+}
+
+/* AgentAvatar */
+.stream-scroll .agent-avatar {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9.5px;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+}
+.stream-scroll .agent-avatar svg {
+  width: 60%;
+  height: 60%;
+}
+.stream-scroll .agent-avatar--user {
+  background: #8a8580;
+}
+.stream-scroll .agent-avatar--claude {
+  background: linear-gradient(135deg, #e08562, #c5634a);
+}
+.stream-scroll .agent-avatar--codex {
+  background: #1a1a1a;
+}
+.stream-scroll .agent-avatar--deepseek {
+  background: #4d6bfe;
+}
+.stream-scroll .agent-avatar--unknown {
+  background: var(--bg-sunken);
+  color: var(--ink-3);
+}
+/* F2：AgentAvatar 的 assistant glyph（`kind="assistant"` → `.agent-avatar--assistant`，见
+ * LiveMessageRow）没有对应背景——白色 glyph 贴透明底看不见。同 --unknown 的暗底浅字口径。 */
+.stream-scroll .agent-avatar--assistant {
+  background: var(--bg-sunken);
+  color: var(--ink-3);
+}
+
+/* MessageContent 正文排版（p/li/ul/h1-h6/blockquote/a/hr/code.inline）——行高退化到浏览器默认
+ * ~1.2 过密难读的根修在这段 */
+.stream-scroll .turn__text {
+  color: var(--ink);
+  font-size: 15px;
+  line-height: 1.7;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.stream-scroll .turn__text p,
+.stream-scroll .turn__text li {
+  color: var(--ink-2);
+}
+.stream-scroll .turn__text blockquote p,
+.stream-scroll .turn__text blockquote li {
+  color: inherit;
+}
+.stream-scroll .turn__text strong,
+.stream-scroll .turn__text b {
+  color: var(--ink);
+  font-weight: 600;
+}
+.stream-scroll .turn__text p {
+  margin: 0 0 10px;
+}
+.stream-scroll .turn__text h1,
+.stream-scroll .turn__text h2,
+.stream-scroll .turn__text h3,
+.stream-scroll .turn__text h4,
+.stream-scroll .turn__text h5,
+.stream-scroll .turn__text h6 {
+  color: var(--ink);
+  font-weight: 600;
+}
+.stream-scroll .turn__text h1 {
+  font-size: 18.5px;
+  line-height: 1.35;
+  margin: 16px 0 6px;
+}
+.stream-scroll .turn__text h2 {
+  font-size: 16.5px;
+  margin: 15px 0 6px;
+}
+.stream-scroll .turn__text h3 {
+  font-size: 15.5px;
+  margin: 14px 0 6px;
+}
+.stream-scroll .turn__text h4,
+.stream-scroll .turn__text h5,
+.stream-scroll .turn__text h6 {
+  font-size: 14.5px;
+  margin: 12px 0 5px;
+}
+.stream-scroll .turn__text > :is(h1, h2, h3, h4, h5, h6):first-child {
+  margin-top: 0;
+}
+.stream-scroll .turn__text ul,
+.stream-scroll .turn__text ol {
+  margin: 6px 0 10px;
+  padding-left: 20px;
+}
+.stream-scroll .turn__text li {
+  margin: 2px 0;
+}
+.stream-scroll .turn__text a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid var(--accent-soft);
+}
+.stream-scroll .turn__text blockquote {
+  border-left: 3px solid var(--line);
+  padding: 4px 0 4px 12px;
+  margin: 8px 0;
+  color: var(--ink-3);
+}
+.stream-scroll .turn__text hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 16px 0;
+}
+.stream-scroll .turn__text code.inline {
+  border-radius: 3px;
+  padding: 1px 5px;
+  background: var(--bg-sunken);
+  color: var(--ink);
+  font-family: "SF Mono", monospace;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* ToolCard（compact 分支，手机端唯一会渲染到的分支，见 ToolCard.tsx:58-72）：真机症状——
+ * "Run command" 标签与命令文字粘连成一串、长命令按正文字号整段换行、没有卡片盒。根因：这四段
+ * 桌面 CSS 此前一条没搬——flex 没了（JSX 剥掉换行空白，两个相邻 span 之间零文本节点，全靠
+ * display:flex;gap 分隔）、等宽 + 单行省略没了、卡片盒没了。 */
+.stream-scroll .toolcard {
+  /* 源 global.css:3970-3980 */
+  display: block;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  margin: 8px 0;
+  background: var(--panel);
+  font-size: inherit;
+}
+.stream-scroll .toolcard--compact {
+  /* 源 global.css:3981-3987，字号 12px→13px */
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 11px;
+  font-size: 13px;
+}
+.stream-scroll .toolcard__tool {
+  /* 源 global.css:4012-4015，字号 11.5px→12.5px */
+  font-weight: 600;
+  font-size: 12.5px;
+}
+.stream-scroll .toolcard__summary {
+  /* 源 global.css:4016-4025，字号 11px→12px——单行省略号的机制在这条 */
+  font-family: "SF Mono", monospace;
+  font-size: 12px;
+  color: var(--ink-3);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

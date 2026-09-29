@@ -1,0 +1,131 @@
+/* SessionListScreen.css — T6d2 · 移动端会话列表布局（新写）。对齐
+ * `stream/SessionStreamScreen.css` 的克制风与 `tokens.css` 变量（暖米底 / 暖橙 accent），不发明
+ * 新配色；状态点配色直接复用 `stream-status-dot` 那套 `--green`/`--ink-4` 双状态取向。
+ */
+
+.session-list-screen {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+/* msgfix2 U3：设置入口——右上角小按钮，44×44 触控目标（同 SessionStreamScreen.css 的
+ * `.app-runtime-back` 既有取向）。 */
+.session-list__settings-button {
+  flex: 0 0 auto;
+  align-self: flex-end;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  margin: 4px 4px 0 0;
+  border: none;
+  background: transparent;
+  color: var(--ink-3);
+}
+
+.session-list-header {
+  flex: 0 0 auto;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-list-empty {
+  margin: auto 0;
+  text-align: center;
+  color: var(--ink-3);
+  font-size: 14px;
+}
+
+.session-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.session-list__item {
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.session-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 14px 16px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-row--selected {
+  background: var(--accent-soft);
+}
+
+.session-status-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ink-4);
+}
+
+.session-status-dot--running {
+  background: var(--green);
+}
+
+.session-status-dot--idle {
+  background: var(--ink-4);
+}
+
+.session-row__body {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.session-row__title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-row__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.session-row__repo {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-row__time {
+  flex: 0 0 auto;
+  color: var(--ink-4);
+}

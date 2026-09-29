@@ -1,0 +1,96 @@
+/* composer.css — T6f3 · 移动端 composer 布局。同 stream/SessionStreamScreen.css 的既有取向：
+ * 用 tokens.css 已裁剪好的桌面 design tokens（暖米底/暖橙 accent），只样式化本文件自己画的元素
+ * （`.composer-*` 前缀），克制风、无 emoji。
+ */
+
+.composer {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px calc(8px + env(safe-area-inset-bottom, 0px));
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.composer__row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.composer__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  resize: none;
+  /* 单行高度地板：16px 字号 × 1.4 行高 = 22.4px 内容高 + 上下 padding 16px + 上下边框 2px ≈
+   * 40px。全局 `* { box-sizing: border-box; }`（tokens.css:26-28）生效，故这里按 border-box 口径
+   * 算（height 含 padding+border），不用另加 content-box 口径的地板值。 */
+  min-height: 40px;
+  max-height: 120px;
+  /* 默认藏滚动条——超过 max-height 时由 JS autosize() 按 scrollHeight 翻成 auto（对齐桌面
+   * InputArea.tsx 的 autosize 手法，见 Composer.tsx）。 */
+  overflow-y: hidden;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--ink);
+  font: inherit;
+  /* 16px（不是 14px）：iOS Safari/WKWebView 对 <16px 的聚焦输入框会自动放大页面——之前靠
+   * index.html 的 maximum-scale=1 压住,同时也禁掉了用户手动缩放（可访问性问题）。16px 从根上
+   * 不触发该行为,index.html 那条 viewport 约束随之放开（见该文件改动）。 */
+  font-size: 16px;
+  line-height: 1.4;
+}
+
+.composer__input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.composer__send {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* ≥44×44 触控目标（Apple HIG / WCAG 2.5.5）——图标本身只有 20px,靠 padding 补足。 */
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: none;
+  border-radius: 12px;
+  background: var(--accent);
+  color: #fff;
+}
+
+.composer__send:disabled {
+  background: var(--line);
+  color: var(--ink-4);
+  /* 禁用态降饱和——描边图标在灰底上进一步压暗,别再用 accent 撞色。 */
+  opacity: 0.6;
+}
+
+.composer__badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.composer__badge--error {
+  color: var(--red);
+}
+
+.composer__badge button {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  padding: 2px 8px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+/* Stop 按钮 + 二次确认 + stopBadge 的样式已随组件一并迁到 stream/SessionStreamScreen.css
+ * （header 右侧）——见该文件 .stream-screen__stop* 规则 + Composer.tsx 文件头注"U4 差量"一节。 */

@@ -1,0 +1,753 @@
+name: Release signed desktop bundles
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing v* tag to build'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '22.23.1'
+  RUST_TOOLCHAIN: '1.97.0'
+  RELEASE_TAG: ${{ inputs.tag }}
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      commit: ${{ steps.release.outputs.commit }}
+    steps:
+      - name: Require dispatch from the default branch
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$DEFAULT_BRANCH" || "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]]; then
+            echo "Desktop releases must be dispatched from the repository default branch." >&2
+            exit 1
+          fi
+
+      - name: Check out the release tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Validate tag provenance and application versions
+        id: release
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag must match v<semver>." >&2
+            exit 1
+          fi
+
+          git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}" >/dev/null
+          tag_commit="$(git rev-list -n 1 "$RELEASE_TAG")"
+          head_commit="$(git rev-parse HEAD)"
+          if [[ "$tag_commit" != "$head_commit" ]]; then
+            echo "Checked-out commit is not the requested tag target." >&2
+            exit 1
+          fi
+
+          git fetch --no-tags origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          if ! git merge-base --is-ancestor "$tag_commit" "origin/${DEFAULT_BRANCH}"; then
+            echo "Release tag must point to a commit reachable from the repository default branch." >&2
+            exit 1
+          fi
+
+          readarray -t versions < <(python3 - <<'PY'
+          import json
+          import tomllib
+
+          with open('app/src-tauri/tauri.conf.json', encoding='utf-8') as stream:
+              print(json.load(stream)['version'])
+          with open('app/package.json', encoding='utf-8') as stream:
+              print(json.load(stream)['version'])
+          with open('app/src-tauri/Cargo.toml', 'rb') as stream:
+              print(tomllib.load(stream)['package']['version'])
+          PY
+          )
+          if [[ "${#versions[@]}" -ne 3 ]]; then
+            echo "Could not read all three application versions." >&2
+            exit 1
+          fi
+          version="${versions[0]}"
+          if [[ "${versions[1]}" != "$version" || "${versions[2]}" != "$version" ]]; then
+            echo "Application versions disagree across tauri.conf.json, package.json, and Cargo.toml." >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_TAG" != "v${version}" ]]; then
+            echo "Tag ${RELEASE_TAG} does not match application version ${version}." >&2
+            exit 1
+          fi
+
+          {
+            echo "tag=${RELEASE_TAG}"
+            echo "version=${version}"
+            echo "commit=${tag_commit}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.asset_suffix }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            platform: macos
+            expected_arch: arm64
+            asset_suffix: macos-arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos
+            expected_arch: x86_64
+            asset_suffix: macos-x64
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            platform: windows
+            expected_arch: x86_64
+            asset_suffix: windows-x64
+    runs-on: ${{ matrix.runner }}
+    environment: desktop-signing
+    steps:
+      - name: Check out the validated release commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix app
+
+      - name: Install the pinned Rust toolchain and target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup override set "$RUST_TOOLCHAIN"
+          rustup target add '${{ matrix.target }}' --toolchain "$RUST_TOOLCHAIN"
+
+      - name: Build the myagent engine for the release target
+        shell: bash
+        run: >-
+          cargo build --locked --release
+          --manifest-path harness-agent/Cargo.toml
+          --bin myagent
+          --target '${{ matrix.target }}'
+
+      - name: Import Developer ID certificate into a temporary keychain
+        if: matrix.platform == 'macos'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$APPLE_CERTIFICATE" || -z "$APPLE_CERTIFICATE_PASSWORD" ]]; then
+            echo "APPLE_CERTIFICATE and APPLE_CERTIFICATE_PASSWORD are required." >&2
+            exit 1
+          fi
+
+          umask 077
+          keychain_path="$RUNNER_TEMP/agentloom-signing.keychain-db"
+          p12_path="$RUNNER_TEMP/agentloom-developer-id.p12"
+          identity_output="$RUNNER_TEMP/agentloom-developer-id.txt"
+          original_keychains="$RUNNER_TEMP/agentloom-original-keychains.txt"
+          keychain_password="$(openssl rand -hex 32)"
+          trap 'rm -f "$p12_path" "$identity_output"' EXIT
+
+          security list-keychains -d user > "$original_keychains"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 -D > "$p12_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$p12_path" -k "$keychain_path" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain_path" >/dev/null
+          python3 - "$original_keychains" "$keychain_path" <<'PY'
+          import shlex
+          import subprocess
+          import sys
+
+          with open(sys.argv[1], encoding='utf-8') as stream:
+              original = shlex.split(stream.read())
+          subprocess.run(
+              ['security', 'list-keychains', '-d', 'user', '-s', sys.argv[2], *original],
+              check=True,
+          )
+          PY
+
+          security find-certificate -a -c 'Developer ID Application' -Z "$keychain_path" > "$identity_output"
+          identity_count="$(awk '$1 == "SHA-1" && $2 == "hash:" { count++ } END { print count + 0 }' "$identity_output")"
+          identity_sha="$(awk '$1 == "SHA-1" && $2 == "hash:" { print $3; exit }' "$identity_output")"
+          if [[ "$identity_count" -ne 1 || ! "$identity_sha" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+            echo "The P12 must contain exactly one Developer ID Application identity." >&2
+            exit 1
+          fi
+
+          identity_sha="$(printf '%s' "$identity_sha" | tr '[:lower:]' '[:upper:]')"
+          security find-identity -v -p codesigning "$keychain_path" > "$identity_output"
+          if ! grep -Eq "^[[:space:]]*[0-9]+\)[[:space:]]+${identity_sha}[[:space:]]" "$identity_output"; then
+            echo "The imported Developer ID identity is not usable for code signing." >&2
+            exit 1
+          fi
+
+          echo "APPLE_SIGNING_IDENTITY=${identity_sha}" >> "$GITHUB_ENV"
+
+      - name: Import Windows code-signing certificate
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE) -or [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            throw 'WINDOWS_CERTIFICATE and WINDOWS_CERTIFICATE_PASSWORD are required.'
+          }
+
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'agentloom-code-signing.pfx'
+          $thumbprintPath = Join-Path $env:RUNNER_TEMP 'agentloom-imported-thumbprints.txt'
+          $base64 = $env:WINDOWS_CERTIFICATE -replace '\s', ''
+          Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($base64))
+          $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
+          $acl = [Security.AccessControl.FileSecurity]::new()
+          $acl.SetAccessRuleProtection($true, $false)
+          $acl.SetOwner($currentUser)
+          $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+            $currentUser,
+            [Security.AccessControl.FileSystemRights]::FullControl,
+            [Security.AccessControl.AccessControlType]::Allow
+          )
+          $acl.AddAccessRule($rule)
+          Set-Acl -LiteralPath $pfxPath -AclObject $acl
+
+          try {
+            $password = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $imported = @(Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation 'Cert:\CurrentUser\My' -Password $password -Exportable:$false)
+          } finally {
+            Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
+          }
+          @($imported | ForEach-Object { $_.Thumbprint }) | Set-Content -LiteralPath $thumbprintPath -Encoding ascii
+
+          $codeSigning = @($imported | Where-Object {
+            $_.HasPrivateKey -and ($_.EnhancedKeyUsageList.ObjectId.Value -contains '1.3.6.1.5.5.7.3.3')
+          })
+          if ($codeSigning.Count -ne 1) {
+            throw 'The PFX must contain exactly one code-signing certificate with a private key.'
+          }
+
+          $certificate = $codeSigning[0]
+          if ($certificate.NotBefore -gt [DateTime]::Now -or $certificate.NotAfter -le [DateTime]::Now) {
+            throw 'The Windows code-signing certificate is not currently valid.'
+          }
+
+          $thumbprint = ($certificate.Thumbprint -replace '\s', '').ToUpperInvariant()
+          if ($thumbprint -notmatch '^[0-9A-F]{40}$') {
+            throw 'The Windows certificate thumbprint is malformed.'
+          }
+
+          "WINDOWS_CERTIFICATE_THUMBPRINT=$thumbprint" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Sign the Windows myagent engine before bundling
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          WINDOWS_TIMESTAMP_URL: https://timestamp.digicert.com
+        run: |
+          # The target-aware beforeBuild copies this signed engine into app/src-tauri/binaries.
+          # Cargo build.rs then copies the same signed bytes into target/release, and Tauri's
+          # Windows bundler verifies that signature before deciding not to sign it a second time.
+          $enginePath = Join-Path $env:GITHUB_WORKSPACE 'harness-agent\target\${{ matrix.target }}\release\myagent.exe'
+          & (Join-Path $env:GITHUB_WORKSPACE 'app\src-tauri\scripts\sign-windows.ps1') $enginePath
+
+      - name: Build, sign, notarize, and staple the macOS app
+        if: matrix.platform == 'macos'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$APPLE_ID" || -z "$APPLE_PASSWORD" || -z "$APPLE_TEAM_ID" ]]; then
+            echo "APPLE_ID, APPLE_PASSWORD, and APPLE_TEAM_ID are required for notarization." >&2
+            exit 1
+          fi
+
+          npm run --prefix app tauri -- build --ci --target '${{ matrix.target }}' --bundles app 2>&1 \
+            | sed -E 's/(Developer ID Application: )[^\"]*/\1(name hidden)/g'
+
+          app_path="app/src-tauri/target/${{ matrix.target }}/release/bundle/macos/AgentLoom.app"
+          if [[ ! -d "$app_path" ]]; then
+            echo "Expected app bundle was not produced." >&2
+            exit 1
+          fi
+
+          for binary in "$app_path/Contents/MacOS/agentloom" "$app_path/Contents/MacOS/myagent"; do
+            if [[ ! -f "$binary" ]]; then
+              echo "Expected app binary is missing: $binary" >&2
+              exit 1
+            fi
+            actual_arch="$(lipo -archs "$binary")"
+            if [[ "$actual_arch" != '${{ matrix.expected_arch }}' ]]; then
+              echo "Unexpected architecture for $binary: $actual_arch" >&2
+              exit 1
+            fi
+          done
+
+          codesign --verify --deep --strict --verbose=2 "$app_path" 2>&1 \
+            | sed -E 's/(Developer ID Application: )[^\"]*/\1(name hidden)/g'
+          spctl --assess --type execute --verbose=2 "$app_path" 2>&1 \
+            | sed -E 's/(Developer ID Application: )[^\"]*/\1(name hidden)/g'
+          xcrun stapler validate "$app_path"
+
+      - name: Package, notarize, and verify the macOS DMG
+        if: matrix.platform == 'macos'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          app_path="app/src-tauri/target/${{ matrix.target }}/release/bundle/macos/AgentLoom.app"
+          asset_dir="$RUNNER_TEMP/release-assets"
+          asset_path="$asset_dir/AgentLoom_${RELEASE_VERSION}_${{ matrix.asset_suffix }}.dmg"
+          stage="$(mktemp -d)"
+          temp_dir="$(mktemp -d)"
+          mount_dir="$(mktemp -d)"
+          mounted=0
+          cleanup() {
+            set +e
+            if [[ "$mounted" -eq 1 ]]; then
+              hdiutil detach "$mount_dir" >/dev/null
+            fi
+            rm -rf "$stage" "$temp_dir" "$mount_dir"
+          }
+          trap cleanup EXIT
+          mkdir -p "$asset_dir"
+
+          ditto "$app_path" "$stage/AgentLoom.app"
+          codesign --verify --deep --strict --verbose=2 "$stage/AgentLoom.app" 2>&1 \
+            | sed -E 's/(Developer ID Application: )[^\"]*/\1(name hidden)/g'
+          ln -s /Applications "$stage/Applications"
+          hdiutil makehybrid -hfs -hfs-volume-name AgentLoom -o "$temp_dir/AgentLoom-hybrid.dmg" "$stage" >/dev/null
+          hdiutil convert "$temp_dir/AgentLoom-hybrid.dmg" -format UDZO -o "$asset_path" >/dev/null
+
+          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$asset_path" 2>&1 \
+            | sed -E 's/(Developer ID Application: )[^\"]*/\1(name hidden)/g'
+          codesign --verify --strict --verbose=2 "$asset_path" 2>&1 \
+            | sed -E 's/(Developer ID Application: )[^\"]*/\1(name hidden)/g'
+          xcrun notarytool submit "$asset_path" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "$asset_path"
+          xcrun stapler validate "$asset_path"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$asset_path" 2>&1 \
+            | sed -E 's/(Developer ID Application: )[^\"]*/\1(name hidden)/g'
+
+          hdiutil attach "$asset_path" -readonly -nobrowse -mountpoint "$mount_dir" >/dev/null
+          mounted=1
+          mounted_app="$mount_dir/AgentLoom.app"
+          # hdiutil makehybrid -hfs synthesizes an empty com.apple.FinderInfo on the mounted app.
+          # Strict codesign treats that HFS transport metadata as modified, so Gatekeeper is the mounted-image gate.
+          spctl --assess --type execute --verbose=2 "$mounted_app" 2>&1 \
+            | sed -E 's/(Developer ID Application: )[^\"]*/\1(name hidden)/g'
+          hdiutil detach "$mount_dir" >/dev/null
+          mounted=0
+
+      - name: Build the signed Windows installer
+        if: matrix.platform == 'windows'
+        shell: bash
+        env:
+          WINDOWS_TIMESTAMP_URL: https://timestamp.digicert.com
+        run: >-
+          npm run --prefix app tauri -- build --ci
+          --target '${{ matrix.target }}'
+          --bundles nsis
+          --config src-tauri/tauri.release.windows.conf.json
+
+      - name: Verify and stage the Windows installer
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          function Assert-PeMachineAmd64 {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$Path
+            )
+
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+              throw 'An expected AMD64 PE executable is missing.'
+            }
+
+            $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            try {
+              $reader = [IO.BinaryReader]::new($stream)
+              try {
+                if ($stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5A4D) {
+                  throw 'An executable does not have a valid DOS/PE header.'
+                }
+                $stream.Position = 0x3C
+                $peOffset = $reader.ReadUInt32()
+                if ([int64]$peOffset + 6 -gt $stream.Length) {
+                  throw 'An executable has an invalid PE header offset.'
+                }
+                $stream.Position = $peOffset
+                if ($reader.ReadUInt32() -ne 0x00004550) {
+                  throw 'An executable does not have a valid PE signature.'
+                }
+                $machine = $reader.ReadUInt16()
+                if ($machine -ne 0x8664) {
+                  throw ("Expected PE Machine AMD64 (0x8664), found 0x{0:X4}." -f $machine)
+                }
+              } finally {
+                $reader.Dispose()
+              }
+            } finally {
+              $stream.Dispose()
+            }
+          }
+
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE 'app\src-tauri\target\${{ matrix.target }}\release'
+          $bundleDir = Join-Path $releaseDir 'bundle\nsis'
+          $installers = @(Get-ChildItem -LiteralPath $bundleDir -File -Filter '*.exe')
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer, found $($installers.Count)."
+          }
+
+          $mainExecutable = Join-Path $releaseDir 'agentloom.exe'
+          $nsisSidecarSource = Join-Path $env:GITHUB_WORKSPACE 'app\src-tauri\binaries\myagent-${{ matrix.target }}.exe'
+          $targetSidecarCopy = Join-Path $releaseDir 'myagent.exe'
+          foreach ($artifact in @($mainExecutable, $nsisSidecarSource, $targetSidecarCopy)) {
+            Assert-PeMachineAmd64 -Path $artifact
+          }
+
+          $signedArtifacts = @($mainExecutable, $nsisSidecarSource, $targetSidecarCopy, $installers[0].FullName)
+          foreach ($artifact in $signedArtifacts) {
+            if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
+              throw "Expected signed bundle artifact is missing: $artifact"
+            }
+
+            $signature = Get-AuthenticodeSignature -LiteralPath $artifact
+            $actualThumbprint = if ($null -eq $signature.SignerCertificate) { '' } else { $signature.SignerCertificate.Thumbprint }
+            if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+              throw "Authenticode signature is not valid for ${artifact}: $($signature.Status)."
+            }
+            if ($actualThumbprint -ne $env:WINDOWS_CERTIFICATE_THUMBPRINT) {
+              throw "Bundle artifact was not signed by the imported certificate: $artifact"
+            }
+            if ($null -eq $signature.TimeStamperCertificate) {
+              throw "Bundle artifact has no trusted RFC 3161 timestamp: $artifact"
+            }
+          }
+
+          $installDir = Join-Path $env:LOCALAPPDATA "AgentLoomSmoke-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if ($installDir -match '\s') {
+            throw 'The NSIS smoke-test path must not contain whitespace so /D= can remain the final unquoted argument.'
+          }
+          Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
+
+          $appProcess = $null
+          try {
+            # NSIS documents /S for silent mode and /D=<absolute path> as the final, unquoted argument.
+            $installProcess = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+            if ($installProcess.ExitCode -ne 0) {
+              throw "The NSIS installer smoke test failed with exit code $($installProcess.ExitCode)."
+            }
+
+            $installedMain = Join-Path $installDir 'agentloom.exe'
+            $installedSidecar = Join-Path $installDir 'myagent.exe'
+            foreach ($artifact in @($installedMain, $installedSidecar)) {
+              Assert-PeMachineAmd64 -Path $artifact
+
+              $signature = Get-AuthenticodeSignature -LiteralPath $artifact
+              $actualThumbprint = if ($null -eq $signature.SignerCertificate) { '' } else { $signature.SignerCertificate.Thumbprint }
+              if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+                throw "An installed executable has an invalid Authenticode signature: $($signature.Status)."
+              }
+              if ($actualThumbprint -ne $env:WINDOWS_CERTIFICATE_THUMBPRINT) {
+                throw 'An installed executable was not signed by the imported certificate.'
+              }
+              if ($null -eq $signature.TimeStamperCertificate) {
+                throw 'An installed executable has no trusted RFC 3161 timestamp.'
+              }
+            }
+
+            $appProcess = Start-Process -FilePath $installedMain -PassThru
+            try {
+              Start-Sleep -Seconds 8
+              $appProcess.Refresh()
+              if ($appProcess.HasExited) {
+                throw "The installed AgentLoom executable exited immediately with code $($appProcess.ExitCode)."
+              }
+            } finally {
+              if ($null -ne $appProcess -and -not $appProcess.HasExited) {
+                Stop-Process -Id $appProcess.Id -Force -ErrorAction SilentlyContinue
+                Wait-Process -Id $appProcess.Id -ErrorAction SilentlyContinue
+              }
+            }
+
+            $uninstaller = Join-Path $installDir 'uninstall.exe'
+            if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
+              throw 'The NSIS installer did not install its uninstaller.'
+            }
+
+            # Standard /S lets NSIS copy the uninstaller to a temporary process and remove the install directory.
+            # Start-Process -Wait covers the launched process tree; polling below also covers delayed self-cleanup.
+            $uninstallProcess = Start-Process -FilePath $uninstaller -ArgumentList @('/S') -Wait -PassThru
+            if ($uninstallProcess.ExitCode -ne 0) {
+              throw "The NSIS uninstaller smoke test failed with exit code $($uninstallProcess.ExitCode)."
+            }
+
+            $uninstallDeadline = [DateTime]::UtcNow.AddSeconds(60)
+            do {
+              $mainRemains = Test-Path -LiteralPath $installedMain -PathType Leaf
+              $sidecarRemains = Test-Path -LiteralPath $installedSidecar -PathType Leaf
+              $installDirRemains = Test-Path -LiteralPath $installDir -PathType Container
+              if (-not $mainRemains -and -not $sidecarRemains -and -not $installDirRemains) {
+                break
+              }
+              Start-Sleep -Seconds 1
+            } while ([DateTime]::UtcNow -lt $uninstallDeadline)
+
+            if ($mainRemains -or $sidecarRemains -or $installDirRemains) {
+              $remaining = @()
+              if ($mainRemains) { $remaining += 'agentloom.exe' }
+              if ($sidecarRemains) { $remaining += 'myagent.exe' }
+              if ($installDirRemains) { $remaining += 'install directory' }
+              throw "Silent NSIS uninstall did not remove: $($remaining -join ', ')."
+            }
+          } finally {
+            try {
+              if (Test-Path -LiteralPath $installDir) {
+                Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction Stop
+              }
+            } catch {
+              Write-Warning 'Fallback cleanup of the dedicated NSIS smoke-test directory failed.'
+            }
+          }
+
+          $assetDir = Join-Path $env:RUNNER_TEMP 'release-assets'
+          New-Item -ItemType Directory -Path $assetDir -Force | Out-Null
+          $assetPath = Join-Path $assetDir "AgentLoom_$env:RELEASE_VERSION`_${{ matrix.asset_suffix }}.exe"
+          Copy-Item -LiteralPath $installers[0].FullName -Destination $assetPath
+
+      - name: Reject generated lockfile drift
+        shell: bash
+        run: git diff --exit-code -- app/package-lock.json app/src-tauri/Cargo.lock harness-agent/Cargo.lock
+
+      - name: Upload the platform asset
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-${{ matrix.asset_suffix }}
+          path: ${{ runner.temp }}/release-assets/AgentLoom_${{ needs.validate.outputs.version }}_${{ matrix.asset_suffix }}.*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove the temporary macOS keychain
+        if: always() && matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set +e
+
+          original_keychains="$RUNNER_TEMP/agentloom-original-keychains.txt"
+          restore_status=0
+          if [[ -f "$original_keychains" ]]; then
+            python3 - "$original_keychains" <<'PY'
+          import shlex
+          import subprocess
+          import sys
+
+          with open(sys.argv[1], encoding='utf-8') as stream:
+              original = shlex.split(stream.read())
+          subprocess.run(
+              ['security', 'list-keychains', '-d', 'user', '-s', *original],
+              check=True,
+          )
+          PY
+            restore_status=$?
+          fi
+          security delete-keychain "$RUNNER_TEMP/agentloom-signing.keychain-db" >/dev/null 2>&1 || true
+          rm -f "$original_keychains"
+          exit "$restore_status"
+
+      - name: Remove the temporary Windows certificate
+        if: always() && matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'agentloom-code-signing.pfx') -Force -ErrorAction SilentlyContinue
+          $thumbprintPath = Join-Path $env:RUNNER_TEMP 'agentloom-imported-thumbprints.txt'
+          if (Test-Path -LiteralPath $thumbprintPath -PathType Leaf) {
+            foreach ($thumbprint in Get-Content -LiteralPath $thumbprintPath) {
+              if ($thumbprint -match '^[0-9A-Fa-f]{40}$') {
+                Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" -Force -ErrorAction SilentlyContinue
+              }
+            }
+            Remove-Item -LiteralPath $thumbprintPath -Force -ErrorAction SilentlyContinue
+          }
+
+  release:
+    name: Create draft GitHub release
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      VALIDATED_COMMIT: ${{ needs.validate.outputs.commit }}
+    steps:
+      - name: Check out the validated release commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Download signed platform assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: desktop-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Validate the release asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expected=(
+            "AgentLoom_${RELEASE_VERSION}_macos-arm64.dmg"
+            "AgentLoom_${RELEASE_VERSION}_macos-x64.dmg"
+            "AgentLoom_${RELEASE_VERSION}_windows-x64.exe"
+          )
+          for asset in "${expected[@]}"; do
+            if [[ ! -f "release-assets/$asset" ]]; then
+              echo "Missing release asset: $asset" >&2
+              exit 1
+            fi
+          done
+
+          binary_asset_count="$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          if [[ "$binary_asset_count" -ne 3 ]]; then
+            echo "Expected exactly three uniquely named platform assets, found $binary_asset_count." >&2
+            exit 1
+          fi
+
+          (
+            cd release-assets
+            printf '%s\n' "${expected[@]}" | LC_ALL=C sort | while IFS= read -r asset; do
+              sha256sum "$asset"
+            done > SHA256SUMS.txt
+          )
+
+          checksum_lines="$(wc -l < release-assets/SHA256SUMS.txt | tr -d ' ')"
+          total_asset_count="$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          if [[ "$checksum_lines" -ne 3 || "$total_asset_count" -ne 4 ]]; then
+            echo "Expected three checksums and four total release assets." >&2
+            exit 1
+          fi
+
+      - name: Create or refresh the draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag='${{ needs.validate.outputs.tag }}'
+          assert_remote_tag_unchanged() {
+            git fetch --force --no-tags origin "+refs/tags/${tag}:refs/tags/${tag}"
+            current_tag_commit="$(git rev-parse "refs/tags/${tag}^{commit}")"
+            if [[ "$current_tag_commit" != "$VALIDATED_COMMIT" ]]; then
+              echo "Release tag moved after validation; failing the release workflow." >&2
+              exit 1
+            fi
+          }
+
+          assert_remote_tag_unchanged
+          if gh release view "$tag" --json isDraft >/dev/null 2>&1; then
+            is_draft="$(gh release view "$tag" --json isDraft --jq .isDraft)"
+            if [[ "$is_draft" != 'true' ]]; then
+              echo "Release $tag is already published; refusing to replace its assets." >&2
+              exit 1
+            fi
+            draft_body="$(gh release view "$tag" --json body --jq .body)"
+            if [[ "$draft_body" != *'Signed desktop candidates. Verify them before publishing this draft.'* ]]; then
+              echo "Release $tag draft was not created by this workflow; refusing to delete it." >&2
+              exit 1
+            fi
+            # Delete only the draft release object. The existing, validated tag is intentionally retained.
+            gh release delete "$tag" --yes
+          fi
+
+          assets=(
+            "release-assets/AgentLoom_${RELEASE_VERSION}_macos-arm64.dmg"
+            "release-assets/AgentLoom_${RELEASE_VERSION}_macos-x64.dmg"
+            "release-assets/AgentLoom_${RELEASE_VERSION}_windows-x64.exe"
+            'release-assets/SHA256SUMS.txt'
+          )
+          gh release create "$tag" "${assets[@]}" \
+            --draft \
+            --verify-tag \
+            --title "AgentLoom ${RELEASE_VERSION}" \
+            --notes "Signed desktop candidates. Verify them before publishing this draft. Windows Authenticode is validated; SmartScreen reputation is not guaranteed."
+
+          assert_remote_tag_unchanged
+
+          expected_names=(
+            "AgentLoom_${RELEASE_VERSION}_macos-arm64.dmg"
+            "AgentLoom_${RELEASE_VERSION}_macos-x64.dmg"
+            "AgentLoom_${RELEASE_VERSION}_windows-x64.exe"
+            'SHA256SUMS.txt'
+          )
+          mapfile -t expected_names < <(printf '%s\n' "${expected_names[@]}" | LC_ALL=C sort)
+          mapfile -t remote_names < <(gh release view "$tag" --json assets --jq '.assets[].name' | LC_ALL=C sort)
+          if [[ "${#remote_names[@]}" -ne "${#expected_names[@]}" ]]; then
+            echo "Draft release does not contain exactly four assets." >&2
+            exit 1
+          fi
+          for index in "${!expected_names[@]}"; do
+            if [[ "${remote_names[$index]}" != "${expected_names[$index]}" ]]; then
+              echo "Draft release asset set differs from the validated local set." >&2
+              exit 1
+            fi
+          done

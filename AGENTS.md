@@ -4,6 +4,11 @@ Rules for AI agents working in this repository. Read this before writing code.
 Human contributors: see [`CONTRIBUTING.md`](CONTRIBUTING.md) — this file is the
 same rules in a form you can hand to a tool.
 
+Also read `CLAUDE.md` (product paradigm, collaboration rules) and
+`GUIDELINES.zh.md` (coding baseline), plus any `AGENTS.*.md` file beside this
+one: maintainers may keep local-only notes there, and they never relax the
+rules in this file.
+
 ## Before you write any code
 
 What you may do without an issue depends on the size of the change:
@@ -20,6 +25,12 @@ What you may do without an issue depends on the size of the change:
   for a maintainer to label it `accepted` before writing code. If no such
   issue exists, stop and offer to draft one instead. Feature pull requests
   without a linked `accepted` issue are closed unread.
+- **Maintainer-assigned work.** When a maintainer of this repository runs you
+  directly as their own agent and hands you a task brief, that brief takes the
+  place of the `accepted` issue, including for the "unless the accepted issue
+  explicitly asks" exceptions below. This does not apply to contributions from
+  anyone else: an outside contributor's pull request still needs a linked
+  `accepted` issue. Every other rule in this file still applies.
 
 ## Scope rules
 
@@ -97,6 +108,68 @@ has never been a reason for rejection here. Undisclosed slop has.
   configuration files.
 - AgentLoom's own state (session records, logs, scratch files) must never be
   written into a user's project working tree.
+
+## Lead mode
+
+This section applies to Codex when Codex is acting as lead or coordinator in
+this repository. It does not change the Claude workflow described in
+`CLAUDE.md`, and it does not loosen anything above.
+
+### Trigger
+
+Enter Lead mode when the maintainer says or implies:
+
+- "先对齐", "不要急着改", "先不要写代码"
+- "只做规划 / 思考 / 拆解 / 定根因 / 方案"
+- Codex is explicitly acting as lead or coordinator
+
+### Lead boundary
+
+In Lead mode, Codex does not edit business code, tests, configs, or commits
+unless the maintainer explicitly approves moving from planning into
+implementation.
+
+Codex lead is responsible for:
+
+- Environment probing: repo status, available tools, relevant app/runtime state.
+- Problem framing: goal, non-goals, scope, assumptions, done_when.
+- Root-cause analysis: evidence first, with uncertainty called out.
+- Task decomposition: small atomic tasks with file scope and acceptance.
+- Worker/reviewer prompts when work is delegated.
+- Review and verdict after implementation.
+
+Codex lead is not responsible for directly doing the implementation in the
+same planning step.
+
+### Task shape
+
+Each implementation task should be small enough to review independently:
+
+- Single concern.
+- Prefer three files or fewer.
+- Explicit allowed files and forbidden files.
+- One concrete acceptance command or GUI acceptance checklist.
+- Clear stop conditions, including scope expansion, missing tools, or unclear
+  product behavior.
+
+### GUI requirement
+
+For GUI bugs, unit tests or Web UI checks are not enough by themselves.
+The plan must include real desktop GUI verification when the product path runs
+through the Tauri app.
+
+The acceptance should state what a user should see after each click, including
+failure states such as a menu flashing closed, state rollback, toast/error
+display, or disabled controls.
+
+### Review gate
+
+After implementation, Codex should require:
+
+- Code review focused on behavior regressions and missed edge cases.
+- Relevant tests or build checks.
+- GUI verification for GUI-facing changes.
+- A concise verdict before commit or handoff.
 
 ## When to stop and ask
 

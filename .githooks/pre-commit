@@ -1,0 +1,130 @@
+#!/bin/bash
+# AgentLoom doc-governance 硬闸（app 线 only·自我限定·worktree 共享 .git 安全）
+# 作用：归档/移动文档后，若入口文档(INDEX/README/BACKLOG/_archive-INDEX)残留断链 → 拦下提交。
+# To limit checks to internal documentation changes, exit early unless this worktree has the docs index marker file and the commit touches that docs tree.
+#           harness/master 等无 INDEX.md 的树自动放行（零跨线干扰）。
+# 启用（新 clone / 重装）：bash scripts/install-hooks.sh
+# 绕过单次提交：git commit --no-verify
+# The doc-governance check below runs in a subshell (its internal `exit 0`
+# early-outs only end the subshell, not this script), so whether it skips
+# or blocks, execution still continues into the local gates section.
+(
+export PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin:$PATH
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+cd "$ROOT" || exit 0
+[ -e docs/"superpowers"/INDEX.md ] || exit 0
+git diff --cached --name-only -- docs/"superpowers"/ 2>/dev/null | grep -q . || exit 0
+cd docs/"superpowers" || exit 0
+GATE="INDEX.md specs/2026-05-21-github-fleet-ide/README.md specs/2026-05-21-github-fleet-ide/BACKLOG.md _archive/INDEX.md"
+broken=$(grep -rhoE "(_archive/)?(specs|plans|notes)/[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-zA-Z0-9._-]+\.(md|html|txt)" $GATE 2>/dev/null \
+  | sort -u \
+  | while IFS= read -r f; do [ -e "$f" ] || echo "$f"; done \
+  | grep -v "2026-05-29-harness-agent-architecture")
+[ -z "$broken" ] && exit 0
+{
+  echo ""
+  echo "✗ doc-governance 硬闸：入口文档有断链（归档/移动后没改引用）："
+  printf '    BROKEN: %s\n' $broken
+  echo "  → 把引用改指 _archive/ 或全路径、或 git mv 回原处，再提交。"
+  echo "  （确需绕过：git commit --no-verify）"
+} >&2
+exit 1
+)
+doc_gov_status=$?
+
+# --- cli-line broken-link check (previously only installed locally in the
+# main tree's .git/hooks/pre-commit and never committed; now carried over
+# verbatim into the versioned .githooks/ so it survives the core.hooksPath
+# switch) ---
+# Self-limiting: only runs when this tree has harness-agent/docs/INDEX.md
+# and this commit touches harness-agent/docs/.
+(
+export PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin:$PATH
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+cd "$ROOT" || exit 0
+[ -e harness-agent/docs/INDEX.md ] || exit 0
+git diff --cached --name-only -- harness-agent/docs/ 2>/dev/null | grep -q . || exit 0
+cd harness-agent/docs || exit 0
+broken=""
+for gf in INDEX.md _archive/INDEX.md doc-governance.md; do
+  [ -e "$gf" ] || continue
+  d=$(dirname "$gf")
+  while IFS= read -r ref; do
+    [ -e "$d/$ref" ] || broken="$broken
+    BROKEN: $gf -> $ref"
+  done < <(grep -hoE "(\.\./)*(_archive/)?(specs|plans|notes)/[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-zA-Z0-9._/-]+\.(md|html|txt)" "$gf" 2>/dev/null | sort -u)
+done
+[ -z "$broken" ] && exit 0
+{
+  echo ""
+  echo "✗ doc-governance 硬闸(cli)：入口文档有断链（归档/移动后没改引用）："
+  printf '%s\n' "$broken"
+  echo "  → 把引用改指正确相对路径（如 ../_archive/specs/...）、或 git mv 回原处，再提交。"
+  echo "  （确需绕过：git commit --no-verify）"
+} >&2
+exit 1
+)
+cli_gov_status=$?
+
+if [ "$doc_gov_status" -ne 0 ] || [ "$cli_gov_status" -ne 0 ]; then
+  exit 1
+fi
+
+# ---- Local gates (file-size / conventions / oss-residue / doc-orphans) ----
+# Read-only checks against the working tree, not the index; never fix,
+# only block. A missing script (e.g. a cli-line-only clone, or a gate not
+# yet installed in this tree) is skipped, not treated as a failure.
+# Bypass: git commit --no-verify
+export PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin:$PATH
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+cd "$ROOT" || exit 0
+
+# --no-renames expands a rename into a deleted-old-path plus an added-new-
+# path line, so `git mv src/a.ts <governed-docs-tree>/a.ts` cannot be folded
+# into an opaque rename record that hides the source path; --diff-filter=
+# ACDMRTUXB explicitly includes deletes and renames, so old paths still count.
+staged=$(git diff --cached --name-only --no-renames --diff-filter=ACDMRTUXB 2>/dev/null)
+# Source gates err on the side of running: any staged path outside the
+# app-line governed docs tree counts as touching source (an unrelated docs
+# folder, or a rename that lands inside that tree but originates elsewhere,
+# still counts) -- over-running beats missing a real gate.
+has_non_docs=$(printf '%s\n' "$staged" | grep -v '^docs/'"superpowers"'/' | grep -q . && echo 1 || echo 0)
+has_docs=$(printf '%s\n' "$staged" | grep -q '^docs/' && echo 1 || echo 0)
+
+run_gate() {
+  name="$1"; script="$2"; shift 2
+  [ -f "$script" ] || return 0
+  out=$("$@" 2>&1)
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "" >&2
+    echo "✗ 本地门禁 [$name] 未通过：" >&2
+    printf '%s\n' "$out" | tail -20 >&2
+    echo "  （确需绕过：git commit --no-verify）" >&2
+    return 1
+  fi
+  return 0
+}
+
+failed=0
+if [ "$has_non_docs" = "1" ]; then
+  run_gate "file-size" scripts/check_file_size.py python3 scripts/check_file_size.py || failed=1
+  run_gate "conventions" scripts/check_conventions.py python3 scripts/check_conventions.py || failed=1
+fi
+# Check HEAD rather than the index: force-adding one private file must not
+# switch a public tree to default mode and allow that file through.
+if git ls-tree -r --name-only HEAD -- docs/"superpowers" 2>/dev/null | grep -q .; then
+  if [ "$has_non_docs" = "1" ]; then
+    run_gate "oss-residue" scripts/check_oss_residue.sh bash scripts/check_oss_residue.sh || failed=1
+  fi
+elif [ "$has_non_docs" = "1" ] || printf '%s\n' "$staged" | grep -q '^docs/'"superpowers"'/'; then
+  run_gate "oss-residue" scripts/check_oss_residue.sh bash scripts/check_oss_residue.sh --public-tree || failed=1
+fi
+if [ "$has_docs" = "1" ]; then
+  run_gate "doc-orphans" scripts/check_doc_orphans.py python3 scripts/check_doc_orphans.py || failed=1
+fi
+
+# Check commit identities for every commit.
+run_gate "commit-identity" scripts/check_commit_identity.sh bash scripts/check_commit_identity.sh || failed=1
+
+exit "$failed"

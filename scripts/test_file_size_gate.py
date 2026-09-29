@@ -15,7 +15,6 @@ from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 SCRIPT = Path(__file__).resolve().with_name("check_file_size.py")
-_INTERNAL_TREE = (SCRIPT.parent.parent / "/".join(("docs", "superpowers"))).is_dir()
 spec = importlib.util.spec_from_file_location("file_size_gate", SCRIPT)
 gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
@@ -24,7 +23,6 @@ spec.loader.exec_module(gate)
 def workflow_variants():
     root = SCRIPT.parent.parent
     candidates = [root / ".github/workflows/file-size-gate.yml", root / ".github/workflows/ci.yml"]
-    candidates.extend((root / "docs").glob("**/github-templates/workflows/ci.yml"))
     return [(path, "master" if path.name == "file-size-gate.yml" else "main")
             for path in candidates if path.is_file()]
 
@@ -158,23 +156,6 @@ class ClassificationTests(unittest.TestCase):
                     for name in ("frontend", "engine", "app-backend", "windows-check"):
                         self.assertIn(f"  {name}:\n    needs: file-size-gate\n", source)
                     self.assertEqual(source.count("needs.file-size-gate.outputs.baseline"), 2)
-
-    @unittest.skipUnless(_INTERNAL_TREE, "public tree: .github/workflows/public-snapshot-size-gate.yml only exists in the internal repo")
-    def test_public_snapshot_gate_fetches_public_main_with_base_flag(self):
-        path = SCRIPT.parent.parent / ".github/workflows/public-snapshot-size-gate.yml"
-        self.assertTrue(path.is_file())
-        source = path.read_text()
-        self.assertIn("git fetch --no-tags https://github.com/MyAgentHubs/agentloom.git "
-                      "+refs/heads/main:refs/remotes/public/main", source)
-        self.assertIn("python3 -I scripts/check_file_size.py --base refs/remotes/public/main", source)
-
-    @unittest.skipUnless(_INTERNAL_TREE, "public tree: .github/workflows/public-snapshot-size-gate.yml only exists in the internal repo")
-    def test_public_snapshot_gate_pins_fallback_baseline_to_pre_push_sha(self):
-        path = SCRIPT.parent.parent / ".github/workflows/public-snapshot-size-gate.yml"
-        source = path.read_text()
-        self.assertIn("github.event.before", source)
-        self.assertIn("git update-ref refs/remotes/origin/master", source)
-
 
 class RepositoryTests(unittest.TestCase):
     def setUp(self):
@@ -519,9 +500,9 @@ class RepositoryTests(unittest.TestCase):
         path.parent.rmdir()
         self.assertIn("拒绝放行", self.run_gate(2))
 
-    def run_ci_shell(self, workflow, event, before, expected):
+    def run_ci_shell(self, workflow, branch, event, before, expected):
         env = dict(self.env, GITHUB_EVENT_NAME=event, SIZE_GATE_BEFORE=before,
-                   GITHUB_OUTPUT=str(self.root / "ci-output"))
+                   DEFAULT_BRANCH=branch, GITHUB_OUTPUT=str(self.root / "ci-output"))
         result = subprocess.run(
             ["bash", "-c", workflow_shell(workflow, "Fetch and pin file size baseline")],
             cwd=self.root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -544,7 +525,7 @@ class RepositoryTests(unittest.TestCase):
                 for ref in gate.BASELINE_REFS:
                     self.git("update-ref", "-d", ref)
                 self.assertIn("缺少基线", self.run_gate(2))
-                self.run_ci_shell(workflow, "pull_request", "", 0)
+                self.run_ci_shell(workflow, branch, "pull_request", "", 0)
                 self.assertEqual(self.git("rev-parse", f"refs/remotes/origin/{branch}"), strict)
                 self.assertIn(" / 1100 / 1000 / ", self.run_gate(1))
 
@@ -562,7 +543,7 @@ class RepositoryTests(unittest.TestCase):
                     self.git("update-ref", "-d", ref)
                 self.git("update-ref", f"refs/remotes/origin/{branch}", candidate)
                 self.run_gate(0)  # Reproduce checkout's false green before pinning.
-                self.run_ci_shell(workflow, "push", strict, 0)
+                self.run_ci_shell(workflow, branch, "push", strict, 0)
                 self.assertEqual(self.git("rev-parse", f"refs/remotes/origin/{branch}"), strict)
                 self.assertIn(" / 1100 / 1000 / ", self.run_gate(1))
                 if branch == "main":
@@ -576,6 +557,22 @@ class RepositoryTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stdout)
                     self.assertIn(" / 1100 / 1000 / ", self.run_gate(1))
 
+    def test_ci_push_removes_non_default_candidate_ref(self):
+        workflow = SCRIPT.parent.parent / ".github/workflows/file-size-gate.yml"
+        self.write("app/src/a.ts", 1000)
+        strict = self.baseline()
+        self.git("config", "remote.origin.url", str(self.root))
+        self.git("update-ref", "refs/heads/main", strict)
+        self.write("app/src/a.ts", 1100)
+        self.git("add", "--", str(self.root / "app/src/a.ts"))
+        self.git("commit", "-q", "-m", "candidate")
+        candidate = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/remotes/origin/master", candidate)
+        self.run_gate(0)
+        self.run_ci_shell(workflow, "main", "push", strict, 0)
+        self.assertEqual(self.git("rev-parse", "refs/remotes/origin/main"), strict)
+        self.assertIn(" / 1100 / 1000 / ", self.run_gate(1))
+
     def test_ci_first_import_and_missing_before_fail_closed(self):
         self.write("app/src/a.ts", 1)
         commit = self.baseline()
@@ -585,10 +582,10 @@ class RepositoryTests(unittest.TestCase):
             for before in ("0" * 40, "", "not-a-commit"):
                 with self.subTest(branch=branch, before=before):
                     self.assertIn("first import requires a reviewed baseline",
-                                  self.run_ci_shell(workflow, "push", before, 1))
+                                  self.run_ci_shell(workflow, branch, "push", before, 1))
             # A syntactically valid but missing previous object must also fail.
             with self.subTest(branch=branch, before="missing object"):
-                self.run_ci_shell(workflow, "push", "a" * 40, 128)
+                self.run_ci_shell(workflow, branch, "push", "a" * 40, 128)
 
     def test_ci_real_shallow_push_fetches_previous_object(self):
         self.created.add(self.root / "scripts/check_file_size.py")
@@ -610,7 +607,7 @@ class RepositoryTests(unittest.TestCase):
                     self.root = checkout
                     self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "true")
                     self.run_gate(0)  # Shallow checkout points the baseline at HEAD.
-                    self.run_ci_shell(workflow, "push", strict, 0)
+                    self.run_ci_shell(workflow, branch, "push", strict, 0)
                     self.assertIn(" / 1100 / 1000 / ", self.run_gate(1))
                 finally:
                     self.root = original

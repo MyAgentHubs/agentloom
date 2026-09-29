@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-"""Regression + drift-guard checks for scripts/check_oss_residue.sh.
+"""Regression checks for scripts/check_oss_residue.sh.
 
-The daily gate is a mirror of the six residue regexes that
-scripts/build-oss-snapshot.sh runs against a stripped snapshot, plus a KEEP
-list mirroring every "stripped wholesale, then explicitly copied back"
-exception in that script. This test asserts neither ever drifts, then
-exercises the daily gate against disposable temporary git repositories.
+Default mode scans all tracked files except PRIVATE_PATHS, with PRIVATE_EXCEPT
+restoring public fixtures to the scan. Public-tree mode also reports tracked
+private paths. Tests exercise both modes in disposable temporary git repositories
+and verify that every private exception lies under a private path.
 """
 
 import os
-import re
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -20,9 +17,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parent.parent
-SNAPSHOT_SCRIPT = ROOT / "scripts/build-oss-snapshot.sh"
 RESIDUE_SCRIPT = ROOT / "scripts/check_oss_residue.sh"
-_INTERNAL_TREE = (ROOT / "/".join(("docs", "superpowers"))).is_dir()
 
 # Concatenated so this file's own source never spells these strings out
 # contiguously (mirrors the same rule check_oss_residue.sh follows, and
@@ -34,37 +29,13 @@ PRIVATE_REPO_LEAK = "github-" + "coding-agent"
 COMPANY_LEAK = "after" + "ship"
 PERSONAL_LEAK = "panda" + "withai"
 
-# The oss-release spec directory build-oss-snapshot.sh reads public drafts
-# and templates from. Built from DOC_PATH_LEAK for the same reason as above.
-SPEC_DIR_PREFIX = DOC_PATH_LEAK + "/specs/2026-08-01-oss-release"
-
-# Bump only after mirroring a newly-added check in both scripts.
-EXPECTED_SCAN_COUNT = 6
-
-
-def extract_scan_patterns(script_path):
-    """Evaluate each literal `scan "label" pattern` line (indentation
-    tolerated) with a stub `scan` function. Evaluating -- rather than
-    regex-parsing the quoting -- means both a plain single-quoted pattern
-    and a concatenated one resolve to their real runtime string, so the
-    comparison is on effective behavior."""
-    lines = [line for line in script_path.read_text().splitlines() if re.match(r'^\s*scan\s+"', line)]
-    stub = "scan() { printf '%s\\x1f%s\\x1e' \"$1\" \"$2\"; }\n"
-    result = subprocess.run(
-        ["bash", "-c", stub + "\n".join(lines)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True,
-    )
-    entries = [chunk for chunk in result.stdout.split("\x1e") if chunk]
-    return [tuple(chunk.split("\x1f", 1)) for chunk in entries]
-
 
 def get_debug_entries(label):
     """Ask the real check_oss_residue.sh (running against this repo) for one
-    of its resolved arrays (EXCLUDE/KEEP/REPLACED/PRIVATE_PATHS/PRIVATE_EXCEPT),
-    so guard tests compare against actual runtime values rather than
-    re-parsing bash literals. The introspection dump goes to stderr alongside
-    a real, normal scan (never a shortcut that skips it), so the scan's own
-    exit code is ignored here."""
+    of its resolved private-path arrays, so guard tests compare against
+    actual runtime values rather than re-parsing bash literals. The
+    introspection dump goes to stderr alongside a normal scan, whose exit
+    code is ignored here."""
     result = subprocess.run(
         ["bash", str(RESIDUE_SCRIPT)],
         cwd=ROOT, env={**os.environ, "OSS_RESIDUE_DEBUG_ARRAYS": "1"},
@@ -79,10 +50,6 @@ def get_debug_entries(label):
     return values
 
 
-def get_keep_entries():
-    return get_debug_entries("KEEP")
-
-
 def keep_covers(keep_entries, path):
     for entry in keep_entries:
         if entry == path:
@@ -94,76 +61,12 @@ def keep_covers(keep_entries, path):
     return False
 
 
-# Top-level directories build-oss-snapshot.sh's STRIP array removes
-# wholesale; a $SRC/-rooted variable under one of these that later feeds a
-# cp/cp -R into $OUT is a "stripped, then copied back" exception.
-STRIPPED_TOP_LEVEL = (
-    "docs/", "evals/", ".github/", ".githooks/", ".claude/", ".superpowers/",
-    ".remember/", "harness-agent/docs/", "harness-agent/evals/", "remote-web/",
-    "remote-relay/",
-)
-
-SRC_VAR_ASSIGN_RE = re.compile(r'^(\w+)="\$SRC/([^"]+)"$', re.MULTILINE)
-INSTALL_DOC_CALL_RE = re.compile(r'^install_doc\s+(\S+)\s+(\S+)$', re.MULTILINE)
-EXTRA_LOOP_RE = re.compile(r'for extra in ([^;]+); do')
-
-
-@unittest.skipUnless(_INTERNAL_TREE, "public tree: scripts/build-oss-snapshot.sh only exists in the internal repo")
-class DriftGuardTests(unittest.TestCase):
-    def test_six_patterns_match_snapshot_script(self):
-        expected = extract_scan_patterns(SNAPSHOT_SCRIPT)
-        actual = extract_scan_patterns(RESIDUE_SCRIPT)
-        self.assertEqual(len(expected), EXPECTED_SCAN_COUNT, expected)
-        self.assertEqual(len(actual), EXPECTED_SCAN_COUNT, actual)
-        self.assertEqual(expected, actual)
-
-    def test_indented_new_check_is_detected_by_extraction(self):
-        """A 7th check added inside an `if`/loop (naturally indented) must
-        still be picked up by extraction, so the count comparison above
-        actually has a chance to catch it if check_oss_residue.sh is not
-        updated to match."""
-        mutated_text = SNAPSHOT_SCRIPT.read_text() + '\n  scan "internal jira ticket ids" \'PROJ-[0-9]{4,}\'\n'
-        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as handle:
-            handle.write(mutated_text)
-            mutated_path = Path(handle.name)
-        self.addCleanup(mutated_path.unlink)
-        mutated_patterns = extract_scan_patterns(mutated_path)
-        self.assertEqual(len(mutated_patterns), EXPECTED_SCAN_COUNT + 1, mutated_patterns)
-        self.assertNotEqual(mutated_patterns, extract_scan_patterns(RESIDUE_SCRIPT))
-
-
-def extract_strip_array(script_path):
-    """STRIP is a plain, unquoted bash array literal (no variable expansion),
-    so a direct line-range regex is enough -- no need for the extract_bash_array
-    approach the KEEP/PRIVATE_PATHS arrays use in get_debug_entries()."""
-    match = re.search(r'^STRIP=\(\n(.*?)^\)\n', script_path.read_text(), re.MULTILINE | re.DOTALL)
-    assert match is not None, "STRIP array not found in build-oss-snapshot.sh"
-    return [line.strip() for line in match.group(1).splitlines() if line.strip()]
-
-
 def normalize_private_path(entry):
     return entry[:-2] if entry.endswith("/*") else entry
 
 
-@unittest.skipUnless(_INTERNAL_TREE, "public tree: scripts/build-oss-snapshot.sh only exists in the internal repo")
 class PrivatePathsDriftGuardTests(unittest.TestCase):
-    """PRIVATE_PATHS (scripts/check_oss_residue.sh, --public-tree mode) is
-    the single definition of "paths that move to the private repo". Every
-    entry must either be identical to one of build-oss-snapshot.sh's STRIP
-    entries, or a documented-narrower subpath of one (DOC_PATH_LEAK's tree is
-    narrower than STRIP's whole-of-docs, because docs/benchmarks.md stays
-    public) -- so a typo or an un-mirrored addition on either side goes red
-    here instead of silently drifting."""
-
-    def test_every_private_path_is_covered_by_strip(self):
-        strip = extract_strip_array(SNAPSHOT_SCRIPT)
-        private_paths = sorted({normalize_private_path(e) for e in get_debug_entries("PRIVATE_PATHS")})
-        self.assertTrue(private_paths)
-        uncovered = [
-            path for path in private_paths
-            if not any(path == entry or path.startswith(entry + "/") for entry in strip)
-        ]
-        self.assertEqual(uncovered, [])
+    """PRIVATE_EXCEPT entries must remain nested under PRIVATE_PATHS."""
 
     def test_every_private_except_is_nested_under_a_private_path(self):
         private_paths = get_debug_entries("PRIVATE_PATHS")
@@ -172,52 +75,6 @@ class PrivatePathsDriftGuardTests(unittest.TestCase):
         for entry in private_except:
             base = normalize_private_path(entry)
             self.assertTrue(keep_covers(private_paths, base), f"{entry} not nested under PRIVATE_PATHS")
-
-
-@unittest.skipUnless(_INTERNAL_TREE, "public tree: scripts/build-oss-snapshot.sh only exists in the internal repo")
-class StructuralGuardTests(unittest.TestCase):
-    """Parse build-oss-snapshot.sh itself: if it grows a new
-    strip-then-copy-back step, KEEP must grow with it or these go red."""
-
-    def setUp(self):
-        self.snapshot_text = SNAPSHOT_SCRIPT.read_text()
-        self.keep = get_keep_entries()
-
-    def test_evals_and_harness_evals_copy_backs_are_covered(self):
-        checked = 0
-        for name, src_path in SRC_VAR_ASSIGN_RE.findall(self.snapshot_text):
-            if not src_path.startswith(STRIPPED_TOP_LEVEL):
-                continue
-            # Only count vars actually used as a bare `cp`/`cp -R` source
-            # into $OUT -- e.g. SPEC is $SRC/docs/... too, but it is never
-            # copied wholesale, only read piecemeal by install_doc() etc.
-            used_as_copy_source = re.search(rf'cp\s+(-R\s+)?"\${re.escape(name)}"\s+"\$OUT/', self.snapshot_text)
-            if not used_as_copy_source:
-                continue
-            checked += 1
-            self.assertTrue(keep_covers(self.keep, src_path), f"{src_path} not covered by KEEP")
-        self.assertGreaterEqual(checked, 3, "expected at least the 3 known evals/ copy-backs")
-
-    def test_install_doc_sources_are_covered(self):
-        pairs = INSTALL_DOC_CALL_RE.findall(self.snapshot_text)
-        self.assertEqual(len(pairs), 7, pairs)
-        for from_name, _to in pairs:
-            expected = f"{SPEC_DIR_PREFIX}/{from_name}"
-            self.assertTrue(keep_covers(self.keep, expected), f"{expected} not covered by KEEP")
-
-    def test_extra_root_files_are_covered(self):
-        match = EXTRA_LOOP_RE.search(self.snapshot_text)
-        self.assertIsNotNone(match)
-        extras = match.group(1).split()
-        self.assertEqual(extras, ["LICENSE", "TRADEMARK.md", "CODE_OF_CONDUCT.md"])
-        for extra in extras:
-            expected = f"{SPEC_DIR_PREFIX}/{extra}"
-            self.assertTrue(keep_covers(self.keep, expected), f"{expected} not covered by KEEP")
-
-    def test_github_templates_source_is_covered(self):
-        self.assertIn('cp -R "$SPEC/github-templates/."', self.snapshot_text)
-        expected_glob = f"{SPEC_DIR_PREFIX}/github-templates/*"
-        self.assertIn(expected_glob, self.keep)
 
 
 class RepositoryTests(unittest.TestCase):
@@ -284,21 +141,18 @@ class RepositoryTests(unittest.TestCase):
         self.assertIn("FAIL  internal abs paths", output)
         self.assertIn("app/src/leak.ts", output)
 
-    def test_internal_abs_path_under_strip_dir_passes(self):
-        self.write("docs/notes/leak.md", f"{HOME_LEAK}\n")
+    def test_dash_named_tracked_file_does_not_hide_leak(self):
+        self.write("-q", "clean\n")
+        self.write("app/src/leak.ts", f"// {HOME_LEAK}\n")
         self.commit()
-        self.run_gate(0)
+        output = self.run_gate(1)
+        self.assertIn("app/src/leak.ts", output)
 
     def test_internal_doc_path_label(self):
         self.write("app/src/leak2.ts", f"// {DOC_PATH_LEAK}\n")
         self.commit()
         output = self.run_gate(1)
         self.assertIn("FAIL  internal doc paths", output)
-
-    def test_replaced_file_content_not_scanned(self):
-        self.write("harness-agent/README.md", f"// {HOME_LEAK}\n")
-        self.commit()
-        self.run_gate(0)
 
     def test_private_repo_name_label(self):
         self.write("app/src/leak3.ts", f"// {PRIVATE_REPO_LEAK}\n")
@@ -336,12 +190,6 @@ class RepositoryTests(unittest.TestCase):
         output = self.run_gate(1)
         self.assertIn("FAIL  internal abs paths", output)
 
-    def test_keep_harness_agent_swebench_fair30_scanned(self):
-        self.write("harness-agent/evals/swebench-venv/scratch/fairA/fair30_ids.json", f"{HOME_LEAK}\n")
-        self.commit()
-        output = self.run_gate(1)
-        self.assertIn("FAIL  internal abs paths", output)
-
     def test_evals_outside_kept_fixtures_stays_excluded(self):
         self.write("evals/other/leak.json", f"{HOME_LEAK}\n")
         self.commit()
@@ -352,22 +200,23 @@ class RepositoryTests(unittest.TestCase):
         self.commit()
         self.run_gate(0)
 
-    def test_keep_install_doc_source_scanned(self):
-        self.write(f"{SPEC_DIR_PREFIX}/README-draft.en.md", f"{HOME_LEAK}\n")
-        self.commit()
-        output = self.run_gate(1)
-        self.assertIn("FAIL  internal abs paths", output)
-
-    def test_keep_github_templates_source_scanned(self):
-        self.write(f"{SPEC_DIR_PREFIX}/github-templates/workflows/ci.yml", f"{HOME_LEAK}\n")
-        self.commit()
-        output = self.run_gate(1)
-        self.assertIn("FAIL  internal abs paths", output)
-
     def test_docs_outside_spec_release_stays_excluded(self):
         self.write(f"{DOC_PATH_LEAK}/unrelated-note.md", f"{HOME_LEAK}\n")
         self.commit()
         self.run_gate(0)
+
+    def test_private_path_globs_are_anchored(self):
+        paths = (
+            f"{DOC_PATH_LEAK}-public/x.md",
+            "harness-agent/docs-extra/x.md",
+            "evalsX/x.md",
+        )
+        for path in paths:
+            self.write(path, f"{HOME_LEAK}\n")
+        self.commit()
+        output = self.run_gate(1)
+        for path in paths:
+            self.assertIn(path, output)
 
     def test_debug_arrays_flag_never_skips_the_scan(self):
         self.write("app/src/leak7.ts", f"// {HOME_LEAK}\n")
@@ -380,6 +229,66 @@ class RepositoryTests(unittest.TestCase):
         self.commit()
         output = self.run_gate(0)
         self.assertNotIn("private path", output)
+
+    def test_default_scans_remote_web(self):
+        path = "remote-web/src/leak.ts"
+        self.write(path, f"// {HOME_LEAK}\n")
+        self.commit()
+        output = self.run_gate(1)
+        self.assertIn("FAIL  internal abs paths", output)
+        self.assertIn(path, output)
+
+    def test_default_scans_github_dir(self):
+        path = ".github/workflows/x.yml"
+        self.write(path, f"# {HOME_LEAK}\n")
+        self.commit()
+        output = self.run_gate(1)
+        self.assertIn("FAIL  internal abs paths", output)
+        self.assertIn(path, output)
+
+    def test_default_scans_githooks_dir(self):
+        path = ".githooks/pre-commit"
+        self.write(path, f"# {HOME_LEAK}\n")
+        self.commit()
+        output = self.run_gate(1)
+        self.assertIn("FAIL  internal abs paths", output)
+        self.assertIn(path, output)
+
+    def test_default_scans_root_rule_file(self):
+        path = "AGENTS.md"
+        self.write(path, f"{HOME_LEAK}\n")
+        self.commit()
+        output = self.run_gate(1)
+        self.assertIn("FAIL  internal abs paths", output)
+        self.assertIn(path, output)
+
+    def test_default_scans_docs_outside_private_tree(self):
+        path = "docs/notes/leak.md"
+        self.write(path, f"{HOME_LEAK}\n")
+        self.commit()
+        output = self.run_gate(1)
+        self.assertIn("FAIL  internal abs paths", output)
+        self.assertIn(path, output)
+
+    def test_self_exclusion_matches_full_path_not_basename(self):
+        path = "app/scripts/check_oss_residue.sh"
+        self.write(path, f"{HOME_LEAK}\n")
+        self.commit()
+        output = self.run_gate(1)
+        self.assertIn(path, output)
+
+    def test_default_skips_private_tree(self):
+        self.write(f"{DOC_PATH_LEAK}/notes/leak.md", f"{HOME_LEAK}\n")
+        self.commit()
+        self.run_gate(0)
+
+    def test_default_reports_private_except_fixture(self):
+        path = "evals/swebench/fair30_ids.json"
+        self.write(path, f"{HOME_LEAK}\n")
+        self.commit()
+        output = self.run_gate(1)
+        self.assertIn("FAIL  internal abs paths", output)
+        self.assertIn(path, output)
 
     def test_public_tree_clean_repo_passes_and_scans_self_excluded(self):
         self.write("app/src/clean.ts", "export const ok = true;\n")
@@ -395,11 +304,20 @@ class RepositoryTests(unittest.TestCase):
         self.assertIn("FAIL  tracked file under a private path", output)
         self.assertIn(f"{DOC_PATH_LEAK}/leak.md", output)
 
+    def test_public_tree_flags_new_private_mount_points(self):
+        paths = (".private/notes.md", "CLAUDE.local.md", "AGENTS.private.md")
+        for path in paths:
+            self.write(path, "clean\n")
+        self.commit()
+        output = self.run_gate(1, extra_args=["--public-tree"])
+        self.assertIn("FAIL  tracked file under a private path", output)
+        for path in paths:
+            self.assertIn(path, output)
+
     def test_public_tree_scans_paths_the_default_mode_excludes(self):
         # DOC_PATH_LEAK's tree is excluded from content scanning in default
-        # mode (test_internal_abs_path_under_strip_dir_passes); --public-tree mode
-        # scans every tracked file, so the same content trips the six regexes
-        # here even before the private-path check runs.
+        # mode; --public-tree scans private trees and also runs the private-path
+        # check, so this content trips the residue scan.
         self.write(f"{DOC_PATH_LEAK}/leak.md", f"{HOME_LEAK}\n")
         self.commit()
         output = self.run_gate(1, extra_args=["--public-tree"])
@@ -439,62 +357,6 @@ class RepositoryTests(unittest.TestCase):
             "internal abs paths", "personal identifiers", "tracked file under a private path",
         ):
             self.assertTrue(f"ok    {label}" in output or f"FAIL  {label}" in output, (label, output))
-
-
-@unittest.skipUnless(_INTERNAL_TREE, "public tree: scripts/build-oss-snapshot.sh only exists in the internal repo")
-class SnapshotScanSelfExemptionTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix=".oss-snapshot-scan-test-", dir=ROOT)
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.write("scripts/check_oss_residue.sh", RESIDUE_SCRIPT.read_text())
-
-    def write(self, relative, content):
-        path = self.root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
-
-    def extract_snapshot_scan(self):
-        matches = re.findall(
-            r'^scan\(\) \{\n(.*?)^\}', SNAPSHOT_SCRIPT.read_text(),
-            re.MULTILINE | re.DOTALL,
-        )
-        self.assertEqual(len(matches), 1, "expected one top-level snapshot scan function")
-        return matches[0]
-
-    def run_snapshot_scan(self, out_dir, label, pattern):
-        script = (
-            "set -euo pipefail\n"
-            f"OUT={shlex.quote(str(out_dir))}\n"
-            "fail=0\n"
-            "scan() {\n" + self.extract_snapshot_scan() + "}\n"
-            f"scan {shlex.quote(label)} {shlex.quote(pattern)}\n"
-            'echo "FAIL=$fail"\n'
-        )
-        result = subprocess.run(
-            ["bash", "-c", script],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stdout)
-        return result.stdout
-
-    def test_snapshot_scan_ignores_copied_gate_itself(self):
-        self.assertIn(PRIVATE_REPO_LEAK, RESIDUE_SCRIPT.read_text())
-        output = self.run_snapshot_scan(self.root, "private repo names", PRIVATE_REPO_LEAK)
-        self.assertIn("FAIL=0", output)
-        self.assertIn("ok    private repo names", output)
-
-    def test_snapshot_scan_reports_other_file(self):
-        self.write("scripts/other.sh", f"# {HOME_LEAK}\n")
-        output = self.run_snapshot_scan(self.root, "internal abs paths", HOME_LEAK)
-        self.assertIn("FAIL=1", output)
-        self.assertIn("scripts/other.sh", output)
-
-    def test_snapshot_scan_reports_same_basename_at_other_path(self):
-        self.write("app/scripts/check_oss_residue.sh", f"# {HOME_LEAK}\n")
-        output = self.run_snapshot_scan(self.root, "internal abs paths", HOME_LEAK)
-        self.assertIn("FAIL=1", output)
-        self.assertIn("app/scripts/check_oss_residue.sh", output)
 
 
 if __name__ == "__main__":

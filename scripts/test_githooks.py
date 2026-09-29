@@ -20,19 +20,19 @@ REPO_ROOT = SCRIPT.parent.parent
 HOOKS_DIR = REPO_ROOT / ".githooks"
 INSTALL_SCRIPT = REPO_ROOT / "scripts/install-hooks.sh"
 ZERO_SHA = "0" * 40
-# Joined at runtime so the public-snapshot residue scan (which greps for the
+# Joined at runtime so the public-tree residue scan (which greps for the
 # literal joined path) does not flag these fixture paths as leftover
 # indexing code.
 DOCS_TREE = "/".join(("docs", "superpowers"))
-_INTERNAL_TREE = (REPO_ROOT / DOCS_TREE).is_dir()
 
 
 def _has_cargo():
     return shutil.which("cargo") is not None
 
 
-@unittest.skipUnless(_INTERNAL_TREE, "public tree: .githooks/ fixtures only exist in the internal repo")
-class HooksFixtureTests(unittest.TestCase):
+class HooksFixtureBase(unittest.TestCase):
+    initial_internal_tree = True
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix=".githooks-test-", dir=REPO_ROOT)
         self.addCleanup(self.temp.cleanup)
@@ -57,7 +57,11 @@ class HooksFixtureTests(unittest.TestCase):
 
         self.git("config", "core.hooksPath", ".githooks")
         self.write("README.md", "fixture\n")
-        self.git("add", "--", "README.md")
+        initial_paths = ["README.md"]
+        if self.initial_internal_tree:
+            self.write(f"{DOCS_TREE}/.keep", "fixture\n")
+            initial_paths.append(f"{DOCS_TREE}/.keep")
+        self.git("add", "--", *initial_paths)
         self.git("commit", "-q", "-m", "init")
 
     def git(self, *args, check=True, env=None):
@@ -88,6 +92,8 @@ class HooksFixtureTests(unittest.TestCase):
         self.git("add", "--", *paths)
         return self.git("commit", "-q", "-m", message, *extra_args, check=False, env=env)
 
+
+class HooksFixtureTests(HooksFixtureBase):
     # ---- pre-commit ----
 
     def test_docs_only_commit_with_no_broken_links_passes(self):
@@ -194,10 +200,10 @@ class HooksFixtureTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_oss_residue_gate_runs_public_tree_mode_when_docs_superpowers_untracked(self):
-        # The governed docs tree exists on disk but nothing under it is
-        # tracked by git (only an untracked scratch file) -> the hook's
-        # `git ls-files` probe must find no tracked path and pick
-        # --public-tree mode.
+        # The governed docs tree exists on disk, but HEAD has no file under it.
+        # An untracked scratch file must not change the public-tree mode.
+        self.git("rm", "--", f"{DOCS_TREE}/.keep")
+        self.git("commit", "-q", "-m", "remove internal marker")
         log = self.root / "oss-residue-args.log"
         self.write(
             "scripts/check_oss_residue.sh",
@@ -234,6 +240,31 @@ class HooksFixtureTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(log.exists(), result.stdout + result.stderr)
         self.assertEqual(log.read_text().strip(), "")
+
+    def test_internal_tree_real_residue_gate_allows_ordinary_file(self):
+        shutil.copyfile(
+            REPO_ROOT / "scripts/check_oss_residue.sh",
+            self.root / "scripts/check_oss_residue.sh",
+        )
+        self.write("app/src/ordinary.ts", "export const ordinary = 1;\n")
+        result = self.commit(["app/src/ordinary.ts"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_internal_tree_real_residue_gate_allows_pathspec_doc_commit(self):
+        shutil.copyfile(
+            REPO_ROOT / "scripts/check_oss_residue.sh",
+            self.root / "scripts/check_oss_residue.sh",
+        )
+        result = self.commit(["scripts/check_oss_residue.sh"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        doc_path = f"{DOCS_TREE}/INDEX.md"
+        self.write(doc_path, "# index\n")
+        result = self.commit([doc_path])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.write(doc_path, "# updated index\n")
+        self.git("add", "--", doc_path)
+        result = self.git("commit", "-q", "-m", "update index", "--", doc_path, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     # ---- pre-push ----
 
@@ -351,7 +382,36 @@ class HooksFixtureTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
-@unittest.skipUnless(_INTERNAL_TREE, "public tree: .githooks/ fixtures only exist in the internal repo")
+class PublicTreeHooksFixtureTests(HooksFixtureBase):
+    initial_internal_tree = False
+
+    def test_force_added_private_file_is_blocked(self):
+        shutil.copyfile(
+            REPO_ROOT / "scripts/check_oss_residue.sh",
+            self.root / "scripts/check_oss_residue.sh",
+        )
+        private_file = f"{DOCS_TREE}/private.md"
+        self.write(private_file, "fixture\n")
+        self.git("add", "-f", "--", private_file)
+        result = self.git("commit", "-q", "-m", "private file", check=False)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("oss-residue", result.stderr)
+
+    def test_force_added_private_file_with_source_is_blocked(self):
+        shutil.copyfile(
+            REPO_ROOT / "scripts/check_oss_residue.sh",
+            self.root / "scripts/check_oss_residue.sh",
+        )
+        self.write("app/src/ordinary.ts", "export const ordinary = 1;\n")
+        self.git("add", "--", "app/src/ordinary.ts")
+        private_file = f"{DOCS_TREE}/private.md"
+        self.write(private_file, "fixture\n")
+        self.git("add", "-f", "--", private_file)
+        result = self.git("commit", "-q", "-m", "private file with source", check=False)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("oss-residue", result.stderr)
+
+
 class InstallHooksScriptTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix=".install-hooks-test-", dir=REPO_ROOT)
@@ -411,7 +471,7 @@ class InstallHooksScriptTests(unittest.TestCase):
 
 class SourceResidueTests(unittest.TestCase):
     def test_this_file_does_not_contain_the_joined_docs_literal(self):
-        # scripts/check_oss_residue.sh greps the public-snapshot-bound tree
+        # The public-tree residue scan greps tracked files
         # for the literal joined path; fixtures here must assemble it at
         # runtime via DOCS_TREE instead of spelling it out.
         joined_literal = "/".join(("docs", "superpowers"))

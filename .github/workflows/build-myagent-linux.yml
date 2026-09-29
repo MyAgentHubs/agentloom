@@ -1,0 +1,105 @@
+name: Build myagent Linux binaries (draft)
+
+# 草案 workflow：给树莓派（aarch64）等 Linux 设备的 myagent 引擎产出交叉编译二进制，
+# 只上传为 workflow artifact 供人工下载核验，不建 GitHub Release、不签名、不发布。
+# 用 cargo-zigbuild（zig 当交叉链接器）一次跑出 aarch64-unknown-linux-gnu 与
+# x86_64-unknown-linux-gnu 两个目标；本地已用同样的命令在 Pi 4（aarch64）上跑通
+# `info --json` / `--help` / 一次最小 `run`，这里只做「CI 也能这样交叉编出来」的回归。
+#
+# 触发范围刻意小：只在改了 harness-agent 相关文件的 PR 上跑，外加手动触发，方便先
+# review 这份草案本身，不在 push master 时自动跑（那是下一步：确认草案可用之后再决定
+# 常驻触发条件与是否接入 release 流程）。
+#
+# This workflow ships in the public repo like the others and runs only on the triggers below.
+#
+# 用 --profile release-small（harness-agent/Cargo.toml 里 inherits = "release" 的
+# 独立 profile）而不是 --release：瘦身设置（strip/lto/codegen-units=1）只对这类资源
+# 受限设备的产物生效，macOS 桌面 sidecar 走默认 release profile 不受影响。
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-myagent-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_TOOLCHAIN: '1.97.0'
+  CARGO_ZIGBUILD_VERSION: '0.23.4'
+
+jobs:
+  build:
+    name: Cross-build myagent (aarch64 + x86_64 Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the dispatched commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Install the pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup override set "$RUST_TOOLCHAIN"
+          rustup target add aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
+
+      - name: Set up Python (for the zig compiler toolchain package)
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install zig (via the ziglang PyPI package, as cargo-zigbuild's docs recommend for CI)
+        shell: bash
+        run: |
+          set -euo pipefail
+          pip install ziglang==0.16.0
+          python -m ziglang version
+
+      - name: Install cargo-zigbuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION"
+
+      - name: Cross-build myagent for aarch64-unknown-linux-gnu and x86_64-unknown-linux-gnu
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo zigbuild --locked --profile release-small \
+            --manifest-path harness-agent/Cargo.toml \
+            --bin myagent \
+            --target aarch64-unknown-linux-gnu \
+            --target x86_64-unknown-linux-gnu
+
+      - name: Collect and report binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp harness-agent/target/aarch64-unknown-linux-gnu/release-small/myagent dist/myagent-aarch64-linux
+          cp harness-agent/target/x86_64-unknown-linux-gnu/release-small/myagent dist/myagent-x86_64-linux
+          file dist/myagent-aarch64-linux dist/myagent-x86_64-linux
+          ls -la dist/
+
+      - name: Upload aarch64 binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: myagent-aarch64-linux
+          path: dist/myagent-aarch64-linux
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload x86_64 binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: myagent-x86_64-linux
+          path: dist/myagent-x86_64-linux
+          if-no-files-found: error
+          retention-days: 14

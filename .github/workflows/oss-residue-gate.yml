@@ -1,0 +1,44 @@
+name: OSS residue gate
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  oss-residue-gate:
+    runs-on: ${{ github.repository == 'MyAgentHubs/agentloom-internal' && fromJSON('["self-hosted","macOS","ARM64"]') || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan tracked files for internal-string residue
+        run: ${{ github.repository == 'MyAgentHubs/agentloom-internal' && 'bash scripts/check_oss_residue.sh' || 'bash scripts/check_oss_residue.sh --public-tree' }}
+      - name: Check commit identities
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            range="$BASE..$HEAD"
+          else
+            # Force pushes and concurrency cancellation can lose the before..sha range, so scan all ancestors of the commit (the script excludes the baseline).
+            range="$SHA"
+          fi
+          bash scripts/check_commit_identity.sh --range "$range"
+      - name: Test commit identity regressions
+        # -I prevents candidate Python modules / sitecustomize from shadowing stdlib.
+        run: python3 -I scripts/test_check_commit_identity.py
+      - name: Test gate regressions
+        # -I prevents candidate Python modules / sitecustomize from shadowing stdlib.
+        run: python3 -I scripts/test_check_oss_residue.py
