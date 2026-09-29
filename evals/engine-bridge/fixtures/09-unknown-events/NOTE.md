@@ -1,3 +1,3 @@
-# 09-unknown-events —— review 备注
+# 09-unknown-events: reviewer notes
 
-「告警可见性」目前只是 eprintln、进程内不可断言——期望值不盖这半句，用户 review 时定是否升格。
+Unknown-event warning visibility is currently only printed via `eprintln` to stderr and cannot be asserted in-process. `expected.json` therefore covers only that the run tolerates unknown events and completes normally, not that the warning is visible.
