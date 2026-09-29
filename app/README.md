@@ -1,10 +1,12 @@
-# AgentLoom 应用（app/）
+# AgentLoom app (`app/`)
 
-桌面应用：Tauri 2 + React / TypeScript 前端 + Rust 后端（`src-tauri/`）。内置 `harness-agent/` 里的 myagent 引擎，作为 sidecar 随应用一起运行。
+**English** · [简体中文](README.zh-CN.md)
 
-## 本地开发
+The desktop app: a Tauri 2 + React / TypeScript frontend with a Rust backend (`src-tauri/`). It embeds the myagent engine from `harness-agent/` and runs it as a sidecar alongside the app.
 
-在 `app/` 下，先构建并放好 sidecar（Tauri 构建脚本需要它），再起应用：
+## Local development
+
+From `app/`, first build the sidecar and put it in place (the Tauri build script needs it), then start the app:
 
     cargo build --release --locked --manifest-path ../harness-agent/Cargo.toml
     triple="$(rustc -vV | sed -n 's/^host: //p')"
@@ -13,13 +15,13 @@
     npm ci
     npm run tauri dev
 
-## 检查
+## Checks
 
-    npm run typecheck        # TypeScript 类型检查（vitest 不查类型，必须单独跑）
-    npm test                 # 前端测试（Vitest）
-    npm run format:check     # 格式检查
-    cargo test --no-fail-fast --manifest-path src-tauri/Cargo.toml   # Rust 后端测试
+    npm run typecheck        # TypeScript type check (vitest does not type-check; run it separately)
+    npm test                 # frontend tests (Vitest)
+    npm run format:check     # format check
+    cargo test --no-fail-fast --manifest-path src-tauri/Cargo.toml   # Rust backend tests
 
-## 更多
+## More
 
-项目概览见根目录 `README.md`，贡献流程见 `CONTRIBUTING.md`，完整检查清单与协作规则见根目录 `AGENTS.md`。
+See the root `README.md` for the project overview, `CONTRIBUTING.md` for the contribution flow, and the root `AGENTS.md` for the full checklist and collaboration rules.
