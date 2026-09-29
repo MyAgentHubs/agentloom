@@ -1,200 +1,251 @@
-# AgentLoom Remote Control relay 骨架
+**English** · [简体中文](README.zh-CN.md)
 
-Cloudflare Workers + Durable Objects 版 relay 骨架，覆盖
-**S1 接入与鉴权 / S2 房间 DO / S3 配额与滥用防护** 三块（单层信封、`kind`
-含 `live`、`command_id` 为信封顶层字段——本轮修复把上一版骨架自己猜的
-外层 `{envelope, milestone, command_id}` 包装拆掉了，详见下方「协议形状」
-一节）。
+# AgentLoom Remote Control relay skeleton
 
-## 这是什么、不是什么
+A Cloudflare Workers + Durable Objects relay skeleton covering three areas:
+**S1 access and authentication / S2 room DO / S3 quota and abuse protection**
+(single-layer envelope, `kind` includes `live`, and `command_id` is a top-level
+envelope field — an earlier skeleton guessed at an outer
+`{envelope, milestone, command_id}` wrapper, which has been removed; see the
+"Protocol shape" section below).
 
-relay 是一台「传话服务器」：桌面 AgentLoom 和远端（手机/浏览器）都主动出站
-连它，它在两边之间搬**密文信封** + 一点路由用的元数据。
+## What this is and is not
 
-**relay 只见密文**：`src/envelope.js` 只解析/校验信封的外层字段（v / room /
-epoch / seq / kind / session / ct / n / ts），从不尝试解密 `ct`——relay 没有
-任何内容钥匙（`K_room` 只在桌面和已配对的远端设备手里）。这是
-E2EE 的边界，也是整个方案「relay 挂了/被黑了也读不到会话内容」这条承诺的
-代码落点。
+The relay is a "message forwarding server": the desktop AgentLoom and the remote
+(phone/browser) both connect to it outbound, and it carries **ciphertext
+envelopes** plus a little routing metadata between the two sides.
 
-**同域托管这条边界，如实转述**：Web 远端（另一个组件 C1/S4，
-本骨架未包含）如果和 relay 同域托管，解密用的 JS 代码就是 relay 运营方下发
-的——理论上运营方随时能推一份偷钥匙的版本。也就是说**同域托管的 Web 端
-E2EE 防外人、防入侵，不防运营方自己**。这不是本骨架的实现缺陷，是这个拓扑
-形状本身的取舍，等 iOS 原生端（M5）才能给出更完整的承诺。
+**The relay only sees ciphertext**: `src/envelope.js` only parses/validates the
+outer envelope fields (v / room / epoch / seq / kind / session / ct / n / ts) and
+never tries to decrypt `ct` — the relay holds no content key (`K_room` lives only
+on the desktop and on paired remote devices). This is the E2EE boundary, and the
+place in code that backs the promise that "even if the relay is down or
+compromised, session content cannot be read".
 
-## 协议形状（单层信封，无外层包装）
+**Same-origin hosting — an honest statement of this boundary**: if the Web remote
+(a separate component, C1/S4, not included in this skeleton) is hosted on the same
+origin as the relay, the JS that does the decryption is shipped by the relay
+operator — in theory the operator could push a key-stealing version at any time.
+In other words, **E2EE for a same-origin-hosted Web client protects against
+outsiders and intruders, not against the operator itself**. This is not an
+implementation defect of this skeleton; it is a trade-off inherent to this
+topology, and a more complete guarantee has to wait for the native iOS client (M5).
 
-WS 消息要么是一个**明文控制帧**（顶层 `t` 字段，presence /
-`control.notify_hint` / `input.ack` 三种，`ct`/`n` 都没有），要么本身就是
-一个**信封**——不再有 `{ envelope: ... }` 外层包装：
+## Protocol shape (single-layer envelope, no outer wrapper)
+
+A WS message is either a **plaintext control frame** (top-level `t` field; three
+kinds: presence / `control.notify_hint` / `input.ack`; no `ct`/`n`), or is itself
+an **envelope** — there is no `{ envelope: ... }` outer wrapper any more:
 
 ```
 { v, room, epoch,
-  kind,        // "event"(里程碑·relay 盖 seq+落库) | "live"(只转发·永不落库·seq 恒 null)
+  kind,        // "event"(milestone; relay stamps seq + persists) | "live"(forward only; never persisted; seq always null)
                // | "input" | "control" | "presence"
-  session,     // sid 或 null
-  command_id,  // 可选·仅 kind=input（以及明文帧 input.ack）会带·relay 可读·入 AAD
-  seq,         // 仅 kind=event·relay 盖·不入 AAD
+  session,     // sid or null
+  command_id,  // optional; only carried by kind=input (and the plaintext frame input.ack); relay-readable; part of AAD
+  seq,         // only kind=event; stamped by relay; not part of AAD
   ct, n, ts }
 
 AAD = v | room | epoch | kind | session | command_id
 ```
 
-上一版骨架自己猜了一层 `{ envelope, milestone, command_id }` 外层包装、且
-把 `milestone`/`command_id` 当成协议里没写、relay 自己需要的路由手柄。
-现已按复核结果订正——`kind` 本身就是路由手柄（`event`/`live` 两个
-值分别对应旧版「event + milestone 布尔位」的两种组合），`command_id` 正式
-转正为信封顶层字段。详细理由见 `src/room-do.js` / `src/envelope.js` 文件头。
+An earlier skeleton guessed at an outer `{ envelope, milestone, command_id }`
+wrapper, and treated `milestone`/`command_id` as routing handles the protocol did
+not specify but the relay needed. This has been corrected following review —
+`kind` itself is the routing handle (the two values `event`/`live` correspond to
+the two combinations of the old "event + milestone boolean"), and `command_id` is
+now formally a top-level envelope field. For the detailed rationale see the file
+headers of `src/room-do.js` / `src/envelope.js`.
 
-## 这个骨架做了什么
+## What this skeleton does
 
-- **S1 接入与鉴权**（`src/auth.js` + `src/room-do.js` 的 `fetch`）：两种
-  凭据、两种身份。桌面端用 `Authorization: Bearer` 头带房间所有者凭据，
-  relay 对它做哈希后与认领房间时登记的哈希做常量时间比对，通过则以
-  `desktop` 身份接入；远端（手机/浏览器）通过 WebSocket 子协议带凭据，
-  子协议里必须恰好有一个版本项 `agentloom-rc-v1` 和一个 `token.<64 位
-  十六进制>` 项，relay 再到该房间的令牌登记表里查这个令牌对应的设备，
-  通过则以 `remote` 身份接入。查询串里不再接受令牌。**默认拒绝**：没带
-  凭据、子协议格式有歧义、房间没登记过对应令牌、令牌过期或已被吊销，一律
-  401，鉴权失败过于频繁则回 429；不存在匿名能连上看看的路径。令牌的
-  **签发与登记**由桌面端在配对之后通过控制帧写进 relay，relay 只负责比对与
-  到期处理。**鉴权先于落库**：业务表要等鉴权通过之后才会创建，鉴权失败的
-  请求不会给房间落下任何行。
-- **S2 房间 DO**（`src/room-do.js` + `src/room-store.js`）：一个 DO = 一个
-  房间，用 **Hibernation API**（`ctx.acceptWebSocket` /
-  `webSocketMessage` / `webSocketClose`，不是 `ws.accept()`）接 WebSocket，
-  DO 内 SQLite 存里程碑事件日志（`events` 表，`seq` 由 `room_meta` 里一个
-  独立单调计数器分配，不是 `MAX(events.seq)+1`——防未来加保留窗裁剪后 seq
-  往回掉）+ 每设备连接的少量元数据（`ws.serializeAttachment()`，
-  实现里有 ≤16KB 的防线）。
-- **epoch 防双写**：桌面每次连上来，DO 把房间 epoch +1；`insertMilestone`
-  拒绝 `epoch` 落后于房间当前 epoch 的写入（旧连接没死透又来了一个新连接
-  时，旧连接的写入会被挡）。
-- **kind 本身决定落不落库**：`kind=event` 恒是里程碑，落库、盖单调递增
-  的 `seq`；`kind=live` 恒只转发、不落库、`seq` 恒 `null`；presence 不落库。
-- **两条通道**：`kind=input` 走 FIFO——桌面在线直转，桌面离线则暂存进
-  `pending_input` 表（30 分钟 TTL，过期广播 `input.expired` 并丢弃）；
-  `kind=control` 即刻投递——桌面在线才转发，桌面离线直接告知发送方
-  `desktop_offline`（不暂存，因为「插队通道」的语义就是现在生效或不生效，
-  不该有「攒到明天生效」这种事）。
-- **重连补发**：远端带 `?last_seq=N` 连入，DO 先回一帧
-  `{t:"replay.head", epoch, headSeq}`，再把 `seq > N` 的里程碑按 seq 升序
-  逐条推送，之后才接 live。
-- **S3 配额，断 live、保里程碑**：按房间
-  「里程碑写入条数/月」计数（`quota_counters` 表，UTC 年-月分桶）；超过
-  `MONTHLY_MILESTONE_LIMIT`（默认值见 `src/quota.js`，生产数值待产品侧
-  另定）后，只有 `kind=live` 被降级丢弃、并把
-  `{t:"quota.exceeded", channel:"live"}` 广播给房间内所有连接（含远端，
-  不是只回桌面）；`kind=event`（里程碑）**永不因配额降级**——丢里程碑等于
-  产品承诺的历史记录出现补不回来的空洞，比多算一点成本严重得多；
-  `kind=control` 永远放行（配额闸不该连 Stop 都按不动）；匿名/无令牌走不到
-  这一步，S1 那关就先拒了。
-- **role 强制方向**（`src/room-do.js` 的 `webSocketMessage`/
-  `handlePlainFrame`）：连接的 role 由接入时验过的凭据决定（所有者凭据 =
-  `desktop`，子协议令牌 = `remote`），不由客户端自报。relay 据此把读得到的
-  方向管住：拒绝
-  `role=remote` 发 `kind=event`（否则任何持有 `K_room` 的远端都能伪造一条
-  「agent 说的话」广播、还会被落库/被将来的重连当成真实历史回放）；拒绝
-  `role=desktop` 发 `kind=input`；`input.ack` 与 `control.notify_hint`
-  仅接受来自桌面连接。违反方向的一律拒绝 + 回 `{t:"error",
-  reason:"role_forbidden"}`，不静默丢弃。
+- **S1 access and authentication** (`src/auth.js` + `fetch` in `src/room-do.js`):
+  two credentials, two identities. The desktop presents the room owner credential
+  in an `Authorization: Bearer` header; the relay hashes it and compares it in
+  constant time with the hash registered when the room was claimed, and on success
+  admits it as `desktop`. The remote (phone/browser) presents its credential via
+  WebSocket subprotocols; there must be exactly one version entry
+  `agentloom-rc-v1` and one `token.<64 hex chars>` entry, and the relay then looks
+  that token up in the room's token registry to find the corresponding device, and
+  on success admits it as `remote`. Tokens are no longer accepted in the query
+  string. **Deny by default**: no credential, an ambiguous subprotocol format, no
+  matching token registered for the room, or an expired or revoked token all yield
+  401, and too-frequent authentication failures yield 429; there is no anonymous
+  "just let me connect and look" path. Token **issuance and registration** is done
+  by the desktop after pairing, by writing them into the relay through control
+  frames; the relay is only responsible for comparison and expiry handling.
+  **Authenticate before persisting**: business tables are only created after
+  authentication succeeds, so a failed authentication never leaves any rows behind
+  for the room.
+- **S2 room DO** (`src/room-do.js` + `src/room-store.js`): one DO = one room. It
+  accepts WebSockets using the **Hibernation API** (`ctx.acceptWebSocket` /
+  `webSocketMessage` / `webSocketClose`, not `ws.accept()`). SQLite inside the DO
+  stores the milestone event log (the `events` table; `seq` is allocated by a
+  separate monotonic counter in `room_meta`, not `MAX(events.seq)+1` — so that seq
+  cannot go backwards if a retention window trim is added later) plus a small
+  amount of per-device connection metadata (`ws.serializeAttachment()`, with a
+  ≤16KB guard in the implementation).
+- **epoch double-write protection**: each time the desktop connects, the DO bumps
+  the room epoch by 1; `insertMilestone` rejects writes whose `epoch` is behind
+  the room's current epoch (when an old connection is not fully dead and a new one
+  arrives, the old connection's writes are blocked).
+- **`kind` itself decides whether to persist**: `kind=event` is always a
+  milestone, persisted and stamped with a monotonically increasing `seq`;
+  `kind=live` is always forward-only, not persisted, with `seq` always `null`;
+  presence is not persisted.
+- **Two channels**: `kind=input` goes through a FIFO — forwarded directly if the
+  desktop is online, otherwise buffered in the `pending_input` table (30-minute
+  TTL; on expiry `input.expired` is broadcast and the item is dropped);
+  `kind=control` is delivered immediately — forwarded only if the desktop is
+  online, otherwise the sender is told `desktop_offline` right away (not buffered,
+  because the semantics of a "queue-jumping channel" are that it takes effect now
+  or not at all, never "accumulate and take effect tomorrow").
+- **Reconnect replay**: a remote connecting with `?last_seq=N` first gets a
+  `{t:"replay.head", epoch, headSeq}` frame from the DO, then the milestones with
+  `seq > N` are pushed one by one in ascending seq order, and only then does it
+  join the live stream.
+- **S3 quota: cut live, keep milestones**: a per-room "milestone writes per month"
+  counter (the `quota_counters` table, bucketed by UTC year-month); once
+  `MONTHLY_MILESTONE_LIMIT` is exceeded (default value in `src/quota.js`; the
+  production number is to be set separately by the product side), only `kind=live`
+  is degraded and dropped, and `{t:"quota.exceeded", channel:"live"}` is broadcast
+  to all connections in the room (including the remote, not only the desktop);
+  `kind=event` (milestones) is **never degraded by quota** — losing a milestone
+  leaves an unrecoverable hole in the history the product promises, which is far
+  worse than a bit of extra cost; `kind=control` is always let through (the quota
+  gate must not stop even Stop from working); anonymous/token-less connections
+  never reach this point, since S1 rejects them first.
+- **Role-enforced direction** (`webSocketMessage`/`handlePlainFrame` in
+  `src/room-do.js`): a connection's role is determined by the credential verified
+  at admission (owner credential = `desktop`, subprotocol token = `remote`), not
+  self-reported by the client. The relay uses it to police the directions it can
+  observe: it rejects `role=remote` sending `kind=event` (otherwise any remote
+  holding `K_room` could forge an "agent said this" broadcast, which would also be
+  persisted / replayed by a future reconnect as real history); it rejects
+  `role=desktop` sending `kind=input`; `input.ack` and `control.notify_hint` are
+  only accepted from the desktop connection. Anything violating the direction is
+  rejected with `{t:"error", reason:"role_forbidden"}` — not silently dropped.
 
-## S4 同域静态托管 + 安全头（T6g1）
+## S4 same-origin static hosting + security headers (T6g1)
 
-`remote-web`（C1 手机 Web 端）构建产物挂在这个 worker 同域下，`wrangler.toml`
-的 `[assets]` 绑定指向 `../remote-web/dist`——**部署/`wrangler dev` 联调静态
-资源之前必须先手动 build 一次**：
+The `remote-web` (C1 mobile Web client) build output is mounted under this
+worker's origin; the `[assets]` binding in `wrangler.toml` points at
+`../remote-web/dist` — **before deploying / doing `wrangler dev` integration with
+static assets you must run a build manually once**:
 
 ```bash
 cd remote-web
-npm run build   # 生成/刷新 remote-web/dist/——这一步不会被 wrangler 自动触发
+npm run build   # generates/refreshes remote-web/dist/ -- wrangler does not trigger this step automatically
 ```
 
-`src/index.js` 的 `fetch()` 路由分流（`run_worker_first = true`，所有请求都先
-进这里，见 `wrangler.toml` 注释）：`/healthz`、`/room/*`（WS 升级/claim 限速）
-继续走原有路由、行为不变；其余 GET/HEAD 请求转发 `env.ASSETS.fetch()`
-（`not_found_handling = "single-page-application"`——手机端是纯 URL fragment
-路由的 SPA，任何未命中真实文件的路径都拿 index.html 应答，200 不是 3xx），响应
-经 `src/security-headers.js::withSecurityHeaders()` 统一叠加四类安全头：
-`Content-Security-Policy`（script-src 只放行 `'self'` + `remote-web/index.html`
-里那段 fragment bootstrap 内联脚本的 SHA-256 hash，不留 `'unsafe-inline'` 口子）
-/ `Referrer-Policy: no-referrer` / `X-Content-Type-Options: nosniff` /
-`Cache-Control`（`/assets/` 下带内容 hash 的文件长缓存 immutable，其余
-`no-store`）。
+`fetch()` in `src/index.js` routes requests (`run_worker_first = true`, so every
+request enters here first; see the comment in `wrangler.toml`): `/healthz` and
+`/room/*` (WS upgrade / claim rate limiting) continue through the existing
+routes with unchanged behavior; all other GET/HEAD requests are forwarded to
+`env.ASSETS.fetch()` (`not_found_handling = "single-page-application"` — the
+mobile client is an SPA with pure URL-fragment routing, so any path that does not
+match a real file is answered with index.html, status 200 rather than 3xx), and
+the response goes through `src/security-headers.js::withSecurityHeaders()`, which
+applies four kinds of security headers uniformly: `Content-Security-Policy`
+(script-src allows only `'self'` plus the SHA-256 hash of the inline fragment
+bootstrap script in `remote-web/index.html`, leaving no `'unsafe-inline'` hole) /
+`Referrer-Policy: no-referrer` / `X-Content-Type-Options: nosniff` /
+`Cache-Control` (content-hashed files under `/assets/` get long-lived immutable
+caching, everything else `no-store`).
 
-**CSP hash 与 dist 实际内联脚本的联动（防手改漂移）**：
-`src/security-headers.js` 的 `BOOTSTRAP_INLINE_SCRIPT_SHA256_BASE64` 常量不是
-抄一次就完事——`test/security-headers.test.js` 会在测试期读
-`remote-web/dist/index.html` 现算那段内联脚本文字的 SHA-256，跟这个常量断言
-相等；`remote-web/index.html` 的 fragment bootstrap 脚本改了文字却忘了同步
-更新常量，这条测试先红，不会等到线上 CSP 把整个 App 挡成白屏才被发现。
+**Coupling between the CSP hash and the actual inline script in dist (guarding
+against drift from hand edits)**: the `BOOTSTRAP_INLINE_SCRIPT_SHA256_BASE64`
+constant in `src/security-headers.js` is not a copy-once-and-forget value —
+`test/security-headers.test.js` reads `remote-web/dist/index.html` at test time,
+computes the SHA-256 of that inline script text, and asserts it equals this
+constant; if the fragment bootstrap script in `remote-web/index.html` is edited
+without updating the constant, this test goes red first, instead of the problem
+only surfacing when the production CSP blocks the entire app into a white screen.
 
-**fragment 安全边界如实披露（同「这是什么、不是什么」一节的 E2EE 边界口径）**：
-这批安全头防的是「第三方脚本/字体混进来」「配对 fragment 被 3xx 继承/落进
-Referer」这类外部攻击面，不改变「同域托管的 Web 端 E2EE 防外人、防入侵，不防
-relay 运营方自己」这条已披露的取舍——CSP 挡不住运营方自己下发一份读配对材料
-的恶意页面代码，那是拓扑形状本身的取舍。
+**Honest disclosure of the fragment security boundary (same stance as the E2EE
+boundary in the "What this is and is not" section)**: these security headers
+defend against external attack surface such as "third-party scripts/fonts getting
+in" and "the pairing fragment being inherited by a 3xx or leaking into Referer".
+They do not change the already disclosed trade-off that "E2EE for a
+same-origin-hosted Web client protects against outsiders and intruders, not
+against the relay operator itself" — CSP cannot stop the operator from shipping
+malicious page code that reads the pairing material; that is a trade-off inherent
+to the topology.
 
-## 未做（本骨架的边界，不是遗漏）
+## Not done (the boundary of this skeleton, not omissions)
 
-- 生产配额数值（`DEFAULT_MONTHLY_MILESTONE_LIMIT` 是骨架能跑通用的占位值，
-  不是产品拍板的数字）。
-- staging 部署 + 手机真机矩阵冒烟 + 首屏预算数值门禁（T6g2，另一张单——本单
-  只做同域托管的代码/配置/安全头，不跑 `wrangler deploy`）。
-- 桌面侧令牌签发 / 配对握手的完整流程在桌面端实现，本目录的 relay 只负责
-  登记令牌、比对令牌和执行到期。
-- **速率限流的范围**（跟 S3 的「月度里程碑配额」是两码事，见
-  `src/quota.js` 文件头——配额管「这个月写太多行」，限流管「这一秒钟讲话
-  太快」）：`wrangler.toml` 的 `RL_CLAIM`/`RL_UPGRADE` 在边缘按来源 IP 覆盖
-  claim 与 WS upgrade 两个入口；房间内另有按来源 IP 计的鉴权失败限流、
-  远端入站帧限流、配对握手帧限流、按设备限制并发连接数，以及 input/control
-  帧的按设备窗口限流（实现见 `src/room-do-ratelimit.js`）。这些限流的内存
-  计数在 DO 休眠后会重置；没有按房间整体计的消息限流。
-- **L2**：seq 分配（`room-store.js` 的 `allocateSeq`）从「读计数器」到
-  「写回 +1」之间不能有 `await`——目前全同步天然满足，注释已点明这个
-  不变量，但没有专门的并发测试去钉死它。
-- **L3**：`onlineDesktop()` 目前直接取 `getWebSockets("desktop")` 的第一个，
-  没有处理「新旧两个桌面连接短暂并存」时该挑 epoch 更大的那个。
-- **L4**：`pending_input` 的 FIFO 顺序目前只按 `created_at` 排序，没有
-  rowid 之类的次级排序去打破同毫秒并发入队的顺序不确定性。
-- **L5**：`validateEnvelope` 没有强制 `kind=live`/`presence` 的信封
-  `seq` 必须是 `null`——目前只校验 `seq` 是合法整数或 null，没有按 kind
-  收紧。
+- Production quota numbers (`DEFAULT_MONTHLY_MILESTONE_LIMIT` is a placeholder
+  that lets the skeleton run, not a number settled by the product).
+- Staging deployment + a real-phone device matrix smoke test + a first-screen
+  budget numeric gate (T6g2, a separate task — this task only covers the code /
+  config / security headers for same-origin hosting and does not run
+  `wrangler deploy`).
+- The complete flow of desktop-side token issuance / pairing handshake is
+  implemented in the desktop app; the relay in this directory is only responsible
+  for registering tokens, comparing tokens and enforcing expiry.
+- **Scope of rate limiting** (a different thing from S3's "monthly milestone
+  quota", see the header of `src/quota.js` — quota governs "too many rows written
+  this month", rate limiting governs "talking too fast this second"): `RL_CLAIM`/
+  `RL_UPGRADE` in `wrangler.toml` cover the claim and WS upgrade entry points at
+  the edge, keyed by source IP; inside a room there are additionally per-source-IP
+  authentication-failure limiting, remote inbound frame limiting, pairing
+  handshake frame limiting, a per-device concurrent connection cap, and per-device
+  window limiting of input/control frames (see `src/room-do-ratelimit.js` for the
+  implementation). The in-memory counters of these limiters reset after the DO
+  hibernates; there is no message rate limit counted per room as a whole.
+- **L2**: between "read the counter" and "write back +1" in seq allocation
+  (`allocateSeq` in `room-store.js`) there must be no `await` — currently
+  everything is synchronous so this holds naturally, and a comment states this
+  invariant, but there is no dedicated concurrency test pinning it down.
+- **L3**: `onlineDesktop()` currently just takes the first of
+  `getWebSockets("desktop")`, and does not handle picking the one with the larger
+  epoch when a new and an old desktop connection briefly coexist.
+- **L4**: the FIFO order of `pending_input` is currently sorted only by
+  `created_at`, with no secondary ordering such as rowid to break the ordering
+  nondeterminism of same-millisecond concurrent enqueues.
+- **L5**: `validateEnvelope` does not enforce that the `seq` of `kind=live`/
+  `presence` envelopes must be `null` — it currently only checks that `seq` is a
+  valid integer or null, without tightening by kind.
 
-## 本地跑法
+## Running locally
 
 ```bash
 cd remote-relay
 npm install
-npm test               # 纯逻辑单测（envelope / auth / quota / room-store / room-do / S4 静态托管+安全头）
+npm test               # pure-logic unit tests (envelope / auth / quota / room-store / room-do / S4 static hosting + security headers)
 
-# 联调静态资源（S4）/ 本地起 DO 环境前，先 build 一次 remote-web（wrangler 不会自动触发这一步）：
+# Before integrating static assets (S4) / starting a local DO environment, build remote-web once (wrangler does not trigger this step automatically):
 (cd ../remote-web && npm run build)
 
-npx wrangler dev        # 起本地 DO 环境，联调用；需要 wrangler 能访问网络
-npx wrangler deploy --dry-run   # 只编译校验，不会真的发布
+npx wrangler dev        # start a local DO environment for integration; needs wrangler to have network access
+npx wrangler deploy --dry-run   # compile and validate only; does not actually publish
 ```
 
-## 测试怎么跑起来的
+## How the tests work
 
-`src/room-store.js` 的 SQL 逻辑不依赖 Cloudflare 专属 API，只依赖一个最小
-适配器接口 `sql.exec(query, ...params) -> Array<行对象>`。`room-do.js` 里
-用一个薄适配器包 `ctx.storage.sql`（Cloudflare DO 的真实 SQLite）；
-`test/room-store.test.js` 用一个薄适配器包 Node 20+ 内建的 `node:sqlite`
-（真实 SQLite，不是手搓的假实现）。两边跑的是**同一份** `room-store.js`
-代码，不是「测试另写一份看起来像的逻辑」——seq 分配、epoch 拒绝、回放
-查询、配额计数这几块因此是真被验证过的，不是自证。
+The SQL logic in `src/room-store.js` does not depend on any Cloudflare-specific
+API; it only depends on a minimal adapter interface
+`sql.exec(query, ...params) -> Array<row object>`. `room-do.js` wraps
+`ctx.storage.sql` (Cloudflare DO's real SQLite) with a thin adapter;
+`test/room-store.test.js` wraps Node 20+'s built-in `node:sqlite` (real SQLite,
+not a hand-rolled fake) with a thin adapter. Both sides run the **same**
+`room-store.js` code, not "a separate piece of logic written for the tests that
+merely looks similar" — so seq allocation, epoch rejection, replay queries and
+quota counting are genuinely verified rather than self-certified.
 
-`test/room-do.test.js` 给 `room-do.js` 搭了一个 mock-ctx
-替身：`ctx.storage.sql` 复用同一套 node:sqlite 适配器；`ctx.acceptWebSocket`
-/ `ctx.getWebSockets` 用一个数组当连接登记表；WebSocket 本体只实现
-`send`/`serializeAttachment`/`deserializeAttachment` 三个方法。直接驱动
-`fetch()`（鉴权 401/404、M2 鉴权前置）和 `webSocketMessage()`（消息路由/
-H1 role 方向/H3 配额降级）——这两个是 RoomDO 真正暴露给外界的入口，替身只
-顶掉它们依赖的运行时基础设施，业务逻辑一行没改。
+`test/room-do.test.js` sets up a mock-ctx stand-in for `room-do.js`:
+`ctx.storage.sql` reuses the same node:sqlite adapter; `ctx.acceptWebSocket` /
+`ctx.getWebSockets` use an array as the connection registry; the WebSocket itself
+implements only the three methods `send`/`serializeAttachment`/
+`deserializeAttachment`. It drives `fetch()` (authentication 401/404, M2
+authentication-first) and `webSocketMessage()` (message routing / H1 role
+direction / H3 quota degradation) directly — these are the two entry points
+RoomDO actually exposes to the outside world, and the stand-in only replaces the
+runtime infrastructure they depend on; not a single line of business logic is
+changed.
 
-真正跑不进单测的只剩 Hibernation 生命周期本身（`new WebSocketPair()` 到
-`return new Response(null, {status:101, webSocket:client})` 这一段握手
-成功后的 101 响应），`src/room-do.js` 顶部注释里标了「集成测试待 wrangler
-dev 手验」。
+The only thing that cannot be run in unit tests is the Hibernation lifecycle
+itself (the 101 response after a successful handshake, from
+`new WebSocketPair()` to `return new Response(null, {status:101, webSocket:client})`);
+the comment at the top of `src/room-do.js` marks it as "integration test pending
+manual verification with wrangler dev".

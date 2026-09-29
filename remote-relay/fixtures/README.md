@@ -1,3 +1,5 @@
+**English** · [简体中文](README.zh-CN.md)
+
 # fixtures
 
 Cross-endpoint contract fixtures shared by the desktop Rust test suite and the
@@ -9,36 +11,45 @@ official RFC 7748 X25519 test vectors.
 All values here are public, non-secret protocol fixtures — no live keys,
 tokens, or credentials.
 
-`wire-v1.9-pending.json` 已删除（M0 §10.1/§10.2）：`reply` kind 五张信封样张
-（`reply_with_command_id`/`reply_missing_command_id`/`reply_with_client_msg_id_rejected`/
-`reply_with_seq_rejected`/`reply_with_null_session`）已合入 `wire-v1.json` 正式文件（既有条目
-零改动，只追加，现共 139 条）——relay 侧 `envelope.js` `ENVELOPE_KINDS`/`validateEnvelope` 与
-`remote-web/src/crypto/envelope.test.ts` 的计数断言均已同步。
+`wire-v1.9-pending.json` has been deleted (M0 §10.1/§10.2): the five `reply` kind
+envelope samples (`reply_with_command_id`/`reply_missing_command_id`/`reply_with_client_msg_id_rejected`/
+`reply_with_seq_rejected`/`reply_with_null_session`) have been merged into the
+official `wire-v1.json` file (existing entries unchanged, append-only, now 139
+entries in total) — the count assertions in the relay-side `envelope.js`
+`ENVELOPE_KINDS`/`validateEnvelope` and in `remote-web/src/crypto/envelope.test.ts`
+have both been updated accordingly.
 
-`data-plane-v1.9-pending.json` 已删除（M0 §10.4/§10.5/§10.6）：5 张样张
-（`msg_fetch_request`/`msg_chunk`/`msg_fetch_error_stale_revision`/`msg_fetch_error_not_found`/
-`msg_completed_with_content_ref`）已合入 `data-plane-v1.json` 正式文件（既有 31 张条目零改动，
-只追加，`cases` 现共 36 张·32 valid/4 invalid）——对应
-`remote-web/src/events/parseFrame.ts`（`msg.fetch`/`msg.chunk`/`msg.fetch.error` 三型解析 +
-`msg.completed`/history row 的可选 `content_ref` 透传）、
-`remote-web/src/events/msgFetch.ts`（`MsgChunkReassembler` 重组状态机 + `MsgFetchClient` 发送/
-接收编排）、`remote-web/src/events/milestoneProjection.ts`（`revision` 高者胜投影）的真路径消费；
-`remote-web/src/events/parseFrame.test.ts` 的硬编码计数断言同步改为 36/32/4。
+`data-plane-v1.9-pending.json` has been deleted (M0 §10.4/§10.5/§10.6): its 5
+samples (`msg_fetch_request`/`msg_chunk`/`msg_fetch_error_stale_revision`/`msg_fetch_error_not_found`/
+`msg_completed_with_content_ref`) have been merged into the official
+`data-plane-v1.json` file (the existing 31 entries unchanged, append-only;
+`cases` now totals 36 · 32 valid / 4 invalid) — they are consumed by real code
+paths in `remote-web/src/events/parseFrame.ts` (parsing of the three types
+`msg.fetch`/`msg.chunk`/`msg.fetch.error`, plus pass-through of the optional
+`content_ref` on `msg.completed`/history rows),
+`remote-web/src/events/msgFetch.ts` (the `MsgChunkReassembler` reassembly state
+machine + `MsgFetchClient` send/receive orchestration), and
+`remote-web/src/events/milestoneProjection.ts` (projection where the higher
+`revision` wins); the hard-coded count assertions in
+`remote-web/src/events/parseFrame.test.ts` were updated to 36/32/4.
 
-`client-msg-id-derivation-v1.json` 的 `revision` 派生新用例（M0 §10.7）
-已合入正式文件（4+2=6 条向量）：`revision==1` 与现行派生逐字节相同——不追加 `|1`
-后缀，这条『存量零扰动』约束由文件里第一条既有向量（`"msg.completed|s-1|dk-1"`）
-证明；`revision>1` 在 name 末尾追加 `|<revision>`（如
-`"msg.completed|s-1|dk-1|2"`），对应 `remote_gateway.rs` 的
-`derive_msg_completed_client_msg_id(session_id, dedup_key, revision)`。原 pending
-样张 `client-msg-id-derivation-v1.9-pending.json` 已删除。
+The new `revision` derivation cases in `client-msg-id-derivation-v1.json` (M0
+§10.7) have been merged into the official file (4+2=6 vectors): `revision==1` is
+byte-for-byte identical to the current derivation — no `|1` suffix is appended,
+and this "zero disturbance to existing data" constraint is proven by the first
+existing vector in the file (`"msg.completed|s-1|dk-1"`); for `revision>1`,
+`|<revision>` is appended to the end of the name (e.g.
+`"msg.completed|s-1|dk-1|2"`), corresponding to
+`derive_msg_completed_client_msg_id(session_id, dedup_key, revision)` in
+`remote_gateway.rs`. The original pending sample
+`client-msg-id-derivation-v1.9-pending.json` has been deleted.
 
-
-`wire-v1.9-pending.json`（`reply` kind 信封 5 条正反例：合法带 command_id/缺
-command_id 拒/带 client_msg_id 拒/带 seq 拒/session=null 合法）已合入正式
-`wire-v1.json`（`envelope.js` 的 `ENVELOPE_KINDS` 新增 `reply` + relay
-route 表 `reply_routes` 落地，详 M0 协议文档 §10.3）——pending 文件已删除，不再
-单独列出。
+`wire-v1.9-pending.json` (five positive/negative cases for `reply` kind
+envelopes: valid with command_id / rejected without command_id / rejected with
+client_msg_id / rejected with seq / valid with session=null) has been merged into
+the official `wire-v1.json` (`ENVELOPE_KINDS` in `envelope.js` gains `reply`, and
+the relay route table `reply_routes` is in place; see M0 protocol document
+§10.3) — the pending file has been deleted and is no longer listed separately.
 
 The relay server implementation itself is open-sourced in this repository, at
 https://github.com/MyAgentHubs/agentloom/tree/main/remote-relay
