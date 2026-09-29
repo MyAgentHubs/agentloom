@@ -21,7 +21,8 @@ describe("useComposerDraft", () => {
   });
 
   it("debounces saves and writes only the last value", () => {
-    const setItem = vi.spyOn(localStorage, "setItem");
+    // Spy on the Storage prototype: the instance may be jsdom's Storage or the test-setup fallback.
+    const setItem = vi.spyOn(Object.getPrototypeOf(localStorage), "setItem");
     const { result } = renderHook(() => useComposerDraft("a"));
     act(() => result.current.setDraft("h"));
     act(() => result.current.setDraft("he"));
@@ -30,7 +31,8 @@ describe("useComposerDraft", () => {
     act(() => {
       vi.advanceTimersByTime(300);
     });
-    expect(setItem).toHaveBeenCalledTimes(1);
+    const draftWrites = setItem.mock.calls.filter(([k]) => k === KEY("a"));
+    expect(draftWrites).toHaveLength(1);
     expect(JSON.parse(localStorage.getItem(KEY("a")) ?? "{}").text).toBe("hey");
     setItem.mockRestore();
   });

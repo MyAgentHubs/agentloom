@@ -63,18 +63,19 @@ describe("composerDraftStore", () => {
 
   it("degrades silently when localStorage throws", () => {
     saveDraft("s1", { text: "kept", attachments: [] });
-    vi.spyOn(localStorage, "getItem").mockImplementation(() => {
+    // Spy on the Storage prototype: the instance may be jsdom's Storage or the test-setup fallback.
+    const proto = Object.getPrototypeOf(localStorage);
+    const denied = () => {
       throw new Error("denied");
-    });
-    vi.spyOn(localStorage, "setItem").mockImplementation(() => {
-      throw new Error("denied");
-    });
-    vi.spyOn(localStorage, "removeItem").mockImplementation(() => {
-      throw new Error("denied");
-    });
+    };
+    const spies = (["getItem", "setItem", "removeItem"] as const).map((m) =>
+      vi.spyOn(proto, m).mockImplementation(denied),
+    );
     expect(() => saveDraft("s1", { text: "x", attachments: [] })).not.toThrow();
     expect(() => clearDraft("s1")).not.toThrow();
+    // Empty result although "kept" is stored proves the throwing getItem was actually hit.
     expect(loadDraft("s1")).toEqual({ text: "", attachments: [] });
+    spies.forEach((spy) => expect(spy).toHaveBeenCalled());
   });
 
   it("discardDraft drops the stored draft and refuses later writes for that session", () => {
