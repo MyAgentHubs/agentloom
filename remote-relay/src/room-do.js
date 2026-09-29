@@ -31,6 +31,7 @@ import {
   validateEnvelope,
   validatePairAcceptFrame,
 } from "./envelope.js";
+import { reclaimIfAbandoned, touchRoomActivity, withAbandonedCandidate } from "./room-abandon.js";
 import {
   matchesOwnerCredential,
   parseBearerAuthorization,
@@ -276,6 +277,7 @@ export class RoomDO {
     // DO 实例化 + 一行 SQL 写入，把「枚举房间 id」的攻击面变成了「白嫖一次
     // 写」。鉴权失败的请求现在到不了这一行。
     if (roomId) store.ensureRoomId(this.sql, roomId);
+    touchRoomActivity(this.sql);
 
     const requestedLastSeq = Number(url.searchParams.get("last_seq") || 0);
 
@@ -583,6 +585,7 @@ export class RoomDO {
       return;
     }
     this.flushProtocolViolations();
+    touchRoomActivity(this.sql);
     const att = safeAttachment(ws);
     if (att.role !== "desktop" || (att.registry_ready === true &&
         Number(att.epoch) === store.getCurrentEpoch(this.sql))) {
@@ -607,10 +610,8 @@ export class RoomDO {
     // Reclaim guard: the hard gate is "never authenticated" (room_meta absent;
     // ensureBusinessSchema only runs after desktop/token auth succeeds), whether
     // or not an owner was claimed: an unauthenticated POST /claim can register any
-    // hash, so owner presence proves nothing. Rooms that authenticated once have
-    // room_meta and never enter here. No live sockets is an extra defensive check.
-    // claim/reclaim never interleave (single-threaded DO); the deadline is
-    // re-checked live here, and after a reclaim a later claim starts a fresh room.
+    // hash, so owner presence proves nothing. Authenticated rooms never enter here.
+    // The deadline is re-checked live; after a reclaim a later claim starts a fresh room.
     const unclaimedState = store.getRoomState(this.sql);
     if (!store.hasTable(this.sql, "room_meta") && this.ctx.getWebSockets().length === 0) {
       const createdAt = unclaimedState.created_at == null ? null : Number(unclaimedState.created_at);
@@ -638,6 +639,7 @@ export class RoomDO {
     // Without a successful authenticated WebSocket session, there are no business
     // tables or sockets to maintain, so return before running token cleanup.
     if (!store.hasTable(this.sql, "room_meta")) return;
+    if (await reclaimIfAbandoned(this.ctx, this.sql)) return;
     // SEC-1 防御性兜底：正常路径业务 schema 已在 fetch() 鉴权成功时建好，这里
     // 只防未来排序意外（比如某次改动让 alarm 抢在任何鉴权请求之前先被调度）。
     // ensureBusinessSchema 幂等，重复调用安全。
@@ -1799,6 +1801,7 @@ export class RoomDO {
       const reclaimAt = Number(unclaimedState.created_at) + UNCLAIMED_RECLAIM_MS;
       if (nearest == null || reclaimAt < nearest) nearest = reclaimAt;
     }
+    nearest = withAbandonedCandidate(this.sql, this.ctx.getWebSockets().length, now, nearest);
     // C1-TTL（dogfood 修障第二批·手机发消息桌面离线无反馈）：pending_input
     // 暂存 TTL 到期时刻——第五类候选，同款「一处算一处设」结构。之前
     // purgeExpiredPendingInput 只在 handleInput 高频路径里顺带触发，没有

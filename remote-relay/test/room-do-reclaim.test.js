@@ -1,8 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { RoomDO } from "../src/room-do.js";
 import * as store from "../src/room-store.js";
+import { ABANDONED_ROOM_RECLAIM_MS, LAST_ACTIVITY_KEY } from "../src/room-abandon.js";
 
 // Reclaim of rooms that never authenticated (no room_meta), claimed or not.
 // Minimal ctx stand-in: real node:sqlite plus an alarm/socket recorder.
@@ -47,6 +49,10 @@ function makeCtx() {
     alarmLog,
     acceptWebSocket: (ws) => sockets.push(ws),
     getWebSockets: () => sockets,
+    disconnectWebSocket(ws) {
+      const index = sockets.indexOf(ws);
+      if (index !== -1) sockets.splice(index, 1);
+    },
   };
   return ctx;
 }
@@ -172,4 +178,181 @@ test("R8 hardening：过期但有活连接的未鉴权房 alarm() 不重排（�
   await room.alarm();
 
   assert.equal(ctx.alarmLog.scheduled, null, "must not re-arm an alarm in the past");
+});
+
+// ---- Abandoned-but-authenticated rooms ----
+
+const CREDENTIAL = "a".repeat(64);
+const CREDENTIAL_HASH = createHash("sha256").update(CREDENTIAL).digest("hex");
+
+function fakeWs() {
+  let stored = null;
+  return {
+    send() {},
+    close() {},
+    serializeAttachment(value) {
+      stored = structuredClone(value);
+    },
+    deserializeAttachment: () => stored,
+  };
+}
+
+// Workers globals are absent under Node: stub WebSocketPair and a Response that
+// accepts status 101.
+async function withUpgradeRuntime(callback) {
+  const NativeResponse = globalThis.Response;
+  const NativeWebSocketPair = globalThis.WebSocketPair;
+  globalThis.Response = class TestResponse {
+    constructor(body, init = {}) {
+      this.body = body;
+      this.status = init.status ?? 200;
+      this.headers = new Headers(init.headers || {});
+    }
+  };
+  globalThis.WebSocketPair = class TestWebSocketPair {
+    constructor() {
+      this[0] = fakeWs();
+      this[1] = fakeWs();
+    }
+  };
+  try {
+    return await callback();
+  } finally {
+    globalThis.Response = NativeResponse;
+    if (NativeWebSocketPair === undefined) delete globalThis.WebSocketPair;
+    else globalThis.WebSocketPair = NativeWebSocketPair;
+  }
+}
+
+// The attack: unauthenticated claim of an arbitrary hash, then one desktop
+// connection with the matching credential (creates the business schema).
+async function claimAndConnectOnce(room, ctx) {
+  const claimRes = await room.fetch(claimRequest(CREDENTIAL_HASH));
+  assert.equal(claimRes.status, 200);
+  const res = await withUpgradeRuntime(() =>
+    room.fetch(
+      new Request(`https://relay.example/room/${ROOM}`, {
+        headers: { Upgrade: "websocket", Authorization: `Bearer ${CREDENTIAL}` },
+      })
+    )
+  );
+  assert.equal(res.status, 101);
+  assert.equal(store.hasTable(room.sql, "room_meta"), true);
+  const ws = ctx.getWebSockets()[0];
+  return ws;
+}
+
+async function abandonedRoom() {
+  const { room, ctx } = makeSchemaLessRoom();
+  const ws = await claimAndConnectOnce(room, ctx);
+  ctx.disconnectWebSocket(ws);
+  await room.webSocketClose(ws);
+  return { room, ctx, ws };
+}
+
+function setIdleFor(room, idleMs) {
+  store.setMeta(room.sql, LAST_ACTIVITY_KEY, Date.now() - idleMs);
+}
+
+test("R8 abandoned：攻击者 claim + 带自己凭据连一次，断开后空闲满 7 天，alarm() 整库清空", async () => {
+  const { room, ctx } = await abandonedRoom();
+  const touched = Number(store.getMeta(room.sql, LAST_ACTIVITY_KEY));
+  assert.ok(Math.abs(touched - Date.now()) < 5_000, "connect/close records last activity");
+
+  await room.alarm();
+  assert.equal(ctx.alarmLog.deleteAllCalled, false, "recent activity: not reclaimed");
+
+  setIdleFor(room, ABANDONED_ROOM_RECLAIM_MS + 1);
+  await room.alarm();
+  assert.equal(ctx.alarmLog.deleteAllCalled, true);
+  assert.deepEqual(room.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table'"), []);
+});
+
+test("R8 abandoned：空闲不足 7 天不回收，且回收 alarm 排在 last_activity + 7d", async () => {
+  const { room, ctx } = await abandonedRoom();
+  setIdleFor(room, ABANDONED_ROOM_RECLAIM_MS - 60_000);
+  const lastActivity = Number(store.getMeta(room.sql, LAST_ACTIVITY_KEY));
+  ctx.alarmLog.scheduled = null;
+
+  await room.alarm();
+
+  assert.equal(ctx.alarmLog.deleteAllCalled, false);
+  assert.equal(ctx.alarmLog.scheduled, lastActivity + ABANDONED_ROOM_RECLAIM_MS);
+});
+
+test("R8 abandoned：有活连接的房即使空闲已满 7 天也不回收、也不重排（避免过去时刻循环）", async () => {
+  const { room, ctx } = makeSchemaLessRoom();
+  await claimAndConnectOnce(room, ctx);
+  setIdleFor(room, ABANDONED_ROOM_RECLAIM_MS + 1);
+  ctx.alarmLog.scheduled = null;
+
+  await room.alarm();
+
+  assert.equal(ctx.alarmLog.deleteAllCalled, false);
+  assert.ok(ctx.alarmLog.scheduled == null || ctx.alarmLog.scheduled > Date.now(), "never a past alarm");
+});
+
+const VALUABLE_DATA = {
+  "token_subjects (paired phone)":
+    "INSERT INTO token_subjects (subject, generation, state, scope) VALUES ('device:x', 1, 'active', 'remote')",
+  "token_subjects (revoked phone)":
+    "INSERT INTO token_subjects (subject, generation, state, scope) VALUES ('device:x', 1, 'revoked', NULL)",
+  "token_aliases":
+    "INSERT INTO token_aliases (token_hash, subject, kind, generation, access_expires, valid_until) VALUES ('h', 's', 'current', 1, NULL, 1)",
+  "token_put_fingerprints":
+    `INSERT INTO token_put_fingerprints (subject, generation, fingerprint) VALUES ('s', 1, '${"f".repeat(64)}')`,
+  "events":
+    "INSERT INTO events (seq, epoch, kind, ct, n, ts) VALUES (1, 1, 'event', 'c', 'n', 1)",
+  "pairing_routes": "INSERT INTO pairing_routes (subject, connection_id) VALUES ('pairing', 'c')",
+  "pending_input (unexpired)":
+    `INSERT INTO pending_input (command_id, envelope, created_at, expires_at) VALUES ('c', '{}', 1, ${Date.now() + 3_600_000})`,
+  "refresh_requests (unexpired)":
+    `INSERT INTO refresh_requests (request_id, subject, request_generation, connection_id, deadline) VALUES ('r', 's', 1, 'c', ${Date.now() + 3_600_000})`,
+  "reply_routes (unexpired)":
+    `INSERT INTO reply_routes (command_id, subject, connection_id, deadline) VALUES ('c', 's', 'c', ${Date.now() + 3_600_000})`,
+};
+
+for (const [name, insert] of Object.entries(VALUABLE_DATA)) {
+  test(`R8 abandoned：房里还有 ${name} 时，空闲满 7 天也不回收`, async () => {
+    const { room, ctx } = await abandonedRoom();
+    room.sql.exec(insert);
+    setIdleFor(room, ABANDONED_ROOM_RECLAIM_MS + 1);
+
+    await room.alarm();
+
+    assert.equal(ctx.alarmLog.deleteAllCalled, false);
+    assert.equal(store.hasTable(room.sql, "room_meta"), true);
+  });
+}
+
+test("R8 abandoned：已过期的 pending_input / refresh_requests / reply_routes 不算有价值数据，空闲满 7 天照常回收", async () => {
+  const { room, ctx } = await abandonedRoom();
+  room.sql.exec("INSERT INTO pending_input (command_id, envelope, created_at, expires_at) VALUES ('c', '{}', 1, 2)");
+  room.sql.exec("INSERT INTO refresh_requests (request_id, subject, request_generation, connection_id, deadline) VALUES ('r', 's', 1, 'c', 2)");
+  room.sql.exec("INSERT INTO reply_routes (command_id, subject, connection_id, deadline) VALUES ('c', 's', 'c', 2)");
+  setIdleFor(room, ABANDONED_ROOM_RECLAIM_MS + 1);
+
+  await room.alarm();
+
+  assert.equal(ctx.alarmLog.deleteAllCalled, true);
+});
+
+test("R8 abandoned：回收后同一实例可再 claim→连接（自愈）", async () => {
+  const { room, ctx } = await abandonedRoom();
+  setIdleFor(room, ABANDONED_ROOM_RECLAIM_MS + 1);
+  await room.alarm();
+  assert.equal(ctx.alarmLog.deleteAllCalled, true);
+
+  const ws = await claimAndConnectOnce(room, ctx);
+  assert.ok(ws, "desktop reconnects into the fresh room");
+});
+
+test("R8 abandoned：升级前已鉴权、没有活动时间戳的老房，首次 alarm() 只起算不回收", async () => {
+  const { room, ctx } = await abandonedRoom();
+  room.sql.exec("DELETE FROM room_meta WHERE key = ?", LAST_ACTIVITY_KEY);
+
+  await room.alarm();
+
+  assert.equal(ctx.alarmLog.deleteAllCalled, false);
+  assert.ok(store.getMeta(room.sql, LAST_ACTIVITY_KEY) != null, "clock is seeded, not assumed ancient");
 });
