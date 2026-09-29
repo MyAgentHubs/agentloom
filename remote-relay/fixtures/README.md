@@ -40,8 +40,8 @@ command_id 拒/带 client_msg_id 拒/带 seq 拒/session=null 合法）已合入
 route 表 `reply_routes` 落地，详 M0 协议文档 §10.3）——pending 文件已删除，不再
 单独列出。
 
-The relay server implementation itself is open-sourced separately at
-https://github.com/MyAgentHubs/agentloom-remote-control-server
+The relay server implementation itself is open-sourced in this repository, at
+https://github.com/MyAgentHubs/agentloom/tree/main/remote-relay
 
 `data-plane-v1.json` also includes `input_ack_failed_no_agent`, the desktop's asynchronous
 terminal failure receipt with the optional `reason: "no_agent"` field.

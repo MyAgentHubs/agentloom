@@ -126,7 +126,7 @@ official relay is used out of the box:
 - **Remote control** — scan a QR code and drive a desktop session from your phone: watch it
   stream live, send input, approve or stop a run. End-to-end encrypted — the relay only ever
   forwards ciphertext. An official relay is built in, and the
-  [relay server is open source](https://github.com/MyAgentHubs/agentloom-remote-control-server)
+  [relay server is open source](https://github.com/MyAgentHubs/agentloom/tree/main/remote-relay)
   (AGPL-3.0) if you'd rather run your own.
 - **Bring your own everything** — OpenAI-compatible and Anthropic-compatible endpoints,
   custom base URLs, local models.
