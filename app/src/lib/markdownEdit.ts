@@ -12,8 +12,9 @@ export type Edit = {
   selEnd: number;
 };
 
-// Indent, then "1." or a bullet, then at least one space. "1.5" and "-a" are not list items.
-const LIST_LINE = /^([ \t]*)(?:(\d+)\.|[-*])( +)/;
+// Indent, "1." or a bullet, at least one space, then an optional task box.
+// "1.5" and "-a" are not list items.
+const LIST_LINE = /^([ \t]*)(\d+\.|[-*])( +)(\[[ xX]\](?: +|$))?/;
 const OPEN_FENCE_LINE = /^( {0,3})```[^`]*$/;
 const FENCE_START = /^ {0,3}```/;
 
@@ -39,7 +40,11 @@ export function toggleWrap(
   const m = marker.length;
   const sel = value.slice(selStart, selEnd);
   // Markers sit just outside the selection (or around an empty caret): remove them.
+  // A selection that contains further markers spans several wrapped runs, so
+  // stripping the outer pair would leave stray markers behind: wrap it instead.
+  const hasInnerMarker = sel.includes(marker);
   if (
+    !hasInnerMarker &&
     selStart >= m &&
     value.slice(selStart - m, selStart) === marker &&
     value.slice(selEnd, selEnd + m) === marker
@@ -54,8 +59,13 @@ export function toggleWrap(
     };
   }
   // The selection itself starts and ends with the markers: remove them.
-  if (sel.length >= 2 * m && sel.startsWith(marker) && sel.endsWith(marker)) {
-    const inner = sel.slice(m, sel.length - m);
+  const inner = sel.slice(m, sel.length - m);
+  if (
+    sel.length >= 2 * m &&
+    sel.startsWith(marker) &&
+    sel.endsWith(marker) &&
+    !inner.includes(marker)
+  ) {
     return {
       from: selStart,
       to: selEnd,
@@ -82,14 +92,19 @@ export function continueList(
   const ls = lineStartOf(value, selStart);
   const le = lineEndOf(value, selEnd);
   const line = value.slice(ls, le);
+  // Inside a fenced code block a "- " line is code, not a list.
+  if (countFenceLines(value.slice(0, ls)) % 2 === 1) return null;
   const match = LIST_LINE.exec(line);
   if (!match || selStart < ls + match[0].length) return null;
   // An item with nothing after its prefix ends the list.
   if (line.slice(match[0].length).trim() === "") {
     return { from: ls, to: le, insert: "", selStart: ls, selEnd: ls };
   }
-  const [prefix, indent, num, spaces] = match;
-  const next = num ? `${indent}${BigInt(num) + 1n}.${spaces}` : prefix;
+  const [, indent, marker, spaces, task] = match;
+  const nextMarker = marker.endsWith(".")
+    ? `${BigInt(marker.slice(0, -1)) + 1n}.`
+    : marker;
+  const next = `${indent}${nextMarker}${spaces}${task ? "[ ] " : ""}`;
   const insert = `\n${next}`;
   const caret = selStart + insert.length;
   return { from: selStart, to: selEnd, insert, selStart: caret, selEnd: caret };
@@ -115,7 +130,10 @@ export function indentListLine(
     };
   }
   const leading = match[1];
-  if (leading === "") return null;
+  // Nothing to outdent: still report it as handled so Shift+Tab keeps focus in the box.
+  if (leading === "") {
+    return { from: ls, to: ls, insert: "", selStart, selEnd };
+  }
   const n = leading.startsWith("\t") ? 1 : Math.min(2, leading.length);
   return {
     from: ls,

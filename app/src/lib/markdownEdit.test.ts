@@ -64,6 +64,16 @@ describe("toggleWrap", () => {
   it("unwraps when the selection itself includes the markers", () => {
     expect(run(bold, "a «**hi**» b")).toBe("a «hi» b");
   });
+  it("never leaves stray markers when the selection spans several wrapped runs", () => {
+    expect(run(bold, "«**a** and **b**»")).toBe("**«**a** and **b**»**");
+    expect(run(code, "«`a` and `b`»")).toBe("`«`a` and `b`»`");
+    expect(run(bold, "**«a** and **b»**")).toBe("****«a** and **b»****");
+  });
+  it("wraps a selection that holds only one side of a marker", () => {
+    expect(run(bold, "«**a»")).toBe("**«**a»**");
+    expect(run(bold, "«a**»")).toBe("**«a**»**");
+    expect(run(code, "«`a»")).toBe("`«`a»`");
+  });
   it("removes an empty pair when the caret sits inside it", () => {
     expect(run(bold, "a **|** b")).toBe("a | b");
   });
@@ -115,6 +125,31 @@ describe("continueList", () => {
     expect(run(cont, "1. 你好😀|")).toBe("1. 你好😀\n2. |");
     expect(run(cont, "你好\n- 世界|")).toBe("你好\n- 世界\n- |");
   });
+  it("exits the list when text follows the empty item", () => {
+    expect(run(cont, "- |\nnext")).toBe("|\nnext");
+    expect(run(cont, "1. a\n2. |\nafter\nmore")).toBe("1. a\n|\nafter\nmore");
+  });
+  it("continues and exits task list items", () => {
+    expect(run(cont, "- [ ] a|")).toBe("- [ ] a\n- [ ] |");
+    expect(run(cont, "- [x] a|")).toBe("- [x] a\n- [ ] |");
+    expect(run(cont, "* [X] a|")).toBe("* [X] a\n* [ ] |");
+    expect(run(cont, "1. [ ] a|")).toBe("1. [ ] a\n2. [ ] |");
+    expect(run(cont, "  - [ ] a|")).toBe("  - [ ] a\n  - [ ] |");
+    expect(run(cont, "- [ ] |")).toBe("|");
+    expect(run(cont, "- [x] |")).toBe("|");
+    expect(run(cont, "1. [ ] |")).toBe("|");
+  });
+  it("treats a link-like bracket after a bullet as plain item text", () => {
+    expect(run(cont, "- [link](u)|")).toBe("- [link](u)\n- |");
+    expect(run(cont, "- [ab] c|")).toBe("- [ab] c\n- |");
+  });
+  it("returns null inside a fenced code block", () => {
+    expect(run(cont, "```yaml\n- old|")).toBeNull();
+    expect(run(cont, "```yaml\n- |")).toBeNull();
+    expect(run(cont, "```yaml\n1. old|")).toBeNull();
+    expect(run(cont, "```yaml\n1. |")).toBeNull();
+    expect(run(cont, "```\nx\n```\n- a|")).toBe("```\nx\n```\n- a\n- |");
+  });
   it("returns null for plain text lines", () => {
     expect(run(cont, "hello|")).toBeNull();
     expect(run(cont, "")).toBeNull();
@@ -153,8 +188,13 @@ describe("indentListLine", () => {
     expect(run(outdent, "  - a|")).toBe("- a|");
     expect(run(outdent, " - a|")).toBe("- a|");
   });
-  it("returns null when there is nothing to outdent", () => {
-    expect(run(outdent, "- a|")).toBeNull();
+  it("reports a no-op edit when a list line has nothing to outdent", () => {
+    expect(run(outdent, "- a|")).toBe("- a|");
+    expect(run(outdent, "1. «a»")).toBe("1. «a»");
+  });
+  it("does not report a no-op for multi-line selections or plain lines", () => {
+    expect(run(outdent, "«- a\n- b»")).toBeNull();
+    expect(run(outdent, "a|")).toBeNull();
   });
   it("returns null for non-list lines", () => {
     expect(run(indent, "hello|")).toBeNull();
@@ -186,6 +226,9 @@ describe("autoCloseFence", () => {
   });
   it("treats the second fence in a document as a closer", () => {
     expect(run(fence, "```ts\ncode\n```|")).toBeNull();
+  });
+  it("closes an opening fence that is followed by more text", () => {
+    expect(run(fence, "```ts|\nmore text")).toBe("```ts\n|\n```\nmore text");
   });
   it("returns null when the fence is not at the line start", () => {
     expect(run(fence, "use ```|")).toBeNull();

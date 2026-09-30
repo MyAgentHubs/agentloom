@@ -148,6 +148,53 @@ describe("composer Markdown keys", () => {
     expect(ta.value).toBe("  - a");
     fireEvent.keyDown(ta, { key: "Tab", shiftKey: true });
     expect(ta.value).toBe("- a");
+    // Nothing left to outdent: the key is swallowed so focus stays in the box.
+    expect(fireEvent.keyDown(ta, { key: "Tab", shiftKey: true })).toBe(false);
+    expect(ta.value).toBe("- a");
+  });
+
+  it("Tab keeps the browser default for multi-line selections", () => {
+    const { ta, type } = setup();
+    type("- a\n- b", 0, 7);
+    expect(fireEvent.keyDown(ta, { key: "Tab" })).toBe(true);
+    expect(fireEvent.keyDown(ta, { key: "Tab", shiftKey: true })).toBe(true);
+    expect(ta.value).toBe("- a\n- b");
+  });
+
+  it("ignores Ctrl or Cmd combined with Shift+Enter and Tab", () => {
+    const { ta, type } = setup();
+    type("- a");
+    for (const mod of [{ ctrlKey: true }, { metaKey: true }]) {
+      expect(fireEvent.keyDown(ta, { ...shiftEnter, ...mod })).toBe(true);
+      expect(fireEvent.keyDown(ta, { key: "Tab", ...mod })).toBe(true);
+    }
+    expect(ta.value).toBe("- a");
+  });
+
+  it("continues task list items", () => {
+    const { ta, type } = setup();
+    type("- [x] done");
+    fireEvent.keyDown(ta, shiftEnter);
+    expect(ta.value).toBe("- [x] done\n- [ ] ");
+    fireEvent.keyDown(ta, shiftEnter);
+    expect(ta.value).toBe("- [x] done\n");
+  });
+
+  it("does not read value or selection for unrelated keys", () => {
+    const { ta, type } = setup();
+    type("hello");
+    const proto = HTMLTextAreaElement.prototype;
+    const value = vi.spyOn(proto, "value", "get");
+    const start = vi.spyOn(proto, "selectionStart", "get");
+    const end = vi.spyOn(proto, "selectionEnd", "get");
+    for (const key of ["a", "Enter", "Backspace", "ArrowLeft"]) {
+      fireEvent.keyDown(ta, { key });
+    }
+    fireEvent.keyDown(ta, { key: "b" });
+    fireEvent.keyDown(ta, { key: "Tab", ctrlKey: true });
+    expect(value).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+    expect(end).not.toHaveBeenCalled();
   });
 
   it("Tab on a plain line is not intercepted", () => {
@@ -182,14 +229,17 @@ describe("composer Markdown keys", () => {
   });
 
   it("uses execCommand when available, so the browser owns the edit and undo", () => {
-    const exec = vi.fn(() => true);
-    doc.execCommand = exec;
     const { ta, type } = setup();
+    const exec = vi.fn((_cmd: string, _ui?: boolean, text?: string) => {
+      ta.setRangeText(text ?? "", ta.selectionStart, ta.selectionEnd, "end");
+      ta.dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
+    });
+    doc.execCommand = exec;
     type("1. a");
     fireEvent.keyDown(ta, shiftEnter);
     expect(exec).toHaveBeenCalledWith("insertText", false, "\n2. ");
-    // The stub did not edit anything: no manual setRangeText on this path.
-    expect(ta.value).toBe("1. a");
+    expect(ta.value).toBe("1. a\n2. ");
   });
 
   it("falls back to setRangeText and an input event when execCommand is missing", () => {
