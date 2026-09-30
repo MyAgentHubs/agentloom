@@ -77,3 +77,36 @@ export function discardDraft(sessionId: string): void {
   discarded.add(sessionId);
   clearDraft(sessionId);
 }
+
+/**
+ * Drop drafts whose session no longer exists (deleted through paths that bypass discardDraft).
+ * Keys are collected before deleting so removal cannot shift the iteration; the new-session draft stays.
+ * Returns the number of removed drafts.
+ */
+export function pruneDrafts(liveIds: ReadonlySet<string>): number {
+  let removed = 0;
+  try {
+    const orphans: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key === null || !key.startsWith(PREFIX)) continue;
+      const id = key.slice(PREFIX.length);
+      if (id !== NEW_SESSION_KEY && !liveIds.has(id)) orphans.push(key);
+    }
+    for (const key of orphans) {
+      localStorage.removeItem(key);
+      removed++;
+    }
+  } catch {
+    // storage unavailable — leftover drafts are harmless
+  }
+  return removed;
+}
+
+/** Pass-through for a successfully loaded full session list (archived included): prune, then hand the list back. */
+export function pruneDraftsForSessions<T extends { id: string }>(
+  sessions: T[],
+): T[] {
+  pruneDrafts(new Set(sessions.map((s) => s.id)));
+  return sessions;
+}

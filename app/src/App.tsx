@@ -43,7 +43,7 @@ import { Lightbox } from "./components/Lightbox";
 import { isAgentAvailable, type RuntimeDetect } from "./lib/agentAvailability";
 import { shouldShowInstallGuide } from "./lib/agentOnboarding";
 import { loadLastAgentId, saveLastAgentId } from "./lib/agentPrefStore";
-import { discardDraft } from "./lib/composerDraftStore";
+import { discardDraft, pruneDraftsForSessions } from "./lib/composerDraftStore";
 import { saveProjectEdits } from "./lib/editProject";
 import {
   applyEventTransportBatch,
@@ -3135,7 +3135,7 @@ function AppContent() {
     if (initedRef.current) return; // StrictMode 下 effect 双调，防重复初始化
     initedRef.current = true;
     (async () => {
-      let list = await refreshSessions();
+      let list = pruneDraftsForSessions(await refreshSessions());
       if (list.length === 0) {
         const sid = crypto.randomUUID();
         if (activeRepoId !== null) {
