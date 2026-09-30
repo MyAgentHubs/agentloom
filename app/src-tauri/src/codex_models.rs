@@ -374,13 +374,31 @@ mod tests {
                 .success());
         }
 
+        // Only real pids: 0 and -1 would signal a whole process group or every process.
+        fn parse_pids(text: &str) -> Vec<i32> {
+            text.lines()
+                .filter_map(|line| line.trim().parse::<i32>().ok())
+                .filter(|pid| *pid > 1)
+                .collect()
+        }
+
         fn kill_all(pid_file: &Path) {
-            for pid in read_lines(pid_file) {
+            let text = std::fs::read_to_string(pid_file).unwrap_or_default();
+            for pid in parse_pids(&text) {
                 let _ = std::process::Command::new("kill")
-                    .args(["-9", &pid])
+                    .args(["-9", &pid.to_string()])
                     .stderr(Stdio::null())
                     .status();
             }
+        }
+
+        #[test]
+        fn parse_pids_accepts_only_real_pids() {
+            assert_eq!(
+                parse_pids("0\n-1\n\nabc\n1\n 4242 \n7 8\n99999999999\n"),
+                [4242]
+            );
+            assert_eq!(parse_pids("2\n3"), [2, 3]);
         }
 
         #[test]
@@ -465,20 +483,26 @@ mod tests {
         #[test]
         fn endless_stdout_is_cut_off_while_reading() {
             let dir = tempfile::tempdir().unwrap();
-            let bin = script(dir.path(), "[ \"$1\" = warm ] && exit 0\nexec yes");
+            // A finite burst well over the limit, then no EOF: a reader that waited for the end
+            // would sit until the deadline (bounded to 16 MiB of memory), a capped one returns at
+            // once.
+            let body = format!(
+                "[ \"$1\" = warm ] && exit 0\nhead -c {} /dev/zero\nexec sleep 30",
+                4 * STDOUT_LIMIT
+            );
+            let bin = script(dir.path(), &body);
             warm(&bin);
             let started = Instant::now();
-            let err = run_capped(&bin, &[], Duration::from_secs(30)).unwrap_err();
+            let err = run_capped(&bin, &[], Duration::from_secs(5)).unwrap_err();
             let elapsed = started.elapsed();
             assert!(err.contains("exceeded"), "{err}");
-            // Reading to the end would only stop at the 30s deadline.
-            assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+            assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
         }
 
         // The child exits at once but leaves a descendant that keeps stdout open.
         fn lingering_descendant_script(dir: &Path, pids: &Path) -> std::path::PathBuf {
             let body = format!(
-                "[ \"$1\" = warm ] && exit 0\nsleep 6 &\necho $! >> '{}'\nexit 0",
+                "[ \"$1\" = warm ] && exit 0\nsleep 30 &\necho $! >> '{}'\nexit 0",
                 pids.display()
             );
             let bin = script(dir, &body);
