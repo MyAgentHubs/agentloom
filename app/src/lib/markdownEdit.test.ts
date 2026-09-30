@@ -192,6 +192,10 @@ describe("indentListLine", () => {
     expect(run(outdent, "- a|")).toBe("- a|");
     expect(run(outdent, "1. «a»")).toBe("1. «a»");
   });
+  it("returns null when there is nothing to outdent", () => {
+    expect(run(outdent, "plain text|")).toBeNull();
+    expect(run(outdent, "1.5 倍|")).toBeNull();
+  });
   it("does not report a no-op for multi-line selections or plain lines", () => {
     expect(run(outdent, "«- a\n- b»")).toBeNull();
     expect(run(outdent, "a|")).toBeNull();
