@@ -177,3 +177,28 @@ pub(super) async fn install_gh() -> Result<(), String> {
 pub(super) fn detect_brew() -> bool {
     github::detect_brew_available()
 }
+
+// Errors from this command are never shown to the user: the frontend silently falls back
+// to its static model table, so the strings here stay plain English for logs only.
+#[tauri::command]
+pub(super) async fn list_codex_models(
+    db: State<'_, Db>,
+) -> Result<Vec<crate::codex_models::CodexModelInfo>, String> {
+    let codex_override = match db.0.lock() {
+        Ok(conn) => db::get_app_setting(&conn, CODEX_CLI_PATH_SETTING)
+            .ok()
+            .flatten(),
+        Err(_) => None,
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = detect::detect_codex_with_override(codex_override.as_deref())
+            .path
+            .ok_or_else(|| "codex CLI not found".to_string())?;
+        crate::codex_models::list_codex_models_with_bin(
+            std::path::Path::new(&path),
+            std::time::Duration::from_secs(15),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}

@@ -30,6 +30,7 @@ mod checkpoint_hook;
 mod cmd_agents;
 #[path = "lib/cmd_artifacts.rs"]
 mod cmd_artifacts;
+mod codex_models;
 use cmd_artifacts::*;
 #[path = "lib/cmd_continuation.rs"]
 mod cmd_continuation;
@@ -338,7 +339,8 @@ use cmd_agents::{
 };
 use cmd_detect::{
     cli_path_override_for_spawn, detect_brew, detect_gh, detect_git, detect_runtime, install_gh,
-    list_repos, list_repos_by_status, load_cli_path_override_cache, set_cli_path,
+    list_codex_models, list_repos, list_repos_by_status, load_cli_path_override_cache,
+    set_cli_path,
 };
 #[cfg(test)]
 use cmd_detect::{
@@ -610,6 +612,7 @@ pub fn run() {
             detect_git,
             detect_gh,
             install_gh,
+            list_codex_models,
             detect_brew,
             // cluster L Task 7
             add_repo,

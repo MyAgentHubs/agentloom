@@ -108,6 +108,7 @@ fn enclosing_fn_name(text: &str, idx: usize) -> Option<String> {
 /// 白名单——已逐条核实身份、不是 agent CLI 子进程，允许留在统一口之外：
 /// - `agent.rs::spawn_with_stdin_prompt_ack` —— 本身就是统一口的实现，不能自己调自己。
 /// - `agent/harness_runtime.rs::path_from_login_shell` —— 探测用户 login shell 的真实 PATH，不是 agent 进程。
+/// - `codex_models.rs::run_capped` - short-lived `codex debug models` runner (lists models only, no prompt, timeout and stdout cap); not an agent run.
 /// - `detect.rs::query_registry_value` —— Windows `reg query` 注册表探针。
 /// - `github.rs::command_output_with_timeout` —— git/gh 命令的通用超时执行器。
 /// - `lib/win_taskkill.rs::windows_taskkill_tree` —— Windows `taskkill` 树杀探针。
@@ -120,6 +121,7 @@ fn agent_backend_commands_spawn_via_stdin_prompt_helper() {
     const ALLOWLIST: &[(&str, &str)] = &[
         ("agent.rs", "spawn_with_stdin_prompt_ack"),
         ("agent/harness_runtime.rs", "path_from_login_shell"),
+        ("codex_models.rs", "run_capped"),
         ("detect.rs", "query_registry_value"),
         ("github.rs", "command_output_with_timeout"),
         ("lib/win_taskkill.rs", "windows_taskkill_tree"),
