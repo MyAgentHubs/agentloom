@@ -5,14 +5,12 @@ use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 /// Upper bound for the captured stdout of one `debug models` run.
 const STDOUT_LIMIT: usize = 4 * 1024 * 1024;
-/// Only the head of stderr is kept, for error messages.
-const STDERR_KEEP: usize = 2048;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CodexModelInfo {
@@ -80,19 +78,20 @@ fn run_capped(bin: &Path, args: &[&str], timeout: Duration) -> Result<Vec<u8>, S
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::null());
     let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
 
     let overflow = Arc::new(AtomicBool::new(false));
     let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
     let flag = Arc::clone(&overflow);
-    let out_reader = thread::spawn(move || read_capped(stdout, STDOUT_LIMIT, Some(flag)));
-    let err_reader = thread::spawn(move || read_capped(stderr, STDERR_KEEP, None));
+    let (tx, rx) = mpsc::channel();
+    // The reader thread is never joined: if a descendant keeps the pipe open it lives until
+    // that descendant exits, but the caller is not held up by it.
+    thread::spawn(move || {
+        let _ = tx.send(read_capped(stdout, STDOUT_LIMIT, &flag));
+    });
 
     let deadline = Instant::now() + timeout;
-    // Readers are not joined on the kill paths so a straggler holding the pipe open (windows,
-    // where only the direct child is killed) cannot block us past the deadline.
     let status = loop {
         if overflow.load(Ordering::SeqCst) {
             kill_tree(&mut child);
@@ -108,16 +107,22 @@ fn run_capped(bin: &Path, args: &[&str], timeout: Duration) -> Result<Vec<u8>, S
         }
     };
 
-    let stdout = out_reader.join().map_err(|_| "reader panicked")?;
-    let stderr = err_reader.join().map_err(|_| "reader panicked")?;
+    if !status.success() {
+        return Err(format!("exited with {status}"));
+    }
+    // The child is gone, so its own output is complete. Wait for the reader only briefly: a
+    // descendant that inherited the pipe would otherwise hold us here past the deadline. The
+    // child is already reaped, so no process-group kill is attempted here (the pid may be reused).
+    // A half-read buffer is never used: a timeout here is an error.
+    let grace = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(500));
+    let stdout = rx.recv_timeout(grace).map_err(|e| match e {
+        mpsc::RecvTimeoutError::Timeout => "stdout still held open by a descendant after exit",
+        mpsc::RecvTimeoutError::Disconnected => "stdout reader thread died",
+    })?;
     if overflow.load(Ordering::SeqCst) {
         return Err(format!("stdout exceeded {STDOUT_LIMIT} bytes"));
-    }
-    if !status.success() {
-        return Err(format!(
-            "exited with {status}: {}",
-            String::from_utf8_lossy(&stderr).trim()
-        ));
     }
     Ok(stdout)
 }
@@ -134,9 +139,8 @@ fn kill_tree(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// Keeps at most `keep` bytes. With `overflow` set, stops reading at the first excess byte
-/// and raises the flag; without it, keeps draining so the child never blocks on the pipe.
-fn read_capped(mut pipe: impl Read, keep: usize, overflow: Option<Arc<AtomicBool>>) -> Vec<u8> {
+/// Keeps at most `keep` bytes; at the first excess byte raises `overflow` and stops reading.
+fn read_capped(mut pipe: impl Read, keep: usize, overflow: &AtomicBool) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -146,10 +150,8 @@ fn read_capped(mut pipe: impl Read, keep: usize, overflow: Option<Arc<AtomicBool
                 let room = keep.saturating_sub(buf.len());
                 buf.extend_from_slice(&chunk[..n.min(room)]);
                 if n > room {
-                    if let Some(flag) = &overflow {
-                        flag.store(true, Ordering::SeqCst);
-                        break;
-                    }
+                    overflow.store(true, Ordering::SeqCst);
+                    break;
                 }
             }
         }
@@ -353,6 +355,162 @@ mod tests {
                 assert!(Instant::now() < deadline, "grandchild {gpid} still running");
                 thread::sleep(Duration::from_millis(50));
             }
+        }
+
+        fn read_lines(path: &Path) -> Vec<String> {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        // Scripts that start with `[ "$1" = warm ] && exit 0` can be pre-run once, see below.
+        fn warm(bin: &Path) {
+            assert!(std::process::Command::new(bin)
+                .arg("warm")
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        fn kill_all(pid_file: &Path) {
+            for pid in read_lines(pid_file) {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid])
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+
+        #[test]
+        fn live_is_tried_first_and_bundled_is_skipped_when_live_succeeds() {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("calls");
+            let body = format!(
+                "echo \"$*\" >> '{}'\ncase \"$*\" in\n*--bundled*)\n{}\n;;\n*)\n{}\n;;\nesac",
+                log.display(),
+                emit(r#"{"models":[{"slug":"bundled","visibility":"list","priority":1}]}"#),
+                emit(r#"{"models":[{"slug":"live","visibility":"list","priority":1}]}"#),
+            );
+            let bin = script(dir.path(), &body);
+            let models = list_codex_models_with_bin(&bin, LONG).unwrap();
+            assert_eq!(models[0].slug, "live");
+            assert_eq!(read_lines(&log), ["debug models"]);
+        }
+
+        #[test]
+        fn bundled_is_called_second_with_the_flag_after_live_fails() {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("calls");
+            let body = format!(
+                "echo \"$*\" >> '{}'\ncase \"$*\" in\n*--bundled*)\n{}\n;;\n*) exit 3;;\nesac",
+                log.display(),
+                emit(r#"{"models":[{"slug":"bundled","visibility":"list","priority":1}]}"#),
+            );
+            let bin = script(dir.path(), &body);
+            let models = list_codex_models_with_bin(&bin, LONG).unwrap();
+            assert_eq!(models[0].slug, "bundled");
+            assert_eq!(read_lines(&log), ["debug models", "debug models --bundled"]);
+        }
+
+        #[test]
+        fn realistic_size_output_parses_and_sorts() {
+            // About 600 KB in total, like a real `debug models` dump: long instruction texts
+            // per model, only some of them visible.
+            let filler = "x".repeat(10_000);
+            let models: Vec<String> = (0..60)
+                .map(|i| {
+                    let visibility = if i % 10 == 0 { "list" } else { "hide" };
+                    format!(
+                        r#"{{"slug":"m{i}","display_name":"M{i}","visibility":"{visibility}","priority":{},"base_instructions":"{filler}","supported_reasoning_levels":[{{"effort":"low","description":"d"}}]}}"#,
+                        100 - i
+                    )
+                })
+                .collect();
+            let json = format!(r#"{{"models":[{}]}}"#, models.join(","));
+            assert!(json.len() > 600_000 && json.len() < STDOUT_LIMIT);
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("models.json");
+            std::fs::write(&file, json).unwrap();
+            let bin = script(dir.path(), &format!("exec cat '{}'", file.display()));
+            let models = list_codex_models_with_bin(&bin, LONG).unwrap();
+            let slugs: Vec<_> = models.iter().map(|m| m.slug.as_str()).collect();
+            assert_eq!(slugs, ["m50", "m40", "m30", "m20", "m10", "m0"]);
+            assert_eq!(models[0].reasoning_levels, ["low"]);
+        }
+
+        #[test]
+        fn stdout_of_exactly_the_limit_is_ok() {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = script(
+                dir.path(),
+                &format!("exec head -c {STDOUT_LIMIT} /dev/zero"),
+            );
+            let out = run_capped(&bin, &[], LONG).unwrap();
+            assert_eq!(out.len(), STDOUT_LIMIT);
+        }
+
+        #[test]
+        fn stdout_one_byte_over_the_limit_is_err() {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = script(
+                dir.path(),
+                &format!("exec head -c {} /dev/zero", STDOUT_LIMIT + 1),
+            );
+            let err = run_capped(&bin, &[], LONG).unwrap_err();
+            assert!(err.contains("exceeded"), "{err}");
+        }
+
+        #[test]
+        fn endless_stdout_is_cut_off_while_reading() {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = script(dir.path(), "[ \"$1\" = warm ] && exit 0\nexec yes");
+            warm(&bin);
+            let started = Instant::now();
+            let err = run_capped(&bin, &[], Duration::from_secs(30)).unwrap_err();
+            let elapsed = started.elapsed();
+            assert!(err.contains("exceeded"), "{err}");
+            // Reading to the end would only stop at the 30s deadline.
+            assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+        }
+
+        // The child exits at once but leaves a descendant that keeps stdout open.
+        fn lingering_descendant_script(dir: &Path, pids: &Path) -> std::path::PathBuf {
+            let body = format!(
+                "[ \"$1\" = warm ] && exit 0\nsleep 6 &\necho $! >> '{}'\nexit 0",
+                pids.display()
+            );
+            let bin = script(dir, &body);
+            warm(&bin);
+            bin
+        }
+
+        #[test]
+        fn exit_with_descendant_holding_stdout_still_honours_the_deadline() {
+            let dir = tempfile::tempdir().unwrap();
+            let pids = dir.path().join("pids");
+            let bin = lingering_descendant_script(dir.path(), &pids);
+            let started = Instant::now();
+            let result = run_capped(&bin, &[], Duration::from_secs(1));
+            let elapsed = started.elapsed();
+            kill_all(&pids);
+            let err = result.unwrap_err();
+            assert!(err.contains("still held open"), "{err}");
+            assert!(elapsed < Duration::from_millis(2500), "{elapsed:?}");
+        }
+
+        #[test]
+        fn both_steps_with_lingering_descendants_stay_bounded() {
+            let dir = tempfile::tempdir().unwrap();
+            let pids = dir.path().join("pids");
+            let bin = lingering_descendant_script(dir.path(), &pids);
+            let started = Instant::now();
+            let result = list_codex_models_with_bin(&bin, Duration::from_secs(1));
+            let elapsed = started.elapsed();
+            kill_all(&pids);
+            assert!(result.is_err());
+            assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
         }
 
         #[test]
