@@ -100,7 +100,15 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     compatDisableNonessential: false,
     compatDisableThinking: false,
     accessPoints: [],
-    nativeModels: ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4"],
+    nativeModels: [
+      "gpt-6-astra",
+      "gpt-6-sol",
+      "gpt-6-luna",
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+      "gpt-5.5",
+    ],
     nativePrimaryModel: "gpt-5",
     nativeMapping: {
       opus: "gpt-5",

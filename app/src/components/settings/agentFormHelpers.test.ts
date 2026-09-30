@@ -12,6 +12,7 @@ import {
   normalizeEndpoint,
   PROVIDER_PRESETS,
   readModelCache,
+  resolveModelChoices,
   resolveModelsEndpoint,
   writeModelCache,
 } from "./agentFormHelpers";
@@ -50,9 +51,13 @@ describe("PROVIDER_PRESETS 配置表", () => {
 
   it("Codex native 模型按新到旧暴露当前版本", () => {
     expect(staticModelsFor("codex")).toEqual([
+      "gpt-6-astra",
+      "gpt-6-sol",
+      "gpt-6-luna",
       "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
       "gpt-5.5",
-      "gpt-5.4",
     ]);
     expect(usesCustomStaticModelInput("codex", undefined, "gpt-5")).toBe(true);
   });
@@ -953,5 +958,56 @@ describe("deriveModelMapping", () => {
       haiku: "foo-5",
       subagent: "foo-5",
     });
+  });
+});
+
+describe("resolveModelChoices", () => {
+  const S = CUSTOM_MODEL_SENTINEL;
+
+  it("nativeLive 为 null 时与旧行为等价（静态表 + live 合并）", () => {
+    const args = { staticModels: ["a", "b"], liveModels: ["c"], current: "x" };
+    const r = resolveModelChoices({ ...args, nativeLive: null });
+    expect(r.options).toEqual(mergeModelOptions(["a", "b"], ["c"], "x"));
+    expect(r.unknown).toBe(true);
+    expect(
+      resolveModelChoices({ ...args, nativeLive: null, current: "c" }).unknown,
+    ).toBe(false);
+    expect(
+      resolveModelChoices({ ...args, nativeLive: null, current: "" }).unknown,
+    ).toBe(false);
+  });
+
+  it("nativeLive 非 null 时忽略静态表", () => {
+    const r = resolveModelChoices({
+      staticModels: ["static-a"],
+      liveModels: [],
+      nativeLive: ["live-a", "live-b"],
+      current: "live-a",
+    });
+    expect(r.options).toEqual(["live-a", "live-b", S]);
+    expect(r.unknown).toBe(false);
+  });
+
+  it("当前值不在本机清单时追加到末尾且判为未识别", () => {
+    const r = resolveModelChoices({
+      staticModels: ["static-a"],
+      liveModels: [],
+      nativeLive: ["live-a"],
+      current: "static-a",
+    });
+    expect(r.options).toEqual(["live-a", "static-a", S]);
+    expect(r.unknown).toBe(true);
+  });
+
+  it("accessPoint / borrow 场景（nativeLive 为 null）行为不变", () => {
+    const r = resolveModelChoices({
+      staticModels: staticModelsFor("deepseek", "default"),
+      liveModels: ["deepseek-live-x"],
+      nativeLive: null,
+      current: "deepseek-live-x",
+    });
+    expect(r.options).toContain("deepseek-live-x");
+    expect(r.options[r.options.length - 1]).toBe(S);
+    expect(r.unknown).toBe(false);
   });
 });

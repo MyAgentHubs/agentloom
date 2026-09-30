@@ -138,6 +138,25 @@ export function mergeModelOptions(
   return out;
 }
 
+/** Dropdown options and the unknown-id hint; a non-null `nativeLive` (the local CLI's own list) is authoritative over the static table. */
+export function resolveModelChoices(args: {
+  staticModels: string[];
+  liveModels: string[];
+  nativeLive: string[] | null;
+  current: string;
+}): { options: string[]; unknown: boolean } {
+  const { staticModels, liveModels, nativeLive, current } = args;
+  const known = nativeLive ?? [...staticModels, ...liveModels];
+  return {
+    options: mergeModelOptions(
+      nativeLive ?? staticModels,
+      nativeLive ? [] : liveModels,
+      current,
+    ),
+    unknown: current.trim() !== "" && !known.includes(current),
+  };
+}
+
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 function cacheKey(preset: string, endpoint: string): string {
   return `agentloom:models:${preset}:${normalizeEndpoint(endpoint) ?? endpoint}`;

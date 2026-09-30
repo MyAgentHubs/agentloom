@@ -15,9 +15,9 @@ import {
   deriveAccess,
   engineView,
   inferProviderAccessPoint,
-  mergeModelOptions,
   normalizeEndpoint,
   readModelCache,
+  resolveModelChoices,
   resolveModelsEndpoint,
   writeModelCache,
 } from "./agentFormHelpers";
@@ -56,6 +56,7 @@ import {
   type TestState,
 } from "./agentFormTypes";
 import { ModelDropdown } from "./ModelDropdown";
+import { useCodexLiveModels } from "./useCodexLiveModels";
 
 function SegmentButton({
   active,
@@ -157,11 +158,6 @@ export function AgentForm({
     currentProvider().accessPoints.find((ap) => ap.id === accessPointId);
   const staticModels =
     currentAccessPoint()?.knownModels ?? currentProvider().nativeModels ?? [];
-  const modelOptions = mergeModelOptions(
-    staticModels,
-    liveModels,
-    values.primaryModel,
-  );
   const provider = currentProvider();
   const multiAP = provider.accessPoints.length >= 2;
   const hasStoredKey = agent?.has_key ?? false;
@@ -178,10 +174,14 @@ export function AgentForm({
   const showCustomModelInput = isHarness
     ? !harnessHasModelChoices || customModel
     : customModel;
-  const isUnknownModel =
-    values.primaryModel.trim() !== "" &&
-    !staticModels.includes(values.primaryModel) &&
-    !liveModels.includes(values.primaryModel);
+  const nativeLive = useCodexLiveModels(values.preset === "codex" && isNative);
+  const { options: modelOptions, unknown: isUnknownModel } =
+    resolveModelChoices({
+      staticModels,
+      liveModels,
+      nativeLive,
+      current: values.primaryModel,
+    });
   // 编辑态锁 access 家族：只显示与该 agent 同族的预设组（codex 审出的 Medium——
   // 跨族点击会存出「access 与 preset 脱钩」的坏配置，如 harness agent 配上借壳
   // /anthropic 端点）。要换族请新建 agent；新增态三组全显。

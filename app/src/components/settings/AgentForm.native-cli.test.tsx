@@ -691,4 +691,91 @@ describe("AgentForm", () => {
 
     expect(screen.queryByTestId("test-conn-btn")).not.toBeInTheDocument();
   });
+
+  it("codex 模型下拉用本机清单，不再混入写死的静态表", async () => {
+    invokeMock.mockImplementation((cmd: string) =>
+      Promise.resolve(
+        cmd === "list_codex_models"
+          ? [{ slug: "gpt-9-test", display_name: "GPT-9" }]
+          : undefined,
+      ),
+    );
+
+    render(<AgentForm onCancel={vi.fn()} onSaved={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Codex CLI" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("list_codex_models"),
+    );
+    openMoreOptions();
+    fireEvent.click(await screen.findByRole("button", { name: /^gpt-5 ▾/ }));
+
+    expect(
+      await screen.findByRole("menuitemradio", { name: /gpt-9-test/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("menuitemradio", { name: /gpt-6-astra/ }),
+    ).toBeNull();
+  });
+
+  it("codex 当前模型在本机清单里时不提示未识别的模型", async () => {
+    invokeMock.mockImplementation((cmd: string) =>
+      Promise.resolve(
+        cmd === "list_codex_models"
+          ? [{ slug: "gpt-9-test", display_name: "GPT-9" }]
+          : undefined,
+      ),
+    );
+    const codex = (model: string) =>
+      agent({
+        id: "codex",
+        name: "Codex",
+        access: "native",
+        provider: "codex",
+        primary_model: model,
+        endpoint: null,
+      });
+
+    const { unmount } = render(
+      <AgentForm
+        agent={codex("gpt-9-test")}
+        onCancel={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("list_codex_models"),
+    );
+    await waitFor(() => expect(screen.queryByText(/未识别的模型/)).toBeNull());
+    unmount();
+
+    render(
+      <AgentForm
+        agent={codex("gpt-nope")}
+        onCancel={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText(/未识别的模型/)).toBeInTheDocument();
+  });
+
+  it("list_codex_models 失败时下拉仍是静态表且无报错文案", async () => {
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "list_codex_models"
+        ? Promise.reject("codex not found")
+        : Promise.resolve(undefined),
+    );
+
+    render(<AgentForm onCancel={vi.fn()} onSaved={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Codex CLI" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("list_codex_models"),
+    );
+    openMoreOptions();
+    fireEvent.click(await screen.findByRole("button", { name: /^gpt-5 ▾/ }));
+
+    expect(
+      await screen.findByRole("menuitemradio", { name: /gpt-6-astra/ }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/codex not found/)).toBeNull();
+  });
 });
