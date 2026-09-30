@@ -24,8 +24,9 @@ export function useCodexLiveModels(enabled: boolean): string[] | null {
     }
     setModels(cachedSlugs());
     let cancelled = false;
-    invoke<unknown>("list_codex_models")
-      .then((res) => {
+    void (async () => {
+      try {
+        const res = await invoke<unknown>("list_codex_models");
         if (cancelled || !Array.isArray(res)) return;
         const slugs = [
           ...new Set(
@@ -37,8 +38,10 @@ export function useCodexLiveModels(enabled: boolean): string[] | null {
         if (slugs.length === 0) return;
         writeModelCache("codex", "", slugs);
         setModels(slugs);
-      })
-      .catch(() => {});
+      } catch {
+        /* fall back silently */
+      }
+    })();
     return () => {
       cancelled = true;
     };
