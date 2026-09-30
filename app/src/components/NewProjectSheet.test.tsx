@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { I18nProvider } from "../i18n";
 import { NewProjectSheet } from "./NewProjectSheet";
 
@@ -11,11 +11,11 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: openMock }));
 function renderSheet(
   overrides: {
     onClose?: () => void;
-    onCreate?: ReturnType<typeof vi.fn>;
+    onCreate?: Mock<(...args: any[]) => any>;
     mode?: "create" | "edit";
     initial?: { name: string; icon: string | null; path?: string };
-    onSave?: ReturnType<typeof vi.fn>;
-    onRemove?: ReturnType<typeof vi.fn>;
+    onSave?: Mock<(...args: any[]) => any>;
+    onRemove?: Mock<(...args: any[]) => any>;
   } = {},
 ) {
   const onClose = overrides.onClose ?? vi.fn();

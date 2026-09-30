@@ -5,7 +5,7 @@ import {
   waitFor,
   act,
 } from "@testing-library/react";
-import { expect, type vi } from "vitest";
+import { expect, type Mock } from "vitest";
 import App from "../../App";
 import type { ChatMessage } from "../../types/agent";
 import { makeSession } from "../../test/factories";
@@ -14,7 +14,7 @@ import type { createAppTestMocks } from "./appTestMocks";
 import type { createAppTestInteractions } from "./appTestInteractions";
 
 export function createAppTestReviewScenarios(
-  invokeMock: ReturnType<typeof vi.fn>,
+  invokeMock: Mock<(...args: any[]) => any>,
   fixtures: ReturnType<typeof createAppTestFixtures>,
   mocks: ReturnType<typeof createAppTestMocks>,
   interactions: ReturnType<typeof createAppTestInteractions>,

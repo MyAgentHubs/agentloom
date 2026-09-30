@@ -1,4 +1,4 @@
-import { vi, beforeEach, afterEach } from "vitest";
+import { vi, beforeEach, afterEach, type Mock } from "vitest";
 import { clearTeamConfigCache } from "../../lib/useTeamConfig";
 import { setChatVerbosity } from "../../lib/chatVerbosity";
 import { createAppTestFixtures } from "./appTestFixtures";
@@ -13,7 +13,7 @@ export function setupAppTests({
   openMock,
   sessionMainProps,
 }: {
-  invokeMock: ReturnType<typeof vi.fn>;
+  invokeMock: Mock<(...args: any[]) => any>;
   listenMock: ReturnType<typeof vi.fn>;
   openMock: ReturnType<typeof vi.fn>;
   sessionMainProps: unknown[];

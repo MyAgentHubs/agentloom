@@ -1,10 +1,10 @@
-import type { vi } from "vitest";
+import type { Mock } from "vitest";
 import type { AgentProfile, Session, ChatMessage } from "../../types/agent";
 import { makeSession } from "../../test/factories";
 import type { createAppTestFixtures } from "./appTestFixtures";
 
 export function createAppTestMocks(
-  invokeMock: ReturnType<typeof vi.fn>,
+  invokeMock: Mock<(...args: any[]) => any>,
   fixtures: ReturnType<typeof createAppTestFixtures>,
 ) {
   const {

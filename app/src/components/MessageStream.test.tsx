@@ -1,6 +1,15 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { act, useState } from "react";
-import { afterEach, beforeEach, describe, it, expect, vi, test } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  it,
+  expect,
+  vi,
+  test,
+  type Mock,
+} from "vitest";
 import { MessageStream, stableMessageKeys } from "./MessageStream";
 import type { ChatMessage, LeadSummaryBlock, MemberUnit } from "../types/agent";
 import { setChatVerbosity } from "../lib/chatVerbosity";
@@ -158,7 +167,7 @@ function verifierResultMessage(id: string, summary: string): ChatMessage {
 
 function renderProbedAssistant(
   text: string,
-  renderProbe: ReturnType<typeof vi.fn>,
+  renderProbe: Mock<(...args: any[]) => any>,
 ): ChatMessage {
   const message: ChatMessage = {
     role: "assistant",
