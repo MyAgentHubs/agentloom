@@ -7,6 +7,7 @@ import {
 import { useAttachmentPort } from "../lib/attachmentPortContext";
 import { scanImagePaths } from "../lib/imagePathScan";
 import "../styles/chatImage.css";
+import { PathContextTarget } from "./PathContextTarget";
 
 export function isLocalImagePath(src: string): boolean {
   if (
@@ -97,40 +98,48 @@ function decodeLocalImagePath(path: string): string {
 
 export function PreviewablePath({
   path,
+  copyPath = path,
   onOpenPreview,
 }: {
   path: string;
+  copyPath?: string;
   onOpenPreview?: (path: string) => void;
 }) {
-  if (!onOpenPreview) return <code className="inline">{path}</code>;
-
   return (
-    <code
-      className="inline inline-path"
-      role="button"
-      tabIndex={0}
-      title={path}
-      onClick={() => onOpenPreview(path)}
-      onKeyDown={(event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          onOpenPreview(path);
-        }
-      }}
-    >
-      {path}
-    </code>
+    <PathContextTarget path={copyPath}>
+      {(props) => (
+        <code
+          {...props}
+          className={onOpenPreview ? "inline inline-path" : "inline"}
+          role={onOpenPreview ? "button" : undefined}
+          tabIndex={0}
+          title={path}
+          onClick={() => onOpenPreview?.(path)}
+          onKeyDown={(event) => {
+            props.onKeyDown?.(event);
+            if (onOpenPreview && (event.key === "Enter" || event.key === " ")) {
+              event.preventDefault();
+              onOpenPreview(path);
+            }
+          }}
+        >
+          {path}
+        </code>
+      )}
+    </PathContextTarget>
   );
 }
 
 export function LocalMarkdownImage({
   path,
+  copyPath,
   alt,
   sessionId,
   onOpenPreview,
   onOpenLightbox,
 }: {
   path: string;
+  copyPath?: string;
   alt?: string;
   sessionId?: string | null;
   onOpenPreview?: (path: string) => void;
@@ -175,19 +184,31 @@ export function LocalMarkdownImage({
 
   if (dataUri) {
     return (
-      <img
-        src={dataUri}
-        alt={alt ?? ""}
-        className="al-chat-image"
-        onClick={onOpenLightbox ? () => onOpenLightbox(decodedPath) : undefined}
-        style={{
-          cursor: onOpenLightbox ? "zoom-in" : undefined,
-        }}
-      />
+      <PathContextTarget path={copyPath ?? decodedPath}>
+        {(props) => (
+          <img
+            {...props}
+            src={dataUri}
+            alt={alt ?? ""}
+            className="al-chat-image"
+            tabIndex={0}
+            onClick={
+              onOpenLightbox ? () => onOpenLightbox(decodedPath) : undefined
+            }
+            style={{ cursor: onOpenLightbox ? "zoom-in" : undefined }}
+          />
+        )}
+      </PathContextTarget>
     );
   }
   if (failed) {
-    return <PreviewablePath path={decodedPath} onOpenPreview={onOpenPreview} />;
+    return (
+      <PreviewablePath
+        path={decodedPath}
+        copyPath={copyPath}
+        onOpenPreview={onOpenPreview}
+      />
+    );
   }
   return (
     <span
@@ -345,15 +366,16 @@ export function localImageMarkdownComponent(
     src,
     alt,
     className,
-    node: _node,
+    node,
     ...props
-  }: React.ComponentProps<"img"> & { node?: unknown }) {
+  }: React.ComponentProps<"img"> & ExtraProps) {
     const opts = optsRef.current;
     if (src && isLocalImagePath(src)) {
       return (
         <LocalMarkdownImage
           key={src}
           path={src}
+          copyPath={node?.data?.localCopyPath}
           alt={alt}
           sessionId={opts.sessionId}
           onOpenPreview={opts.onOpenPreview}

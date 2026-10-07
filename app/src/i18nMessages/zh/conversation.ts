@@ -70,6 +70,8 @@ export const messages = {
   "messageContent.imageLoading": "正在加载图片…",
   "messageContent.imageLoadFailed": "[图片加载失败]",
   "messageContent.imageArtifact.preview": "预览图片 {name}",
+  "messageContent.pathMenu.label": "文件操作",
+  "messageContent.pathMenu.copyPath": "复制路径",
   "messageContent.imageMenu.label": "图片操作",
   "messageContent.imageMenu.copyImage": "复制图片",
   "messageContent.imageMenu.copyPath": "复制全路径",

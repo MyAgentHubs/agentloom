@@ -3,6 +3,7 @@ import type { MutableRefObject } from "react";
 import type { Components } from "react-markdown";
 import type { LeadSummaryBlock as LSB, Finding } from "../types/agent";
 import { useI18n } from "../i18n";
+import { rehypeLocalCopyPaths } from "../lib/rehypeLocalCopyPaths";
 import { useMarkdownLib } from "../lib/useMarkdown";
 import {
   localImageBareListItemComponent,
@@ -81,6 +82,7 @@ function LeadMarkdown({
   return (
     <markdownLib.Markdown
       remarkPlugins={[markdownLib.remarkGfm]}
+      rehypePlugins={[rehypeLocalCopyPaths]}
       skipHtml={true}
       urlTransform={leadUrlTransform}
       components={components}

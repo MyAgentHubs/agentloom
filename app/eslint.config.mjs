@@ -23,7 +23,6 @@ export const LEGACY_LONG_FUNCTION_FILES = [
   "src/components/GateCard.tsx",
   "src/components/GlobalSearch.tsx",
   "src/components/InputArea.tsx",
-  "src/components/MarkdownBody.tsx",
   "src/components/MemberDrillIn.tsx",
   "src/components/MessageStream.tsx",
   "src/components/NewProjectSheet.tsx",

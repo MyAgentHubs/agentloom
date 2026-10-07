@@ -1,4 +1,5 @@
 import { useCallback, type KeyboardEvent } from "react";
+import { insertMath } from "../lib/mathEdit";
 import { insertText } from "../lib/insertText";
 import {
   autoCloseFence,
@@ -16,13 +17,15 @@ function editFor(e: KeyboardEvent<HTMLTextAreaElement>): Edit | null {
   const key = e.key.toLowerCase();
   // Ctrl+B / Ctrl+E are native cursor moves on macOS, so only Cmd counts there.
   const mod = e.metaKey || (e.ctrlKey && !isMac());
+  const math = mod && e.shiftKey && (key === "m" || key === "e");
   const wrap = mod && !e.shiftKey && (key === "b" || key === "e");
   // Enter sends; Shift+Enter is the line break, so list and fence help hooks in there.
   const lineBreak = !e.metaKey && !e.ctrlKey && key === "enter" && e.shiftKey;
   const tab = !e.metaKey && !e.ctrlKey && key === "tab";
-  if (!wrap && !lineBreak && !tab) return null;
+  if (!math && !wrap && !lineBreak && !tab) return null;
   // Read the text only for keys we may handle: this runs on every keydown.
   const { value, selectionStart: s, selectionEnd: end } = e.currentTarget;
+  if (math) return insertMath(value, s, end, key === "e");
   if (wrap) return toggleWrap(value, s, end, key === "b" ? "**" : "`");
   if (lineBreak) {
     return autoCloseFence(value, s, end) ?? continueList(value, s, end);
