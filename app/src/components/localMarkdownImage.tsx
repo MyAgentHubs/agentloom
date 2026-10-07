@@ -98,13 +98,15 @@ function decodeLocalImagePath(path: string): string {
 
 export function PreviewablePath({
   path,
+  copyPath = path,
   onOpenPreview,
 }: {
   path: string;
+  copyPath?: string;
   onOpenPreview?: (path: string) => void;
 }) {
   return (
-    <PathContextTarget path={path}>
+    <PathContextTarget path={copyPath}>
       {(props) => (
         <code
           {...props}
@@ -130,12 +132,14 @@ export function PreviewablePath({
 
 export function LocalMarkdownImage({
   path,
+  copyPath,
   alt,
   sessionId,
   onOpenPreview,
   onOpenLightbox,
 }: {
   path: string;
+  copyPath?: string;
   alt?: string;
   sessionId?: string | null;
   onOpenPreview?: (path: string) => void;
@@ -180,7 +184,7 @@ export function LocalMarkdownImage({
 
   if (dataUri) {
     return (
-      <PathContextTarget path={decodedPath}>
+      <PathContextTarget path={copyPath ?? decodedPath}>
         {(props) => (
           <img
             {...props}
@@ -198,7 +202,13 @@ export function LocalMarkdownImage({
     );
   }
   if (failed) {
-    return <PreviewablePath path={decodedPath} onOpenPreview={onOpenPreview} />;
+    return (
+      <PreviewablePath
+        path={decodedPath}
+        copyPath={copyPath}
+        onOpenPreview={onOpenPreview}
+      />
+    );
   }
   return (
     <span
@@ -356,15 +366,16 @@ export function localImageMarkdownComponent(
     src,
     alt,
     className,
-    node: _node,
+    node,
     ...props
-  }: React.ComponentProps<"img"> & { node?: unknown }) {
+  }: React.ComponentProps<"img"> & ExtraProps) {
     const opts = optsRef.current;
     if (src && isLocalImagePath(src)) {
       return (
         <LocalMarkdownImage
           key={src}
           path={src}
+          copyPath={node?.data?.localCopyPath}
           alt={alt}
           sessionId={opts.sessionId}
           onOpenPreview={opts.onOpenPreview}

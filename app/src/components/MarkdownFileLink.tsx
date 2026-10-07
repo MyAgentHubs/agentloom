@@ -10,12 +10,14 @@ import { PathContextTarget } from "./PathContextTarget";
 export function MarkdownFileLink({
   children,
   href,
+  copyPath,
   sessionId,
   onOpenPreview,
   onError,
 }: {
   children?: ReactNode;
   href?: string;
+  copyPath?: string;
   sessionId?: string | null;
   onOpenPreview?: (path: string) => void;
   onError: (error: unknown) => void;
@@ -45,8 +47,8 @@ export function MarkdownFileLink({
       {children}
     </a>
   );
-  return local ? (
-    <PathContextTarget path={path}>
+  return copyPath !== undefined || local ? (
+    <PathContextTarget path={copyPath ?? path}>
       {(props) => cloneElement(link, props)}
     </PathContextTarget>
   ) : (

@@ -22,6 +22,15 @@ describe("chat path copying", () => {
       "report",
       "reports/monthly report.md",
     ],
+    ["[file](file:///tmp/a%20b.txt)", "file", "/tmp/a b.txt"],
+    ["[file](file:///tmp/a%2520b.txt)", "file", "/tmp/a%20b.txt"],
+    ["[file](reports/a%23b.txt)", "file", "reports/a#b.txt"],
+    [
+      "[中文](outputs/%E6%8A%A5%E5%91%8A%20a.txt)",
+      "中文",
+      "outputs/报告 a.txt",
+    ],
+    ["`images/a%20b.png`", "images/a%20b.png", "images/a%20b.png"],
     ["`/tmp/missing.txt`", "/tmp/missing.txt", "/tmp/missing.txt"],
     ["[报告](outputs/报告.csv)", "报告", "outputs/报告.csv"],
     ["[document](outputs/report.pdf)", "document", "outputs/report.pdf"],
@@ -64,6 +73,43 @@ describe("chat path copying", () => {
     await waitFor(() =>
       expect(screen.getByRole("status")).toHaveTextContent("复制失败"),
     );
+  });
+
+  it("clamps the menu to the viewport and closes on outside pointer or Tab", () => {
+    render(
+      <MarkdownBody streaming={false}>
+        {"[file](file:///tmp/missing.txt)"}
+      </MarkdownBody>,
+    );
+    const link = screen.getByText("file");
+    fireEvent.contextMenu(link, { clientX: 10000, clientY: 10000 });
+    expect(screen.getByRole("menu")).toHaveStyle({
+      left: `${window.innerWidth - 188}px`,
+      top: `${window.innerHeight - 52}px`,
+    });
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole("menu")).toBeNull();
+    fireEvent.keyDown(link, { key: "ContextMenu" });
+    expect(screen.getByRole("menuitem")).toHaveFocus();
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("keeps navigation sanitized even when a file URL can be copied", () => {
+    const onOpenPreview = vi.fn();
+    render(
+      <MarkdownBody streaming={false} onOpenPreview={onOpenPreview}>
+        {"[file](file:///tmp/missing.txt) [unsafe](javascript:alert)"}
+      </MarkdownBody>,
+    );
+    const file = screen.getByText("file");
+    expect(file).toHaveAttribute("href", "");
+    fireEvent.click(file);
+    expect(invoke).not.toHaveBeenCalled();
+    expect(onOpenPreview).not.toHaveBeenCalled();
+    fireEvent.contextMenu(screen.getByText("unsafe"));
+    expect(screen.queryByRole("menu")).toBeNull();
   });
 
   it("copies a loaded local image path", async () => {
@@ -114,4 +160,25 @@ describe("chat path copying", () => {
     fireEvent.contextMenu(screen.getByText("array.map()"));
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
+});
+
+it.each([
+  ["images/a%2520b.png", "images/a%20b.png"],
+  ["file:///tmp/a%2520b.png", "/tmp/a%20b.png"],
+  ["images/a%23b.png", "images/a#b.png"],
+])("decodes the image URL once for copying: %s", async (url, expected) => {
+  invoke.mockResolvedValue({
+    kind: "image",
+    imageBase64: "aW1hZ2U=",
+    mediaType: "image/png",
+  });
+  render(
+    <MarkdownBody streaming={false}>{`![review-image](${url})`}</MarkdownBody>,
+  );
+  const image = await screen.findByRole("img", { name: "review-image" });
+  const reads = invoke.mock.calls.length;
+  fireEvent.contextMenu(image);
+  fireEvent.click(screen.getByRole("menuitem", { name: "复制路径" }));
+  await waitFor(() => expect(writeText).toHaveBeenCalledWith(expected));
+  expect(invoke).toHaveBeenCalledTimes(reads);
 });

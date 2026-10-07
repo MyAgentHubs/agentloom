@@ -1,9 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import Markdown, { defaultUrlTransform } from "react-markdown";
+import Markdown, { defaultUrlTransform, type ExtraProps } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import { rehypeLocalCopyPaths } from "../lib/rehypeLocalCopyPaths";
 import rehypeKatex from "rehype-katex";
+import { remarkChatMath } from "../lib/remarkChatMath";
 import { remarkLatexDelimiters } from "../lib/remarkLatexDelimiters";
 import "katex/dist/katex.min.css";
 import "../styles/chatMath.css";
@@ -92,10 +94,11 @@ export const MarkdownBody = React.memo(function MarkdownBody({
 
   const components = useMemo(
     () => ({
-      a({ children, href }: React.ComponentProps<"a">) {
+      a({ children, href, node }: React.ComponentProps<"a"> & ExtraProps) {
         return (
           <MarkdownFileLink
             href={href}
+            copyPath={node?.data?.localCopyPath}
             sessionId={sessionId}
             onOpenPreview={onOpenPreview}
             onError={(error) =>
@@ -162,8 +165,16 @@ export const MarkdownBody = React.memo(function MarkdownBody({
   return (
     <>
       <Markdown
-        remarkPlugins={[remarkGfm, remarkMath, remarkLatexDelimiters]}
-        rehypePlugins={[[rehypeKatex, { trust: false, maxExpand: 1000 }]]}
+        remarkPlugins={[
+          remarkGfm,
+          [remarkMath, { singleDollarTextMath: false }],
+          remarkLatexDelimiters,
+          remarkChatMath,
+        ]}
+        rehypePlugins={[
+          rehypeLocalCopyPaths,
+          [rehypeKatex, { trust: false, maxExpand: 1000, maxSize: 20 }],
+        ]}
         skipHtml={true}
         urlTransform={makeImgOnlyUrlTransform(defaultUrlTransform)}
         components={components}

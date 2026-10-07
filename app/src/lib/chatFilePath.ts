@@ -21,3 +21,14 @@ export function decodeFilePath(path: string): string {
     return path;
   }
 }
+
+// Receives the Markdown URL before the navigation/image transforms touch it.
+// Code spans are literal paths and must never pass through URL decoding.
+export function copyPathFromUrl(url: string): string | undefined {
+  if (/^file:/i.test(url)) {
+    const match = /^file:(\/{1,3})(.*)$/i.exec(url);
+    if (!match || match[1].length === 2 || match[2].startsWith("/")) return;
+    return decodeFilePath("/" + match[2]);
+  }
+  return isLocalFileReference(url) ? decodeFilePath(url) : undefined;
+}

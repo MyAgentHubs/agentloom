@@ -10,3 +10,13 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* Inline equations are atomic; scroll the equation instead of clipping the turn. */
+.katex:not(.katex-display > .katex) {
+  display: inline-block;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  vertical-align: middle;
+  padding-block: 0.2em;
+}

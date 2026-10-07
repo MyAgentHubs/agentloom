@@ -1,6 +1,6 @@
 import type { Root } from "mdast";
 import type { Extension as FromMarkdownExtension } from "mdast-util-from-markdown";
-import type { State, Tokenizer } from "micromark-util-types";
+import type { State, Tokenizer, TokenizeContext } from "micromark-util-types";
 import type { Plugin } from "unified";
 import type {} from "remark-parse";
 
@@ -13,7 +13,11 @@ declare module "micromark-util-types" {
 // Recognize TeX delimiters before CommonMark consumes their backslashes.
 // A tokenizer (rather than a source-wide replacement) leaves code, URLs,
 // escaped backslashes, and ordinary brackets to the Markdown parser.
+// Failed suffixes belong to one inline parser context, not a processor or message.
+// Once no closer exists in a suffix, later openers cannot need another full scan.
+const failedSuffixes = new WeakMap<TokenizeContext, Map<number, number>>();
 const tokenize: Tokenizer = function (effects, ok, nok) {
+  const context = this;
   let closing = 0;
   return start;
 
@@ -24,13 +28,18 @@ const tokenize: Tokenizer = function (effects, ok, nok) {
   }
 
   function body(code: Parameters<State>[0]): ReturnType<State> {
-    if (code === null) return nok(code);
+    if (code === null) {
+      const failed = failedSuffixes.get(context) ?? new Map<number, number>();
+      failed.set(closing, context.now().offset);
+      failedSuffixes.set(context, failed);
+      return nok(code);
+    }
     effects.consume(code);
     return code === 92 ? afterSlash : body;
   }
 
   function afterSlash(code: Parameters<State>[0]): ReturnType<State> {
-    if (code === null) return nok(code);
+    if (code === null) return body(code);
     effects.consume(code);
     if (code === closing) {
       effects.exit("latexMath");
@@ -43,6 +52,8 @@ const tokenize: Tokenizer = function (effects, ok, nok) {
   function opening(code: Parameters<State>[0]): ReturnType<State> {
     if (code !== 40 && code !== 91) return nok(code);
     closing = code === 40 ? 41 : 93;
+    if (context.now().offset < (failedSuffixes.get(context)?.get(closing) ?? 0))
+      return nok(code);
     effects.consume(code);
     return body;
   }
