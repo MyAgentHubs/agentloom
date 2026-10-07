@@ -17,7 +17,7 @@
     "tauri": "tauri",
     "test": "npm run check:filesize && vitest run && npm run test:scripts",
     "check:filesize": "python3 ../scripts/check_file_size.py",
-    "test:scripts": "node --test scripts/updater-manifest.node-test.mjs && python3 ../scripts/test_file_size_gate.py",
+    "test:scripts": "node --test scripts/updater-manifest.node-test.mjs scripts/check-webview-compat.node-test.mjs && python3 ../scripts/test_file_size_gate.py",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\"",

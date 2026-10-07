@@ -62,7 +62,6 @@ FEATURE_NAMES=(
   "Array.prototype.toSorted(...)"
   "Array.prototype.toReversed(...)"
   "Array.prototype.toSpliced(...)"
-  "structuredClone(...)"
   "import.meta.resolve(...)"
 )
 FEATURE_PATTERNS=(
@@ -72,9 +71,10 @@ FEATURE_PATTERNS=(
   '\.toSorted\('
   '\.toReversed\('
   '\.toSpliced\('
-  'structuredClone\('
   'import\.meta\.resolve'
 )
+# structuredClone shipped in Safari 15.4, before the Safari 16 baseline.
+# https://webkit.org/blog/12445/new-webkit-features-in-safari-15-4/
 # 已知但本刀不纳入扫描：Array.prototype.with(...) / TypedArray#with(...)。
 # `.with(` 在真实代码里到处是同名方法/链式调用（选项对象 builder、Promise
 # 链……），纯文本 grep 假命中率极高，纳入只会淹没真实信号、把人训练成无视
@@ -389,6 +389,9 @@ EOF
   }
 
   make_fixture "clean" 'console.log("clean fixture: no Safari-16-incompatible feature here");'
+  make_fixture "structuredclone" 'console.log(structuredClone({ value: 1 }));'
+  make_fixture "guardedclone" 'const clone = typeof structuredClone === "function" ? value => structuredClone(value) : value => JSON.parse(JSON.stringify(value)); console.log(clone({ value: 1 }));'
+  make_fixture "groupby" 'console.log(Object.groupBy([1, 2], value => value % 2));'
   make_fixture "lookbehind" 'const re = /(?<=foo)bar/; console.log(re.test("foobar"));'
   make_fixture "staticblock" 'class Foo { static #x; static { Foo.#x = 1; } } console.log(Foo);'
 
@@ -413,6 +416,9 @@ EOF
   }
 
   run_case "clean" 0
+  run_case "structuredclone" 0
+  run_case "guardedclone" 0
+  run_case "groupby" 1
   run_case "lookbehind" 1
   run_case "staticblock" 1
 
