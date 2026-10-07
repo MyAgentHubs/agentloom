@@ -2,6 +2,11 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import Markdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import { remarkLatexDelimiters } from "../lib/remarkLatexDelimiters";
+import "katex/dist/katex.min.css";
+import "../styles/chatMath.css";
 import { CodeBlock } from "./CodeBlock";
 import { MermaidBlock } from "./MermaidBlock";
 import { useI18n } from "../i18n";
@@ -199,7 +204,8 @@ export const MarkdownBody = React.memo(function MarkdownBody({
   return (
     <>
       <Markdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkMath, remarkLatexDelimiters]}
+        rehypePlugins={[[rehypeKatex, { trust: false, maxExpand: 1000 }]]}
         skipHtml={true}
         urlTransform={makeImgOnlyUrlTransform(defaultUrlTransform)}
         components={components}
