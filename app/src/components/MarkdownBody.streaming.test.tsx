@@ -9,6 +9,9 @@ describe("math streaming and input boundaries", () => {
     "$$\nx^2\n$$",
     String.raw`\(\frac{1}{2}\)`,
     String.raw`\[\frac{1}{2}\]`,
+    "\\[\nx^2\n\\]",
+    "\\(x +\ny\\)",
+    "\\[x +\\\ny\\]",
   ])("waits for closure at every possible chunk boundary: %s", (formula) => {
     const prefix = formula.includes("\n") ? "before\n\n" : "before ";
     const suffix = formula.includes("\n") ? "\n\nafter" : " after";

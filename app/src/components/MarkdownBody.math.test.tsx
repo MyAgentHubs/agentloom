@@ -5,6 +5,68 @@ import { MarkdownBody } from "./MarkdownBody";
 const formula = String.raw`D_{\mathrm{KL}}(P \parallel Q) \neq D_{\mathrm{KL}}(Q \parallel P)`;
 
 describe("chat math", () => {
+  it.each(["\n", "\r\n", "\r"])(
+    "renders multiline display math with %j line endings and preserves surrounding content",
+    (newline) => {
+      const source = ["before", "", "\\[", "x + y", "\\]", "", "after"].join(
+        newline,
+      );
+      const { container } = render(
+        <MarkdownBody streaming={false}>{source}</MarkdownBody>,
+      );
+      expect(container.querySelectorAll(".katex-display")).toHaveLength(1);
+      expect(container.querySelector("annotation")?.textContent).toBe("x + y");
+      expect(container.textContent).toContain("before");
+      expect(container.textContent).toContain("after");
+    },
+  );
+
+  it.each([
+    ["> \\[\n> x + y\n> \\]", "blockquote"],
+    ["- \\[\n  x + y\n  \\]", "li"],
+  ])(
+    "preserves multiline TeX math in Markdown containers: %s",
+    (source, tag) => {
+      const { container } = render(
+        <MarkdownBody streaming={false}>{`${source}\n\nafter`}</MarkdownBody>,
+      );
+      expect(container.querySelector(`${tag} .katex-display`)).not.toBeNull();
+      expect(container.querySelector("annotation")?.textContent).toBe("x + y");
+      expect(container.textContent).toContain("after");
+    },
+  );
+
+  it.each([
+    "x +\ny",
+    "x +\\\ny",
+    "\\begin{aligned}x &= 1 \\\\\ny &= 2\\end{aligned}",
+  ])("preserves formula content across line endings: %s", (value) => {
+    const { container } = render(
+      <MarkdownBody
+        streaming={false}
+      >{`before \\(${value}\\) after`}</MarkdownBody>,
+    );
+    expect(container.querySelector("annotation")?.textContent).toBe(value);
+    expect(container.querySelector(".katex-error")).toBeNull();
+    expect(container.querySelector(".katex-display")).toBeNull();
+    expect(container.textContent).toContain("after");
+  });
+
+  it("renders multiple multiline formulas without dropping later Markdown", () => {
+    const { container } = render(
+      <MarkdownBody streaming={false}>
+        {"\\[\nx\n\\]\n\n- middle\n\n\\[\ny\n\\]\n\n**after**"}
+      </MarkdownBody>,
+    );
+    expect(
+      [...container.querySelectorAll("annotation")].map(
+        (node) => node.textContent,
+      ),
+    ).toEqual(["x", "y"]);
+    expect(container.querySelector("li")?.textContent).toBe("middle");
+    expect(container.querySelector("strong")?.textContent).toBe("after");
+  });
+
   it.each([
     [`$${formula}$`, false],
     [`$$\n${formula}\n$$`, true],

@@ -1,5 +1,6 @@
 import type { Root } from "mdast";
 import type { Extension as FromMarkdownExtension } from "mdast-util-from-markdown";
+import { markdownLineEnding } from "micromark-util-character";
 import type { State, Tokenizer, TokenizeContext } from "micromark-util-types";
 import type { Plugin } from "unified";
 import type {} from "remark-parse";
@@ -7,6 +8,7 @@ import type {} from "remark-parse";
 declare module "micromark-util-types" {
   interface TokenTypeMap {
     latexMath: "latexMath";
+    latexMathData: "latexMathData";
   }
 }
 
@@ -23,6 +25,7 @@ const tokenize: Tokenizer = function (effects, ok, nok) {
 
   function start(code: Parameters<State>[0]): ReturnType<State> {
     effects.enter("latexMath");
+    effects.enter("latexMathData");
     effects.consume(code);
     return opening;
   }
@@ -34,14 +37,29 @@ const tokenize: Tokenizer = function (effects, ok, nok) {
       failedSuffixes.set(context, failed);
       return nok(code);
     }
+    // Micromark splits inline content into linked chunks at every line ending.
+    // Emit each break so subtokenize can map our events back to those chunks.
+    if (markdownLineEnding(code)) {
+      effects.exit("latexMathData");
+      effects.enter("lineEnding");
+      effects.consume(code);
+      effects.exit("lineEnding");
+      return afterLineEnding;
+    }
     effects.consume(code);
     return code === 92 ? afterSlash : body;
   }
 
+  function afterLineEnding(code: Parameters<State>[0]): ReturnType<State> {
+    effects.enter("latexMathData");
+    return body(code);
+  }
+
   function afterSlash(code: Parameters<State>[0]): ReturnType<State> {
-    if (code === null) return body(code);
+    if (code === null || markdownLineEnding(code)) return body(code);
     effects.consume(code);
     if (code === closing) {
+      effects.exit("latexMathData");
       effects.exit("latexMath");
       return ok;
     }
