@@ -1,0 +1,49 @@
+.composer-math {
+  position: relative;
+}
+.composer-math__popover {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 30;
+  width: min(360px, 65vw);
+  max-height: min(420px, 60vh);
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink-2);
+  box-shadow: 0 8px 24px rgba(72, 54, 35, 0.16);
+  font-size: 12px;
+}
+.composer-math__popover > button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: 8px;
+  border: 0;
+  border-radius: 4px;
+  padding: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.composer-math__popover > button:hover,
+.composer-math__popover > button:focus-visible {
+  background: var(--line);
+}
+.composer-math__popover summary {
+  cursor: pointer;
+}
+.composer-math__example {
+  min-width: 0;
+  border-top: 1px solid var(--line);
+  padding-block: 8px;
+}
+.composer-math__example pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

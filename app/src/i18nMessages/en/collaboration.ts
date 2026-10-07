@@ -1,4 +1,11 @@
 export const messages = {
+  "composer.math.label": "Insert math",
+  "composer.math.inline": "Inline formula",
+  "composer.math.display": "Display formula",
+  "composer.math.hint":
+    "Select text to wrap, or insert at the cursor. You can also type $…$, $$…$$, \\(…\\) or \\[…\\] directly. Escape dollar signs in prices as \\$5.",
+  "composer.math.examples": "Formula examples (source and preview)",
+
   "codingTask.phase.finalizing": "Finalizing changes",
   "codingTask.phase.askVerify": "Confirm verification command",
   "codingTask.phase.verifying": "Verifying",

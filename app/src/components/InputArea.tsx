@@ -11,6 +11,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { importAttachmentPaths } from "../lib/importAttachmentPaths";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import type { Mode } from "./ModeDropdown";
+import { ComposerMathTools } from "./ComposerMathTools";
 import { ComposerAgentSelector } from "./ComposerAgentSelector";
 import type {
   AgentProfile,
@@ -772,6 +773,11 @@ export function InputArea({
               <path d="M5 10v1a7 7 0 0014 0v-1M12 18v4" />
             </svg>
           </button>
+          <ComposerMathTools
+            textarea={taRef}
+            composing={composingRef}
+            disabled={readonly}
+          />
           <span className="composer__sp" />
           <ComposerAgentSelector
             agents={agents}

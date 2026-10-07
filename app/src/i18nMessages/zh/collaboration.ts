@@ -1,4 +1,11 @@
 export const messages = {
+  "composer.math.label": "插入公式",
+  "composer.math.inline": "行内公式",
+  "composer.math.display": "独立公式",
+  "composer.math.hint":
+    "选中文本后包裹，或在光标处插入。也可直接输入 $…$、$$…$$、\\(…\\) 或 \\[…\\]。金额中的美元符号可写成 \\$5。",
+  "composer.math.examples": "公式示例（源码与预览）",
+
   "codingTask.phase.finalizing": "固化改动",
   "codingTask.phase.askVerify": "待确认验证命令",
   "codingTask.phase.verifying": "验证中",
