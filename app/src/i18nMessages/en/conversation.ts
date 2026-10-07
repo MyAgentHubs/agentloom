@@ -72,6 +72,8 @@ export const messages = {
   "messageContent.imageLoading": "Loading image…",
   "messageContent.imageLoadFailed": "[Image failed to load]",
   "messageContent.imageArtifact.preview": "Preview image {name}",
+  "messageContent.pathMenu.label": "File actions",
+  "messageContent.pathMenu.copyPath": "Copy path",
   "messageContent.imageMenu.label": "Image actions",
   "messageContent.imageMenu.copyImage": "Copy image",
   "messageContent.imageMenu.copyPath": "Copy full path",

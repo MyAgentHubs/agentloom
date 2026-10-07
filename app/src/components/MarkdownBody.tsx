@@ -18,33 +18,8 @@ import {
   PreviewablePath,
 } from "./localMarkdownImage";
 import { renderBackendError } from "../lib/backendMsg";
-import { useAttachmentPort } from "../lib/attachmentPortContext";
-
-// 内联代码若形如「带已知可预览后缀的文件路径」→ 可点开预览。
-// 要求：无空白/反引号/圆括号（排掉 array.map()、foo.bar() 这类），且以已知后缀结尾。
-const PREVIEWABLE_PATH =
-  /^[^\s`()]+\.(md|markdown|mdx|txt|log|svg|png|jpe?g|gif|webp|bmp|ico|html?|json|ya?ml|toml|ini|cfg|conf|xml|csv|tsx?|jsx?|mjs|cjs|py|rs|go|java|kt|rb|php|c|cc|cpp|h|hpp|cs|swift|sh|bash|zsh|sql|css|scss|less|vue|svelte)$/i;
-function isPreviewablePath(s: string): boolean {
-  return s.length <= 512 && PREVIEWABLE_PATH.test(s);
-}
-
-function isLocalPreviewablePath(path: string): boolean {
-  if (!isPreviewablePath(path)) return false;
-  // 排除 mailto:、javascript: 等 URI scheme，同时保留 Windows 盘符路径。
-  return !/^[a-z][a-z\d+.-]*:/i.test(path) || /^[a-z]:[\\/]/i.test(path);
-}
-
-function isHtmlPath(path: string): boolean {
-  return /\.html?$/i.test(path);
-}
-
-function decodeFilePath(path: string): string {
-  try {
-    return decodeURIComponent(path);
-  } catch {
-    return path;
-  }
-}
+import { isLocalFileReference, isPreviewablePath } from "../lib/chatFilePath";
+import { MarkdownFileLink } from "./MarkdownFileLink";
 
 type Props = {
   children: string;
@@ -69,7 +44,6 @@ export const MarkdownBody = React.memo(function MarkdownBody({
   autoInlineImagePaths = false,
 }: Props) {
   const { t } = useI18n();
-  const attachmentPort = useAttachmentPort();
   const [attachmentOpenError, setAttachmentOpenError] = useState<string | null>(
     null,
   );
@@ -119,32 +93,17 @@ export const MarkdownBody = React.memo(function MarkdownBody({
   const components = useMemo(
     () => ({
       a({ children, href }: React.ComponentProps<"a">) {
-        const external = !!href && /^https?:\/\//i.test(href);
         return (
-          <a
+          <MarkdownFileLink
             href={href}
-            onClick={(event) => {
-              event.preventDefault();
-              if (external) {
-                void attachmentPort.openUrl(href).catch(() => {});
-                return;
-              }
-              if (!href || !isLocalPreviewablePath(href)) return;
-
-              const decodedPath = decodeFilePath(href);
-              if (isHtmlPath(decodedPath)) {
-                void attachmentPort
-                  .openExternal(decodedPath, sessionId ?? null)
-                  .catch((error) => {
-                    setAttachmentOpenError(renderBackendError(error, t));
-                  });
-                return;
-              }
-              onOpenPreview?.(decodedPath);
-            }}
+            sessionId={sessionId}
+            onOpenPreview={onOpenPreview}
+            onError={(error) =>
+              setAttachmentOpenError(renderBackendError(error, t))
+            }
           >
             {children}
-          </a>
+          </MarkdownFileLink>
         );
       },
       code({ className, children, ...props }: React.ComponentProps<"code">) {
@@ -155,7 +114,7 @@ export const MarkdownBody = React.memo(function MarkdownBody({
             return <MermaidBlock code={raw} complete={!streaming} />;
           return <CodeBlock code={raw} lang={match[1]} />;
         }
-        if (onOpenPreview && isPreviewablePath(raw)) {
+        if (isPreviewablePath(raw) && isLocalFileReference(raw)) {
           return <PreviewablePath path={raw} onOpenPreview={onOpenPreview} />;
         }
         return (
@@ -190,7 +149,6 @@ export const MarkdownBody = React.memo(function MarkdownBody({
       },
     }),
     [
-      attachmentPort,
       bareParagraphComponent,
       bareListItemComponent,
       imgComponent,

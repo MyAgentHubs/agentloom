@@ -7,6 +7,7 @@ import {
 import { useAttachmentPort } from "../lib/attachmentPortContext";
 import { scanImagePaths } from "../lib/imagePathScan";
 import "../styles/chatImage.css";
+import { PathContextTarget } from "./PathContextTarget";
 
 export function isLocalImagePath(src: string): boolean {
   if (
@@ -102,24 +103,28 @@ export function PreviewablePath({
   path: string;
   onOpenPreview?: (path: string) => void;
 }) {
-  if (!onOpenPreview) return <code className="inline">{path}</code>;
-
   return (
-    <code
-      className="inline inline-path"
-      role="button"
-      tabIndex={0}
-      title={path}
-      onClick={() => onOpenPreview(path)}
-      onKeyDown={(event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          onOpenPreview(path);
-        }
-      }}
-    >
-      {path}
-    </code>
+    <PathContextTarget path={path}>
+      {(props) => (
+        <code
+          {...props}
+          className={onOpenPreview ? "inline inline-path" : "inline"}
+          role={onOpenPreview ? "button" : undefined}
+          tabIndex={0}
+          title={path}
+          onClick={() => onOpenPreview?.(path)}
+          onKeyDown={(event) => {
+            props.onKeyDown?.(event);
+            if (onOpenPreview && (event.key === "Enter" || event.key === " ")) {
+              event.preventDefault();
+              onOpenPreview(path);
+            }
+          }}
+        >
+          {path}
+        </code>
+      )}
+    </PathContextTarget>
   );
 }
 
@@ -175,15 +180,21 @@ export function LocalMarkdownImage({
 
   if (dataUri) {
     return (
-      <img
-        src={dataUri}
-        alt={alt ?? ""}
-        className="al-chat-image"
-        onClick={onOpenLightbox ? () => onOpenLightbox(decodedPath) : undefined}
-        style={{
-          cursor: onOpenLightbox ? "zoom-in" : undefined,
-        }}
-      />
+      <PathContextTarget path={decodedPath}>
+        {(props) => (
+          <img
+            {...props}
+            src={dataUri}
+            alt={alt ?? ""}
+            className="al-chat-image"
+            tabIndex={0}
+            onClick={
+              onOpenLightbox ? () => onOpenLightbox(decodedPath) : undefined
+            }
+            style={{ cursor: onOpenLightbox ? "zoom-in" : undefined }}
+          />
+        )}
+      </PathContextTarget>
     );
   }
   if (failed) {
