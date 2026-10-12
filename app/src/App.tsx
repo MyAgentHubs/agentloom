@@ -46,6 +46,12 @@ import { loadLastAgentId, saveLastAgentId } from "./lib/agentPrefStore";
 import { discardDraft, pruneDraftsForSessions } from "./lib/composerDraftStore";
 import { saveProjectEdits } from "./lib/editProject";
 import {
+  appRouteKey,
+  routeFromState,
+  type AppRoute,
+  type AppView,
+} from "./lib/appRoute";
+import {
   applyEventTransportBatch,
   type AppAgentEventBatchPayload,
 } from "./lib/eventTransportBatch";
@@ -239,13 +245,6 @@ type SessionMutator = (
 ) => void;
 /** 左栏行状态点三态（切走后仍知 agent 死活）：running=跑着；attention=needs_decision/error/blocked；done=completed。 */
 type SessionDotStatus = "running" | "attention" | "done";
-type AppView = "overview" | "session" | "intro";
-type AppRoute = {
-  view: AppView;
-  sessionId: string | null;
-  namespaceId: string | null;
-  repoId: string | null;
-};
 type CodingLoopDisplayMeta = {
   worker_name: string;
   step_done?: number;
@@ -320,25 +319,6 @@ export function pruneNavHistory(
   }
 
   return { history: merged, index: currentIndexAfterFilter };
-}
-
-function appRouteKey(route: AppRoute): string {
-  if (route.view === "session") return `session:${route.sessionId ?? ""}`;
-  return `${route.view}:${route.namespaceId ?? ""}:${route.repoId ?? ""}`;
-}
-
-function routeFromState(
-  view: AppView,
-  currentId: string | null,
-  namespaceId: string,
-  repoId: string | null,
-): AppRoute {
-  return {
-    view,
-    sessionId: view === "session" ? currentId : null,
-    namespaceId: view === "session" ? null : namespaceId,
-    repoId: view === "session" ? null : repoId,
-  };
 }
 
 type RuntimeTeamConfig = {
@@ -5075,10 +5055,30 @@ function AppContent() {
     setMessagesBySession(next);
   }
 
+  // Restore an archived session before sending into it (the backend rejects archived sessions); stays in place, no navigation.
+  async function ensureSessionUnarchived(sid: string): Promise<boolean> {
+    try {
+      await invoke("set_session_archived", { id: sid, archived: false });
+      setSessionDotStatus(sid, null);
+      sessionsRef.current = await refreshSessions();
+      return !sessionsRef.current.find((s) => s.id === sid)?.archived;
+    } catch (e) {
+      setToast(renderBackendError(String(e), t));
+      return false;
+    }
+  }
+
   function onSend(text: string, mode: Mode, config?: ComposerRuntimeConfig) {
     const sid = currentIdRef.current;
     if (!sid) return;
     if (loadingSessionsRef.current.has(sid)) return;
+    if (sessionsRef.current.find((s) => s.id === sid)?.archived) {
+      // Known gap: the composer already cleared its draft, so a failed restore loses it.
+      void ensureSessionUnarchived(sid).then((ok) => {
+        if (ok && currentIdRef.current === sid) onSend(text, mode, config);
+      });
+      return;
+    }
     // msgfix2 Q1：会话正忙（自己在跑，或 lead 已收尾但 member 卡还在跑）→ 不再拒发，
     // 改投队列（完成后自动递送）。agentId/mode 在这一刻就钉死，交给 sid 显式的
     // 投递函数原样消费，不依赖之后可能漂移的当前视图全局态。
