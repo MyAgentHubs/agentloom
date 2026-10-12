@@ -73,6 +73,7 @@ describe("App", () => {
     agentEventCb,
     emitAgentEventBatch,
     deferred,
+    configureTeamLead,
   } = setupAppTests({ invokeMock, listenMock, openMock, sessionMainProps });
 
   it("切换动态 agent 后发送 agentId，completed 不再前端补写 append_message（刀 R R3：已后端归约器持久化）", async () => {
@@ -998,5 +999,166 @@ describe("App", () => {
       ).toHaveTextContent("拒绝后正文"),
     );
     expect(hintTurn?.textContent).toBe(hintText);
+  });
+
+  async function openArchivedSessionForSend(
+    agentList: AgentProfile[],
+    setArchived: (args: any) => Promise<unknown>,
+  ) {
+    let sessionsState: Session[] = [
+      makeSession({ id: "a", title: "活动会话" }),
+      makeSession({
+        id: "z",
+        title: "归档会话",
+        archived: true,
+        archived_at: 1,
+      }),
+    ];
+    mockBasicApp(agentList);
+    const defaultInvoke = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation((cmd: string, args?: any) => {
+      if (cmd === "list_sessions") return Promise.resolve([...sessionsState]);
+      if (cmd === "set_session_archived") {
+        return setArchived(args).then(() => {
+          sessionsState = sessionsState.map((s) =>
+            s.id === args.id
+              ? { ...s, archived: args.archived, archived_at: null }
+              : s,
+          );
+        });
+      }
+      return defaultInvoke?.(cmd, args);
+    });
+    const { container } = render(<App />);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("get_messages", {
+        sessionId: "a",
+      }),
+    );
+    await act(async () => {
+      fireEvent.click(container.querySelector('[data-session-id="z"]')!);
+    });
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("get_messages", {
+        sessionId: "z",
+      }),
+    );
+    return container;
+  }
+
+  it("归档会话里发送：先 set_session_archived(false) 再 send_message，且会话移出已归档区", async () => {
+    const container = await openArchivedSessionForSend(agentProfiles, () =>
+      Promise.resolve(),
+    );
+    expect(container.querySelector(".sb-arch")).toBeTruthy();
+
+    const input = screen.getByPlaceholderText(/输入消息/);
+    await act(async () => {
+      fireEvent.change(input, { target: { value: "继续干活" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+    });
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "send_message",
+        expect.objectContaining({ sessionId: "z", message: "继续干活" }),
+      ),
+    );
+    const order = invokeMock.mock.calls.map(([cmd]) => cmd);
+    expect(order.indexOf("set_session_archived")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("set_session_archived")).toBeLessThan(
+      order.indexOf("send_message"),
+    );
+    expect(invokeMock).toHaveBeenCalledWith("set_session_archived", {
+      id: "z",
+      archived: false,
+    });
+    await waitFor(() => expect(container.querySelector(".sb-arch")).toBeNull());
+    expect(screen.queryByText(/启动失败/)).toBeNull();
+  });
+
+  it("归档会话里发送：set_session_archived 失败则不发 send_message、不出现启动失败气泡", async () => {
+    await openArchivedSessionForSend(agentProfiles, () =>
+      Promise.reject("DB_BUSY"),
+    );
+
+    const input = screen.getByPlaceholderText(/输入消息/);
+    await act(async () => {
+      fireEvent.change(input, { target: { value: "继续干活" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+    });
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_session_archived", {
+        id: "z",
+        archived: false,
+      }),
+    );
+    await act(async () => {});
+    expect(invokeMock.mock.calls.map(([cmd]) => cmd)).not.toContain(
+      "send_message",
+    );
+    expect(screen.queryByText(/启动失败/)).toBeNull();
+  });
+
+  it("归档会话里 Agent Team 送出：先解归档再 start_lead_session", async () => {
+    await openArchivedSessionForSend(
+      [
+        agentProfile({
+          cap_lead: "planner",
+          provider: "claude",
+          access: "native",
+        }),
+        agentProfile({
+          id: "deepseek",
+          name: "DeepSeek",
+          provider: "deepseek",
+          sort_order: 1,
+        }),
+      ],
+      () => Promise.resolve(),
+    );
+    const defaultInvoke = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation((cmd: string, args?: any) => {
+      if (cmd === "detect_runtime")
+        return Promise.resolve({
+          claude: { available: true },
+          codex: { available: true },
+        });
+      if (cmd === "start_lead_session") return Promise.resolve();
+      if (cmd === "set_session_agent_config")
+        return Promise.resolve({
+          session_id: args.sessionId,
+          lead_agent_id: args.leadAgentId ?? null,
+          member_agent_ids: args.memberAgentIds ?? [],
+        });
+      if (cmd === "get_lead_loop_state")
+        return Promise.resolve({
+          sessionId: "z",
+          autonomy: "cautious",
+          activeRunId: null,
+          activeTaskId: null,
+          lastEventCursor: null,
+        });
+      return defaultInvoke?.(cmd, args);
+    });
+    await screen.findByText("Claude Code");
+    await configureTeamLead();
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), {
+      target: { value: "团队干活" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "start_lead_session",
+        expect.objectContaining({ sessionId: "z", message: "团队干活" }),
+      ),
+    );
+    const order = invokeMock.mock.calls.map(([cmd]) => cmd);
+    expect(order.indexOf("set_session_archived")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("set_session_archived")).toBeLessThan(
+      order.indexOf("start_lead_session"),
+    );
   });
 });
