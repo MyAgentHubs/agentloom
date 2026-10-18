@@ -209,3 +209,12 @@ test("withSecurityHeaders：/assets/ 下形似带 hash 的路径若 404，不得
   assert.equal(response.status, 404);
   assert.equal(response.headers.get("Cache-Control"), "no-store");
 });
+
+test("withSecurityHeaders：304 Not Modified 的带 hash 资源仍是 immutable（条件请求重验证不得改写浏览器已存的缓存头）", () => {
+  const response = withSecurityHeaders(
+    fakeAssetResponse({ status: 304, body: null, contentType: "text/javascript; charset=utf-8" }),
+    new URL("https://relay.example.com/assets/index-BTlQZ0UP.js"),
+  );
+  assert.equal(response.status, 304);
+  assert.equal(response.headers.get("Cache-Control"), "public, max-age=31536000, immutable");
+});
