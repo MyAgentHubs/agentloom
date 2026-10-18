@@ -142,6 +142,7 @@ test("withSecurityHeaders：index.html（非 /assets/ 路径）四头逐项正�
   assert.equal(response.headers.get("Referrer-Policy"), "no-referrer");
   assert.equal(response.headers.get("X-Content-Type-Options"), "nosniff");
   assert.equal(response.headers.get("Cache-Control"), "no-store");
+  assert.equal(response.headers.get("Strict-Transport-Security"), "max-age=31536000");
   // 原响应的其它头（content-type/etag）原样保留，没被覆盖/丢失。
   assert.equal(response.headers.get("content-type"), "text/html; charset=utf-8");
   assert.equal(response.headers.get("etag"), '"fake-etag"');
@@ -187,4 +188,24 @@ test("withSecurityHeaders：不改写原响应 status（根路径禁 3xx 的前�
   const response = withSecurityHeaders(fakeAssetResponse({ status: 200 }), url);
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("location"), null);
+});
+
+test("withSecurityHeaders：HSTS 恰为 max-age=31536000（不带 includeSubDomains/preload），404 也带", () => {
+  const response = withSecurityHeaders(
+    fakeAssetResponse({ status: 404 }),
+    new URL("https://relay.example.com/.env"),
+  );
+  assert.equal(response.status, 404);
+  assert.equal(response.headers.get("Strict-Transport-Security"), "max-age=31536000");
+  assert.equal(response.headers.get("Cache-Control"), "no-store");
+  assert.ok(response.headers.get("Content-Security-Policy"));
+});
+
+test("withSecurityHeaders：/assets/ 下形似带 hash 的路径若 404，不得被标 immutable（否则 404 被缓存一年）", () => {
+  const response = withSecurityHeaders(
+    fakeAssetResponse({ status: 404 }),
+    new URL("https://relay.example.com/assets/index-BTlQZ0UP.js"),
+  );
+  assert.equal(response.status, 404);
+  assert.equal(response.headers.get("Cache-Control"), "no-store");
 });

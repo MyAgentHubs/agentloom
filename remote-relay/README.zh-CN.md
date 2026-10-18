@@ -116,14 +116,14 @@ npm run build   # 生成/刷新 remote-web/dist/——这一步不会被 wrangle
 `src/index.js` 的 `fetch()` 路由分流（`run_worker_first = true`，所有请求都先
 进这里，见 `wrangler.toml` 注释）：`/healthz`、`/room/*`（WS 升级/claim 限速）
 继续走原有路由、行为不变；其余 GET/HEAD 请求转发 `env.ASSETS.fetch()`
-（`not_found_handling = "single-page-application"`——手机端是纯 URL fragment
-路由的 SPA，任何未命中真实文件的路径都拿 index.html 应答，200 不是 3xx），响应
-经 `src/security-headers.js::withSecurityHeaders()` 统一叠加四类安全头：
+（`not_found_handling = "none"`——手机端是纯 URL fragment 路由的 SPA，真实路径
+只有 `/` 与 `/assets/*`，未命中真实文件的路径回 404，仍带安全头），响应
+经 `src/security-headers.js::withSecurityHeaders()` 统一叠加安全头：
 `Content-Security-Policy`（script-src 只放行 `'self'` + `remote-web/index.html`
 里那段 fragment bootstrap 内联脚本的 SHA-256 hash，不留 `'unsafe-inline'` 口子）
 / `Referrer-Policy: no-referrer` / `X-Content-Type-Options: nosniff` /
-`Cache-Control`（`/assets/` 下带内容 hash 的文件长缓存 immutable，其余
-`no-store`）。
+`Strict-Transport-Security: max-age=31536000` / `Cache-Control`（`/assets/` 下
+带内容 hash 的 200 文件长缓存 immutable，其余 `no-store`）。
 
 **CSP hash 与 dist 实际内联脚本的联动（防手改漂移）**：
 `src/security-headers.js` 的 `BOOTSTRAP_INLINE_SCRIPT_SHA256_BASE64` 常量不是

@@ -62,14 +62,14 @@ new_sqlite_classes = ["RoomDO"] # DO 内置 SQLite（免费档形态，母文档
 # `src/index.js`，由它决定哪些走 `/room/*`/`/healthz` 现有路由、哪些转给 `env.ASSETS.fetch()`
 # 再叠加安全头——WS 升级/`/room/*`/healthz 的路由行为完全不变（见 `src/index.js` 注释）。
 #
-# `not_found_handling = "single-page-application"`：手机端是纯 URL fragment 路由的 SPA
-# （`#p=<配对 payload>`，fragment 不上送服务器），没有任何真实存在的服务端路径需要区分——任何没
-# 命中 dist/ 里真实文件的请求都直接拿 index.html 应答（200，不是 3xx 重定向），地址栏路径原样
-# 保留。
+# `not_found_handling = "none"`：手机端是纯 URL fragment 路由的 SPA（`#p=<配对 payload>`，
+# fragment 不上送服务器），服务端只有 `/`（index.html）与 `/assets/*` 两类真实路径。没命中 dist/
+# 里真实文件的请求由平台回 404（`src/index.js` 照样叠加安全头）——不再用 index.html 兜底，否则漏洞
+# 扫描器探测 `/.env`、`/.git/config` 之类路径全拿 200，既诱导重复探测又污染访问统计。
 [assets]
 directory = "../remote-web/dist"
 binding = "ASSETS"
-not_found_handling = "single-page-application"
+not_found_handling = "none"
 run_worker_first = true
 
 # ----------------------------------------------------------------------------

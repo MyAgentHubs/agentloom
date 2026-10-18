@@ -86,9 +86,12 @@ export function withSecurityHeaders(assetResponse, url) {
   response.headers.set("Content-Security-Policy", buildContentSecurityPolicy(url.host));
   response.headers.set("Referrer-Policy", "no-referrer");
   response.headers.set("X-Content-Type-Options", "nosniff");
+  // 不带 includeSubDomains/preload：只对本主机承诺 HTTPS，不替同 zone 的其它子域做决定。
+  response.headers.set("Strict-Transport-Security", "max-age=31536000");
+  // 只有真命中的 200 才能 immutable：未命中路径现在回 404，形似 hash 的 404 被缓存一年就是事故。
   response.headers.set(
     "Cache-Control",
-    isHashedAssetPath(url.pathname) ? "public, max-age=31536000, immutable" : "no-store",
+    response.ok && isHashedAssetPath(url.pathname) ? "public, max-age=31536000, immutable" : "no-store",
   );
   return response;
 }

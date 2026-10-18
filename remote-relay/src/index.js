@@ -112,9 +112,9 @@ export default {
     }
 
     // T6g1 · S4 同域静态托管：其余所有 GET/HEAD 请求交给 env.ASSETS（wrangler.toml [assets] 绑定
-    // 指向 remote-web 的构建产物 `../remote-web/dist`；`not_found_handling =
-    // "single-page-application"` 让任何没命中真实文件的路径都拿到 index.html，200 而非 3xx——
-    // 手机端是纯 fragment 路由的 SPA，唯一会被访问的路径就是根路径本身）。安全头统一叠加在这里，
+    // 指向 remote-web 的构建产物 `../remote-web/dist`；`not_found_handling = "none"`，没命中真实
+    // 文件的路径由平台回 404——手机端是纯 fragment 路由的 SPA，唯一会被访问的路径就是根路径本身，
+    // 200 而非 3xx）。安全头（含 404 响应）统一叠加在这里，
     // 不依赖 [assets] 配置本身能不能设头（Cloudflare Assets 目前没有给 `_headers` 文件之外的
     // 每请求响应头注入点，且 `_headers` 文件不支持这里需要的「按当前请求 host 动态拼 connect-src」）。
     if (request.method !== "GET" && request.method !== "HEAD") {
