@@ -142,16 +142,17 @@ npm run build   # generates/refreshes remote-web/dist/ -- wrangler does not trig
 request enters here first; see the comment in `wrangler.toml`): `/healthz` and
 `/room/*` (WS upgrade / claim rate limiting) continue through the existing
 routes with unchanged behavior; all other GET/HEAD requests are forwarded to
-`env.ASSETS.fetch()` (`not_found_handling = "single-page-application"` — the
-mobile client is an SPA with pure URL-fragment routing, so any path that does not
-match a real file is answered with index.html, status 200 rather than 3xx), and
+`env.ASSETS.fetch()` (`not_found_handling = "none"` — the mobile client is an SPA with pure
+URL-fragment routing, so only `/` and `/assets/*` are real paths; any path that
+does not match a real file gets a 404, still with the security headers), and
 the response goes through `src/security-headers.js::withSecurityHeaders()`, which
-applies four kinds of security headers uniformly: `Content-Security-Policy`
+applies its security headers uniformly: `Content-Security-Policy`
 (script-src allows only `'self'` plus the SHA-256 hash of the inline fragment
 bootstrap script in `remote-web/index.html`, leaving no `'unsafe-inline'` hole) /
 `Referrer-Policy: no-referrer` / `X-Content-Type-Options: nosniff` /
-`Cache-Control` (content-hashed files under `/assets/` get long-lived immutable
-caching, everything else `no-store`).
+`Strict-Transport-Security: max-age=31536000` / `Cache-Control` (content-hashed
+200 files under `/assets/` get long-lived immutable caching, everything else
+`no-store`).
 
 **Coupling between the CSP hash and the actual inline script in dist (guarding
 against drift from hand edits)**: the `BOOTSTRAP_INLINE_SCRIPT_SHA256_BASE64`

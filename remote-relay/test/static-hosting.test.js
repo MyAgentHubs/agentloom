@@ -1,7 +1,7 @@
 "use strict";
 // static-hosting.test.js — T6g1 · worker 顶层路由分流（src/index.js 的 fetch()）：
 //   ① /healthz、② /room/*（含 WS 升级/claim 限速）零回归——继续走原路由、不经过 env.ASSETS；
-//   ③ 其余 GET/HEAD 转 env.ASSETS.fetch() 并叠加安全头（SPA fallback、根路径不重定向、
+//   ③ 其余 GET/HEAD 转 env.ASSETS.fetch() 并叠加安全头（未命中路径 404、根路径不重定向、
 //     /assets/ 与非 /assets/ 的 Cache-Control 分流）；
 //   ④ 非 GET/HEAD 的杂项路径维持 404（不误触 ASSETS）。
 //
@@ -11,6 +11,7 @@
 // Cloudflare 内部 Asset Worker 本身的 SPA fallback/html_handling 实现（那部分是 wrangler 的责任，
 // 线上/staging 冒烟验证归 T6g2）。
 
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/index.js";
@@ -156,16 +157,26 @@ test("GET /：转发 env.ASSETS.fetch，200、无 3xx/Location，四类安全头
   assert.equal(await response.text(), "<html>spa shell</html>");
 });
 
-test("GET /some/deep/fragment-only-spa/path：SPA fallback 场景（模拟 ASSETS 对未命中路径回 index.html·200）同样安全头齐全、no-store", async () => {
-  const { env, assets } = makeEnv();
-  const response = await worker.fetch(
-    new Request("https://relay.example.com/some/deep/fragment-only-spa/path"),
-    env,
-  );
+test("GET /.env（ASSETS 对未命中路径回 404）：404 原样透传，安全头 + HSTS + no-store 齐全", async () => {
+  const { env, assets } = makeEnv({ assets: makeFakeAssets({ status: 404, body: "Not Found" }) });
+  const response = await worker.fetch(new Request("https://relay.example.com/.env"), env);
   assert.equal(assets.calls.length, 1);
-  assert.equal(response.status, 200);
+  assert.equal(response.status, 404);
   assert.equal(response.headers.get("Cache-Control"), "no-store");
-  assert.ok(response.headers.get("Content-Security-Policy"));
+  assert.equal(response.headers.get("Strict-Transport-Security"), "max-age=31536000");
+  assert.equal(
+    response.headers.get("Content-Security-Policy"),
+    buildContentSecurityPolicy("relay.example.com"),
+  );
+});
+
+test("wrangler.toml [assets]：不得配 SPA fallback（未命中路径必须由平台回 404，而非 index.html 200）", () => {
+  const toml = readFileSync(new URL("../wrangler.toml", import.meta.url), "utf8");
+  const assetsSection = toml.match(/^\[assets\]\n((?:(?!\[).*\n?)*)/m)?.[1] ?? "";
+  const live = assetsSection.split("\n").filter((line) => !line.trim().startsWith("#")).join("\n");
+  assert.match(live, /^binding = "ASSETS"$/m);
+  assert.doesNotMatch(live, /single-page-application/);
+  assert.match(live, /^not_found_handling = "none"$/m);
 });
 
 test("GET /assets/index-BTlQZ0UP.js（真实内容 hash 长度形态）：长缓存 immutable，安全头仍统一叠加", async () => {

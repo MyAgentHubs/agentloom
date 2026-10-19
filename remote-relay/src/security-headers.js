@@ -86,9 +86,13 @@ export function withSecurityHeaders(assetResponse, url) {
   response.headers.set("Content-Security-Policy", buildContentSecurityPolicy(url.host));
   response.headers.set("Referrer-Policy", "no-referrer");
   response.headers.set("X-Content-Type-Options", "nosniff");
+  // No includeSubDomains/preload: commit only this host to HTTPS, not other subdomains in the zone.
+  response.headers.set("Strict-Transport-Security", "max-age=31536000");
+  // Only real 2xx hits and 304 revalidations (headers must match the original) may be immutable:
+  // unknown paths now return 404, and caching a hash-shaped 404 for a year would be an incident.
   response.headers.set(
     "Cache-Control",
-    isHashedAssetPath(url.pathname) ? "public, max-age=31536000, immutable" : "no-store",
+    (response.ok || response.status === 304) && isHashedAssetPath(url.pathname) ? "public, max-age=31536000, immutable" : "no-store",
   );
   return response;
 }
